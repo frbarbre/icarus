@@ -1,0 +1,6 @@
+pre-commit:
+  parallel: false
+  jobs:
+    - name: fix-phase-1
+      run: mise exec -- moon run root:fix-phase-1
+      stage_fixed: true

@@ -1,0 +1,44 @@
+{
+  "facets": [
+    {
+      "id": "type",
+      "label": "File types",
+      "default": "implementation",
+      "values": [
+        { "id": "implementation", "label": "Implementation" },
+        { "id": "imports", "label": "Imports only" },
+        { "id": "test", "label": "Tests" },
+        { "id": "documentation", "label": "Documentation" },
+        { "id": "generated", "label": "Generated" },
+        { "id": "lint-baseline", "label": "Lint baselines" },
+        { "id": "agent-guidance", "label": "Agent guidance" },
+        { "id": "localization", "label": "Localization" },
+        { "id": "assets", "label": "Assets" }
+      ],
+      "rules": [
+        { "id": "imports", "value": "imports", "when": { "any": [ { "attr": { "name": "review-imports", "state": "set" } }, { "content": "imports_only" } ] } },
+        { "id": "review-generated", "value": "generated", "when": { "attr": { "name": "review-generated", "state": "set" } } },
+        { "id": "review-test", "value": "test", "when": { "attr": { "name": "review-test", "state": "set" } } },
+        { "id": "review-documentation", "value": "documentation", "when": { "attr": { "name": "review-documentation", "state": "set" } } },
+        { "id": "review-agent-guidance", "value": "agent-guidance", "when": { "attr": { "name": "review-agent-guidance", "state": "set" } } },
+        { "id": "review-localization", "value": "localization", "when": { "attr": { "name": "review-localization", "state": "set" } } },
+        { "id": "review-assets", "value": "assets", "when": { "attr": { "name": "review-assets", "state": "set" } } },
+        { "id": "review-implementation", "value": "implementation", "when": { "attr": { "name": "review-implementation", "state": "set" } } },
+        { "id": "linguist-generated", "value": "generated", "when": { "attr": { "name": "linguist-generated", "state": "set" } } },
+        { "id": "linguist-documentation", "value": "documentation", "when": { "attr": { "name": "linguist-documentation", "state": "set" } } },
+        { "id": "generated-unset", "value": "implementation", "when": { "all": [ { "builtin": "generated_heuristic" }, { "any": [ { "attr": { "name": "review-generated", "state": "unset" } }, { "attr": { "name": "linguist-generated", "state": "unset" } } ] } ] } },
+        { "id": "generated-heuristic", "value": "generated", "when": { "builtin": "generated_heuristic" } },
+        { "id": "test-unset", "value": "implementation", "when": { "all": [ { "builtin": "test_heuristic" }, { "attr": { "name": "review-test", "state": "unset" } } ] } },
+        { "id": "test-heuristic", "value": "test", "when": { "builtin": "test_heuristic" } }
+      ]
+    }
+  ],
+  "analyzers": {
+    "imports_only": {
+      "max_changed_lines": 60,
+      "max_files": 200,
+      "max_bytes": 256000,
+      "semantics": "orca-v1"
+    }
+  }
+}

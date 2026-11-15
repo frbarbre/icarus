@@ -1,0 +1,2 @@
+# Versions come from mise (mise.toml, rust-toolchain.toml), so moon only orchestrates.
+rust: {}

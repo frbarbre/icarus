@@ -1,0 +1,50 @@
+{
+  "data": {
+    "repository": {
+      "baseTip": { "target": { "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } },
+      "pullRequest": {
+        "stack": {
+          "number": 42,
+          "size": 3,
+          "baseRefName": "main",
+          "entries": {
+            "nodes": [
+              {
+                "position": 3,
+                "pullRequest": {
+                  "number": 812, "state": "OPEN", "isDraft": false,
+                  "headRefOid": "4444444444444444444444444444444444444444",
+                  "mergeable": "MERGEABLE", "reviewDecision": "REVIEW_REQUIRED",
+                  "mergeStateStatus": "BLOCKED", "isInMergeQueue": false
+                }
+              },
+              {
+                "position": 1,
+                "pullRequest": {
+                  "number": 810, "state": "MERGED", "isDraft": false,
+                  "headRefOid": "7777777777777777777777777777777777777777",
+                  "mergeable": "UNKNOWN", "reviewDecision": "APPROVED",
+                  "mergeStateStatus": "UNKNOWN", "isInMergeQueue": false
+                }
+              },
+              {
+                "position": 2,
+                "pullRequest": {
+                  "number": 811, "state": "OPEN", "isDraft": true,
+                  "title": "Billing export UI", "url": "https://github.com/acme/widgets/pull/811",
+                  "headRefName": "billing-export-ui",
+                  "author": { "login": "dependabot", "avatarUrl": "https://avatars.githubusercontent.com/in/29110?s=64&v=4" },
+                  "commits": { "nodes": [ { "commit": { "statusCheckRollup": { "state": "FAILURE" } } } ] },
+                  "headRefOid": "1111111111111111111111111111111111111111",
+                  "mergeable": "MERGEABLE", "reviewDecision": null,
+                  "mergeStateStatus": "CLEAN", "isInMergeQueue": true
+                }
+              },
+              { "position": 4, "pullRequest": null }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

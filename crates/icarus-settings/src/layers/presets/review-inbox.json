@@ -1,0 +1,13 @@
+{
+  "rules": {
+    "orca_compat": {
+      "enabled": true,
+      "statusByCondition": {
+        "reviewing": "in-review"
+      },
+      "reviewInbox": {
+        "enabled": true
+      }
+    }
+  }
+}

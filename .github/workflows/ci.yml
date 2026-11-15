@@ -1,0 +1,162 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write # lets a failed fast check cancel the rest of the run
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  LINUX_SHARDS: 4
+  MACOS_SHARDS: 2
+
+jobs:
+  # Phase 1: format, TOML, typos, workflow lint. No compilation, so a mistake fails CI in about a minute.
+  rapid:
+    name: rapid checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has-rust: ${{ steps.detect.outputs.has-rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          cache: true
+      - id: detect
+        run: echo "has-rust=$([ -f Cargo.toml ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Phase 1
+        run: |
+          if [ "${{ steps.detect.outputs.has-rust }}" = "true" ]; then
+            moon ci root:check-phase-1
+          else
+            typos && taplo fmt --check && actionlint
+          fi
+
+  # Phase 2: clippy (type errors and lints) and cargo-deny. Runs in parallel with the test build;
+  # a failure here cancels the whole run instead of waiting for tests.
+  lint:
+    name: lint and types
+    needs: rapid
+    if: needs.rapid.outputs.has-rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          cache: true
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: moon ci root:check-phase-2
+      - name: Cancel the rest of the run
+        if: failure() && github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel ${{ github.run_id }} --repo ${{ github.repository }}
+
+  # Build every test binary once per OS, then shard the run across many runners.
+  build-tests:
+    name: build tests (${{ matrix.os }})
+    needs: rapid
+    if: needs.rapid.outputs.has-rust == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          cache: true
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: tests-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo nextest archive --workspace --locked --archive-file nextest-${{ matrix.os }}.tar.zst
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-${{ matrix.os }}
+          path: nextest-${{ matrix.os }}.tar.zst
+          retention-days: 3
+
+  shard-matrix:
+    name: shard matrix
+    needs: rapid
+    if: needs.rapid.outputs.has-rust == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.matrix.outputs.include }}
+    steps:
+      - id: matrix
+        run: |
+          {
+            printf 'include=['
+            sep=''
+            for i in $(seq 1 "$LINUX_SHARDS"); do printf '%s{"os":"ubuntu-latest","shard":%d,"total":%d}' "$sep" "$i" "$LINUX_SHARDS"; sep=','; done
+            for i in $(seq 1 "$MACOS_SHARDS"); do printf '%s{"os":"macos-latest","shard":%d,"total":%d}' "$sep" "$i" "$MACOS_SHARDS"; done
+            printf ']\n'
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test (${{ matrix.os }} ${{ matrix.shard }}/${{ matrix.total }})
+    needs: [build-tests, shard-matrix]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.shard-matrix.outputs.include) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-${{ matrix.os }}
+      - run: >-
+          cargo-nextest nextest run
+          --archive-file nextest-${{ matrix.os }}.tar.zst
+          --workspace-remap .
+          --profile ci
+          --partition slice:${{ matrix.shard }}/${{ matrix.total }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: junit-${{ matrix.os }}-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The single required status check for branch protection and the merge queue.
+  ci-ok:
+    name: ci ok
+    needs: [rapid, lint, build-tests, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed or was skipped
+        run: |
+          results='${{ toJSON(needs.*.result) }}'
+          echo "$results"
+          if echo "$results" | grep -Eq '"(failure|cancelled)"'; then exit 1; fi

@@ -1,0 +1,886 @@
+//! Git operations for Icarus: repos, worktrees and the single Changes list.
+//!
+//! Everything shells out to `git`, which is what users and agents run too, so behaviour matches.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+pub mod filters;
+pub mod turns;
+
+pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
+    git_env(repo, args, &[])
+}
+
+pub fn git_env(repo: &Path, args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "core.quotePath=false"])
+        .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn git_ok(repo: &Path, args: &[&str]) -> Option<String> {
+    git(repo, args).ok().map(|s| s.trim().to_string())
+}
+
+/// `https://github.com/acme/widgets.git` and `git@github.com:acme/widgets` both become `github.com/acme/widgets`.
+pub fn canonical_remote(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let rest = if let Some(rest) = url.split_once("://").map(|(_, r)| r) {
+        rest.rsplit_once('@')
+            .map(|(_, r)| r)
+            .unwrap_or(rest)
+            .to_string()
+    } else if let Some((user_host, path)) = url.split_once(':') {
+        let host = user_host
+            .rsplit_once('@')
+            .map(|(_, h)| h)
+            .unwrap_or(user_host);
+        format!("{host}/{path}")
+    } else {
+        return None;
+    };
+    let rest = rest.split_once(':').map_or(rest.clone(), |(host, tail)| {
+        // Drop an explicit port (`host:22/owner/repo`) but keep scp-style paths handled above.
+        match tail.split_once('/') {
+            Some((port, path)) if port.chars().all(|c| c.is_ascii_digit()) => {
+                format!("{host}/{path}")
+            }
+            _ => rest.clone(),
+        }
+    });
+    Some(rest.to_ascii_lowercase())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepoInfo {
+    /// The main checkout that owns all linked worktrees.
+    pub root: PathBuf,
+    pub remote: Option<String>,
+    pub default_base: Option<String>,
+}
+
+pub fn repo_info(path: &Path) -> Result<RepoInfo> {
+    let common = git(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = PathBuf::from(common.trim());
+    let root = if common.file_name().is_some_and(|n| n == ".git") {
+        common
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(common.clone())
+    } else {
+        PathBuf::from(git(path, &["rev-parse", "--show-toplevel"])?.trim())
+    };
+    let remote = git_ok(&root, &["remote", "get-url", "origin"]).and_then(|u| canonical_remote(&u));
+    let default_base = default_base_ref(&root);
+    Ok(RepoInfo {
+        root,
+        remote,
+        default_base,
+    })
+}
+
+/// `origin/HEAD`'s target, else the first existing of origin/main, origin/master, main, master.
+pub fn default_base_ref(repo: &Path) -> Option<String> {
+    if let Some(target) = git_ok(
+        repo,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    ) && let Some(name) = target.strip_prefix("refs/remotes/")
+    {
+        return Some(name.to_string());
+    }
+    let candidates = [
+        ("refs/remotes/origin/main", "origin/main"),
+        ("refs/remotes/origin/master", "origin/master"),
+        ("refs/heads/main", "main"),
+        ("refs/heads/master", "master"),
+    ];
+    let existing = git_ok(repo, &["for-each-ref", "--format=%(refname)"])?;
+    candidates
+        .iter()
+        .find(|(full, _)| existing.lines().any(|l| l == *full))
+        .map(|(_, short)| short.to_string())
+}
+
+/// Resolves a base name the way Orca does: names with `/` prefer remotes, bare names are branches.
+pub fn qualify_ref(repo: &Path, name: &str) -> Option<String> {
+    let candidates: Vec<String> = if name.starts_with("refs/") {
+        vec![name.to_string()]
+    } else if name.contains('/') {
+        vec![format!("refs/remotes/{name}"), format!("refs/heads/{name}")]
+    } else {
+        vec![format!("refs/heads/{name}")]
+    };
+    candidates.into_iter().find(|r| {
+        git_ok(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{r}^{{commit}}"),
+            ],
+        )
+        .is_some()
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub main: bool,
+}
+
+pub fn list_worktrees(repo: &Path) -> Result<Vec<Worktree>> {
+    let output = git(repo, &["worktree", "list", "--porcelain"])?;
+    let mut worktrees = Vec::new();
+    let mut current: Option<Worktree> = None;
+    for line in output.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+            continue;
+        }
+        let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+        match key {
+            "worktree" => {
+                current = Some(Worktree {
+                    path: PathBuf::from(value),
+                    head: None,
+                    branch: None,
+                    detached: false,
+                    main: worktrees.is_empty(),
+                });
+            }
+            "HEAD" => {
+                if let Some(w) = current.as_mut() {
+                    w.head = Some(value.to_string());
+                }
+            }
+            "branch" => {
+                if let Some(w) = current.as_mut() {
+                    w.branch = Some(value.trim_start_matches("refs/heads/").to_string());
+                }
+            }
+            "detached" => {
+                if let Some(w) = current.as_mut() {
+                    w.detached = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(worktrees)
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateWorktree<'a> {
+    pub repo: &'a Path,
+    pub path: &'a Path,
+    pub branch: &'a str,
+    /// Start point, e.g. `origin/main`. Ignored when the branch already exists.
+    pub base: &'a str,
+    pub fetch: bool,
+}
+
+pub fn create_worktree(request: &CreateWorktree<'_>) -> Result<Worktree> {
+    if request.fetch
+        && let Some((remote, branch)) = request.base.split_once('/')
+    {
+        let _ = git(request.repo, &["fetch", "--quiet", remote, branch]);
+    }
+    if let Some(parent) = request.path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let path = request.path.to_string_lossy();
+    let branch_exists = git_ok(
+        request.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", request.branch),
+        ],
+    )
+    .is_some();
+    if branch_exists {
+        git(request.repo, &["worktree", "add", &path, request.branch])?;
+    } else {
+        git(
+            request.repo,
+            &["worktree", "add", "-b", request.branch, &path, request.base],
+        )?;
+    }
+    list_worktrees(request.repo)?
+        .into_iter()
+        .find(|w| same_path(&w.path, request.path))
+        .context("created worktree not listed")
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RemoveError {
+    #[error("worktree has uncommitted changes; pass force to delete anyway")]
+    Dirty,
+    #[error(transparent)]
+    Git(#[from] anyhow::Error),
+}
+
+pub fn remove_worktree(
+    repo: &Path,
+    path: &Path,
+    force: bool,
+    delete_branch: bool,
+) -> Result<(), RemoveError> {
+    if !force && is_dirty(path)? {
+        return Err(RemoveError::Dirty);
+    }
+    let branch = list_worktrees(repo)?
+        .into_iter()
+        .find(|w| same_path(&w.path, path))
+        .and_then(|w| w.branch);
+    let path_str = path.to_string_lossy();
+    if force {
+        git(repo, &["worktree", "remove", "--force", &path_str])?;
+    } else {
+        git(repo, &["worktree", "remove", &path_str])?;
+    }
+    if delete_branch && let Some(branch) = branch {
+        let flag = if force { "-D" } else { "-d" };
+        let _ = git(repo, &["branch", flag, &branch]);
+    }
+    Ok(())
+}
+
+pub fn is_dirty(path: &Path) -> Result<bool> {
+    Ok(
+        !git(path, &["status", "--porcelain", "--untracked-files=normal"])?
+            .trim()
+            .is_empty(),
+    )
+}
+
+/// What the next-action button needs to know about a worktree's local state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LocalState {
+    pub branch: Option<String>,
+    pub head_oid: Option<String>,
+    pub has_uncommitted_changes: bool,
+    pub upstream: Option<String>,
+    pub unpushed_commits: u32,
+    pub behind_upstream: u32,
+    /// A merge, rebase or cherry-pick stopped with conflicts.
+    pub has_local_conflicts: bool,
+    pub is_default_branch: bool,
+}
+
+pub fn local_state(worktree: &Path) -> Result<LocalState> {
+    let branch = git_ok(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let head_oid = git_ok(
+        worktree,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    );
+    let status = git(
+        worktree,
+        &["status", "--porcelain=v2", "-z", "--untracked-files=normal"],
+    )?;
+    let records: Vec<&str> = status.split('\0').filter(|r| !r.is_empty()).collect();
+    let has_local_conflicts = records.iter().any(|r| r.starts_with("u "));
+    let has_uncommitted_changes = !records.is_empty();
+    let upstream = git_ok(
+        worktree,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    );
+    let (behind_upstream, unpushed_commits) = match upstream {
+        Some(_) => {
+            let counts = git_ok(
+                worktree,
+                &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+            )
+            .unwrap_or_default();
+            let mut parts = counts
+                .split_whitespace()
+                .map(|v| v.parse::<u32>().unwrap_or(0));
+            (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+        }
+        None => (0, 0),
+    };
+    let default_branch =
+        default_base_ref(worktree).map(|base| base.rsplit('/').next().unwrap_or(&base).to_string());
+    let is_default_branch = matches!((&branch, &default_branch), (Some(b), Some(d)) if b == d);
+    Ok(LocalState {
+        branch,
+        head_oid,
+        has_uncommitted_changes,
+        upstream,
+        unpushed_commits,
+        behind_upstream,
+        has_local_conflicts,
+        is_default_branch,
+    })
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+}
+
+impl ChangeStatus {
+    fn from_letter(letter: char) -> Self {
+        match letter {
+            'A' => Self::Added,
+            'D' => Self::Deleted,
+            'R' => Self::Renamed,
+            'C' => Self::Copied,
+            _ => Self::Modified,
+        }
+    }
+
+    pub fn letter(self) -> char {
+        match self {
+            Self::Added => 'A',
+            Self::Modified => 'M',
+            Self::Deleted => 'D',
+            Self::Renamed => 'R',
+            Self::Copied => 'C',
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Area {
+    Staged,
+    Unstaged,
+    Untracked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Entry {
+    pub path: String,
+    pub status: ChangeStatus,
+    pub old_path: Option<String>,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+    pub area: Option<Area>,
+    pub conflicted: bool,
+}
+
+/// One row of the Changes list: everything that differs from the merge base, committed or not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChangeRow {
+    pub path: String,
+    pub status: ChangeStatus,
+    pub old_path: Option<String>,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+    pub committed: bool,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub untracked: bool,
+    pub conflicted: bool,
+    #[serde(default)]
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum CompareStatus {
+    Ready {
+        base: String,
+        merge_base: String,
+        ahead: u64,
+        behind: u64,
+    },
+    NoBase,
+    InvalidBase {
+        base: String,
+    },
+    NoMergeBase {
+        base: String,
+    },
+    UnbornHead,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Changes {
+    pub compare: CompareStatus,
+    pub rows: Vec<ChangeRow>,
+    pub added: u64,
+    pub removed: u64,
+}
+
+fn parse_raw_numstat(output: &str) -> Vec<Entry> {
+    // `git diff --raw --numstat -z`: raw records first, then numstat records, NUL separated.
+    let mut fields = output.split('\0').peekable();
+    let mut entries: Vec<Entry> = Vec::new();
+    while let Some(field) = fields.peek() {
+        if !field.starts_with(':') {
+            break;
+        }
+        let header = fields.next().unwrap_or_default();
+        let letter = header
+            .split_whitespace()
+            .last()
+            .and_then(|s| s.chars().next())
+            .unwrap_or('M');
+        let status = ChangeStatus::from_letter(letter);
+        let first = fields.next().unwrap_or_default().to_string();
+        let (path, old_path) = if matches!(status, ChangeStatus::Renamed | ChangeStatus::Copied) {
+            (fields.next().unwrap_or_default().to_string(), Some(first))
+        } else {
+            (first, None)
+        };
+        entries.push(Entry {
+            path,
+            status,
+            old_path,
+            added: None,
+            removed: None,
+            area: None,
+            conflicted: false,
+        });
+    }
+    let mut counts: BTreeMap<String, (Option<u64>, Option<u64>)> = BTreeMap::new();
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        let mut parts = field.splitn(3, '\t');
+        let added = parts.next().and_then(|v| v.parse().ok());
+        let removed = parts.next().and_then(|v| v.parse().ok());
+        let path = match parts.next() {
+            Some("") | None => {
+                // Renames print an empty path, then old and new paths as separate fields.
+                let _old = fields.next();
+                fields.next().unwrap_or_default().to_string()
+            }
+            Some(path) => path.to_string(),
+        };
+        counts.insert(path, (added, removed));
+    }
+    for entry in &mut entries {
+        if let Some((added, removed)) = counts.get(&entry.path) {
+            entry.added = *added;
+            entry.removed = *removed;
+        }
+    }
+    entries
+}
+
+type LineCounts = BTreeMap<String, (u64, u64)>;
+
+/// Per-path line counts from the merge base to the working tree, including untracked files.
+fn line_counts(
+    worktree: &Path,
+    merge_base: &str,
+    untracked: &[String],
+) -> Result<(LineCounts, std::collections::BTreeSet<String>)> {
+    let output = git(
+        worktree,
+        &[
+            "-c",
+            "diff.autoRefreshIndex=false",
+            "diff",
+            "-z",
+            "--numstat",
+            "-M",
+            merge_base,
+            "--",
+        ],
+    )?;
+    let mut counts = BTreeMap::new();
+    let mut binary = std::collections::BTreeSet::new();
+    let mut fields = output.split('\0');
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        let mut parts = field.splitn(3, '\t');
+        let added = parts.next().and_then(|v| v.parse().ok());
+        let removed = parts.next().and_then(|v| v.parse().ok());
+        let path = match parts.next() {
+            Some("") | None => {
+                let _old = fields.next();
+                fields.next().unwrap_or_default().to_string()
+            }
+            Some(path) => path.to_string(),
+        };
+        if let (Some(a), Some(r)) = (added, removed) {
+            counts.insert(path, (a, r));
+        } else {
+            binary.insert(path);
+        }
+    }
+    for path in untracked {
+        if let Ok(content) = std::fs::read(worktree.join(path)) {
+            if content.contains(&0) {
+                binary.insert(path.clone());
+                continue;
+            }
+            let lines = content
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count() as u64;
+            counts.insert(path.clone(), (lines, 0));
+        }
+    }
+    Ok((counts, binary))
+}
+
+pub fn status_entries(worktree: &Path) -> Result<Vec<Entry>> {
+    let output = git(
+        worktree,
+        &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+    )?;
+    let mut entries = Vec::new();
+    let mut fields = output.split('\0');
+    while let Some(record) = fields.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let kind = record.chars().next().unwrap_or(' ');
+        match kind {
+            '?' => entries.push(Entry {
+                path: record[2..].to_string(),
+                status: ChangeStatus::Added,
+                old_path: None,
+                added: None,
+                removed: None,
+                area: Some(Area::Untracked),
+                conflicted: false,
+            }),
+            '1' | '2' => {
+                let parts: Vec<&str> = record
+                    .splitn(if kind == '1' { 9 } else { 10 }, ' ')
+                    .collect();
+                let xy: Vec<char> = parts.get(1).copied().unwrap_or("..").chars().collect();
+                let path = parts.last().copied().unwrap_or_default().to_string();
+                let old_path = if kind == '2' {
+                    fields.next().map(str::to_string)
+                } else {
+                    None
+                };
+                for (index, area) in [(0, Area::Staged), (1, Area::Unstaged)] {
+                    let letter = xy.get(index).copied().unwrap_or('.');
+                    if letter != '.' {
+                        entries.push(Entry {
+                            path: path.clone(),
+                            status: ChangeStatus::from_letter(letter),
+                            old_path: old_path.clone(),
+                            added: None,
+                            removed: None,
+                            area: Some(area),
+                            conflicted: false,
+                        });
+                    }
+                }
+            }
+            'u' => {
+                let path = record
+                    .splitn(11, ' ')
+                    .last()
+                    .unwrap_or_default()
+                    .to_string();
+                entries.push(Entry {
+                    path,
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: None,
+                    removed: None,
+                    area: Some(Area::Unstaged),
+                    conflicted: true,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(entries)
+}
+
+/// Merges branch and working-tree entries into one row per file (Orca's `buildAllChangeEntries`).
+pub fn merge_rows(
+    branch: &[Entry],
+    local: &[Entry],
+    uncommitted_only: bool,
+    line_counts: Option<&BTreeMap<String, (u64, u64)>>,
+) -> Vec<ChangeRow> {
+    let mut by_path: BTreeMap<String, (Option<&Entry>, Vec<&Entry>)> = BTreeMap::new();
+    for entry in branch {
+        by_path.entry(entry.path.clone()).or_default().0 = Some(entry);
+    }
+    for entry in local {
+        by_path.entry(entry.path.clone()).or_default().1.push(entry);
+    }
+    let mut rows = Vec::new();
+    for (path, (branch_entry, locals)) in by_path {
+        if uncommitted_only && locals.is_empty() {
+            continue;
+        }
+        let deleted_locally = locals.iter().any(|e| e.status == ChangeStatus::Deleted)
+            && !locals.iter().any(|e| e.area == Some(Area::Untracked));
+        let (from_status, from_old) = match (branch_entry, uncommitted_only) {
+            (Some(b), false) => (b.status, b.old_path.clone()),
+            _ => {
+                if locals
+                    .iter()
+                    .any(|e| e.area == Some(Area::Untracked) || e.status == ChangeStatus::Added)
+                {
+                    (ChangeStatus::Added, None)
+                } else if let Some(r) = locals
+                    .iter()
+                    .find(|e| matches!(e.status, ChangeStatus::Renamed | ChangeStatus::Copied))
+                {
+                    (r.status, r.old_path.clone())
+                } else {
+                    (ChangeStatus::Modified, None)
+                }
+            }
+        };
+        if deleted_locally && from_status == ChangeStatus::Added {
+            continue;
+        }
+        let status = if deleted_locally {
+            ChangeStatus::Deleted
+        } else {
+            from_status
+        };
+        let old_path = if deleted_locally { None } else { from_old };
+        let (added, removed) = if uncommitted_only {
+            match locals.as_slice() {
+                [single] => (single.added, single.removed),
+                _ => (None, None),
+            }
+        } else if let Some((a, r)) = line_counts.and_then(|c| c.get(&path)) {
+            (Some(*a), Some(*r))
+        } else {
+            let mut sources: Vec<&Entry> = locals.clone();
+            if let Some(b) = branch_entry {
+                sources.push(b);
+            }
+            match sources.as_slice() {
+                [single] => (single.added, single.removed),
+                _ => (None, None),
+            }
+        };
+        rows.push(ChangeRow {
+            committed: branch_entry.is_some(),
+            staged: locals.iter().any(|e| e.area == Some(Area::Staged)),
+            unstaged: locals.iter().any(|e| e.area == Some(Area::Unstaged)),
+            untracked: locals.iter().any(|e| e.area == Some(Area::Untracked)),
+            conflicted: locals.iter().any(|e| e.conflicted),
+            binary: false,
+            path,
+            status,
+            old_path,
+            added,
+            removed,
+        });
+    }
+    rows
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChangesQuery {
+    /// Base ref name; `None` uses the repo's default base.
+    pub base: Option<String>,
+    pub uncommitted_only: bool,
+}
+
+/// The Changes list for a worktree: every file that differs from the merge base, committed or not.
+pub fn changes(worktree: &Path, query: &ChangesQuery) -> Result<Changes> {
+    let local = status_entries(worktree)?;
+    let untracked: Vec<String> = local
+        .iter()
+        .filter(|e| e.area == Some(Area::Untracked))
+        .map(|e| e.path.clone())
+        .collect();
+    let head = git_ok(
+        worktree,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    );
+    let base_name = query.base.clone().or_else(|| default_base_ref(worktree));
+    let compare = match (&head, &base_name) {
+        (None, _) => CompareStatus::UnbornHead,
+        (_, None) => CompareStatus::NoBase,
+        (Some(head), Some(base)) => match qualify_ref(worktree, base) {
+            None => CompareStatus::InvalidBase { base: base.clone() },
+            Some(qualified) => match git_ok(worktree, &["merge-base", &qualified, head]) {
+                None => CompareStatus::NoMergeBase { base: base.clone() },
+                Some(merge_base) => {
+                    let counts = git_ok(
+                        worktree,
+                        &[
+                            "rev-list",
+                            "--left-right",
+                            "--count",
+                            &format!("{qualified}...{head}"),
+                        ],
+                    )
+                    .unwrap_or_default();
+                    let mut parts = counts
+                        .split_whitespace()
+                        .map(|v| v.parse::<u64>().unwrap_or(0));
+                    let behind = parts.next().unwrap_or(0);
+                    let ahead = parts.next().unwrap_or(0);
+                    CompareStatus::Ready {
+                        base: base.clone(),
+                        merge_base,
+                        ahead,
+                        behind,
+                    }
+                }
+            },
+        },
+    };
+    let rows = match &compare {
+        CompareStatus::Ready { merge_base, .. } if !query.uncommitted_only => {
+            let head = head.clone().unwrap_or_default();
+            let raw = git(
+                worktree,
+                &[
+                    "diff",
+                    "--raw",
+                    "--numstat",
+                    "-z",
+                    "-M",
+                    "-C",
+                    merge_base,
+                    &head,
+                    "--",
+                ],
+            )?;
+            let branch = parse_raw_numstat(&raw);
+            let (counts, binary) = line_counts(worktree, merge_base, &untracked)?;
+            let mut rows = merge_rows(&branch, &local, false, Some(&counts));
+            for row in &mut rows {
+                row.binary = binary.contains(&row.path);
+            }
+            rows
+        }
+        _ => {
+            let counts = match head {
+                Some(ref head) => line_counts(worktree, head, &untracked).ok(),
+                None => None,
+            };
+            let mut rows = merge_rows(&[], &local, true, None);
+            if let Some((counts, binary)) = counts {
+                for row in &mut rows {
+                    if let Some((a, r)) = counts.get(&row.path) {
+                        row.added = Some(*a);
+                        row.removed = Some(*r);
+                    }
+                    row.binary = binary.contains(&row.path);
+                }
+            }
+            rows
+        }
+    };
+    let added = rows.iter().filter_map(|r| r.added).sum();
+    let removed = rows.iter().filter_map(|r| r.removed).sum();
+    Ok(Changes {
+        compare,
+        rows,
+        added,
+        removed,
+    })
+}
+
+pub fn commit_rows(worktree: &Path, from: Option<&str>, to: &str) -> Result<Vec<ChangeRow>> {
+    let from = match from {
+        Some(from) => from.to_string(),
+        None => git(worktree, &["hash-object", "-t", "tree", "--stdin"])?
+            .trim()
+            .to_string(),
+    };
+    let raw = git(
+        worktree,
+        &[
+            "diff",
+            "--raw",
+            "--numstat",
+            "-z",
+            "-M",
+            "-C",
+            &from,
+            to,
+            "--",
+        ],
+    )?;
+    Ok(parse_raw_numstat(&raw)
+        .into_iter()
+        .map(|entry| ChangeRow {
+            binary: entry.added.is_none() && entry.removed.is_none(),
+            path: entry.path,
+            status: entry.status,
+            old_path: entry.old_path,
+            added: entry.added,
+            removed: entry.removed,
+            committed: true,
+            staged: false,
+            unstaged: false,
+            untracked: false,
+            conflicted: false,
+        })
+        .collect())
+}
+
+pub(crate) fn resolve_commit(worktree: &Path, name: &str) -> Option<String> {
+    git_ok(
+        worktree,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{name}^{{commit}}"),
+        ],
+    )
+}
+
+pub(crate) fn first_parent(worktree: &Path, oid: &str) -> Option<String> {
+    git_ok(
+        worktree,
+        &["rev-parse", "--verify", "--quiet", &format!("{oid}^1")],
+    )
+}
+
+#[cfg(test)]
+mod tests;

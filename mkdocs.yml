@@ -2,6 +2,16 @@ site_name: icarus
 docs_dir: docs
 nav:
   - Home: index.md
+  - Plan: plan.md
+  - Progress: progress.md
+  - Feature inventory: features.md
+  - Settings compatibility: settings-compat.md
+  - GitHub panel: github-panel.md
+  - GitHub review: github-review.md
+  - Source control: source-control.md
+  - Panes and tabs: panes-and-tabs.md
+  - UI reference: ui-reference.md
+  - Open-source research: oss-research.md
 
 plugins:
-  - techdocs-core   
+  - techdocs-core

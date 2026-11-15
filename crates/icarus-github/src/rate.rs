@@ -1,0 +1,130 @@
+use crate::http::HttpResponse;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub const TIER_TWO_FLOOR: u64 = 500;
+pub const STOP_FLOOR: u64 = 50;
+pub const SEARCH_FLOOR: u64 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct RateLimit {
+    pub limit: u64,
+    pub remaining: u64,
+    pub reset: u64,
+    #[serde(default)]
+    pub used: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollTier {
+    Full,
+    FingerprintOnly,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RateBudget {
+    limits: BTreeMap<String, RateLimit>,
+    backoff_until: Option<u64>,
+}
+
+impl RateBudget {
+    pub fn observe(&mut self, resource: &str, limit: RateLimit) {
+        self.limits.insert(resource.to_owned(), limit);
+    }
+
+    pub fn observe_response(&mut self, response: &HttpResponse) {
+        let number = |name: &str| response.header(name).and_then(|value| value.parse().ok());
+        if let (Some(limit), Some(remaining), Some(reset)) = (
+            number("x-ratelimit-limit"),
+            number("x-ratelimit-remaining"),
+            number("x-ratelimit-reset"),
+        ) {
+            let resource = response.header("x-ratelimit-resource").unwrap_or("core");
+            self.observe(
+                resource,
+                RateLimit {
+                    limit,
+                    remaining,
+                    reset,
+                    used: number("x-ratelimit-used").unwrap_or(0),
+                },
+            );
+        }
+        if let Some(wait) = retry_after(response) {
+            let until = now_epoch() + wait.as_secs();
+            self.backoff_until = Some(
+                self.backoff_until
+                    .map_or(until, |current| current.max(until)),
+            );
+        }
+    }
+
+    pub fn get(&self, resource: &str) -> Option<RateLimit> {
+        self.limits.get(resource).copied()
+    }
+
+    pub fn backoff_until(&self) -> Option<u64> {
+        self.backoff_until
+    }
+
+    pub fn tier_at(&self, now: u64) -> PollTier {
+        if self.backoff_until.is_some_and(|until| until > now) {
+            return PollTier::Stopped;
+        }
+        match self.live("graphql", now) {
+            Some(limit) if limit.remaining < STOP_FLOOR => PollTier::Stopped,
+            Some(limit) if limit.remaining < TIER_TWO_FLOOR => PollTier::FingerprintOnly,
+            _ => PollTier::Full,
+        }
+    }
+
+    pub fn tier(&self) -> PollTier {
+        self.tier_at(now_epoch())
+    }
+
+    pub fn allows_at(&self, resource: &str, now: u64) -> bool {
+        if self.backoff_until.is_some_and(|until| until > now) {
+            return false;
+        }
+        let floor = if resource == "search" {
+            SEARCH_FLOOR
+        } else {
+            STOP_FLOOR
+        };
+        self.live(resource, now)
+            .is_none_or(|limit| limit.remaining >= floor)
+    }
+
+    pub fn allows(&self, resource: &str) -> bool {
+        self.allows_at(resource, now_epoch())
+    }
+
+    fn live(&self, resource: &str, now: u64) -> Option<RateLimit> {
+        self.get(resource).filter(|limit| limit.reset > now)
+    }
+}
+
+pub(crate) fn retry_after(response: &HttpResponse) -> Option<Duration> {
+    if !matches!(response.status, 403 | 429) {
+        return None;
+    }
+    if let Some(seconds) = response
+        .header("retry-after")
+        .and_then(|value| value.parse().ok())
+    {
+        return Some(Duration::from_secs(seconds));
+    }
+    if response.header("x-ratelimit-remaining") == Some("0") {
+        let reset: u64 = response.header("x-ratelimit-reset")?.parse().ok()?;
+        return Some(Duration::from_secs(reset.saturating_sub(now_epoch())));
+    }
+    None
+}
+
+pub(crate) fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}

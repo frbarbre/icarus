@@ -1,0 +1,511 @@
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use icarus_client::Client;
+use serde_json::json;
+
+struct ServerProcess {
+    child: Child,
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_server(home: &Path) -> ServerProcess {
+    // A killed server leaves its socket and token behind; the token is rewritten only after a new bind.
+    let _ = std::fs::remove_file(home.join("server.token"));
+    let child = Command::new(env!("CARGO_BIN_EXE_icarus-server"))
+        .args(["--home", home.to_str().expect("utf8 home"), "serve"])
+        .env("ICARUS_WORKSPACE_ROOT", home.join("workspaces"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(home.join("server.sock").exists() && home.join("server.token").exists()) {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    ServerProcess { child }
+}
+
+#[tokio::test]
+async fn terminal_outlives_its_client_and_resumes_by_sequence() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _server = start_server(home.path());
+
+    let (client, mut events) = Client::connect(home.path(), "test").await.expect("connect");
+    let info = client
+        .request(
+            "terminal.create",
+            json!({ "command": ["/bin/cat"], "cwd": "/tmp" }),
+        )
+        .await
+        .expect("create");
+    let id = info["id"].as_str().expect("id").to_string();
+    let attached = client
+        .request("terminal.attach", json!({ "id": id }))
+        .await
+        .expect("attach");
+    assert!(attached["snapshot"].is_string());
+
+    client
+        .request("terminal.write", json!({ "id": id, "text": "before\n" }))
+        .await
+        .expect("write");
+    let mut last_seq: u64;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline.into(), events.recv())
+            .await
+            .expect("output event in time")
+            .expect("event stream open");
+        if event.topic == "terminal.output" {
+            last_seq = event.payload["seq"].as_u64().expect("seq") + 1;
+            let read = client
+                .request("terminal.read", json!({ "id": id }))
+                .await
+                .expect("read");
+            if read["text"].as_str().unwrap_or("").contains("before") {
+                break;
+            }
+        }
+    }
+    drop(events);
+    drop(client);
+
+    // The client is gone; the program keeps running and producing output.
+    let (client, _events) = Client::connect(home.path(), "test-2")
+        .await
+        .expect("reconnect");
+    client
+        .request("terminal.write", json!({ "id": id, "text": "after\n" }))
+        .await
+        .expect("write after reconnect");
+    client
+        .request(
+            "terminal.wait",
+            json!({ "id": id, "contains": "after", "timeout_ms": 10000 }),
+        )
+        .await
+        .expect("wait");
+    let resumed = client
+        .request(
+            "terminal.attach",
+            json!({ "id": id, "since_seq": last_seq }),
+        )
+        .await
+        .expect("resume");
+    assert!(
+        resumed["snapshot"].is_null(),
+        "should resume without a snapshot"
+    );
+    let listed = client
+        .request("terminal.list", json!({}))
+        .await
+        .expect("list");
+    assert_eq!(listed[0]["running"], json!(true));
+
+    client
+        .request("terminal.kill", json!({ "id": id, "remove": true }))
+        .await
+        .expect("kill");
+}
+
+#[tokio::test]
+async fn agent_keeps_working_without_a_client_and_replays_by_sequence() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let work = tempfile::tempdir().expect("workdir");
+    let _server = start_server(home.path());
+    let fake = env!("CARGO_BIN_EXE_icarus-fake-agent");
+
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let info = client
+        .request(
+            "agent.create",
+            json!({ "cwd": work.path(), "command": [fake], "title": "Fix CI", "prompt": "hello" }),
+        )
+        .await
+        .expect("create agent");
+    let id = info["id"].as_str().expect("id").to_string();
+    client
+        .request("agent.wait", json!({ "id": id, "timeout_ms": 10000 }))
+        .await
+        .expect("first turn finishes");
+
+    // Start a slow turn, then disconnect while it runs.
+    let target = work.path().join("note.txt");
+    client
+        .request(
+            "agent.send",
+            json!({ "id": id, "text": format!("sleep:300 write:{} from-agent", target.display()) }),
+        )
+        .await
+        .expect("send");
+    let seen = client
+        .request("agent.events", json!({ "id": id }))
+        .await
+        .expect("events")
+        .as_array()
+        .expect("array")
+        .len() as u64;
+    drop(client);
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("agent wrote file"),
+        "from-agent"
+    );
+
+    let (client, mut events) = Client::connect(home.path(), "test-2")
+        .await
+        .expect("reconnect");
+    let attached = client
+        .request("agent.attach", json!({ "id": id, "since": seen }))
+        .await
+        .expect("attach");
+    let kinds: Vec<&str> = attached["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap_or_default())
+        .collect();
+    assert!(kinds.contains(&"tool_call"), "{kinds:?}");
+    assert!(kinds.contains(&"tool_result"), "{kinds:?}");
+    assert!(kinds.contains(&"turn_end"), "{kinds:?}");
+    assert_eq!(attached["info"]["state"], "idle");
+    assert_eq!(
+        attached["info"]["rate_limits"]["unifiedWindows"]["five_hour"]["utilization"],
+        0.1
+    );
+
+    // Live events flow to the attached client.
+    client
+        .request("agent.send", json!({ "id": id, "text": "again" }))
+        .await
+        .expect("send again");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline.into(), events.recv())
+            .await
+            .expect("live event in time")
+            .expect("open stream");
+        if event.topic == "agent.event" && event.payload["event"]["kind"] == "turn_end" {
+            break;
+        }
+    }
+    let transcript = client
+        .request("agent.read", json!({ "id": id }))
+        .await
+        .expect("read");
+    let text = transcript["text"].as_str().expect("text");
+    assert!(
+        text.contains("> hello") && text.contains("echo: again"),
+        "{text}"
+    );
+    assert!(
+        home.path()
+            .join("threads")
+            .join(format!("{id}.jsonl"))
+            .exists()
+    );
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .status()
+        .expect("git");
+    assert!(status.success(), "git {args:?}");
+}
+
+#[tokio::test]
+async fn workspace_lifecycle_creates_a_worktree_with_an_agent_and_lists_changes() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let repo = tempfile::tempdir().expect("repo");
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    git(repo.path(), &["config", "user.email", "t@example.com"]);
+    git(repo.path(), &["config", "user.name", "T"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.path().join("readme.md"), "hello\n").expect("write");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "init"]);
+    let _server = start_server(home.path());
+    let fake = env!("CARGO_BIN_EXE_icarus-fake-agent");
+
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let project = client
+        .request("project.add", json!({ "path": repo.path() }))
+        .await
+        .expect("add project");
+    assert_eq!(project["base_ref"], "main");
+
+    let note = "notes/agent.txt";
+    let workspace = client
+        .request(
+            "workspace.create",
+            json!({
+                "project": project["id"], "name": "ABC-12 Fix the login page", "status": "todo",
+                "issue": { "provider": "linear", "id": "ABC-12" },
+                "agent_command": [fake], "prompt": format!("write:{note} hi"),
+            }),
+        )
+        .await
+        .expect("create workspace");
+    assert_eq!(workspace["name"], "abc-12-fix-the-login-page");
+    let path = PathBuf::from(workspace["path"].as_str().expect("path"));
+    assert!(path.join("readme.md").exists(), "worktree checked out");
+    let agent_id = workspace["agents"][0]["id"]
+        .as_str()
+        .expect("an agent from the start")
+        .to_string();
+    client
+        .request("agent.wait", json!({ "id": agent_id, "timeout_ms": 10000 }))
+        .await
+        .expect("agent turn");
+
+    let changes = client
+        .request("workspace.changes", json!({ "id": workspace["id"] }))
+        .await
+        .expect("changes");
+    assert_eq!(changes["compare"]["status"], "ready");
+    let rows = changes["rows"].as_array().expect("rows");
+    assert!(
+        rows.iter()
+            .any(|r| r["path"] == note && r["status"] == "added"),
+        "{rows:?}"
+    );
+
+    let updated = client
+        .request(
+            "workspace.set",
+            json!({ "id": "abc-12-fix-the-login-page", "status": "in-review" }),
+        )
+        .await
+        .expect("set status");
+    assert_eq!(updated["status"], "in-review");
+
+    let refused = client
+        .request("workspace.remove", json!({ "id": workspace["id"] }))
+        .await;
+    assert!(refused.is_err(), "dirty worktree needs force");
+    client
+        .request(
+            "workspace.remove",
+            json!({ "id": workspace["id"], "force": true }),
+        )
+        .await
+        .expect("forced remove");
+    assert!(!path.exists());
+    let listed = client
+        .request("workspace.list", json!({}))
+        .await
+        .expect("list");
+    assert_eq!(listed, json!([]));
+    let agents = client
+        .request("agent.list", json!({}))
+        .await
+        .expect("agents");
+    assert_eq!(agents, json!([]), "agents die with their workspace");
+}
+
+#[tokio::test]
+async fn agents_survive_a_server_restart_and_resume_their_session() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let work = tempfile::tempdir().expect("workdir");
+    let fake = env!("CARGO_BIN_EXE_icarus-fake-agent");
+    let server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let info = client
+        .request(
+            "agent.create",
+            json!({ "cwd": work.path(), "command": [fake], "prompt": "first" }),
+        )
+        .await
+        .expect("create");
+    let id = info["id"].as_str().expect("id").to_string();
+    let done = client
+        .request("agent.wait", json!({ "id": id, "timeout_ms": 10000 }))
+        .await
+        .expect("wait");
+    let session = done["provider_session"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    drop(client);
+    drop(server);
+
+    let _server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test")
+        .await
+        .expect("reconnect");
+    let restored = client
+        .request("agent.info", json!({ "id": id }))
+        .await
+        .expect("restored");
+    assert_eq!(restored["state"], "sleeping");
+    assert_eq!(restored["turns"], 1);
+    client
+        .request("agent.send", json!({ "id": id, "text": "second" }))
+        .await
+        .expect("send wakes the agent");
+    let after = client
+        .request("agent.wait", json!({ "id": id, "timeout_ms": 10000 }))
+        .await
+        .expect("wait after wake");
+    assert_eq!(after["state"], "idle");
+    assert_eq!(
+        after["provider_session"],
+        session.as_str(),
+        "resumed the same provider session"
+    );
+    let transcript = client
+        .request("agent.read", json!({ "id": id }))
+        .await
+        .expect("read");
+    let text = transcript["text"].as_str().expect("text");
+    assert!(
+        text.contains("echo: first") && text.contains("echo: second"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_starts_the_server_and_bridges_a_tokenless_client() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let server_bin = env!("CARGO_BIN_EXE_icarus-server");
+    let home_arg = home.path().to_str().expect("utf8").to_string();
+    // Same path an SSH session takes: `icarus-server proxy` on the remote machine.
+    let (client, _events) =
+        Client::connect_command(server_bin, &["--home", &home_arg, "proxy"], "remote")
+            .await
+            .expect("connect through proxy");
+    let info = client
+        .request("server.info", json!({}))
+        .await
+        .expect("info");
+    assert_eq!(info["protocol"], 1);
+    let created = client
+        .request(
+            "terminal.create",
+            json!({ "command": ["/bin/echo", "via-proxy"], "cwd": "/tmp" }),
+        )
+        .await
+        .expect("create over proxy");
+    let id = created["id"].as_str().expect("id");
+    client
+        .request(
+            "terminal.wait",
+            json!({ "id": id, "contains": "via-proxy", "timeout_ms": 5000 }),
+        )
+        .await
+        .expect("output over proxy");
+    client
+        .request("server.shutdown", json!({}))
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test]
+async fn open_file_requests_reach_the_app_connection_only() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _server = start_server(home.path());
+    let (cli, _) = Client::connect(home.path(), "icarus-cli")
+        .await
+        .expect("cli");
+    let refused = cli
+        .request("client.open_file", json!({ "path": "/w/a.tsx", "line": 3 }))
+        .await;
+    assert!(refused.is_err(), "no app connected yet");
+
+    let (_app, mut app_events) = Client::connect(home.path(), "icarus-app")
+        .await
+        .expect("app");
+    let (_panel, mut panel_events) = Client::connect(home.path(), "icarus-panel")
+        .await
+        .expect("panel");
+    let delivered = cli
+        .request(
+            "client.open_file",
+            json!({ "path": "/w/a.tsx", "line": 3, "column": 7 }),
+        )
+        .await
+        .expect("open");
+    assert_eq!(delivered["delivered"], 1);
+    let event = tokio::time::timeout(Duration::from_secs(5), app_events.recv())
+        .await
+        .expect("event in time")
+        .expect("open stream");
+    assert_eq!(event.topic, "client.open_file");
+    assert_eq!(event.payload["line"], 3);
+    assert_eq!(event.payload["column"], 7);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), panel_events.recv())
+            .await
+            .is_err(),
+        "only the app connection opens files, so a file never opens twice"
+    );
+}
+
+#[tokio::test]
+async fn capture_requests_reach_only_the_app() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _server = start_server(home.path());
+    let (cli, _) = Client::connect(home.path(), "icarus-cli")
+        .await
+        .expect("cli");
+    assert!(
+        cli.request("client.capture", json!({ "dir": "/tmp/shots" }))
+            .await
+            .is_err(),
+        "no app connected yet"
+    );
+    let (_app, mut app_events) = Client::connect(home.path(), "icarus-app")
+        .await
+        .expect("app");
+    assert!(
+        cli.request("client.capture", json!({ "dir": "relative" }))
+            .await
+            .is_err(),
+        "the app may run in another directory, so the path must be absolute"
+    );
+    let delivered = cli
+        .request("client.capture", json!({ "dir": "/tmp/shots" }))
+        .await
+        .expect("capture");
+    assert_eq!(delivered["delivered"], 1);
+    let event = tokio::time::timeout(Duration::from_secs(5), app_events.recv())
+        .await
+        .expect("event in time")
+        .expect("open stream");
+    assert_eq!(event.topic, "client.capture");
+    assert_eq!(event.payload["dir"], "/tmp/shots");
+}
+
+#[tokio::test]
+async fn wrong_token_is_rejected() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _server = start_server(home.path());
+    std::fs::write(home.path().join("server.token"), "nope").expect("overwrite token");
+    let result = Client::connect(home.path(), "intruder").await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn second_server_refuses_to_start_on_a_live_socket() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _server = start_server(home.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_icarus-server"))
+        .args(["--home", home.path().to_str().expect("utf8"), "serve"])
+        .output()
+        .expect("run second server");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already running"));
+}

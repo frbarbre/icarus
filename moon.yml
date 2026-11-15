@@ -1,0 +1,69 @@
+language: 'rust'
+
+fileGroups:
+  rust:
+    - 'crates/**/*.rs'
+    - 'crates/**/Cargo.toml'
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+    - 'rust-toolchain.toml'
+  toml:
+    - '**/*.toml'
+    - '!target/**'
+  workflows:
+    - '.github/workflows/*.yml'
+
+tasks:
+  # Phase 1: no compilation, finishes in seconds. Runs first in CI and on pre-commit.
+  check-format:
+    command: 'cargo fmt --all --check'
+    inputs: ['@group(rust)']
+  check-toml:
+    command: 'taplo fmt --check'
+    inputs: ['@group(toml)']
+  check-typos:
+    command: 'typos'
+    inputs: ['**/*', '!target/**']
+  check-actions:
+    command: 'actionlint'
+    inputs: ['@group(workflows)']
+
+  check-phase-1:
+    deps: ['~:check-format', '~:check-toml', '~:check-typos', '~:check-actions']
+
+  fix-format:
+    command: 'cargo fmt --all'
+    options:
+      runInCI: false
+  fix-toml:
+    command: 'taplo fmt'
+    options:
+      runInCI: false
+  fix-typos:
+    command: 'typos --write-changes'
+    options:
+      runInCI: false
+
+  fix-phase-1:
+    deps: ['~:fix-format', '~:fix-toml', '~:fix-typos', '~:check-actions']
+    options:
+      runDepsInParallel: false
+      runInCI: false
+
+  # Phase 2: compiles, so it catches type errors and lints. Fails CI before tests finish.
+  check-lint:
+    command: 'cargo clippy --workspace --all-targets --locked -- -D warnings'
+    inputs: ['@group(rust)']
+  check-deps:
+    command: 'cargo deny check'
+    inputs: ['Cargo.lock', 'deny.toml']
+
+  check-phase-2:
+    deps: ['~:check-lint', '~:check-deps']
+
+  # Local test run; CI shards with nextest directly (see .github/workflows/ci.yml).
+  test:
+    command: 'cargo nextest run --workspace --locked'
+    inputs: ['@group(rust)']
+    options:
+      runInCI: false

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Opens a file in the Icarus window that owns its worktree.
+# Use it as an editor hook, e.g. `export LAUNCH_EDITOR=icarus-open` for launch-editor / TanStack DevTools.
+# Usage: icarus-open <file> [line] [column]   or   icarus-open <file:line:column>
+set -eu
+if [ -n "${2:-}" ]; then
+  exec icarus file open "$1" "$2" "${3:-1}" --focus
+fi
+exec icarus file open "$1" --focus

@@ -1,0 +1,125 @@
+{
+  "data": {
+    "rateLimit": { "cost": 1, "remaining": 4987, "limit": 5000, "resetAt": "2026-11-15T13:00:00Z" },
+    "viewer": { "login": "octocat" },
+    "repository": {
+      "t0": {
+        "id": "PR_kwDOAbc123",
+        "number": 811,
+        "title": "Billing export API",
+        "url": "https://github.com/acme/widgets/pull/811",
+        "state": "OPEN",
+        "isDraft": false,
+        "updatedAt": "2026-11-15T11:58:00Z",
+        "additions": 120,
+        "deletions": 14,
+        "changedFiles": 6,
+        "isCrossRepository": false,
+        "headRefName": "billing-export-api",
+        "baseRefName": "billing-schema",
+        "headRefOid": "1111111111111111111111111111111111111111",
+        "baseRefOid": "2222222222222222222222222222222222222222",
+        "headRef": { "name": "billing-export-api" },
+        "baseRef": { "name": "billing-schema" },
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "BLOCKED",
+        "reviewDecision": "REVIEW_REQUIRED",
+        "isInMergeQueue": true,
+        "mergeQueueEntry": { "state": "AWAITING_CHECKS", "position": 3, "estimatedTimeToMerge": 720 },
+        "autoMergeRequest": { "mergeMethod": "SQUASH", "enabledBy": { "login": "octocat" } },
+        "author": { "login": "octocat", "avatarUrl": "https://avatars.githubusercontent.com/u/583231?s=64&v=4" },
+        "repository": { "name": "widgets", "owner": { "login": "acme" }, "autoMergeAllowed": true },
+        "reviewRequests": {
+          "nodes": [
+            { "asCodeOwner": false, "requestedReviewer": { "__typename": "User", "login": "hubot", "avatarUrl": "https://avatars.githubusercontent.com/u/480938?s=64&v=4" } },
+            { "asCodeOwner": true, "requestedReviewer": { "__typename": "Team", "slug": "pm", "combinedSlug": "acme/pm", "avatarUrl": "https://avatars.githubusercontent.com/t/42?s=64&v=4" } },
+            { "asCodeOwner": false, "requestedReviewer": { "__typename": "Bot", "login": "copilot" } },
+            null
+          ]
+        },
+        "latestReviews": {
+          "nodes": [
+            { "state": "APPROVED", "author": { "login": "monalisa", "avatarUrl": "https://avatars.githubusercontent.com/u/2?s=64&v=4" }, "commit": { "oid": "1111111111111111111111111111111111111111" } },
+            { "state": "COMMENTED", "author": null, "commit": null }
+          ]
+        },
+        "latestOpinionatedReviews": {
+          "nodes": [
+            { "state": "CHANGES_REQUESTED", "author": { "login": "hubot", "avatarUrl": "https://avatars.githubusercontent.com/u/480938?s=64&v=4" }, "commit": { "oid": "3333333333333333333333333333333333333333" } },
+            { "state": "APPROVED", "author": { "login": "monalisa" }, "commit": { "oid": "1111111111111111111111111111111111111111" } }
+          ]
+        },
+        "viewerLatestReview": null,
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "oid": "1111111111111111111111111111111111111111",
+                "statusCheckRollup": {
+                  "state": "PENDING",
+                  "contexts": {
+                    "nodes": [
+                      { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/acme/widgets/actions/runs/1/job/1", "startedAt": "2026-11-15T11:50:00Z", "completedAt": "2026-11-15T11:54:30Z" },
+                      { "__typename": "CheckRun", "name": "deploy-staging", "status": "WAITING", "conclusion": null, "detailsUrl": "https://github.com/acme/widgets/actions/runs/2/job/2" },
+                      { "__typename": "CheckRun", "name": "lint", "status": "REQUESTED", "conclusion": null, "detailsUrl": null },
+                      { "__typename": "CheckRun", "name": "e2e", "status": "PENDING", "conclusion": null, "detailsUrl": null },
+                      { "__typename": "CheckRun", "name": "flaky", "status": "COMPLETED", "conclusion": "STALE", "detailsUrl": null },
+                      { "__typename": "StatusContext", "context": "ci/legacy", "state": "ERROR", "targetUrl": "https://ci.example.com/build/9", "createdAt": "2026-11-15T11:51:00Z" },
+                      { "__typename": "StatusContext", "context": "preview", "state": "EXPECTED", "targetUrl": null }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "t1": {
+        "nodes": [
+          {
+            "id": "PR_kwDOAbc456",
+            "number": 812,
+            "title": "Add billing export UI",
+            "url": "https://github.com/acme/widgets/pull/812",
+            "state": "MERGED",
+            "isDraft": false,
+            "updatedAt": "2026-11-14T09:00:00Z",
+            "additions": 3,
+            "deletions": 1,
+            "changedFiles": 1,
+            "isCrossRepository": true,
+            "headRefName": "billing-export-ui",
+            "baseRefName": "main",
+            "headRefOid": "4444444444444444444444444444444444444444",
+            "baseRefOid": "5555555555555555555555555555555555555555",
+            "headRef": null,
+            "baseRef": { "name": "main" },
+            "mergeable": "UNKNOWN",
+            "mergeStateStatus": "SOMETHING_NEW",
+            "reviewDecision": null,
+            "isInMergeQueue": false,
+            "mergeQueueEntry": null,
+            "autoMergeRequest": null,
+            "author": { "login": "monalisa" },
+            "repository": { "name": "widgets", "owner": { "login": "acme" }, "autoMergeAllowed": true },
+            "reviewRequests": { "nodes": [] },
+            "latestReviews": { "nodes": [] },
+            "latestOpinionatedReviews": { "nodes": [] },
+            "viewerLatestReview": { "state": "COMMENTED", "commit": { "oid": "4444444444444444444444444444444444444444" } },
+            "commits": { "nodes": [ { "commit": { "oid": "4444444444444444444444444444444444444444", "statusCheckRollup": null } } ] }
+          }
+        ]
+      },
+      "t2": null,
+      "t3": { "nodes": [] }
+    }
+  },
+  "errors": [
+    {
+      "type": "NOT_FOUND",
+      "path": ["repository", "t2"],
+      "locations": [{ "line": 6, "column": 5 }],
+      "message": "Could not resolve to a PullRequest with the number of 999."
+    }
+  ]
+}

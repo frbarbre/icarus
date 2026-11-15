@@ -1,0 +1,43 @@
+{
+  "data": {
+    "viewer": { "login": "octocat" },
+    "search": {
+      "nodes": [
+        {
+          "__typename": "PullRequest",
+          "id": "PR_kwDOAbc789",
+          "number": 42,
+          "title": "Tighten widget validation",
+          "url": "https://github.com/acme/widgets/pull/42",
+          "state": "OPEN",
+          "isDraft": false,
+          "updatedAt": "2026-11-15T10:00:00Z",
+          "additions": 10,
+          "deletions": 2,
+          "changedFiles": 2,
+          "isCrossRepository": false,
+          "headRefName": "validation",
+          "baseRefName": "main",
+          "headRefOid": "6666666666666666666666666666666666666666",
+          "baseRefOid": "5555555555555555555555555555555555555555",
+          "headRef": { "name": "validation" },
+          "baseRef": { "name": "main" },
+          "mergeable": "CONFLICTING",
+          "mergeStateStatus": "DIRTY",
+          "reviewDecision": "CHANGES_REQUESTED",
+          "isInMergeQueue": false,
+          "mergeQueueEntry": null,
+          "autoMergeRequest": null,
+          "author": { "login": "hubot" },
+          "repository": { "name": "widgets", "owner": { "login": "acme" }, "autoMergeAllowed": false },
+          "reviewRequests": { "nodes": [ { "asCodeOwner": false, "requestedReviewer": { "__typename": "User", "login": "octocat" } } ] },
+          "latestReviews": { "nodes": [] },
+          "latestOpinionatedReviews": { "nodes": [] },
+          "viewerLatestReview": null,
+          "commits": { "nodes": [] }
+        },
+        { "__typename": "Issue" }
+      ]
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": { "hasNextPage": false, "endCursor": null },
+          "nodes": [
+            {
+              "id": "PRRT_1", "isResolved": false, "isOutdated": false,
+              "path": "src/billing.rs", "line": 42, "originalLine": 40, "startLine": null,
+              "comments": { "nodes": [
+                { "id": "PRRC_1", "body": "This rounds the wrong way.", "url": "https://github.com/acme/widgets/pull/811#discussion_r1",
+                  "createdAt": "2026-11-15T10:00:00Z", "author": { "__typename": "User", "login": "monalisa" } },
+                { "id": "PRRC_2", "body": "Good catch, will fix.", "url": "https://github.com/acme/widgets/pull/811#discussion_r2",
+                  "createdAt": "2026-11-15T10:05:00Z", "author": { "__typename": "User", "login": "octocat" } }
+              ] }
+            },
+            {
+              "id": "PRRT_2", "isResolved": true, "isOutdated": true,
+              "path": "src/export.rs", "line": null, "originalLine": 7, "startLine": null,
+              "comments": { "nodes": [
+                { "id": "PRRC_3", "body": "Nit: rename.", "url": "https://github.com/acme/widgets/pull/811#discussion_r3",
+                  "createdAt": "2026-11-14T10:00:00Z", "author": { "__typename": "User", "login": "hubot" } }
+              ] }
+            },
+            {
+              "id": "PRRT_3", "isResolved": false, "isOutdated": false,
+              "path": "src/lib.rs", "line": 3, "originalLine": 3, "startLine": 1,
+              "comments": { "nodes": [
+                { "id": "PRRC_4", "body": "Potential null dereference.", "url": "https://github.com/acme/widgets/pull/811#discussion_r4",
+                  "createdAt": "2026-11-15T09:00:00Z", "author": { "__typename": "Bot", "login": "coderabbitai" } }
+              ] }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

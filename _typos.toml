@@ -1,0 +1,7 @@
+[files]
+extend-exclude = ["scratch/", "private/", "target/", "*.lock"]
+
+[default.extend-words]
+# Orca settings key names quoted in the compatibility spec.
+Udid = "Udid"
+udid = "udid"

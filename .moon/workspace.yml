@@ -1,0 +1,9 @@
+projects:
+  root: '.'
+
+vcs:
+  defaultBranch: 'main'
+  provider: 'github'
+
+pipeline:
+  cacheLifetime: '7 days'

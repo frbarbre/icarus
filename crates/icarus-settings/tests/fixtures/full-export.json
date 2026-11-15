@@ -1,0 +1,314 @@
+{
+  "format": "orca-settings",
+  "version": 1,
+  "exportedAt": "2026-01-02T03:04:05.678Z",
+  "settings": {
+    "nestWorkspaces": true,
+    "branchPrefix": "custom",
+    "branchPrefixCustom": "dev/",
+    "theme": "dark",
+    "appFontFamily": "Geist",
+    "editorFontFamily": "Example Mono",
+    "editorAutoSaveDelayMs": 1000,
+    "terminalFontSize": 13,
+    "terminalFontFamily": "Example Mono",
+    "terminalLineHeight": 1.2,
+    "terminalThemeDark": "Example Night",
+    "terminalUseSeparateLightTheme": true,
+    "terminalThemeLight": "Example Day",
+    "terminalCustomThemes": [
+      {
+        "id": "custom-1",
+        "name": "Example Night",
+        "source": "warp",
+        "mode": "dark",
+        "terminal": {
+          "foreground": "#eeeeee",
+          "background": "#111111",
+          "black": "#000000",
+          "brightBlack": "#555555"
+        }
+      }
+    ],
+    "terminalInactivePaneOpacity": 0.85,
+    "terminalScrollbackRows": 100000,
+    "terminalQuickCommands": [
+      {
+        "id": "qc-1",
+        "label": "Run tests",
+        "scope": {
+          "type": "global"
+        },
+        "action": "terminal-command",
+        "command": "make test",
+        "appendEnter": true
+      },
+      {
+        "id": "qc-2",
+        "label": "Start dev server",
+        "scope": {
+          "type": "project",
+          "remote": "github.com/example-org/widgets"
+        },
+        "action": "terminal-command",
+        "command": "make dev",
+        "appendEnter": true
+      }
+    ],
+    "notifications": {
+      "enabled": true,
+      "agentTurnDone": false,
+      "sound": "ping"
+    },
+    "agentDefaultArgs": {
+      "claude": "",
+      "codex": "--model example"
+    },
+    "promptCacheTtlMs": 300000,
+    "mobileAutoRestoreFitMs": -1,
+    "orchestrationHeartbeatIntervalMinutes": 0.5,
+    "tinyNumber": 1e-7,
+    "hugeNumber": 1e+21,
+    "commitMessageAi": {
+      "enabled": true,
+      "agentId": null,
+      "instructions": "Write a short summary — imperative mood, no trailing period’s."
+    },
+    "experimentalWorktreeSymlinks": true,
+    "legacyNumberedMap": {
+      "3": "three",
+      "12": "twelve",
+      "name": "mixed"
+    },
+    "sourceControlSectionLayout": {
+      "order": [
+        "changes",
+        "staged",
+        "stash"
+      ],
+      "collapsed": []
+    },
+    "languageServers": {
+      "typescript": {
+        "enabled": true,
+        "server": "tsgo"
+      },
+      "rust": {
+        "enabled": false
+      }
+    },
+    "formatters": {
+      "typescript": {
+        "command": "biome",
+        "args": [
+          "format",
+          "--stdin-file-path",
+          "{file}"
+        ]
+      }
+    },
+    "linters": {
+      "typescript": {
+        "command": "eslint"
+      }
+    }
+  },
+  "ui": {
+    "groupBy": "workspace-status",
+    "sortBy": "smart",
+    "projectOrderBy": "manual",
+    "stackOrder": "asc",
+    "showActiveOnly": false,
+    "hideSleepingWorkspaces": false,
+    "hideTemporaryCheckoutWorkspaces": true,
+    "alwaysShowDefaultBranchWorkspace": true,
+    "agentsGroupBy": "status",
+    "uiZoomLevel": 0,
+    "editorFontZoomLevel": -0.5,
+    "worktreeCardProperties": [
+      "status",
+      "workspace-status",
+      "pr",
+      "linear-title",
+      "ports"
+    ],
+    "agentActivityDisplayMode": "compact",
+    "workspaceStatuses": [
+      {
+        "id": "todo",
+        "label": "Backlog",
+        "color": "neutral",
+        "icon": "circle"
+      },
+      {
+        "id": "in-progress",
+        "label": "Doing",
+        "color": "conductor-progress",
+        "icon": "conductor-progress"
+      },
+      {
+        "id": "status-1",
+        "label": "Konflikter ⚠",
+        "color": "rose",
+        "icon": "circle-alert"
+      },
+      {
+        "id": "status-2",
+        "label": "Their PRs",
+        "color": "violet",
+        "icon": "git-pull-request"
+      },
+      {
+        "id": "status-3-2",
+        "label": "In queue",
+        "color": "sky",
+        "icon": "timer"
+      },
+      {
+        "id": "in-review",
+        "label": "Waiting",
+        "color": "conductor-review",
+        "icon": "conductor-review"
+      },
+      {
+        "id": "completed",
+        "label": "PM sign-off",
+        "color": "amber",
+        "icon": "flag"
+      },
+      {
+        "id": "status-9",
+        "label": "Parked",
+        "color": "zinc",
+        "icon": "circle-pause",
+        "legacyHint": "kept"
+      }
+    ],
+    "workspaceStatusRules": {
+      "enabled": true,
+      "statusByCondition": {
+        "reviewing": "status-2",
+        "merge-queue": "status-3-2",
+        "conflicts": "status-1",
+        "draft": "todo",
+        "review": "in-review",
+        "pm-approval": "completed"
+      },
+      "mergingCheckName": "Reviews satisfied",
+      "newWorkspaceStatus": "todo",
+      "holdStatus": "status-9",
+      "pmApprovalTeam": "example-org/pm-team",
+      "onResolved": "delete",
+      "onReviewed": "delete",
+      "resolveConflictsWithAgent": true,
+      "conflictPromptTemplate": "Resolve the conflicts on {{branch}} against {{baseRef}} in {{worktreePath}}.\n\nRules:\n\t- keep both sides’ intent\n\t- never \"force\" anything — ask first\n\t- unknown {{ variable }} stays as is\nPath C:\\work\\repo and a bell \u0007 survive.",
+      "reviewEnteredCommand": "make dev-down",
+      "actionPrompts": {
+        "commitAndPush": "Commit and push {{branch}} — small, focused commits.",
+        "createPullRequest": "Open a PR for {{branch}} into {{baseRef}}.\n{{prInstructions}}",
+        "readyForReview": "Mark #{{prNumber}} ready: {{prUrl}}",
+        "reviewPullRequest": "Review {{prTitle}} carefully. 日本語もOK 🙂"
+      },
+      "reviewInbox": {
+        "enabled": true,
+        "agent": "claude",
+        "view": "chat",
+        "promptTemplate": "You are reviewing pull request #{{prNumber}} — \"{{title}}\" by {{author}} ({{url}}).",
+        "rereviewPromptTemplate": "Re-review #{{prNumber}} since {{sinceCommit}}; focus on what changed’s impact."
+      },
+      "futureRuleKey": {
+        "nested": [
+          1,
+          2.5
+        ]
+      }
+    },
+    "workspaceBoardOpacity": 1,
+    "workspaceBoardColumnWidth": 320,
+    "syncTaskStatusFromWorkspaceBoard": false,
+    "statusBarItems": [
+      "claude",
+      "codex",
+      "ports"
+    ],
+    "statusBarVisible": true,
+    "usagePercentageDisplay": "used",
+    "statusBarUsageMode": "compact",
+    "browserDefaultZoomLevel": 0
+  },
+  "projects": [
+    {
+      "remote": "github.com/example-org/widgets",
+      "name": "widgets",
+      "settings": {
+        "worktreeBaseRef": "origin/main",
+        "hookSettings": {
+          "mode": "auto",
+          "setupRunPolicy": "run-by-default",
+          "setupAgentStartupPolicy": "wait-for-setup",
+          "scripts": {
+            "setup": "make worktree-setup",
+            "archive": "make worktree-archive"
+          }
+        },
+        "issueSourcePreference": "origin",
+        "defaultJiraProject": {
+          "id": "10001",
+          "key": "WID",
+          "name": "Widgets",
+          "siteId": "site-1"
+        },
+        "forkSyncMode": "safe-auto",
+        "externalWorktreeVisibility": "show",
+        "agentWorktreeVisibility": "hide",
+        "worktreeVisibilitySourcePreferences": {
+          "builtIn": {
+            "claude": "hide"
+          }
+        },
+        "symlinkPaths": [
+          ".env",
+          "config/local.yml"
+        ],
+        "pythonVenvPath": ".venv",
+        "portLabelsCommand": "make print-urls",
+        "ciTriage": {
+          "prompt": "Triage the failure. Prefer reruns for flakes — never force-push."
+        },
+        "sourceControlAi": {
+          "actionOverrides": {
+            "resolveConflicts": {
+              "agentId": "claude",
+              "agentArgs": "",
+              "commandInputTemplate": "Be careful with migrations.\n\n{basePrompt}"
+            }
+          },
+          "prCreationDefaults": {
+            "draft": true,
+            "generateDetailsOnOpen": true
+          }
+        },
+        "staleRepoField": "kept verbatim"
+      },
+      "note": "unknown entry key"
+    },
+    {
+      "remote": "gitlab.example.com/group/sub/tools",
+      "name": "tools",
+      "settings": {
+        "hookSettings": {
+          "mode": "auto",
+          "scripts": {
+            "setup": "",
+            "archive": ""
+          }
+        }
+      }
+    }
+  ],
+  "keybindings": "{\n  \"version\": 1,\n  \"keybindings\": {},\n  \"platforms\": {\n    \"darwin\": {\n      \"tab.nextSameType\": [\n        \"Mod+Shift+BracketRight\"\n      ],\n      \"editor.previousChange\": [\n        \"ArrowUp\"\n      ],\n      \"workspace.delete\": null\n    },\n    \"linux\": {},\n    \"win32\": {}\n  }\n}\n",
+  "editorThemes": {
+    "editor-dark.json": "{\"name\":\"Example Dark\",\"type\":\"dark\",\"colors\":{\"editor.background\":\"#101010\"},\"tokenColors\":[{\"scope\":\"comment\",\"settings\":{\"fontStyle\":\"italic\"}}]}",
+    "editor-light.json": "{\n  \"name\": \"Example Light\",\n  \"colors\": {}\n}"
+  }
+}

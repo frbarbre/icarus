@@ -1,0 +1,18 @@
+{
+  "url": "https://api.github.com/repos/acme/widgets/pulls/811",
+  "id": 1811,
+  "node_id": "PR_kwDOAbc123",
+  "number": 811,
+  "state": "open",
+  "title": "Billing export API",
+  "user": { "login": "octocat", "id": 1 },
+  "head": { "ref": "billing-export-api", "sha": "1111111111111111111111111111111111111111" },
+  "base": { "ref": "billing-schema", "sha": "2222222222222222222222222222222222222222" },
+  "stack": {
+    "id": 9042,
+    "number": 42,
+    "position": 2,
+    "size": 3,
+    "base": { "ref": "main", "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+  }
+}

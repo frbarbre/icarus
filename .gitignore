@@ -1,0 +1,10 @@
+/target/
+/.moon/cache/
+/scratch/
+/private/
+/site/
+icarus.local.json
+.icarus/settings.local.json
+junit.xml
+*.tar.zst
+.DS_Store
