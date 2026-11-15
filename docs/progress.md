@@ -143,6 +143,7 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - `icarus server clients` lists paired clients, and `icarus server revoke <id>` drops one and closes its live connections. These, and `pair`, only work on the server's own machine.
 - `icarus remote add <name> <addr> --code <code>` pairs, pins the certificate fingerprint and saves the server in `~/.config/icarus/servers.json`. `ssh://host` servers can be saved too. `remote list|remove` manage the list, and `--server <name>` points any command at a saved server.
 - The local socket and its token work as before, and the protocol only gained optional fields.
+- Checked live over Tailscale between two Macs: pairing with a pinned certificate, `--server` commands, a terminal run on the remote machine with its output read back, and `server pair` refused from the paired client.
 
 **Linear** (`crates/icarus-linear`, plan D12 and D3):
 - A small read-only client for Linear's GraphQL API. Several issues come back in one query, rate limits pause requests until Linear's reset time, and a rejected key is reported clearly.
@@ -181,7 +182,7 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - `review.upload` puts images (10 MB) and videos (100 MB) into GitHub's own attachments with the `gh` login and returns the markdown to insert.
 - A workspace with unsent drafts is not removed, by hand (without force) or by the rules.
 - RPCs: `review.get`, `review.set_base`, `review.comment.add|edit|remove|clear|list`, `review.set_summary`, `review.submit`, `review.threads`, `review.reply`, `review.resolve|unresolve`, `review.react`, `review.upload`, plus a `review.changed` event. CLI: `icarus review show|base|comment|summary|submit|threads|reply|resolve|unresolve|react|upload`, run from inside a workspace.
-- Checked live on a private sandbox repo: two drafts with an uploaded PNG and MP4, one COMMENT review, reply, resolve, unresolve and reactions read back through `review.threads`; GitHub's refusals to approve or request changes on your own PR; a two-PR stack. Auto-merge could not be enabled on that private repo.
+- Checked live on a private sandbox repo: two drafts with an uploaded PNG and MP4, one COMMENT review, reply, resolve, unresolve and reactions read back through `review.threads`; GitHub's refusals to approve or request changes on your own PR; a two-PR stack. With the sandbox public and a required check on `main`, auto-merge was enabled and disabled on a real PR.
 
 **Releases and updates (D9):**
 - `.github/workflows/release.yml` runs on `v*` tags and by hand (`gh workflow run release.yml -f version=0.2.0`), never on normal pushes. It builds `icarus` + `icarus-server` for Linux x86_64 and aarch64 (glibc, on native Ubuntu 22.04 runners) and a universal macOS tarball, then `Icarus.app` for Apple silicon (`scripts/release/bundle-mac.sh`; Intel with the `intel_app` input) as a `.zip` and a `.dmg`. The app is ad-hoc signed (bundle id `dev.icarus.app`) and Zed's own updater is compiled off with `ZED_UPDATE_EXPLANATION`. It publishes a GitHub release with `SHA256SUMS` and generated notes, and the version is stamped into the binaries (`ICARUS_VERSION`).
@@ -193,8 +194,8 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 ## Blocked on you
 
 Parked until you're back; work continues on other items.
-- **Private repo:** `brew install` and unauthenticated update checks need public release downloads, so they work only once frbarbre/icarus is public. Until then `icarus update` works through a signed-in `gh`.
-- **Cost:** a release builds the Zed app on a macOS runner (roughly an hour, billed 10x while private). Cut releases deliberately.
+- **Second account login:** after `icarus account add`, signing in (`CLAUDE_CONFIG_DIR=… claude /login`) is interactive.
+- **macOS notification permission:** accept the prompt the first time the app shows a notification.
 
 ## In progress
 
