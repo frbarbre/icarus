@@ -124,6 +124,10 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 
 **Layouts (server and CLI, D32):** named tab layouts from settings (`layouts.<name>`) plus a built-in `review` (agent left, browser on `{pr_url}` right), with types shared through `icarus-protocol::layout`. `icarus workspace create --layout`, `icarus workspace layout <ws> <name>`, `icarus layout list|show`, and the rules' create-from-PR and open-layout actions resolve placeholders, bind agent tabs to server agents (prompted tabs start their own agent), store the layout as pending and push it to the app; `workspace.take_layout` applies it once. The app side waits for the agent, browser, diff and explorer tab types.
 
+**The app lives in `app/`:** a soft fork of Zed, kept as plain files in this repo (not a GitHub fork). It's based on upstream `zed-industries/zed` commit `596dfdcf32d85d4d8d17a8887b4d0979ec7c5e14` (2026-11-15). To merge upstream later, diff `app/` against that commit and apply the result to a newer one. It has its own Cargo workspace and toolchain, so the root workspace and CI's fast checks skip it. Build it with `cd app && cargo build -p zed` (on macOS with `DEVELOPER_DIR` set to Xcode).
+
+**Agent tabs and the shared composer (D31):** each agent is a centre tab (`agent_ui::agent_tab`) showing only the conversation; one composer under the centre panes types into the target agent's own draft (the active agent tab, else the last one used), so drafts and attachment chips stay per agent. Closing the last agent tab opens a fresh one. ⌘⌥T opens a new agent tab; attachments, the review layout and the next-action button all target it. Checked in the live app.
+
 **Live app capture:** `icarus app capture [--out DIR]` asks the running app to draw and save each window as a PNG (GPUI `frame-capture` feature), so the real app can be checked end to end without screen-recording permission or a visible GUI session.
 
 **Statuses in the client:** Orca's 11 colours (with separate light and dark tones) and 16 icons. Color and Icon submenus save to settings, and only statuses that currently have workspaces show in the sidebar.

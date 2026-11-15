@@ -1,5 +1,5 @@
 [files]
-extend-exclude = ["scratch/", "private/", "target/", "*.lock"]
+extend-exclude = ["scratch/", "private/", "target/", "app/", "*.lock"]
 
 [default.extend-words]
 # Orca settings key names quoted in the compatibility spec.

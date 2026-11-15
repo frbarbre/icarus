@@ -1,1 +1,1 @@
-exclude = ["scratch/**", "private/**", "target/**"]
+exclude = ["scratch/**", "private/**", "target/**", "app/**"]
