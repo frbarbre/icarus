@@ -36,6 +36,7 @@ pub struct Server {
     pub(crate) linear: crate::linear::LinearService,
     pub(crate) automation: crate::automation::Automation,
     pub(crate) ports: crate::ports::Ports,
+    pub(crate) history: Arc<crate::history::HistoryIndex>,
     /// Connected clients, for requests the server forwards to editors (e.g. open a file).
     clients: std::sync::Mutex<Vec<(String, String, Outbound)>>,
     shutdown: Notify,
@@ -110,6 +111,7 @@ impl Server {
             linear: crate::linear::LinearService::from_env(),
             automation: crate::automation::Automation::default(),
             ports: crate::ports::Ports::default(),
+            history: Arc::default(),
             paths,
             token,
             started_at_ms: SystemTime::now()
@@ -190,6 +192,7 @@ impl Server {
     }
 
     pub async fn run(self: Arc<Self>, listener: UnixListener) -> Result<()> {
+        crate::notifications::spawn(Arc::clone(&self));
         crate::automation::spawn(Arc::clone(&self));
         crate::ports::spawn(Arc::clone(&self));
         crate::linear::spawn(Arc::clone(&self));
@@ -497,6 +500,8 @@ impl Server {
                     env: BTreeMap<String, String>,
                     /// Sent as the first message once the agent is up.
                     prompt: Option<String>,
+                    /// Account id or label; `system` for the provider's own login.
+                    account: Option<String>,
                 }
                 let p: P = params(params_value)?;
                 let cwd = match p.cwd {
@@ -516,19 +521,22 @@ impl Server {
                 let command = p
                     .command
                     .or_else(|| next_action::configured_command(&settings, &provider));
+                let mut options = AgentOptions {
+                    provider,
+                    cwd,
+                    workspace: p.workspace,
+                    title: p.title,
+                    model: p.model,
+                    bypass_permissions: p.bypass_permissions,
+                    resume: p.resume,
+                    command,
+                    env: p.env,
+                    account: None,
+                };
+                self.apply_account(&mut options, p.account.as_deref())?;
                 let thread = self
                     .agents
-                    .create(AgentOptions {
-                        provider,
-                        cwd,
-                        workspace: p.workspace,
-                        title: p.title,
-                        model: p.model,
-                        bypass_permissions: p.bypass_permissions,
-                        resume: p.resume,
-                        command,
-                        env: p.env,
-                    })
+                    .create(options)
                     .await
                     .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
                 if let Some(prompt) = p.prompt {
@@ -1011,6 +1019,13 @@ impl Server {
             }
             "workspace.next_action" | "workspace.run_next_action" => {
                 self.next_action_dispatch(method, params_value).await
+            }
+            "agent.history" | "agent.resume" => self.history_dispatch(method, params_value).await,
+            other if other.starts_with("notification.") => {
+                self.notifications_dispatch(other, params_value).await
+            }
+            other if other.starts_with("account.") => {
+                self.accounts_dispatch(other, params_value).await
             }
             other if other.starts_with("pr.") => self.github_dispatch(other, params_value).await,
             other if other.starts_with("issue.") => self.linear_dispatch(other, params_value).await,

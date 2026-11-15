@@ -202,19 +202,22 @@ impl Server {
         let settings = self.resolved_settings(root);
         let provider = provider.unwrap_or_else(|| next_action::default_provider(&settings));
         let command = next_action::configured_command(&settings, &provider);
+        let mut options = AgentOptions {
+            provider,
+            cwd: workspace.path.clone(),
+            workspace: Some(workspace.id.clone()),
+            title: Some("Agent".into()),
+            model: None,
+            bypass_permissions: true,
+            resume: None,
+            command,
+            env: Default::default(),
+            account: None,
+        };
+        self.apply_account(&mut options, None)?;
         let agent = self
             .agents
-            .create(AgentOptions {
-                provider,
-                cwd: workspace.path.clone(),
-                workspace: Some(workspace.id.clone()),
-                title: Some("Agent".into()),
-                model: None,
-                bypass_permissions: true,
-                resume: None,
-                command,
-                env: Default::default(),
-            })
+            .create(options)
             .await
             .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
         if let Some(prompt) = prompt {

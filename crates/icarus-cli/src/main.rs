@@ -1,5 +1,6 @@
 mod acp;
 mod attach;
+mod extras;
 mod issue;
 mod ports;
 mod rules;
@@ -131,6 +132,21 @@ enum Command {
     Issue {
         #[command(subcommand)]
         command: issue::IssueCommand,
+    },
+    /// Notifications from the server (agents, CI, reviews, merges, rules); newest first.
+    Notifications {
+        /// Only unread ones.
+        #[arg(long)]
+        unread: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[command(subcommand)]
+        command: Option<extras::NotificationsCommand>,
+    },
+    /// Agent accounts: several logins per provider, each in its own config dir.
+    Account {
+        #[command(subcommand)]
+        command: extras::AccountCommand,
     },
 }
 
@@ -445,6 +461,9 @@ enum WorkspaceCommand {
         /// The PR URL for `{pr_url}` in the layout, when the branch has no PR yet.
         #[arg(long)]
         pr_url: Option<String>,
+        /// Account (id or label) for the agent; `system` for the provider's own login.
+        #[arg(long)]
+        account: Option<String>,
     },
     List {
         #[arg(long)]
@@ -493,6 +512,14 @@ enum WorkspaceCommand {
         #[arg(long)]
         run: bool,
     },
+    /// Park the workspace: its agents sleep and its terminals' processes stop, keeping their scrollback.
+    Sleep {
+        id: String,
+    },
+    /// Restart what `sleep` parked.
+    Wake {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -518,9 +545,26 @@ enum AgentCommand {
         /// Resume an earlier provider session.
         #[arg(long)]
         resume: Option<String>,
+        /// Account (id or label); `system` for the provider's own login.
+        #[arg(long)]
+        account: Option<String>,
     },
     /// List agent sessions.
     List,
+    /// Past sessions (sleeping, exited or killed), newest first; --search looks through prompts and answers.
+    History {
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        search: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Only sessions last active before this time (ms since the epoch), for paging.
+        #[arg(long)]
+        before: Option<u64>,
+    },
+    /// Bring a past session back as a live agent in its workspace.
+    Resume { id: String },
     /// Send a message to an agent.
     Send { id: String, text: String },
     /// Print an agent's transcript.
@@ -1303,6 +1347,7 @@ async fn main() -> Result<()> {
                     no_agent,
                     layout,
                     pr_url,
+                    account,
                 } => {
                     let issue = from_linear
                         .as_ref()
@@ -1314,6 +1359,7 @@ async fn main() -> Result<()> {
                                 "project": project, "name": name, "branch": branch, "base": base,
                                 "fetch": fetch, "status": status, "prompt": prompt, "issue": issue,
                                 "agent": !no_agent, "layout": layout, "pr_url": pr_url,
+                                "account": account,
                             }),
                             Duration::from_secs(300),
                         )
@@ -1468,8 +1514,37 @@ async fn main() -> Result<()> {
                         print(&cli, &value, rules::next_action);
                     }
                 }
+                WorkspaceCommand::Sleep { id } | WorkspaceCommand::Wake { id } => {
+                    let method = if matches!(command, WorkspaceCommand::Sleep { .. }) {
+                        "workspace.sleep"
+                    } else {
+                        "workspace.wake"
+                    };
+                    let value = client
+                        .request_timeout(method, json!({ "id": id }), Duration::from_secs(120))
+                        .await?;
+                    print(&cli, &value, |v| {
+                        let count = |key: &str| v[key].as_array().map_or(0, Vec::len);
+                        let verb = if v["sleeping"] == json!(true) {
+                            "parked"
+                        } else {
+                            "woke"
+                        };
+                        format!(
+                            "{verb} {} agent(s) and {} terminal(s)",
+                            count("agents"),
+                            count("terminals")
+                        )
+                    });
+                }
             }
         }
+        Command::Notifications {
+            unread,
+            limit,
+            command,
+        } => extras::notifications(&cli, *unread, *limit, command.as_ref()).await?,
+        Command::Account { command } => extras::account(&cli, command).await?,
         Command::Changes { command } => {
             let client = connect(&cli).await?;
             match command {
@@ -1726,6 +1801,7 @@ async fn main() -> Result<()> {
                     prompt,
                     ask_permissions,
                     resume,
+                    account,
                 } => {
                     let cwd = match cwd {
                         Some(cwd) => cwd.clone(),
@@ -1737,7 +1813,7 @@ async fn main() -> Result<()> {
                             json!({
                                 "cwd": cwd, "provider": provider, "title": title, "workspace": workspace,
                                 "model": model, "prompt": prompt, "bypass_permissions": !ask_permissions,
-                                "resume": resume,
+                                "resume": resume, "account": account,
                             }),
                         )
                         .await?;
@@ -1767,6 +1843,22 @@ async fn main() -> Result<()> {
                             .unwrap_or_default()
                     });
                 }
+                AgentCommand::History {
+                    workspace,
+                    search,
+                    limit,
+                    before,
+                } => {
+                    extras::history(
+                        &cli,
+                        workspace.as_deref(),
+                        search.as_deref(),
+                        *limit,
+                        *before,
+                    )
+                    .await?
+                }
+                AgentCommand::Resume { id } => extras::resume(&cli, id).await?,
                 AgentCommand::Send { id, text } => {
                     let value = client
                         .request("agent.send", json!({ "id": id, "text": text }))

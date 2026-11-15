@@ -261,6 +261,8 @@ impl Server {
         }
 
         let (facts, details, ci_triage) = self.gather_facts(&targets, &config, &mut errors).await;
+        // Notifications are news, not actions, so dry runs send them too.
+        report["notifications"] = json!(self.notify_facts(&facts));
         let statuses: Vec<StatusDef> = setting(&config.settings, &["workspace", "statuses"])
             .cloned()
             .and_then(|v| serde_json::from_value(v).ok())
@@ -624,7 +626,22 @@ impl Server {
                     "notify",
                     json!({ "workspace_id": workspace_id, "message": message, "source": "rules" }),
                 );
-                Executed::ok(json!({ "delivered": delivered }))
+                let label = workspace_id
+                    .as_deref()
+                    .and_then(|id| self.store.workspace(id).ok().flatten())
+                    .map(|w| w.title.unwrap_or(w.name));
+                let stored = self.notify(crate::notifications::NewNotification {
+                    kind: crate::notifications::RULES,
+                    subject: format!("{}|{message}", workspace_id.as_deref().unwrap_or("-")),
+                    title: label.unwrap_or_else(|| "Automation".to_owned()),
+                    body: message.clone(),
+                    workspace_id: workspace_id.clone(),
+                    data: json!({ "source": "rules" }),
+                });
+                Executed::ok(json!({
+                    "delivered": delivered,
+                    "notification": stored.map(|n| n.id),
+                }))
             }
             PlannedAction::OpenLayout {
                 workspace_id,

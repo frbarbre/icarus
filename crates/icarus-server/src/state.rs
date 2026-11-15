@@ -125,6 +125,29 @@ impl Store {
                  token_hash TEXT NOT NULL UNIQUE,
                  created_at_ms INTEGER NOT NULL,
                  last_seen_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS notifications (
+                 id TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 subject TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 body TEXT NOT NULL,
+                 workspace_id TEXT,
+                 data TEXT,
+                 created_at INTEGER NOT NULL,
+                 read INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS notifications_by_time ON notifications(created_at);
+             CREATE TABLE IF NOT EXISTS notification_keys (
+                 key TEXT PRIMARY KEY,
+                 last_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS accounts (
+                 id TEXT PRIMARY KEY,
+                 provider TEXT NOT NULL,
+                 label TEXT NOT NULL,
+                 home TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL
              );",
         )?;
         Ok(Self {
@@ -489,6 +512,197 @@ impl Store {
     }
 }
 
+/// Notifications kept; older ones are dropped as new ones arrive.
+const NOTIFICATIONS_KEPT: i64 = 500;
+/// Dedupe keys older than this are forgotten.
+const NOTIFICATION_KEY_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+impl Store {
+    /// Claims `key` unless it was claimed less than `window_ms` ago; true means go ahead.
+    pub fn reserve_notification_key(&self, key: &str, now: u64, window_ms: u64) -> Result<bool> {
+        let db = self.db();
+        let last: Option<i64> = db
+            .query_row(
+                "SELECT last_at FROM notification_keys WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if last.is_some_and(|last| now.saturating_sub(last as u64) < window_ms) {
+            return Ok(false);
+        }
+        db.execute(
+            "INSERT INTO notification_keys (key, last_at) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET last_at = excluded.last_at",
+            params![key, now as i64],
+        )?;
+        db.execute(
+            "DELETE FROM notification_keys WHERE last_at < ?1",
+            params![now.saturating_sub(NOTIFICATION_KEY_TTL_MS) as i64],
+        )?;
+        Ok(true)
+    }
+
+    pub fn add_notification(&self, notification: &Notification) -> Result<()> {
+        let db = self.db();
+        db.execute(
+            "INSERT INTO notifications (id, kind, subject, title, body, workspace_id, data, created_at, read)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                notification.id,
+                notification.kind,
+                notification.subject,
+                notification.title,
+                notification.body,
+                notification.workspace_id,
+                json_column(&notification.data),
+                notification.created_at as i64,
+                notification.read
+            ],
+        )?;
+        db.execute(
+            "DELETE FROM notifications WHERE rowid NOT IN
+             (SELECT rowid FROM notifications ORDER BY created_at DESC, rowid DESC LIMIT ?1)",
+            params![NOTIFICATIONS_KEPT],
+        )?;
+        Ok(())
+    }
+
+    /// Newest first.
+    pub fn notifications(&self, unread_only: bool, limit: usize) -> Result<Vec<Notification>> {
+        let db = self.db();
+        let mut statement = db.prepare(
+            "SELECT id, kind, subject, title, body, workspace_id, data, created_at, read
+             FROM notifications WHERE NOT (?1 AND read)
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![unread_only, limit as i64], |row| {
+            Ok(Notification {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                subject: row.get(2)?,
+                title: row.get(3)?,
+                body: row.get(4)?,
+                workspace_id: row.get(5)?,
+                data: parse_json(row.get(6)?),
+                created_at: row.get::<_, i64>(7)? as u64,
+                read: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn unread_notifications(&self) -> Result<u64> {
+        let count: i64 = self.db().query_row(
+            "SELECT COUNT(*) FROM notifications WHERE NOT read",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Marks one notification read, or all of them with `None`; returns how many changed.
+    pub fn mark_notifications_read(&self, id: Option<&str>) -> Result<usize> {
+        Ok(self.db().execute(
+            "UPDATE notifications SET read = 1 WHERE NOT read AND (?1 IS NULL OR id = ?1)",
+            params![id],
+        )?)
+    }
+
+    pub fn notification_exists(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT 1 FROM notifications WHERE id = ?1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn clear_notifications(&self) -> Result<usize> {
+        Ok(self.db().execute("DELETE FROM notifications", [])?)
+    }
+
+    pub fn add_account(&self, account: &Account) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO accounts (id, provider, label, home, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                account.id,
+                account.provider,
+                account.label,
+                account.home.to_string_lossy(),
+                account.created_at_ms as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
+        Ok(Account {
+            id: row.get(0)?,
+            provider: row.get(1)?,
+            label: row.get(2)?,
+            home: PathBuf::from(row.get::<_, String>(3)?),
+            created_at_ms: row.get::<_, i64>(4)? as u64,
+        })
+    }
+
+    /// Finds an account by id or label.
+    pub fn account(&self, key: &str) -> Result<Option<Account>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT id, provider, label, home, created_at_ms FROM accounts
+                 WHERE id = ?1 OR label = ?1 ORDER BY created_at_ms LIMIT 1",
+                params![key],
+                Self::account_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn accounts(&self) -> Result<Vec<Account>> {
+        let db = self.db();
+        let mut statement = db.prepare(
+            "SELECT id, provider, label, home, created_at_ms FROM accounts ORDER BY provider, created_at_ms",
+        )?;
+        let rows = statement.query_map([], Self::account_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn remove_account(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .db()
+            .execute("DELETE FROM accounts WHERE id = ?1", params![id])?
+            > 0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Notification {
+    pub id: String,
+    pub kind: String,
+    /// What it is about, e.g. an agent id or `owner/repo#12@sha`; with `kind` it is the dedupe key.
+    pub subject: String,
+    pub title: String,
+    pub body: String,
+    pub workspace_id: Option<String>,
+    pub data: Option<Value>,
+    pub created_at: u64,
+    pub read: bool,
+}
+
+/// A managed agent login: its own config dir, signed in through the provider's own CLI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Account {
+    pub id: String,
+    pub provider: String,
+    pub label: String,
+    pub home: PathBuf,
+    pub created_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PairedClient {
     pub id: String,
@@ -642,6 +856,96 @@ mod tests {
             store.kv_get("rules").expect("get"),
             Some(serde_json::json!({ "ledger": ["b"] }))
         );
+    }
+
+    fn notification(id: &str, created_at: u64) -> Notification {
+        Notification {
+            id: id.into(),
+            kind: "agent_turn_done".into(),
+            subject: "agent-1".into(),
+            title: "Agent finished".into(),
+            body: String::new(),
+            workspace_id: None,
+            data: Some(serde_json::json!({ "agent_id": "agent-1" })),
+            created_at,
+            read: false,
+        }
+    }
+
+    #[test]
+    fn notifications_list_newest_first_and_mark_read() {
+        let store = Store::in_memory().expect("store");
+        store.add_notification(&notification("n1", 1)).expect("add");
+        store.add_notification(&notification("n2", 2)).expect("add");
+        let listed = store.notifications(false, 10).expect("list");
+        assert_eq!(
+            listed.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            ["n2", "n1"]
+        );
+        assert_eq!(listed[0].data, notification("n2", 2).data);
+        assert_eq!(store.mark_notifications_read(Some("n1")).expect("read"), 1);
+        assert_eq!(store.unread_notifications().expect("count"), 1);
+        assert_eq!(store.notifications(true, 10).expect("unread")[0].id, "n2");
+        assert_eq!(store.notifications(false, 1).expect("limit").len(), 1);
+        assert_eq!(store.mark_notifications_read(None).expect("all"), 1);
+        assert_eq!(store.unread_notifications().expect("count"), 0);
+        assert_eq!(store.clear_notifications().expect("clear"), 2);
+        assert!(store.notifications(false, 10).expect("list").is_empty());
+    }
+
+    #[test]
+    fn notification_keys_hold_for_their_window() {
+        let store = Store::in_memory().expect("store");
+        assert!(
+            store
+                .reserve_notification_key("k", 1_000, 5_000)
+                .expect("r")
+        );
+        assert!(
+            !store
+                .reserve_notification_key("k", 5_999, 5_000)
+                .expect("r")
+        );
+        assert!(
+            store
+                .reserve_notification_key("other", 5_999, 5_000)
+                .expect("r")
+        );
+        assert!(
+            store
+                .reserve_notification_key("k", 6_000, 5_000)
+                .expect("r")
+        );
+    }
+
+    #[test]
+    fn notifications_keep_only_the_newest() {
+        let store = Store::in_memory().expect("store");
+        for i in 0..(NOTIFICATIONS_KEPT as u64 + 5) {
+            store
+                .add_notification(&notification(&format!("n{i}"), i))
+                .expect("add");
+        }
+        let all = store.notifications(false, 10_000).expect("list");
+        assert_eq!(all.len() as i64, NOTIFICATIONS_KEPT);
+        assert_eq!(all.last().map(|n| n.id.as_str()), Some("n5"));
+    }
+
+    #[test]
+    fn accounts_round_trip_by_id_or_label() {
+        let store = Store::in_memory().expect("store");
+        let account = Account {
+            id: "acct-1".into(),
+            provider: "claude".into(),
+            label: "Work".into(),
+            home: PathBuf::from("/s/claude-profiles/acct-1/home"),
+            created_at_ms: 1,
+        };
+        store.add_account(&account).expect("add");
+        assert_eq!(store.account("Work").expect("q"), Some(account.clone()));
+        assert_eq!(store.accounts().expect("list"), vec![account]);
+        assert!(store.remove_account("acct-1").expect("remove"));
+        assert_eq!(store.account("acct-1").expect("q"), None);
     }
 
     #[test]

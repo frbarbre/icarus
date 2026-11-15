@@ -422,6 +422,7 @@ mod tests {
             resume: None,
             command: None,
             env: BTreeMap::new(),
+            account: None,
         }
     }
 

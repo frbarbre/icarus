@@ -175,20 +175,21 @@ impl Server {
         title: &str,
         prompt: &str,
     ) -> anyhow::Result<String> {
-        let agent = self
-            .agents
-            .create(AgentOptions {
-                provider: choice.provider,
-                cwd: workspace.path.clone(),
-                workspace: Some(workspace.id.clone()),
-                title: Some(title.to_owned()),
-                model: choice.model,
-                bypass_permissions: true,
-                resume: None,
-                command: choice.command,
-                env: Default::default(),
-            })
-            .await?;
+        let mut options = AgentOptions {
+            provider: choice.provider,
+            cwd: workspace.path.clone(),
+            workspace: Some(workspace.id.clone()),
+            title: Some(title.to_owned()),
+            model: choice.model,
+            bypass_permissions: true,
+            resume: None,
+            command: choice.command,
+            env: Default::default(),
+            account: None,
+        };
+        self.apply_account(&mut options, None)
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        let agent = self.agents.create(options).await?;
         agent.send(prompt, &[]).await?;
         Ok(agent.id().to_owned())
     }

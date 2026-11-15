@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod agent;
 pub mod attachments;
 pub mod automation;
@@ -5,9 +6,11 @@ pub mod changes;
 pub mod codex;
 pub mod emulator;
 pub mod github;
+pub mod history;
 pub mod layouts;
 pub mod linear;
 pub mod next_action;
+pub mod notifications;
 pub mod paths;
 pub mod ports;
 pub mod remote;

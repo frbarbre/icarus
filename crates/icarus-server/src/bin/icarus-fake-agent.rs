@@ -2,7 +2,9 @@
 //!
 //! Each user message is answered with "echo: <text>". Prefixes change behaviour:
 //! `sleep:<ms> <text>` waits first, `write:<path> <text>` emits a Write tool call and result,
-//! `fail <text>` ends the turn as an error, `exit` terminates the process.
+//! `fail <text>` ends the turn as an error, `ask <question>` calls AskUserQuestion first,
+//! `env:A,B` answers with those environment variables,
+//! `exit` terminates the process.
 
 use std::io::{BufRead, Write};
 use std::time::Duration;
@@ -74,6 +76,25 @@ fn main() {
                 "tool_use_result": { "type": "create", "filePath": path, "content": content, "originalFile": null } }),
             );
             text = format!("wrote {path}");
+        }
+        if let Some(question) = text.strip_prefix("ask ") {
+            emit(
+                &mut out,
+                json!({ "type": "assistant", "message": { "id": format!("msg_ask_{turn}"), "role": "assistant", "content": [
+                    { "type": "tool_use", "id": format!("toolu_ask_{turn}"), "name": "AskUserQuestion",
+                      "input": { "questions": [{ "question": question }] } }
+                ] }, "parent_tool_use_id": null, "session_id": session_id }),
+            );
+        }
+        if let Some(names) = text.strip_prefix("env:") {
+            text = names
+                .split(',')
+                .map(|name| match std::env::var(name) {
+                    Ok(value) => format!("{name}={value}"),
+                    Err(_) => format!("{name} unset"),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
         }
         let reply = format!("echo: {text}");
         let message_id = format!("msg_{turn}");

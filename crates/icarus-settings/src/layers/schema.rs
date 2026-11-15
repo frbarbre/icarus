@@ -528,6 +528,37 @@ pub fn document_schema() -> Schema {
             )]),
         ),
         field(
+            "notifications",
+            "Server notifications. Every switch defaults to on.",
+            closed(vec![
+                field("enabled", "Master switch for all notifications.", Bool),
+                field(
+                    "sound",
+                    "Clients play a sound with each notification.",
+                    Bool,
+                ),
+                field("agent_turn_done", "An agent finished its turn.", Bool),
+                field(
+                    "agent_waiting",
+                    "An agent waits for input or a permission.",
+                    Bool,
+                ),
+                field(
+                    "agent_failed",
+                    "An agent's turn failed or its process died.",
+                    Bool,
+                ),
+                field(
+                    "ci_failed",
+                    "Checks failed on a workspace's pull request.",
+                    Bool,
+                ),
+                field("review_requested", "Someone asked for your review.", Bool),
+                field("pr_merged", "A workspace's pull request merged.", Bool),
+                field("rules", "A rule's `notify` action.", Bool),
+            ]),
+        ),
+        field(
             "orca",
             "Orca compatibility data kept so an export reproduces the original file.",
             Any,

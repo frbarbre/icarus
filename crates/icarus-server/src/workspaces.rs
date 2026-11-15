@@ -2,14 +2,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use icarus_git::{CreateWorktree, RemoveError};
 use icarus_protocol::RpcError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::agent::AgentOptions;
+use crate::agent::{AgentOptions, AgentState};
 use crate::next_action;
 use crate::server::{Server, params, rpc, to_value};
 use crate::state::{Workspace, workspace_slug};
@@ -58,6 +58,10 @@ impl Server {
         let mut value = serde_json::to_value(workspace).unwrap_or_default();
         value["agents"] = json!(agents);
         value["terminals"] = json!(terminals);
+        value["sleeping"] = json!(matches!(
+            self.store.kv_get(&sleep_key(&workspace.id)),
+            Ok(Some(_))
+        ));
         value["pr_author"] = workspace
             .branch
             .as_deref()
@@ -126,6 +130,8 @@ impl Server {
                     provider: Option<String>,
                     model: Option<String>,
                     agent_command: Option<Vec<String>>,
+                    /// Account id or label for the agent; `system` for the provider's own login.
+                    account: Option<String>,
                     /// A name under `layouts`, applied once the agent exists (plan D32).
                     layout: Option<String>,
                     pr_url: Option<String>,
@@ -136,6 +142,14 @@ impl Server {
                     .project(&p.project)
                     .map_err(internal)?
                     .ok_or_else(|| rpc("not_found", format!("project {}", p.project)))?;
+                // Checked before the worktree exists, so a typo leaves nothing behind.
+                if let Some(key) = p
+                    .account
+                    .as_deref()
+                    .filter(|k| *k != crate::accounts::SYSTEM)
+                {
+                    self.find_account(key)?;
+                }
                 let mut issue = p.issue;
                 let linked = issue.as_ref().and_then(crate::linear::linear_issue_id);
                 let from_linear = match &linked {
@@ -211,19 +225,22 @@ impl Server {
                     let command = p
                         .agent_command
                         .or_else(|| next_action::configured_command(&settings, &provider));
+                    let mut options = AgentOptions {
+                        provider,
+                        cwd: path,
+                        workspace: Some(workspace.id.clone()),
+                        title: Some("Agent".into()),
+                        model: p.model,
+                        bypass_permissions: true,
+                        resume: None,
+                        command,
+                        env: Default::default(),
+                        account: None,
+                    };
+                    self.apply_account(&mut options, p.account.as_deref())?;
                     let agent = self
                         .agents
-                        .create(AgentOptions {
-                            provider,
-                            cwd: path,
-                            workspace: Some(workspace.id.clone()),
-                            title: Some("Agent".into()),
-                            model: p.model,
-                            bypass_permissions: true,
-                            resume: None,
-                            command,
-                            env: Default::default(),
-                        })
+                        .create(options)
                         .await
                         .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
                     if let Some(prompt) = p.prompt {
@@ -360,7 +377,99 @@ impl Server {
                 self.store
                     .remove_workspace(&workspace.id)
                     .map_err(internal)?;
+                let _ = self.store.kv_delete(&sleep_key(&workspace.id));
                 Ok(json!({ "removed": true }))
+            }
+            "workspace.sleep" => {
+                let key: Key = params(p)?;
+                let workspace = self.workspace_by_key(&key.id)?;
+                let mut parked = self.parked(&workspace.id);
+                let mut parking = Vec::new();
+                for agent in self.agents.all() {
+                    let info = agent.info();
+                    if info.workspace.as_deref() != Some(workspace.id.as_str())
+                        || matches!(info.state, AgentState::Exited | AgentState::Sleeping)
+                    {
+                        continue;
+                    }
+                    agent
+                        .sleep()
+                        .await
+                        .map_err(|e| rpc("sleep_failed", format!("{e:#}")))?;
+                    parked.agents.push(info.id);
+                    parking.push(agent);
+                }
+                let mut stopping = Vec::new();
+                for terminal in self.terminals.list() {
+                    if terminal.workspace.as_deref() != Some(workspace.id.as_str())
+                        || !terminal.running
+                    {
+                        continue;
+                    }
+                    if let Some(session) = self.terminals.get(&terminal.id) {
+                        session
+                            .kill()
+                            .map_err(|e| rpc("kill_failed", format!("{e:#}")))?;
+                        parked.terminals.push(terminal.id);
+                        stopping.push(session);
+                    }
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while (stopping.iter().any(|s| s.is_running())
+                    || parking
+                        .iter()
+                        .any(|a| !matches!(a.state(), AgentState::Sleeping | AgentState::Exited)))
+                    && Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                parked.agents.sort();
+                parked.agents.dedup();
+                parked.terminals.sort();
+                parked.terminals.dedup();
+                self.store
+                    .kv_set(&sleep_key(&workspace.id), &json!(parked))
+                    .map_err(internal)?;
+                self.broadcast(
+                    "workspace.changed",
+                    json!({ "workspaces": [workspace.id], "source": "sleep" }),
+                );
+                Ok(
+                    json!({ "sleeping": true, "agents": parked.agents, "terminals": parked.terminals }),
+                )
+            }
+            "workspace.wake" => {
+                let key: Key = params(p)?;
+                let workspace = self.workspace_by_key(&key.id)?;
+                let parked = self.parked(&workspace.id);
+                let mut agents = Vec::new();
+                for id in &parked.agents {
+                    if let Some(agent) = self.agents.get(id)
+                        && agent
+                            .wake()
+                            .await
+                            .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?
+                    {
+                        agents.push(id.clone());
+                    }
+                }
+                let mut terminals = Vec::new();
+                for id in &parked.terminals {
+                    if let Some(session) = self.terminals.get(id) {
+                        session
+                            .respawn()
+                            .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
+                        terminals.push(id.clone());
+                    }
+                }
+                self.store
+                    .kv_delete(&sleep_key(&workspace.id))
+                    .map_err(internal)?;
+                self.broadcast(
+                    "workspace.changed",
+                    json!({ "workspaces": [workspace.id], "source": "wake" }),
+                );
+                Ok(json!({ "sleeping": false, "agents": agents, "terminals": terminals }))
             }
             other => Err(rpc("unknown_method", other)),
         }
@@ -369,4 +478,26 @@ impl Server {
 
 fn yes() -> bool {
     true
+}
+
+fn sleep_key(workspace_id: &str) -> String {
+    format!("workspace.sleep.{workspace_id}")
+}
+
+/// What `workspace.sleep` stopped, so `workspace.wake` restarts exactly that.
+#[derive(Default, Serialize, Deserialize)]
+struct Parked {
+    agents: Vec<String>,
+    terminals: Vec<String>,
+}
+
+impl Server {
+    fn parked(&self, workspace_id: &str) -> Parked {
+        self.store
+            .kv_get(&sleep_key(workspace_id))
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default()
+    }
 }

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::codex;
 
@@ -57,7 +57,15 @@ pub struct AgentOptions {
     pub command: Option<Vec<String>>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Managed account (plan D13); its config dir is already in `env`.
+    #[serde(default)]
+    pub account: Option<String>,
 }
+
+/// Agent events the server reacts to (notifications), forwarded with the agent's id.
+pub type AgentSignal = (String, AgentEvent);
+
+const SIGNAL_KINDS: &[&str] = &["turn_end", "exit", "notice", "tool_call"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentInfo {
@@ -74,6 +82,8 @@ pub struct AgentInfo {
     pub last_activity_ms: u64,
     pub next_seq: u64,
     pub rate_limits: Option<Value>,
+    pub rate_limits_at_ms: Option<u64>,
+    pub account: Option<String>,
 }
 
 // Hooks run on the blocking pool because snapshots shell out to git.
@@ -90,7 +100,10 @@ struct State {
     turns: u64,
     last_activity_ms: u64,
     rate_limits: Option<Value>,
+    rate_limits_at_ms: Option<u64>,
     killed: bool,
+    /// Set by `sleep`, so the process ending is not mistaken for a crash.
+    parking: bool,
 }
 
 pub struct AgentThread {
@@ -103,6 +116,7 @@ pub struct AgentThread {
     child: tokio::sync::Mutex<Option<Child>>,
     events: broadcast::Sender<AgentEvent>,
     turn_hook: std::sync::OnceLock<Arc<dyn TurnHook>>,
+    signals: std::sync::OnceLock<mpsc::UnboundedSender<AgentSignal>>,
     codex: codex::Rpc,
 }
 
@@ -252,10 +266,10 @@ pub fn normalize(line: &Value) -> Vec<(String, Value)> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Meta {
-    id: String,
-    options: AgentOptions,
-    created_at_ms: u64,
+pub(crate) struct Meta {
+    pub(crate) id: String,
+    pub(crate) options: AgentOptions,
+    pub(crate) created_at_ms: u64,
 }
 
 impl AgentThread {
@@ -275,7 +289,9 @@ impl AgentThread {
             turns: 0,
             last_activity_ms: created_at_ms,
             rate_limits: None,
+            rate_limits_at_ms: None,
             killed: false,
+            parking: false,
         };
         for event in events {
             match event.kind.as_str() {
@@ -284,11 +300,19 @@ impl AgentThread {
                     state.model = event.data["model"].as_str().map(str::to_string);
                 }
                 "user_message" => state.turns += 1,
-                "rate_limit" => state.rate_limits = Some(event.data.clone()),
+                "rate_limit" => {
+                    state.rate_limits = Some(event.data.clone());
+                    state.rate_limits_at_ms = Some(event.at_ms);
+                }
+                "kill" => state.killed = true,
+                "wake" => state.killed = false,
                 _ => {}
             }
             state.last_activity_ms = event.at_ms;
             state.events.push(event);
+        }
+        if state.killed {
+            state.state = AgentState::Exited;
         }
         Arc::new(Self {
             log_path: log_dir.map(|dir| dir.join(format!("{id}.jsonl"))),
@@ -300,6 +324,7 @@ impl AgentThread {
             child: tokio::sync::Mutex::new(None),
             events: sender,
             turn_hook: std::sync::OnceLock::new(),
+            signals: std::sync::OnceLock::new(),
             codex: codex::Rpc::default(),
         })
     }
@@ -310,6 +335,14 @@ impl AgentThread {
 
     pub fn set_turn_hook(&self, hook: Arc<dyn TurnHook>) {
         let _ = self.turn_hook.set(hook);
+    }
+
+    pub fn set_signals(&self, signals: mpsc::UnboundedSender<AgentSignal>) {
+        let _ = self.signals.set(signals);
+    }
+
+    pub fn options(&self) -> &AgentOptions {
+        &self.options
     }
 
     async fn run_turn_hook(&self, prompt: Option<&str>) {
@@ -353,7 +386,8 @@ impl AgentThread {
     }
 
     /// Loads a session saved by an earlier server run; it sleeps until the next message wakes it.
-    pub fn restore(meta_path: &Path, log_dir: &Path) -> Result<Arc<Self>> {
+    /// A killed session stays exited unless `revive` is set.
+    pub fn restore(meta_path: &Path, log_dir: &Path, revive: bool) -> Result<Arc<Self>> {
         let meta: Meta = serde_json::from_slice(&std::fs::read(meta_path)?)?;
         let log = log_dir.join(format!("{}.jsonl", meta.id));
         let events: Vec<AgentEvent> = std::fs::read_to_string(&log)
@@ -368,8 +402,16 @@ impl AgentThread {
             Some(log_dir),
             events,
         );
-        let resumable = lock(&thread.state).provider_session.is_some();
-        thread.record("sleep", json!({ "resumable": resumable }));
+        let (resumable, killed) = {
+            let mut state = lock(&thread.state);
+            if revive {
+                state.killed = false;
+            }
+            (state.provider_session.is_some(), state.killed)
+        };
+        if !killed {
+            thread.record("sleep", json!({ "resumable": resumable }));
+        }
         Ok(thread)
     }
 
@@ -389,6 +431,11 @@ impl AgentThread {
         if let Some(workspace) = &options.workspace {
             process.env("ICARUS_WORKSPACE_ID", workspace);
         }
+        if options.account.is_some() {
+            for key in crate::accounts::auth_env_vars(&options.provider) {
+                process.env_remove(key);
+            }
+        }
         for (key, value) in &options.env {
             process.env(key, value);
         }
@@ -402,6 +449,7 @@ impl AgentThread {
         *self.child.lock().await = Some(child);
         {
             let mut state = lock(&self.state);
+            state.parking = false;
             if matches!(state.state, AgentState::Exited | AgentState::Sleeping) {
                 state.state = AgentState::Starting;
             }
@@ -529,6 +577,7 @@ impl AgentThread {
 
     /// Puts the agent to sleep: its process ends, the session stays resumable.
     pub async fn sleep(&self) -> Result<()> {
+        lock(&self.state).parking = true;
         self.stdin.lock().await.take();
         if let Some(child) = self.child.lock().await.as_mut() {
             let _ = child.start_kill();
@@ -558,7 +607,10 @@ impl AgentThread {
                 state.turns += 1;
             }
             "turn_end" => state.state = AgentState::Idle,
-            "rate_limit" => state.rate_limits = Some(event.data.clone()),
+            "rate_limit" => {
+                state.rate_limits = Some(event.data.clone());
+                state.rate_limits_at_ms = Some(event.at_ms);
+            }
             "exit" | "sleep" => {
                 state.state = if state.killed || state.provider_session.is_none() {
                     AgentState::Exited
@@ -583,6 +635,12 @@ impl AgentThread {
         }
         // Sent under the lock so an attach never sees a seq without its live event.
         let _ = self.events.send(event.clone());
+        drop(state);
+        if SIGNAL_KINDS.contains(&kind)
+            && let Some(signals) = self.signals.get()
+        {
+            let _ = signals.send((self.id.clone(), event.clone()));
+        }
         event
     }
 
@@ -592,7 +650,14 @@ impl AgentThread {
             Some(child) => child.wait().await.ok().and_then(|status| status.code()),
             None => None,
         };
-        self.record("exit", json!({ "code": code }));
+        let (killed, parking) = {
+            let state = lock(&self.state);
+            (state.killed, state.parking)
+        };
+        self.record(
+            "exit",
+            json!({ "code": code, "killed": killed, "unexpected": !killed && !parking }),
+        );
     }
 
     pub fn id(&self) -> &str {
@@ -615,6 +680,8 @@ impl AgentThread {
             last_activity_ms: state.last_activity_ms,
             next_seq: state.events.len() as u64,
             rate_limits: state.rate_limits.clone(),
+            rate_limits_at_ms: state.rate_limits_at_ms,
+            account: self.options.account.clone(),
         }
     }
 
@@ -641,15 +708,10 @@ impl AgentThread {
 
     /// Sends a user message; images are `(media_type, base64)` pairs.
     pub async fn send(self: &Arc<Self>, text: &str, images: &[(String, String)]) -> Result<()> {
-        match self.state() {
-            AgentState::Exited => return Err(anyhow!("agent {} has exited", self.id)),
-            AgentState::Sleeping => {
-                let session = lock(&self.state).provider_session.clone();
-                self.record("wake", json!({ "resume": session }));
-                self.start_process(session).await?;
-            }
-            _ => {}
+        if self.state() == AgentState::Exited {
+            return Err(anyhow!("agent {} has exited", self.id));
         }
+        self.wake().await?;
         if self.is_codex() {
             return self.send_codex(text, images).await;
         }
@@ -670,6 +732,17 @@ impl AgentThread {
             json!({ "text": text, "images": images.len() }),
         );
         Ok(())
+    }
+
+    /// Starts a sleeping agent's process again, resuming its provider session; false if it wasn't asleep.
+    pub async fn wake(self: &Arc<Self>) -> Result<bool> {
+        if self.state() != AgentState::Sleeping {
+            return Ok(false);
+        }
+        let session = lock(&self.state).provider_session.clone();
+        self.record("wake", json!({ "resume": session }));
+        self.start_process(session).await?;
+        Ok(true)
     }
 
     async fn send_codex(&self, text: &str, images: &[(String, String)]) -> Result<()> {
@@ -735,8 +808,10 @@ impl AgentThread {
 
     pub async fn kill(&self) -> Result<()> {
         lock(&self.state).killed = true;
-        if self.child.lock().await.is_none() {
-            self.record("exit", json!({ "code": null }));
+        // Logged at once, so a restart before the process is reaped still knows it was killed.
+        self.record("kill", json!({}));
+        if self.child.lock().await.is_none() || self.state() == AgentState::Sleeping {
+            self.record("exit", json!({ "code": null, "killed": true }));
         }
         self.stdin.lock().await.take();
         if let Some(child) = self.child.lock().await.as_mut() {
@@ -785,19 +860,29 @@ impl AgentThread {
     }
 }
 
-#[derive(Default)]
 pub struct AgentManager {
     threads: Mutex<BTreeMap<String, Arc<AgentThread>>>,
     log_dir: Option<PathBuf>,
     turn_hook: Option<Arc<dyn TurnHook>>,
+    signals: mpsc::UnboundedSender<AgentSignal>,
+    signal_receiver: Mutex<Option<mpsc::UnboundedReceiver<AgentSignal>>>,
+}
+
+impl Default for AgentManager {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl AgentManager {
     pub fn new(log_dir: Option<PathBuf>) -> Self {
+        let (signals, receiver) = mpsc::unbounded_channel();
         Self {
             threads: Mutex::default(),
             log_dir,
             turn_hook: None,
+            signals,
+            signal_receiver: Mutex::new(Some(receiver)),
         }
     }
 
@@ -806,10 +891,36 @@ impl AgentManager {
         self
     }
 
+    /// The turn ends, exits and notices of every agent; only the first caller gets them.
+    pub fn take_signals(&self) -> Option<mpsc::UnboundedReceiver<AgentSignal>> {
+        lock(&self.signal_receiver).take()
+    }
+
+    pub fn log_dir(&self) -> Option<&Path> {
+        self.log_dir.as_deref()
+    }
+
     fn adopt(&self, thread: &AgentThread) {
         if let Some(hook) = &self.turn_hook {
             thread.set_turn_hook(Arc::clone(hook));
         }
+        thread.set_signals(self.signals.clone());
+    }
+
+    /// Reloads one saved session from disk into the live set, replacing a stale entry.
+    pub fn restore_one(&self, id: &str) -> Result<Arc<AgentThread>> {
+        let dir = self.log_dir.as_deref().context("agents are not saved")?;
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(anyhow!("bad agent id {id}"));
+        }
+        let meta = dir.join(format!("{id}.meta.json"));
+        if !meta.is_file() {
+            return Err(anyhow!("no saved agent session {id}"));
+        }
+        let thread = AgentThread::restore(&meta, dir, true)?;
+        self.adopt(&thread);
+        lock(&self.threads).insert(thread.id().to_string(), Arc::clone(&thread));
+        Ok(thread)
     }
 
     /// Reloads sessions saved by earlier server runs as sleeping, resumable agents.
@@ -824,9 +935,12 @@ impl AgentManager {
             if !path.to_string_lossy().ends_with(".meta.json") {
                 continue;
             }
-            match AgentThread::restore(&path, dir) {
+            match AgentThread::restore(&path, dir, false) {
                 Ok(thread) => {
-                    if thread.state() != AgentState::Exited || thread.info().turns > 0 {
+                    // Killed sessions stay in history (and `agent.resume`) only.
+                    let killed = lock(&thread.state).killed;
+                    if !killed && (thread.state() != AgentState::Exited || thread.info().turns > 0)
+                    {
                         self.adopt(&thread);
                         lock(&self.threads).insert(thread.id().to_string(), thread);
                         restored += 1;
@@ -879,6 +993,7 @@ mod tests {
             resume: Some("abc".into()),
             command: None,
             env: BTreeMap::new(),
+            account: None,
         };
         let command = provider_command(&options).expect("command");
         assert_eq!(command[0], "claude");

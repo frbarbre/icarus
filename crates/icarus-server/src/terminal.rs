@@ -67,6 +67,9 @@ struct State {
     next_seq: u64,
     exit_code: Option<u32>,
     running: bool,
+    pid: Option<u32>,
+    /// Bumped by `respawn`, so the previous process's reader cannot mark the new one exited.
+    generation: u64,
 }
 
 pub struct TerminalSession {
@@ -75,13 +78,71 @@ pub struct TerminalSession {
     workspace: Option<String>,
     cwd: PathBuf,
     command: Vec<String>,
+    env: BTreeMap<String, String>,
     created_at_ms: u64,
-    pid: Option<u32>,
     state: Mutex<State>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     events: broadcast::Sender<TerminalEvent>,
+}
+
+/// A started process on a fresh PTY, before it is wired into a session.
+struct Pty {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn MasterPty + Send>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    pid: Option<u32>,
+}
+
+fn open_pty(
+    id: &str,
+    command: &[String],
+    cwd: &PathBuf,
+    workspace: Option<&str>,
+    env: &BTreeMap<String, String>,
+    size: PtySize,
+) -> Result<Pty> {
+    let pair = native_pty_system()
+        .openpty(size)
+        .map_err(|e| anyhow!("openpty: {e}"))?;
+    let mut builder = CommandBuilder::new(&command[0]);
+    builder.args(&command[1..]);
+    builder.cwd(cwd);
+    builder.env("TERM", "xterm-256color");
+    builder.env("COLORTERM", "truecolor");
+    builder.env("ICARUS_TERMINAL_ID", id);
+    if let Some(workspace) = workspace {
+        builder.env("ICARUS_WORKSPACE_ID", workspace);
+    }
+    for (key, value) in env {
+        builder.env(key, value);
+    }
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .map_err(|e| anyhow!("spawn {}: {e}", command[0]))?;
+    drop(pair.slave);
+    let pid = child.process_id();
+    let killer = child.clone_killer();
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| anyhow!("pty reader: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| anyhow!("pty writer: {e}"))?;
+    Ok(Pty {
+        child,
+        reader,
+        writer,
+        master: pair.master,
+        killer,
+        pid,
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -109,41 +170,19 @@ impl TerminalSession {
             pixel_width: 0,
             pixel_height: 0,
         };
-        let pair = native_pty_system()
-            .openpty(size)
-            .map_err(|e| anyhow!("openpty: {e}"))?;
         let command = options
             .command
             .clone()
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| vec![default_shell(), "-l".to_string()]);
-        let mut builder = CommandBuilder::new(&command[0]);
-        builder.args(&command[1..]);
-        builder.cwd(&options.cwd);
-        builder.env("TERM", "xterm-256color");
-        builder.env("COLORTERM", "truecolor");
-        builder.env("ICARUS_TERMINAL_ID", &id);
-        if let Some(workspace) = &options.workspace {
-            builder.env("ICARUS_WORKSPACE_ID", workspace);
-        }
-        for (key, value) in &options.env {
-            builder.env(key, value);
-        }
-        let child = pair
-            .slave
-            .spawn_command(builder)
-            .map_err(|e| anyhow!("spawn {}: {e}", command[0]))?;
-        drop(pair.slave);
-        let pid = child.process_id();
-        let killer = child.clone_killer();
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| anyhow!("pty reader: {e}"))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| anyhow!("pty writer: {e}"))?;
+        let pty = open_pty(
+            &id,
+            &command,
+            &options.cwd,
+            options.workspace.as_deref(),
+            &options.env,
+            size,
+        )?;
         let (events, _) = broadcast::channel(4096);
 
         let session = Arc::new(Self {
@@ -152,8 +191,8 @@ impl TerminalSession {
             workspace: options.workspace,
             cwd: options.cwd,
             command,
+            env: options.env,
             created_at_ms: now_ms(),
-            pid,
             state: Mutex::new(State {
                 emulator: Emulator::new(size.cols, size.rows),
                 ring: VecDeque::new(),
@@ -161,25 +200,71 @@ impl TerminalSession {
                 next_seq: 0,
                 exit_code: None,
                 running: true,
+                pid: pty.pid,
+                generation: 0,
             }),
-            writer: Mutex::new(writer),
-            master: Mutex::new(pair.master),
-            killer: Mutex::new(killer),
+            writer: Mutex::new(pty.writer),
+            master: Mutex::new(pty.master),
+            killer: Mutex::new(pty.killer),
             events,
         });
+        session.start_reader(pty.reader, pty.child, 0)?;
+        Ok(session)
+    }
 
-        let reading = Arc::clone(&session);
+    fn start_reader(
+        self: &Arc<Self>,
+        reader: Box<dyn Read + Send>,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        generation: u64,
+    ) -> Result<()> {
+        let reading = Arc::clone(self);
         std::thread::Builder::new()
             .name(format!("pty-{}", reading.id))
-            .spawn(move || reading.read_loop(reader, child))
+            .spawn(move || reading.read_loop(reader, child, generation))
             .context("spawn pty reader thread")?;
-        Ok(session)
+        Ok(())
+    }
+
+    /// Starts the command again on a fresh PTY after it ended; the screen and scrollback stay.
+    pub fn respawn(self: &Arc<Self>) -> Result<()> {
+        if self.is_running() {
+            return Ok(());
+        }
+        let (columns, rows) = lock(&self.state).emulator.size();
+        let size = PtySize {
+            rows,
+            cols: columns,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pty = open_pty(
+            &self.id,
+            &self.command,
+            &self.cwd,
+            self.workspace.as_deref(),
+            &self.env,
+            size,
+        )?;
+        *lock(&self.writer) = pty.writer;
+        *lock(&self.master) = pty.master;
+        *lock(&self.killer) = pty.killer;
+        let generation = {
+            let mut state = lock(&self.state);
+            state.generation += 1;
+            state.running = true;
+            state.exit_code = None;
+            state.pid = pty.pid;
+            state.generation
+        };
+        self.start_reader(pty.reader, pty.child, generation)
     }
 
     fn read_loop(
         &self,
         mut reader: Box<dyn Read + Send>,
         mut child: Box<dyn portable_pty::Child + Send + Sync>,
+        generation: u64,
     ) {
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
@@ -191,6 +276,9 @@ impl TerminalSession {
         let code = child.wait().ok().map(|status| status.exit_code());
         {
             let mut state = lock(&self.state);
+            if state.generation != generation {
+                return;
+            }
             state.running = false;
             state.exit_code = code;
         }
@@ -244,7 +332,7 @@ impl TerminalSession {
             title: state.emulator.title().map(str::to_string),
             columns,
             rows,
-            pid: self.pid,
+            pid: state.pid,
             running: state.running,
             exit_code: state.exit_code,
             created_at_ms: self.created_at_ms,
@@ -432,6 +520,29 @@ mod tests {
         let (stale, _) = session.attach(Some(resumed.next_seq + 100));
         assert!(stale.snapshot.is_some());
         session.kill().expect("kill");
+    }
+
+    #[test]
+    fn respawn_restarts_the_command_and_keeps_the_scrollback() {
+        let manager = TerminalManager::default();
+        let session = manager.create(options(&["/bin/cat"])).expect("spawn");
+        session.write(b"before-sleep\n").expect("write");
+        wait_until(|| session.full_text().contains("before-sleep"));
+        let first_pid = session.info().pid;
+        session.kill().expect("kill");
+        wait_until(|| !session.is_running());
+
+        session.respawn().expect("respawn");
+        assert!(session.is_running());
+        assert_ne!(session.info().pid, first_pid);
+        session.write(b"after-wake\n").expect("write");
+        wait_until(|| session.full_text().contains("after-wake"));
+        assert!(session.full_text().contains("before-sleep"));
+        // The old reader is gone; only the new process's exit counts.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(session.is_running());
+        session.kill().expect("kill");
+        wait_until(|| !session.is_running());
     }
 
     #[test]

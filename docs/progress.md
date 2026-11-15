@@ -120,7 +120,7 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 
 **Avatars (server):** PR, review, requested-reviewer and stack-entry facts carry real GitHub avatar URLs (`avatarUrl(size: 64)`). `workspace.list` / `workspace.info` add `pr_author {login, avatar_url}` from the PR cache only, so listing never calls GitHub. Live read-only check returned real URLs for users and bots.
 
-**Links, ports and previews in the client:** `icarus::OpenFrontend` (⌘⇧B), `icarus::OpenPreview` (⌘⇧P), `OpenPullRequest`, `CopyPullRequestUrl`; title-bar frontend and preview buttons (picker for several previews, "behind head" warning); port chips on cards, kept live by `ports.changed`; a Previews section in the GitHub panel; real avatars on cards, the panel header, reviewers and stack rows. Icarus workspace folders are trusted automatically. `open_layout` focuses the workspace's agent and opens the PR in the system browser until the embedded tab lands.
+**Links, ports and previews in the client:** `icarus::OpenFrontend` (⌘⇧B), `icarus::OpenPreview` (⌘⌥P, Ctrl+Alt+P on Linux; ⌘⇧P stays the command palette), `OpenPullRequest`, `CopyPullRequestUrl`; title-bar frontend and preview buttons (picker for several previews, "behind head" warning); port chips on cards, kept live by `ports.changed`; a Previews section in the GitHub panel; real avatars on cards, the panel header, reviewers and stack rows. Icarus workspace folders are trusted automatically. `open_layout` focuses the workspace's agent and opens the PR in the system browser until the embedded tab lands.
 
 **Layouts (server and CLI, D32):** named tab layouts from settings (`layouts.<name>`) plus a built-in `review` (agent left, browser on `{pr_url}` right), with types shared through `icarus-protocol::layout`. `icarus workspace create --layout`, `icarus workspace layout <ws> <name>`, `icarus layout list|show`, and the rules' create-from-PR and open-layout actions resolve placeholders, bind agent tabs to server agents (prompted tabs start their own agent), store the layout as pending and push it to the app; `workspace.take_layout` applies it once. The app side waits for the agent, browser, diff and explorer tab types.
 
@@ -152,10 +152,30 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - Without a key everything still works: cards keep the stored issue id and title.
 - The read-only live test (`crates/icarus-linear/tests/live.rs`, key from `ICARUS_LINEAR_LIVE_KEY_COMMAND`) passes against the real API: viewer, team, recent issues by identifier, and not-found handling.
 
+**Notifications (server, D7):**
+- The server makes notifications and keeps them in `state.db` (the newest 500), so none are lost while no client is connected. Each has an id, kind, title, body, workspace, time and a read flag.
+- Kinds: an agent finished its turn, waits for input or a permission, or failed (a failed turn, or a process that died on its own); CI failed, a review was requested, a PR merged (from the rules' GitHub poll, dry runs included); and the rules' `notify` action.
+- Every kind can be switched off with `notifications.<kind>`, plus `notifications.enabled` and `notifications.sound`. All default to on.
+- Repeats are dropped: agent news within 5 seconds (Orca's cooldown), a rule's message within 10 minutes, and GitHub news once per state (the same PR head, the same merge).
+- Clients get a `notification` event (with `sound`) and `notifications.changed` with the unread count. RPCs: `notification.list|read|clear|kinds`. CLI: `icarus notifications [--unread] [--json]`, `icarus notifications read <id>|--all`, `icarus notifications clear`.
+
+**Session history and sleep/wake (server, D8):**
+- `agent.history` lists past sessions (sleeping, exited or killed, with at least one turn): title, provider, workspace, account, first prompt, last activity, turns and whether they can be resumed. It filters by workspace, pages with `before`, and searches what you asked and what the agent answered (every word must appear; a snippet shows where). The index is in memory and reads only the new part of each log.
+- `agent.resume` brings a past session back as a live agent in its own directory, through the provider's own resume. Killed sessions no longer come back by themselves after a server restart; they stay in history until resumed.
+- `workspace.sleep` puts the workspace's agents to sleep and stops its terminals' processes; screens and scrollback stay. `workspace.wake` restarts exactly what was parked. Cards show `sleeping`.
+- CLI: `icarus agent history [--workspace] [--search]`, `icarus agent resume <id>`, `icarus workspace sleep|wake <id>`.
+
+**Multiple accounts (server, D13, §7c):**
+- Each managed account is its own config dir, as in Orca: `<state>/claude-profiles/<id>/home` (`CLAUDE_CONFIG_DIR`) or `<state>/codex-accounts/<id>/home` (`CODEX_HOME`).
+- `account.add` makes the directory and returns the command you run to sign in through the provider's own login, e.g. `CLAUDE_CONFIG_DIR=… claude /login`. Icarus never reads, copies or stores credentials. It reads only the signed-in email from Claude Code's `.claude.json`.
+- `account.select` sets the default per provider (`system` means the provider's own login). `agent.create` and `workspace.create` take an `account` override. Launches on a managed Claude account drop `ANTHROPIC_API_KEY` and the other auth variables, as Orca does.
+- `account.list` shows each account with its newest usage meters, taken from the rate-limit events of agents that ran on it.
+- CLI: `icarus account list|add|remove|use`.
+
 ## Blocked on you
 
 Parked until you're back; work continues on other items.
-- **⌘⇧P:** taken by "Open preview"; the command palette moved to F1. Say if you want it back.
+Nothing right now.
 
 ## In progress
 
