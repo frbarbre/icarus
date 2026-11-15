@@ -19,7 +19,7 @@ pub fn imported_theme_name(slot: &str) -> String {
     }
 }
 
-/// The app's Zed config directory (`paths::config_dir()` in the fork, `APP_NAME` "Zed");
+/// The app's Zed config directory (`paths::config_dir()` in the fork, `APP_NAME` "Icarus");
 /// `ICARUS_ZED_CONFIG_DIR` overrides it.
 pub fn config_dir() -> Option<PathBuf> {
     let absolute = |name: &str| {
@@ -38,7 +38,7 @@ pub fn config_dir() -> Option<PathBuf> {
             .or_else(|| absolute("XDG_CONFIG_HOME"))
             .unwrap_or_else(|| home.join(".config"))
     };
-    Some(base.join("zed"))
+    Some(base.join("icarus"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

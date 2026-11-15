@@ -18,7 +18,13 @@ cask "icarus" do
   zap trash: [
     "~/.config/icarus",
     "~/.icarus",
+    "~/.local/state/Icarus",
+    "~/Library/Application Support/Icarus",
+    "~/Library/Caches/Icarus",
+    "~/Library/HTTPStorages/dev.icarus.app",
     "~/Library/LaunchAgents/dev.icarus.server.plist",
+    "~/Library/Logs/Icarus",
+    "~/Library/Preferences/dev.icarus.app.plist",
     "~/Library/Saved Application State/dev.icarus.app.savedState",
   ]
 end

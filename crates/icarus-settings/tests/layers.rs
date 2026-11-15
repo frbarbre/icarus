@@ -248,7 +248,7 @@ fn json_schema_describes_the_document() {
 fn layer_files_load_and_save() {
     let dir = tempfile::tempdir().expect("tempdir");
     let paths = SettingsPaths {
-        user: Some(dir.path().join("config/icarus/settings.json")),
+        user: Some(dir.path().join("config/icarus/icarus.json")),
         project: Some(dir.path().join("repo").join(layers::PROJECT_FILE)),
         project_local: Some(dir.path().join("repo").join(layers::PROJECT_LOCAL_FILE)),
     };
@@ -307,7 +307,47 @@ fn discovers_standard_paths() {
         paths
             .user
             .as_deref()
-            .is_none_or(|p| p.ends_with("icarus/settings.json"))
+            .is_none_or(|p| p.ends_with("icarus/icarus.json"))
     );
     assert_eq!(Layer::from_name("project-local"), Some(Layer::ProjectLocal));
+}
+
+#[test]
+fn user_layer_falls_back_to_legacy_settings_json_only_when_it_holds_icarus_settings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let user = dir.path().join(layers::USER_FILE);
+    let legacy = dir.path().join("settings.json");
+    let paths = SettingsPaths {
+        user: Some(user.clone()),
+        ..SettingsPaths::default()
+    };
+
+    std::fs::write(&legacy, "// Zed settings\n{ \"ui_font_size\": 16 }").expect("write");
+    assert_eq!(layers::layer_source(Layer::User, &user), user);
+    assert_eq!(layers::read_layer(Layer::User, &user).expect("read"), None);
+    std::fs::write(&legacy, r#"{"ui_font_size": 16, "theme": "One Dark"}"#).expect("write");
+    assert_eq!(layers::layer_source(Layer::User, &user), user);
+
+    std::fs::write(
+        &legacy,
+        r#"{"theme":{"mode":"light"},"sidebar":{"groupBy":"repo"},"languages":{}}"#,
+    )
+    .expect("write");
+    assert_eq!(layers::layer_source(Layer::User, &user), legacy);
+    assert_eq!(layers::layer_source(Layer::Project, &user), user);
+    let stack = LayerStack::load(&paths, &[]).expect("load");
+    let explained = stack.explain("theme.mode").expect("key");
+    assert_eq!(explained.value, Some(Value::from("light")));
+    assert_eq!(
+        explained.winner().and_then(|s| s.origin.clone()),
+        Some(legacy.clone())
+    );
+
+    layers::write_document(&user, &doc(r#"{"theme":{"mode":"dark"}}"#)).expect("write");
+    assert_eq!(layers::layer_source(Layer::User, &user), user);
+    let stack = LayerStack::load(&paths, &[]).expect("load");
+    assert_eq!(
+        stack.get("theme.mode").expect("key"),
+        Some(Value::from("dark"))
+    );
 }

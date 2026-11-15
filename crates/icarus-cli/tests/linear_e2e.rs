@@ -35,7 +35,7 @@ fn start(key: Option<&str>) -> Env {
     std::fs::create_dir_all(&fixtures).expect("fixtures");
     std::fs::create_dir_all(&config).expect("config");
     std::fs::write(
-        config.join("settings.json"),
+        config.join("icarus.json"),
         json!({ "linear": { "poll_interval_ms": 1000 } }).to_string(),
     )
     .expect("settings");

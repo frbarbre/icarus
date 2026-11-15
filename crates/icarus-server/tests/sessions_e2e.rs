@@ -67,7 +67,7 @@ impl World {
         let home = tempfile::tempdir().expect("home");
         let config = tempfile::tempdir().expect("config");
         std::fs::write(
-            config.path().join("settings.json"),
+            config.path().join("icarus.json"),
             json!({ "agents": { "commands": { "claude": [fake()] } } }).to_string(),
         )
         .expect("settings");
@@ -579,7 +579,7 @@ fn remote_control_flags(transcript: &str) -> usize {
 async fn remote_control_starts_claude_with_its_flag_and_toggles_per_agent() {
     let world = World::new(&[]).await;
     std::fs::write(
-        world.config.path().join("settings.json"),
+        world.config.path().join("icarus.json"),
         json!({ "agents": { "commands": { "claude": [fake()] }, "remote_control": true } })
             .to_string(),
     )

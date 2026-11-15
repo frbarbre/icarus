@@ -12,6 +12,9 @@ pub use schema::{Field, Schema, ValidationError, document_schema, json_schema, v
 
 pub const PROJECT_FILE: &str = "icarus.json";
 pub const PROJECT_LOCAL_FILE: &str = "icarus.local.json";
+pub const USER_FILE: &str = "icarus.json";
+// User settings lived here until the app took this directory for its Zed `settings.json`.
+const LEGACY_USER_FILE: &str = "settings.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Layer {
@@ -162,7 +165,35 @@ pub fn config_dir() -> Option<PathBuf> {
 }
 
 pub fn user_settings_path() -> Option<PathBuf> {
-    config_dir().map(|dir| dir.join("settings.json"))
+    config_dir().map(|dir| dir.join(USER_FILE))
+}
+
+// Reads only: writes always target `path`, so the first write moves legacy settings into `icarus.json`.
+pub fn layer_source(layer: Layer, path: &Path) -> PathBuf {
+    if layer != Layer::User || path.file_name() != Some(USER_FILE.as_ref()) || path.exists() {
+        return path.to_owned();
+    }
+    let Some(legacy) = path.parent().map(|dir| dir.join(LEGACY_USER_FILE)) else {
+        return path.to_owned();
+    };
+    match read_document(&legacy) {
+        Ok(Some(doc)) if holds_icarus_settings(&doc) => legacy,
+        _ => path.to_owned(),
+    }
+}
+
+// The app's Zed `settings.json` shares the name, and old Icarus files may hold stale keys, so look for an Icarus-only key.
+fn holds_icarus_settings(doc: &Value) -> bool {
+    let Schema::Object { fields, .. } = document_schema() else {
+        return false;
+    };
+    fields
+        .iter()
+        .any(|field| !matches!(field.name, "$schema" | "theme") && doc.get(field.name).is_some())
+}
+
+pub fn read_layer(layer: Layer, path: &Path) -> Result<Option<Value>, LoadError> {
+    read_document(&layer_source(layer, path))
 }
 
 /// Presets named in a settings document's `presets` list, in order.
@@ -267,11 +298,12 @@ impl LayerStack {
             let Some(path) = paths.path(layer) else {
                 continue;
             };
-            if let Some(doc) = read_document(path)? {
+            let source = layer_source(layer, path);
+            if let Some(doc) = read_document(&source)? {
                 stack.push(LayerDoc {
                     layer,
-                    label: path.display().to_string(),
-                    origin: Some(path.to_owned()),
+                    label: source.display().to_string(),
+                    origin: Some(source),
                     doc,
                 });
             }

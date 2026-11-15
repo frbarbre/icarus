@@ -45,8 +45,7 @@ impl World {
     async fn new(settings: Value, fixtures: Value) -> Self {
         let home = tempfile::tempdir().expect("home");
         let config = tempfile::tempdir().expect("config");
-        std::fs::write(config.path().join("settings.json"), settings.to_string())
-            .expect("settings");
+        std::fs::write(config.path().join("icarus.json"), settings.to_string()).expect("settings");
         let fixtures_path = home.path().join("gh-fixtures.json");
         std::fs::write(&fixtures_path, fixtures.to_string()).expect("fixtures");
         let child = Command::new(env!("CARGO_BIN_EXE_icarus-server"))
@@ -77,11 +76,8 @@ impl World {
     }
 
     fn set_settings(&self, settings: Value) {
-        std::fs::write(
-            self.config.path().join("settings.json"),
-            settings.to_string(),
-        )
-        .expect("settings");
+        std::fs::write(self.config.path().join("icarus.json"), settings.to_string())
+            .expect("settings");
     }
 
     async fn request(&self, method: &str, params: Value) -> Value {

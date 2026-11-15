@@ -47,7 +47,7 @@ impl Env {
         let home = tempfile::tempdir().expect("home");
         let config = home.path().join("config");
         std::fs::create_dir_all(&config).expect("config");
-        std::fs::write(config.join("settings.json"), "{}").expect("settings");
+        std::fs::write(config.join("icarus.json"), "{}").expect("settings");
         let fixtures = home.path().join("gh.json");
         std::fs::write(&fixtures, json!({ "viewer": "me" }).to_string()).expect("fixtures");
         let child = Command::new(sibling("icarus-server"))

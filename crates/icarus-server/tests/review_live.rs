@@ -225,7 +225,7 @@ async fn live_review_round_trip_on_the_sandbox() {
     let home = scratch.path().join("home");
     let config = scratch.path().join("config");
     std::fs::create_dir_all(&config).expect("config");
-    std::fs::write(config.join("settings.json"), "{}").expect("settings");
+    std::fs::write(config.join("icarus.json"), "{}").expect("settings");
     let _server = ServerProcess(
         Command::new(env!("CARGO_BIN_EXE_icarus-server"))
             .args(["--home", home.to_str().expect("utf8"), "serve"])

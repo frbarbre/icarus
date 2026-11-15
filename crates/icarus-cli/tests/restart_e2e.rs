@@ -38,7 +38,7 @@ impl Home {
         let config = dir.path().join("config");
         std::fs::create_dir_all(&config).expect("config");
         std::fs::write(
-            config.join("settings.json"),
+            config.join("icarus.json"),
             json!({ "agents": { "commands": { "claude": [sibling("icarus-fake-agent")] } } })
                 .to_string(),
         )

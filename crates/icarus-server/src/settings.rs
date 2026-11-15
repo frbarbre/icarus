@@ -65,7 +65,7 @@ impl Server {
             .path(layer)
             .ok_or_else(|| rpc("internal", "no settings path"))?
             .to_path_buf();
-        let mut doc = layers::read_document(&path)
+        let mut doc = layers::read_layer(layer, &path)
             .map_err(|e| rpc("settings_invalid", format!("{e:?}")))?
             .unwrap_or_else(icarus_settings::Value::object);
         let key = KeyPath::parse(key).map_err(|e| rpc("invalid_key", format!("{e:?}")))?;
@@ -121,7 +121,11 @@ impl Server {
         project_root: Option<&Path>,
     ) -> Result<LayerStack, RpcError> {
         let paths = SettingsPaths::discover(project_root);
-        let user = match paths.user.as_deref().map(layers::read_document) {
+        let user = match paths
+            .user
+            .as_deref()
+            .map(|path| layers::read_layer(Layer::User, path))
+        {
             Some(Ok(Some(doc))) => Some(doc),
             Some(Err(error)) => return Err(rpc("settings_invalid", format!("{error:?}"))),
             _ => None,
@@ -232,7 +236,7 @@ impl Server {
                 let mut unmatched = Vec::new();
                 let user_path = layers::user_settings_path()
                     .ok_or_else(|| rpc("io", "no user settings path"))?;
-                let mut user = layers::read_document(&user_path)
+                let mut user = layers::read_layer(Layer::User, &user_path)
                     .map_err(|e| rpc("settings_invalid", format!("{e:?}")))?
                     .unwrap_or_else(icarus_settings::Value::object);
                 layers::deep_merge(&mut user, &import.user);
@@ -307,7 +311,7 @@ impl Server {
                 let scope: Scope = params(p)?;
                 let user_path = layers::user_settings_path()
                     .ok_or_else(|| rpc("io", "no user settings path"))?;
-                let user = layers::read_document(&user_path)
+                let user = layers::read_layer(Layer::User, &user_path)
                     .map_err(|e| rpc("settings_invalid", format!("{e:?}")))?
                     .unwrap_or_else(icarus_settings::Value::object);
                 let mut projects = indexmap::IndexMap::new();

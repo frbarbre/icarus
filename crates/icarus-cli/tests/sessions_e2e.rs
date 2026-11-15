@@ -33,7 +33,7 @@ fn start() -> Env {
     std::fs::create_dir_all(&config).expect("config");
     let fake = sibling("icarus-fake-agent");
     std::fs::write(
-        config.join("settings.json"),
+        config.join("icarus.json"),
         json!({ "agents": { "commands": { "claude": [fake] } } }).to_string(),
     )
     .expect("settings");

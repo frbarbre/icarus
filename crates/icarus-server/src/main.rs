@@ -44,7 +44,7 @@ fn configured_listen() -> Result<Vec<String>> {
     let Some(path) = layers::user_settings_path() else {
         return Ok(Vec::new());
     };
-    let doc = layers::read_document(&path)
+    let doc = layers::read_layer(layers::Layer::User, &path)
         .map_err(|e| anyhow::anyhow!("read {}: {e:?}", path.display()))?;
     Ok(doc
         .as_ref()

@@ -75,7 +75,7 @@ impl World {
                 "https://github.com/acme/widgets.git",
             ],
         );
-        let settings_path = config.path().join("icarus").join("settings.json");
+        let settings_path = config.path().join("icarus").join("icarus.json");
         std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("settings dir");
         std::fs::write(&settings_path, "{}").expect("settings");
         let fixtures_path = home.path().join("gh-fixtures.json");

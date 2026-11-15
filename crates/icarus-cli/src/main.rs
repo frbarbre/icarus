@@ -437,7 +437,7 @@ enum SettingsCommand {
         /// Leave the Zed settings and themes alone.
         #[arg(long)]
         skip_zed: bool,
-        /// Zed config directory to merge into (default: the app's, `~/.config/zed`).
+        /// Zed config directory to merge into (default: the app's, `~/.config/icarus`).
         #[arg(long)]
         zed_dir: Option<PathBuf>,
     },

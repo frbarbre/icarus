@@ -763,7 +763,7 @@ pub fn json_schema() -> Value {
     root.insert("title".into(), "Icarus settings".into());
     root.insert(
         "description".into(),
-        "One layer of Icarus settings: built-in defaults < presets < ~/.config/icarus/settings.json < icarus.json < icarus.local.json. Objects merge deeply; arrays and scalars replace.".into(),
+        "One layer of Icarus settings: built-in defaults < presets < ~/.config/icarus/icarus.json < icarus.json < icarus.local.json. Objects merge deeply; arrays and scalars replace.".into(),
     );
     if let Value::Object(body) = to_json_schema(&document_schema()) {
         root.extend(body);

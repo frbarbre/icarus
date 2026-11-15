@@ -61,7 +61,7 @@ async fn update_notifications(client: &Client) -> Vec<Value> {
 async fn update_check_reports_a_newer_release_and_notifies_once_per_version() {
     let home = tempfile::tempdir().expect("home");
     let config = tempfile::tempdir().expect("config");
-    std::fs::write(config.path().join("settings.json"), "{}").expect("settings");
+    std::fs::write(config.path().join("icarus.json"), "{}").expect("settings");
     let fixture = home.path().join("release.json");
     std::fs::write(&fixture, "null").expect("fixture");
     let _server = start(home.path(), config.path(), &fixture);
@@ -121,7 +121,7 @@ async fn update_notifications_follow_their_toggle() {
     let home = tempfile::tempdir().expect("home");
     let config = tempfile::tempdir().expect("config");
     std::fs::write(
-        config.path().join("settings.json"),
+        config.path().join("icarus.json"),
         json!({ "notifications": { "update_available": false } }).to_string(),
     )
     .expect("settings");

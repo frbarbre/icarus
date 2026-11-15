@@ -68,13 +68,19 @@ fn new(cx: &App) -> Arc<dyn CredentialsProvider> {
 /// A credentials provider that stores credentials in the system keychain.
 struct KeychainCredentialsProvider;
 
+// Keychain items are keyed by URL alone, so without a prefix this app would read and overwrite Zed's.
+fn keychain_key(url: &str) -> String {
+    format!("{}:{url}", paths::APP_NAME_LOWERCASE)
+}
+
 impl CredentialsProvider for KeychainCredentialsProvider {
     fn read_credentials<'a>(
         &'a self,
         url: &'a str,
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
-        async move { cx.update(|cx| cx.read_credentials(url)).await }.boxed_local()
+        let key = keychain_key(url);
+        async move { cx.update(|cx| cx.read_credentials(&key)).await }.boxed_local()
     }
 
     fn write_credentials<'a>(
@@ -84,8 +90,9 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         password: &'a [u8],
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        let key = keychain_key(url);
         async move {
-            cx.update(move |cx| cx.write_credentials(url, username, password))
+            cx.update(move |cx| cx.write_credentials(&key, username, password))
                 .await
         }
         .boxed_local()
@@ -99,8 +106,9 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         password: &'a [u8],
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + 'a>> {
+        let key = keychain_key(url);
         async move {
-            cx.update(move |cx| cx.write_credentials_if_not_exists(url, username, password))
+            cx.update(move |cx| cx.write_credentials_if_not_exists(&key, username, password))
                 .await
         }
         .boxed_local()
@@ -111,7 +119,8 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         url: &'a str,
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        async move { cx.update(move |cx| cx.delete_credentials(url)).await }.boxed_local()
+        let key = keychain_key(url);
+        async move { cx.update(move |cx| cx.delete_credentials(&key)).await }.boxed_local()
     }
 }
 
