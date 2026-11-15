@@ -9,6 +9,10 @@ use semver::Version;
 
 const ZED_DOCS_URL: &str = "https://zed.dev/docs";
 
+/// The Icarus release this app belongs to: the workflow's `ICARUS_VERSION`, else the root
+/// workspace version. [`AppVersion`] stays Zed's, which the extension registry filters on.
+pub const ICARUS_VERSION: &str = env!("ICARUS_VERSION");
+
 /// stable | dev | nightly | preview
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
     if cfg!(debug_assertions) {
@@ -205,10 +209,10 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
-            ReleaseChannel::Nightly => "Zed Nightly",
-            ReleaseChannel::Preview => "Zed Preview",
-            ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Dev => "Icarus Dev",
+            ReleaseChannel::Nightly => "Icarus Nightly",
+            ReleaseChannel::Preview => "Icarus Preview",
+            ReleaseChannel::Stable => "Icarus",
         }
     }
 

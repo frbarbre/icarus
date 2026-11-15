@@ -48,6 +48,11 @@ export ZED_BUNDLE=true
 export CARGO_BUNDLE_SKIP_BUILD=true
 # Turns Zed's own updater off at compile time; "Check for Updates" shows this instead.
 export ZED_UPDATE_EXPLANATION="Icarus updates itself: run \`icarus update install\` (or \`brew upgrade --cask icarus\` if Homebrew installed it)."
+# Compiled in instead of app/crates/zed/RELEASE_CHANNEL (dev), as Zed's script/bundle-mac does:
+# stable keeps API keys in the Keychain and names windows "Icarus".
+export ZED_RELEASE_CHANNEL=stable
+# Shown in About; Zed's own version stays the app version, which the extension registry filters on.
+export ICARUS_VERSION="$version"
 
 rustup toolchain install
 rustup target add "$target"
@@ -90,6 +95,7 @@ cp crates/zed/resources/Document.icns "$app_path/Contents/Resources/Document.icn
 plist="$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$plist"
+"$root/scripts/release/brand-plist.sh" "$plist"
 
 entitlements=$(mktemp)
 # Associated domains need a real team identity; ad-hoc signing rejects them.

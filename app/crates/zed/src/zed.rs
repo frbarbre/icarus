@@ -1577,7 +1577,7 @@ fn open_about_window(cx: &mut App) {
             let release_channel = ReleaseChannel::global(cx);
             let release_channel_name = release_channel.display_name();
             let full_version: SharedString = AppVersion::global(cx).to_string().into();
-            let version = env!("CARGO_PKG_VERSION");
+            let version = release_channel::ICARUS_VERSION;
 
             let debug = if cfg!(debug_assertions) {
                 "(debug)"
@@ -1605,11 +1605,11 @@ fn open_about_window(cx: &mut App) {
             let content = match self.commit.as_ref() {
                 Some(commit) => {
                     format!(
-                        "{}\nCommit: {}\nVersion: {}",
+                        "{}\nCommit: {}\nZed Version: {}",
                         self.message, commit, self.full_version
                     )
                 }
-                None => format!("{}\nVersion: {}", self.message, self.full_version),
+                None => format!("{}\nZed Version: {}", self.message, self.full_version),
             };
             cx.write_to_clipboard(ClipboardItem::new_string(content));
             window.remove_window();
@@ -1653,7 +1653,7 @@ fn open_about_window(cx: &mut App) {
                                 .child(Label::new(commit).size(LabelSize::Small))
                             })
                             .child(
-                                Label::new("Version")
+                                Label::new("Zed Version")
                                     .color(Color::Muted)
                                     .size(LabelSize::XSmall),
                             )
@@ -1739,7 +1739,7 @@ fn open_about_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some("About Icarus".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),

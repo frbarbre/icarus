@@ -215,6 +215,12 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - Agent info carries `remote_control` and `remote_control_url` (`https://claude.ai/code/<bridgeSessionId>`, read from Claude Code's `sessions/<pid>.json` records only; the `.key` files beside them are never opened). CLI: `icarus agent remote-control on|off <id> | --workspace <id>`, `--remote-control on|off` on `agent create` and `workspace create`; `icarus agent list` shows the link.
 - Tested with the fake agent; Remote Control with the headless stream-JSON mode against a real account is still spike 0.
 
+**Release prep (v0.1.0):**
+- `scripts/release/bundle-mac.sh` compiles the app on the `stable` channel (`ZED_RELEASE_CHANNEL=stable`, as Zed's own bundle script does); `app/crates/zed/RELEASE_CHANNEL` stays `dev` for local builds. Stable turns on: saved API keys in the Keychain (`icarus:<url>`), the single-instance check (on Icarus's own port, 47737+, so a running Zed is not mistaken for Icarus), the app DB under `db/0-stable` (dev builds keep `0-dev`), Zed's stable extension API range (WIT up to 0.7.0: catppuccin, oxc 0.4.x and tsgo 1.x all fit), no GPUI inspector, and the stable app icon in About.
+- Stays off on every channel: Zed's updater (`ZED_UPDATE_EXPLANATION`; "Check for Updates" points to `icarus update`), crash uploads (no `ZED_MINIDUMP_ENDPOINT` is compiled in), and, through Icarus's default settings, telemetry (`telemetry.metrics` and `telemetry.diagnostics` false), the title bar's "Sign In" and Zed's onboarding banners. "What's new" only follows an update Zed's updater installed, so it never shows. Kept on purpose: the extension registry at api.zed.dev, Zed's docs link, and sign-in from the user menu or agent panel for those who want Zed's hosted models.
+- Branding: windows and the release-channel name read "Icarus" ("Icarus Dev" locally), the app menu says About/Hide/Quit Icarus, Help links to frbarbre/icarus (Zed's email, Twitter, jobs and release-notes items are gone), Install CLI is gone from the menu (it would replace Zed's `/usr/local/bin/zed`), and `scripts/release/brand-plist.sh` renames Zed in the bundle's permission prompts and document type.
+- Versions: the app keeps Zed's version (1.30.0) for the extension registry; About shows the Icarus version (`ICARUS_VERSION` from the workflow, else the root workspace version) with Zed's beside it, and `icarus --version` / `icarus-server --version` report the stamped version like `server.info` and `update.check` already did.
+
 ## Blocked on you
 
 Parked until you're back; work continues on other items.
@@ -227,7 +233,6 @@ Parked until you're back; work continues on other items.
 ## Next
 
 - App (in progress): Explorer, Source Control and GitHub as right-sidebar panels switched like Orca's, and the diff tab type (one file vs base, edit/diff toggle, full LSP).
-- Before v0.1.0: release builds on a stable release channel, so saved API keys go to the Keychain rather than a plain-text dev file; user-facing "Zed" strings in the bundle.
 - App: the review mode UI on top of the `review.*` RPCs (queued comments in the diff, verdict, base picker, threads, media in comments).
 - App: notifications (sound, dock badge, the `notification` event), session history in the palette, account switching in the status bar.
 - App: a Remote Control toggle on agent tabs (the `agent.remote_control` RPC) that shows the claude.ai link.

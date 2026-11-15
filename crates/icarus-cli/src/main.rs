@@ -18,10 +18,16 @@ use icarus_client::Client;
 use icarus_settings::zed_import;
 use serde_json::{Value, json};
 
+/// The release workflow stamps `ICARUS_VERSION` from the tag; local builds report the crate version.
+const VERSION: &str = match option_env!("ICARUS_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
 #[command(
     name = "icarus",
-    version,
+    version = VERSION,
     about = "Control an Icarus server from the shell"
 )]
 struct Cli {

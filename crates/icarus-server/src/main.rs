@@ -9,7 +9,7 @@ use icarus_server::server::Server;
 #[derive(Parser)]
 #[command(
     name = "icarus-server",
-    version,
+    version = icarus_server::updates::VERSION,
     about = "The Icarus server: owns agents, terminals and automations"
 )]
 struct Cli {
