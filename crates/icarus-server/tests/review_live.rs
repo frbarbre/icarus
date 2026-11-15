@@ -2,7 +2,7 @@
 //!
 //! Ignored by default. Run with:
 //! `ICARUS_LIVE_SANDBOX=owner/name cargo test -p icarus-server --test review_live -- --ignored --nocapture`
-//! It refuses any repository that is not private and named like a sandbox.
+//! It refuses any repository that you don't own or that isn't named like a sandbox.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -188,9 +188,12 @@ async fn live_review_round_trip_on_the_sandbox() {
         &["api", &format!("repos/{slug}")],
     ))
     .expect("repo json");
+    let viewer = run(scratch.path(), "gh", &["api", "user", "--jq", ".login"]);
     assert!(
-        info["private"] == true && name.to_lowercase().contains("sandbox"),
-        "refusing to mutate {slug}: only private sandbox repositories"
+        name.to_lowercase().contains("sandbox")
+            && info["owner"]["login"].as_str() == Some(viewer.trim())
+            && info["fork"] == false,
+        "refusing to mutate {slug}: only a sandbox repository you own"
     );
     let mut passed: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
