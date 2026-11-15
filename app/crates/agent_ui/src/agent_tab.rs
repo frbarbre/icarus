@@ -1,14 +1,21 @@
+use std::time::Duration;
+
 use acp_thread::ThreadStatus;
 use agent_client_protocol::v2::schema as acp_v2;
+use anyhow::Context as _;
+use db::kvp::KeyValueStore;
 use gpui::{
     AnyView, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, SharedString, Styled, Subscription, WeakEntity, Window, actions, div,
+    ParentElement, Render, SharedString, Styled, Subscription, Task, WeakEntity, Window, actions,
+    div,
 };
+use project::Project;
 use ui::{Color, Icon, IconName, Label, LabelSize, prelude::*};
-use workspace::item::{Item, ItemEvent};
-use workspace::{Pane, Workspace};
+use workspace::item::{Item, ItemEvent, SerializableItem};
+use workspace::{ItemId, Pane, SaveIntent, Workspace, WorkspaceId};
 
 use crate::conversation_view::ThreadView;
+use crate::thread_metadata_store::ThreadId;
 use crate::{AgentPanel, ConversationView};
 
 actions!(
@@ -24,12 +31,17 @@ actions!(
 /// An agent conversation shown as a center tab; its composer lives in the workspace's [`AgentComposer`].
 pub struct AgentTab {
     conversation_view: Entity<ConversationView>,
+    requested_agent_id: Option<String>,
     observed_thread: Option<EntityId>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl AgentTab {
-    pub fn new(conversation_view: Entity<ConversationView>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        conversation_view: Entity<ConversationView>,
+        requested_agent_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let subscription = cx.observe(&conversation_view, |tab, _, cx| {
             tab.observe_root_thread(cx);
             cx.emit(ItemEvent::UpdateTab);
@@ -37,6 +49,7 @@ impl AgentTab {
         });
         let mut tab = Self {
             conversation_view,
+            requested_agent_id,
             observed_thread: None,
             _subscriptions: vec![subscription],
         };
@@ -46,6 +59,13 @@ impl AgentTab {
 
     pub fn conversation_view(&self) -> &Entity<ConversationView> {
         &self.conversation_view
+    }
+
+    /// The server agent behind this tab: its ACP session id, or the one it was opened for while loading.
+    pub fn agent_id(&self, cx: &App) -> Option<String> {
+        self.thread_view(cx)
+            .map(|view| view.read(cx).thread.read(cx).session_id().0.to_string())
+            .or_else(|| self.requested_agent_id.clone())
     }
 
     pub fn thread_view(&self, cx: &App) -> Option<Entity<ThreadView>> {
@@ -118,6 +138,100 @@ impl Render for AgentTab {
         div().size_full().child(self.conversation_view.clone())
     }
 }
+
+fn serialized_agent_key(workspace_id: WorkspaceId, item_id: ItemId) -> String {
+    format!("icarus-agent-tab:{}:{item_id}", i64::from(workspace_id))
+}
+
+/// What a restored tab needs: the server session to load, and the thread whose saved draft it shows.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializedAgentTab {
+    agent_id: String,
+    thread_id: ThreadId,
+}
+
+impl SerializableItem for AgentTab {
+    fn serialized_item_kind() -> &'static str {
+        "IcarusAgentTab"
+    }
+
+    fn cleanup(
+        _workspace_id: WorkspaceId,
+        _alive_items: Vec<ItemId>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    fn deserialize(
+        _project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        let saved =
+            KeyValueStore::global(cx).read_kvp(&serialized_agent_key(workspace_id, item_id));
+        window.spawn(cx, async move |cx| {
+            let saved = saved?.context("no agent recorded for this tab")?;
+            let SerializedAgentTab {
+                agent_id,
+                thread_id,
+            } = serde_json::from_str(&saved)?;
+            // Panels load alongside restored items, so the tab waits for the agent panel it builds on.
+            for _ in 0..PANEL_WAIT_STEPS {
+                let panel =
+                    workspace.read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))?;
+                if let Some(panel) = panel {
+                    return cx.update(|window, cx| {
+                        let conversation_view = panel.update(cx, |panel, cx| {
+                            panel.new_tab_conversation(
+                                None,
+                                Some(acp_v2::SessionId::new(agent_id.clone())),
+                                Some(thread_id),
+                                window,
+                                cx,
+                            )
+                        });
+                        cx.new(|cx| AgentTab::new(conversation_view, Some(agent_id), cx))
+                    });
+                }
+                cx.background_executor().timer(PANEL_WAIT_STEP).await;
+            }
+            anyhow::bail!("the agent panel never loaded")
+        })
+    }
+
+    fn serialize(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        _closing: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        let workspace_id = workspace.database_id()?;
+        let saved = SerializedAgentTab {
+            agent_id: self.agent_id(cx)?,
+            thread_id: self.conversation_view.read(cx).thread_id,
+        };
+        let saved = serde_json::to_string(&saved).ok()?;
+        let store = KeyValueStore::global(cx);
+        Some(cx.background_spawn(async move {
+            store
+                .write_kvp(serialized_agent_key(workspace_id, item_id), saved)
+                .await
+        }))
+    }
+
+    fn should_serialize(&self, event: &Self::Event) -> bool {
+        matches!(event, ItemEvent::UpdateTab)
+    }
+}
+
+const PANEL_WAIT_STEP: Duration = Duration::from_millis(50);
+const PANEL_WAIT_STEPS: usize = 200;
 
 /// Picks the composer's target: the active agent tab, else the most recently used one still open.
 pub(crate) fn choose_target(
@@ -197,6 +311,17 @@ impl AgentComposer {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
+        if workspace.read(cx).is_restoring() {
+            // Restored agent tabs may still be on their way; a fresh agent now would be one too many.
+            cx.spawn_in(window, async move |composer, cx| {
+                cx.background_executor().timer(PANEL_WAIT_STEP * 4).await;
+                composer.update_in(cx, |composer, window, cx| {
+                    composer.schedule_ensure(window, cx)
+                })
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
         let (open_tabs, active) = {
             let workspace = workspace.read(cx);
             let open_tabs: Vec<Entity<AgentTab>> =
@@ -269,6 +394,23 @@ impl AgentComposer {
         }
     }
 
+    /// Swaps a tab whose agent no longer exists for a fresh agent in the same pane.
+    fn replace_failed_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(workspace), Some(tab)) = (self.workspace.upgrade(), self.target()) else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let pane = workspace.pane_for(&tab);
+            open_agent_tab(workspace, None, pane.clone(), true, window, cx);
+            if let Some(pane) = pane {
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(tab.entity_id(), SaveIntent::Skip, window, cx)
+                        .detach_and_log_err(cx);
+                });
+            }
+        });
+    }
+
     /// Adds an attachment chip to the target agent's draft; it is sent with the next prompt.
     pub fn insert_attachment(
         &mut self,
@@ -296,6 +438,9 @@ impl Render for AgentComposer {
                 thread_view.render_hosted_composer(window, cx)
             })
         });
+        let failed = self
+            .target()
+            .is_some_and(|tab| tab.read(cx).conversation_view.read(cx).failed_to_load());
         div()
             .id("icarus-agent-composer")
             .w_full()
@@ -309,9 +454,26 @@ impl Render for AgentComposer {
                     .px_3()
                     .py_2()
                     .child(
-                        Label::new("Starting agent…")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Label::new(if failed {
+                                    "This agent couldn't be loaded."
+                                } else {
+                                    "Starting agent…"
+                                })
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            )
+                            .when(failed, |this| {
+                                this.child(
+                                    Button::new("replace-failed-agent", "Start a new agent")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|composer, _, window, cx| {
+                                            composer.replace_failed_target(window, cx);
+                                        })),
+                                )
+                            }),
                     ),
             })
     }
@@ -359,14 +521,42 @@ fn open_tab(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<AgentTab>> {
-    let panel = workspace.panel::<AgentPanel>(cx)?;
-    let resume_session_id = agent_id.map(acp_v2::SessionId::new);
-    let conversation_view = panel.update(cx, |panel, cx| {
-        panel.new_tab_conversation(server, resume_session_id, window, cx)
-    });
-    let tab = cx.new(|cx| AgentTab::new(conversation_view, cx));
     let pane = pane.unwrap_or_else(|| workspace.active_pane().clone());
-    workspace.add_item(pane, Box::new(tab.clone()), None, true, focus, window, cx);
+    // A server session can back only one tab, so asking for an open agent moves its tab instead.
+    let existing = agent_id.as_ref().and_then(|agent_id| {
+        workspace
+            .items_of_type::<AgentTab>(cx)
+            .find(|tab| tab.read(cx).agent_id(cx).as_ref() == Some(agent_id))
+    });
+    let tab = match existing {
+        Some(tab) => {
+            match workspace.pane_for(&tab) {
+                Some(source) if source != pane => {
+                    let index = pane.read(cx).items_len();
+                    workspace::move_item(&source, &pane, tab.entity_id(), index, true, window, cx);
+                }
+                _ => {
+                    let index = pane.read(cx).index_for_item(&tab);
+                    if let Some(index) = index {
+                        pane.update(cx, |pane, cx| {
+                            pane.activate_item(index, true, focus, window, cx)
+                        });
+                    }
+                }
+            }
+            tab
+        }
+        None => {
+            let panel = workspace.panel::<AgentPanel>(cx)?;
+            let resume_session_id = agent_id.clone().map(acp_v2::SessionId::new);
+            let conversation_view = panel.update(cx, |panel, cx| {
+                panel.new_tab_conversation(server, resume_session_id, None, window, cx)
+            });
+            let tab = cx.new(|cx| AgentTab::new(conversation_view, agent_id, cx));
+            workspace.add_item(pane, Box::new(tab.clone()), None, true, focus, window, cx);
+            tab
+        }
+    };
     if let Some(composer) = AgentComposer::for_workspace(workspace) {
         let target = tab.clone();
         // Deferred: this may run from the composer's own update, when it opens the replacement for a closed tab.
@@ -380,8 +570,15 @@ fn open_tab(
     Some(tab)
 }
 
+/// Present once agent tabs are on; the agent panel then leaves sessions to the tabs.
+pub struct AgentTabsEnabled;
+
+impl gpui::Global for AgentTabsEnabled {}
+
 /// Gives every workspace window agent tabs and one shared composer; Icarus calls this, upstream Zed does not.
 pub fn init(cx: &mut App) {
+    cx.set_global(AgentTabsEnabled);
+    workspace::register_serializable_item::<AgentTab>(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if let Some(window) = window {
             install(workspace, window, cx);
@@ -414,7 +611,7 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
     use project::Project;
     use std::path::Path;
-    use workspace::{MultiWorkspace, SaveIntent};
+    use workspace::MultiWorkspace;
 
     struct Probe;
 

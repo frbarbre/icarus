@@ -317,6 +317,62 @@ async fn workspace_lifecycle_creates_a_worktree_with_an_agent_and_lists_changes(
 }
 
 #[tokio::test]
+async fn an_agent_never_sent_a_message_survives_a_restart_and_starts_fresh() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let work = tempfile::tempdir().expect("workdir");
+    let fake = env!("CARGO_BIN_EXE_icarus-fake-agent");
+    let server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let info = client
+            .request(
+                "agent.create",
+                json!({ "cwd": work.path(), "command": [fake], "env": { "ICARUS_FAKE_LAZY_INIT": "1" } }),
+            )
+            .await
+            .expect("create");
+        let id = info["id"].as_str().expect("id").to_string();
+        client
+            .request("agent.sleep", json!({ "id": id }))
+            .await
+            .expect("sleep before any message");
+        ids.push(id);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(client);
+    drop(server);
+
+    let _server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test")
+        .await
+        .expect("reconnect");
+    assert!(
+        client
+            .request("agent.info", json!({ "id": ids[0] }))
+            .await
+            .is_err(),
+        "older unused agents hold nothing, so they aren't kept"
+    );
+    let id = ids[1].clone();
+    let restored = client
+        .request("agent.info", json!({ "id": id }))
+        .await
+        .expect("the warm agent comes back, so its tab can reload it");
+    assert_eq!(restored["state"], "sleeping");
+    client
+        .request("agent.send", json!({ "id": id, "text": "hello" }))
+        .await
+        .expect("send wakes it");
+    let after = client
+        .request("agent.wait", json!({ "id": id, "timeout_ms": 10000 }))
+        .await
+        .expect("wait after wake");
+    assert_eq!(after["state"], "idle");
+    assert_eq!(after["turns"], 1);
+}
+
+#[tokio::test]
 async fn agents_survive_a_server_restart_and_resume_their_session() {
     let home = tempfile::tempdir().expect("tempdir");
     let work = tempfile::tempdir().expect("workdir");

@@ -636,7 +636,7 @@
     "bindings": {
       "ctrl-alt-enter": "icarus::RunNextAction",
       "ctrl-shift-b": "icarus::OpenFrontend",
-      "ctrl-shift-p": "icarus::OpenPreview",
+      "ctrl-alt-p": "icarus::OpenPreview",
       "alt-/": "which_key::ShowPendingBindings",
       // Move focus between the major regions of the window (editor, open
       // panels, status bar). Accessibility navigation; mirrors VS Code's
@@ -707,6 +707,7 @@
       "ctrl-tab": "tab_switcher::Toggle",
       "ctrl-e": "file_finder::Toggle",
       "f1": "command_palette::Toggle",
+      "ctrl-shift-p": "command_palette::Toggle",
       "ctrl-shift-m": "diagnostics::Deploy",
       "ctrl-shift-e": "project_panel::ToggleFocus",
       "ctrl-shift-g": "git_panel::ToggleFocus",

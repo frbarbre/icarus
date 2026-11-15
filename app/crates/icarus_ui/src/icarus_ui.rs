@@ -1,4 +1,5 @@
 pub mod github_panel;
+pub mod layout;
 pub mod links;
 mod model;
 mod next_action;
@@ -178,28 +179,19 @@ fn workspace_for_path(
     Some((window, workspace))
 }
 
-/// Payload of the `open_layout` event that review automation sends.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-pub struct OpenLayoutRequest {
-    pub workspace_id: String,
-    pub layout: String,
-    #[serde(default)]
-    pub pr_url: Option<String>,
-}
-
-type ReviewLayoutHandler =
+type LayoutAppliedHandler =
     Arc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static>;
 
-struct GlobalReviewLayoutHandler(ReviewLayoutHandler);
+struct GlobalLayoutAppliedHandler(LayoutAppliedHandler);
 
-impl gpui::Global for GlobalReviewLayoutHandler {}
+impl gpui::Global for GlobalLayoutAppliedHandler {}
 
-/// The app crate owns the agent panel, so it decides how the review layout puts the agent forward.
-pub fn set_review_layout_handler(
+/// The app crate owns the composer, so it decides what gets focus once a layout is in place.
+pub fn set_layout_applied_handler(
     cx: &mut App,
     handler: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
 ) {
-    cx.set_global(GlobalReviewLayoutHandler(Arc::new(handler)));
+    cx.set_global(GlobalLayoutAppliedHandler(Arc::new(handler)));
 }
 
 type OpenAgentHandler = Arc<
@@ -247,11 +239,9 @@ pub fn open_agent_tab(
     }
 }
 
-/// Shows a workspace laid out for review: its window in front with the agent, and the PR beside it.
-fn open_layout(request: OpenLayoutRequest, path: PathBuf, cx: &mut App) {
-    if request.layout != "review_split" {
-        log::warn!("unknown layout {:?}, using review_split", request.layout);
-    }
+/// Shows the workspace's window (opening it if needed) and arranges its tabs as `pending` says.
+fn open_layout(pending: layout::PendingLayout, cx: &mut App) {
+    let path = pending.path.clone();
     let window = match window_for_path(&path, cx) {
         Some(found) => Task::ready(Ok(found)),
         None => {
@@ -271,24 +261,47 @@ fn open_layout(request: OpenLayoutRequest, path: PathBuf, cx: &mut App) {
         window.update(cx, |multi_workspace, window, cx| {
             multi_workspace.activate(workspace.clone(), None, window, cx);
             window.activate_window();
-            let handler = cx
-                .try_global::<GlobalReviewLayoutHandler>()
-                .map(|handler| handler.0.clone());
-            match handler {
-                Some(handler) => {
-                    workspace.update(cx, |workspace, cx| handler(workspace, window, cx))
-                }
-                None => log::error!("no review layout handler registered"),
-            }
+            workspace.update(cx, |workspace, cx| {
+                layout::apply_layout(&pending.layout, &pending.path, workspace, window, cx);
+                layout_applied(workspace, window, cx);
+            });
         })?;
-        // TODO(icarus §3d embedded PR tab): show the pull request in an embedded WebView tab to the
-        // right of the agent once Zed has one; until then it opens in the system browser.
-        if let Some(url) = request.pr_url {
-            cx.update(|cx| cx.open_url(&url));
-        }
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
+}
+
+fn layout_applied(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if let Some(handler) = cx
+        .try_global::<GlobalLayoutAppliedHandler>()
+        .map(|handler| handler.0.clone())
+    {
+        handler(workspace, window, cx);
+    }
+}
+
+/// Applies layouts the server holds for workspaces that are open in a window right now.
+async fn apply_pending_for_open_windows(client: Arc<Client>, cx: &mut gpui::AsyncApp) {
+    let Some(pending) = Tokio::spawn_result(cx, layout::pending_layouts(client.clone()))
+        .await
+        .log_err()
+    else {
+        return;
+    };
+    for candidate in pending {
+        let open = cx.update(|cx| window_for_path(&candidate.path, cx).is_some());
+        if !open {
+            continue;
+        }
+        let taken = Tokio::spawn_result(
+            cx,
+            layout::take_layout(client.clone(), candidate.workspace_id.clone()),
+        )
+        .await;
+        if let Some(Some(pending)) = taken.log_err() {
+            cx.update(|cx| open_layout(pending, cx));
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -384,6 +397,7 @@ fn start_app_connection(cx: &mut App) {
                     )
                 });
             }
+            apply_pending_for_open_windows(client.clone(), cx).await;
             loop {
                 let next = Tokio::spawn(cx, async move {
                     let event = events.recv().await;
@@ -431,36 +445,35 @@ fn start_app_connection(cx: &mut App) {
                         cx.update(|cx| links::ports_changed(event.payload, cx));
                     }
                     "open_layout" => {
-                        let Some(request) =
-                            serde_json::from_value::<OpenLayoutRequest>(event.payload).log_err()
+                        let Some(announced) =
+                            serde_json::from_value::<layout::PendingLayout>(event.payload)
+                                .log_err()
                         else {
                             continue;
                         };
-                        let listed = Tokio::spawn_result(
+                        if let Some(listed) = Tokio::spawn_result(
                             cx,
                             worktree_trust::list_workspace_paths(client.clone()),
                         )
+                        .await
+                        .log_err()
+                        {
+                            cx.update(|cx| {
+                                worktree_trust::set_icarus_workspace_paths(
+                                    listed.into_iter().map(|(_, path)| path).collect(),
+                                    cx,
+                                )
+                            });
+                        }
+                        // Claiming first makes applying idempotent across windows and reconnects.
+                        let taken = Tokio::spawn_result(
+                            cx,
+                            layout::take_layout(client.clone(), announced.workspace_id),
+                        )
                         .await;
-                        let Some(listed) = listed.log_err() else {
-                            continue;
-                        };
-                        let path = listed
-                            .iter()
-                            .find(|(id, _)| *id == request.workspace_id)
-                            .map(|(_, path)| path.clone());
-                        cx.update(|cx| {
-                            worktree_trust::set_icarus_workspace_paths(
-                                listed.into_iter().map(|(_, path)| path).collect(),
-                                cx,
-                            );
-                            match path {
-                                Some(path) => open_layout(request, path, cx),
-                                None => log::error!(
-                                    "open_layout for unknown workspace {}",
-                                    request.workspace_id
-                                ),
-                            }
-                        });
+                        if let Some(Some(pending)) = taken.log_err() {
+                            cx.update(|cx| open_layout(pending, cx));
+                        }
                     }
                     _ => {}
                 }
@@ -479,7 +492,31 @@ pub fn init(cx: &mut App) {
     links::register(cx);
     worktree_trust::register(cx);
     github_panel::register(cx);
-    cx.observe_new(|workspace: &mut Workspace, _, _| {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        if window.is_some() {
+            // A workspace opened after its layout was stored (e.g. the app was closed) applies it now.
+            cx.spawn(async move |workspace, cx| {
+                for _ in 0..20 {
+                    let ready = workspace
+                        .read_with(cx, |workspace, cx| !workspace.root_paths(cx).is_empty())
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                }
+                let client = cx.update(|cx| {
+                    cx.try_global::<AppConnection>()
+                        .and_then(|connection| connection.client.clone())
+                });
+                if let Some(client) = client {
+                    apply_pending_for_open_windows(client, cx).await;
+                }
+            })
+            .detach();
+        }
         workspace.register_action(|workspace, _: &ToggleWorkspacesPanel, window, cx| {
             workspace.toggle_panel_focus::<WorkspacesPanel>(window, cx);
         });
@@ -1120,9 +1157,11 @@ impl WorkspacesPanel {
 impl Render for WorkspacesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let groups = group_by_status(&self.workspaces, &self.status_order);
+        // Same height as the centre's tab bar, so the two bottom borders line up across the window.
         let header = h_flex()
+            .flex_none()
+            .h(ui::Tab::container_height(cx))
             .px_2()
-            .py_1()
             .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)

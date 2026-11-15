@@ -23,10 +23,12 @@ fn main() {
         .unwrap_or_else(|| format!("fake-{}", std::process::id()));
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
-    emit(
-        &mut out,
-        json!({ "type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model", "cwd": std::env::current_dir().ok() }),
-    );
+    let init = json!({ "type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model", "cwd": std::env::current_dir().ok() });
+    // Real `claude -p` says nothing until the first message arrives.
+    let mut lazy_init = std::env::var_os("ICARUS_FAKE_LAZY_INIT").is_some();
+    if !lazy_init {
+        emit(&mut out, init.clone());
+    }
     let mut turn = 0u64;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -35,6 +37,10 @@ fn main() {
         };
         if message["type"] != "user" {
             continue;
+        }
+        if lazy_init {
+            emit(&mut out, init.clone());
+            lazy_init = false;
         }
         let text = message["message"]["content"]
             .as_array()

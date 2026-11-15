@@ -556,6 +556,27 @@ pub fn document_schema() -> Schema {
                 field("review_requested", "Someone asked for your review.", Bool),
                 field("pr_merged", "A workspace's pull request merged.", Bool),
                 field("rules", "A rule's `notify` action.", Bool),
+                field(
+                    "update_available",
+                    "A newer Icarus release is out (once per version).",
+                    Bool,
+                ),
+            ]),
+        ),
+        field(
+            "updates",
+            "Update checks against Icarus's GitHub releases. `icarus update check` works whatever these say.",
+            closed(vec![
+                field(
+                    "channel",
+                    "`stable` checks for new releases in the background (release builds only); `none` never does.",
+                    Schema::Enum(&["stable", "none"]),
+                ),
+                field(
+                    "check_interval_ms",
+                    "How often the background check runs. Default 21600000 (6 hours); at least 60000.",
+                    Integer,
+                ),
             ]),
         ),
         field(

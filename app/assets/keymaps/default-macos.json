@@ -698,8 +698,8 @@
       "cmd-alt-enter": "icarus::RunNextAction",
       "cmd-alt-t": "icarus::NewAgent",
       "cmd-shift-b": "icarus::OpenFrontend",
-      "cmd-shift-p": "icarus::OpenPreview",
-      "f1": "command_palette::Toggle",
+      "cmd-alt-p": "icarus::OpenPreview",
+      "cmd-shift-p": "command_palette::Toggle",
       "cmd-o": "workspace::Open",
       "alt-/": "which_key::ShowPendingBindings",
       // Move focus between the major regions of the window (editor, open

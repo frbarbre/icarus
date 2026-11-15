@@ -694,7 +694,10 @@ pub fn dev_repo_root() -> Option<&'static std::path::Path> {
             Some(
                 start
                     .ancestors()
-                    .find(|dir| dir.join(".git").exists())?
+                    // Icarus keeps this checkout in a subdirectory of its own repo, so `.git` alone finds the wrong root.
+                    .find(|dir| {
+                        dir.join(".git").exists() || dir.join("crates/zed/Cargo.toml").exists()
+                    })?
                     .to_path_buf(),
             )
         })

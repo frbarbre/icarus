@@ -5605,16 +5605,33 @@ impl ThreadView {
                 )
         });
 
+        let hosted = self.composer_hosted_externally;
+        let colors = cx.theme().colors();
+        // The card takes the editor's own background so the input inside reads as one surface.
+        let (card_background, card_border) = (colors.editor_background, colors.border);
         h_flex()
-            .py_2()
-            .bg(editor_bg_color)
+            // A hosted composer continues the conversation's background, so the card is what stands out.
+            .bg(if hosted {
+                colors.panel_background
+            } else {
+                editor_bg_color
+            })
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
             .map(|this| {
+                if hosted {
+                    // Conductor-style: a floating card on the transcript's background, no divider.
+                    this.px_3().pt_1().pb_3()
+                } else {
+                    this.py_2()
+                }
+            })
+            .map(|this| {
                 if has_messages {
                     this.on_action(cx.listener(Self::expand_message_editor))
-                        .border_t_1()
-                        .border_color(cx.theme().colors().border)
+                        .when(!hosted, |this| {
+                            this.border_t_1().border_color(cx.theme().colors().border)
+                        })
                         .when(editor_expanded, |this| this.h(vh(0.8, window)))
                 } else {
                     this.flex_1().size_full()
@@ -5626,7 +5643,19 @@ impl ThreadView {
                     .when(max_content_width.is_none(), |this| this.w_full())
                     .min_w_0()
                     .when(fills_container, |this| this.h_full())
-                    .px_2()
+                    .map(|this| {
+                        if hosted {
+                            this.px_3()
+                                .py_2()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(card_border)
+                                .bg(card_background)
+                                .shadow_xs()
+                        } else {
+                            this.px_2()
+                        }
+                    })
                     .flex_shrink_1()
                     .flex_grow_0()
                     .justify_between()
@@ -6754,6 +6783,13 @@ impl ThreadView {
             } else {
                 IconName::Send
             };
+            if self.composer_hosted_externally {
+                return self.render_round_send_button(
+                    send_icon,
+                    is_editor_empty && !is_generating,
+                    cx,
+                );
+            }
             IconButton::new("send-message", send_icon)
                 .style(ButtonStyle::Filled)
                 .map(|this| {
@@ -6804,6 +6840,44 @@ impl ThreadView {
                 }))
                 .into_any_element()
         }
+    }
+
+    /// The hosted composer's send button: a filled circle, accent-coloured once there is something to send.
+    fn render_round_send_button(
+        &self,
+        icon: IconName,
+        disabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let (background, foreground) = if disabled {
+            (colors.element_disabled, Color::Disabled)
+        } else {
+            (colors.text_accent, Color::Custom(colors.editor_background))
+        };
+        div()
+            .id("send-message")
+            .flex_none()
+            .size_7()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(background)
+            .when(!disabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.opacity(0.85))
+                    .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
+            })
+            .tooltip(move |_window, cx| {
+                if disabled {
+                    Tooltip::for_action("Type to Send", &Chat, cx)
+                } else {
+                    Tooltip::for_action("Send Message", &Chat, cx)
+                }
+            })
+            .child(Icon::new(icon).size(IconSize::Small).color(foreground))
+            .into_any_element()
     }
 
     fn render_add_context_button(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8621,8 +8695,22 @@ impl ThreadView {
     }
 
     /// A hosted composer sits under the transcript instead of filling an empty thread.
-    pub(crate) fn set_composer_hosted_externally(&mut self, hosted: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_composer_hosted_externally(
+        &mut self,
+        hosted: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.composer_hosted_externally = hosted;
+        if hosted {
+            self.message_editor.update(cx, |editor, cx| {
+                editor.set_placeholder_text(
+                    crate::conversation_view::HOSTED_COMPOSER_PLACEHOLDER,
+                    window,
+                    cx,
+                );
+            });
+        }
         self.sync_editor_mode(cx);
         cx.notify();
     }
@@ -14328,6 +14416,33 @@ impl ThreadView {
         }))
     }
 
+    /// What an agent tab shows before its first message, since its composer lives outside the tab.
+    fn render_hosted_empty_state(&self, cx: &Context<Self>) -> impl IntoElement {
+        let title = self
+            .thread
+            .read(cx)
+            .title()
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| self.agent_display_name.clone());
+        v_flex()
+            .id("hosted-empty-state")
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                Icon::new(self.agent_icon)
+                    .size(IconSize::XLarge)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(title).size(LabelSize::Large))
+            .child(
+                Label::new(crate::conversation_view::HOSTED_COMPOSER_PLACEHOLDER)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+    }
+
     fn render_thread_contents(
         &mut self,
         root: Div,
@@ -14347,6 +14462,11 @@ impl ThreadView {
                         .size_full()
                         .child(self.render_entries(cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
+                        .into_any()
+                } else if self.composer_hosted_externally {
+                    this.flex_1()
+                        .size_full()
+                        .child(self.render_hosted_empty_state(cx))
                         .into_any()
                 } else {
                     this.into_any()

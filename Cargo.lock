@@ -768,6 +768,7 @@ dependencies = [
  "icarus-client",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]
@@ -866,6 +867,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",
@@ -874,6 +876,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "uuid",
 ]
 

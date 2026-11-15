@@ -913,6 +913,10 @@ impl ConversationView {
         }
     }
 
+    pub(crate) fn failed_to_load(&self) -> bool {
+        matches!(self.server_state, ServerState::LoadError { .. })
+    }
+
     pub fn as_connected_mut(&mut self) -> Option<&mut ConnectedServerState> {
         match &mut self.server_state {
             ServerState::Connected(connected) => Some(connected),
@@ -1773,19 +1777,24 @@ impl ConversationView {
                 cx,
             );
             if composer_hosted_externally {
-                thread_view.set_composer_hosted_externally(true, cx);
+                thread_view.set_composer_hosted_externally(true, window, cx);
             }
             thread_view
         })
     }
 
     /// Moves every thread's composer out of the transcript, for a host that renders it elsewhere.
-    pub(crate) fn set_composer_hosted_externally(&mut self, hosted: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_composer_hosted_externally(
+        &mut self,
+        hosted: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.composer_hosted_externally = hosted;
         if let Some(connected) = self.as_connected() {
             for thread_view in connected.threads.values() {
                 thread_view.update(cx, |thread_view, cx| {
-                    thread_view.set_composer_hosted_externally(hosted, cx);
+                    thread_view.set_composer_hosted_externally(hosted, window, cx);
                 });
             }
         }
@@ -2346,8 +2355,11 @@ impl ConversationView {
                             session_capabilities.set_available_skills(available_skills);
                             session_capabilities.has_slash_completions()
                         };
-                        let new_placeholder =
-                            placeholder_text(agent_display_name.as_ref(), has_slash_completions);
+                        let new_placeholder = if thread_view.composer_hosted_externally {
+                            HOSTED_COMPOSER_PLACEHOLDER.to_string()
+                        } else {
+                            placeholder_text(agent_display_name.as_ref(), has_slash_completions)
+                        };
                         thread_view.message_editor.update(cx, |editor, cx| {
                             editor.set_placeholder_text(&new_placeholder, window, cx);
                         });
@@ -2371,7 +2383,9 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::PromptUpdated => {
-                if !is_subagent && thread.read(cx).is_draft_thread() {
+                if !is_subagent
+                    && (thread.read(cx).is_draft_thread() || self.composer_hosted_externally)
+                {
                     self.schedule_draft_prompt_persist(cx);
                 }
                 cx.notify();
@@ -2389,7 +2403,8 @@ impl ConversationView {
             let persist = this.update(cx, |this, cx| {
                 let thread = this.root_thread(cx)?;
                 let thread = thread.read(cx);
-                if !thread.is_draft_thread() {
+                // An agent tab keeps its draft across restarts even mid-conversation; the panel only for new threads.
+                if !thread.is_draft_thread() && !this.composer_hosted_externally {
                     return None;
                 }
                 let snapshot: Vec<acp_v2::ContentBlock> = thread
@@ -3951,6 +3966,9 @@ fn native_available_skills(
         })
         .collect()
 }
+
+pub(crate) const HOSTED_COMPOSER_PLACEHOLDER: &str =
+    "Ask anything, @ to mention files, / for commands";
 
 fn placeholder_text(agent_name: &str, has_commands: bool) -> String {
     if agent_name == agent::ZED_AGENT_ID.as_ref() {

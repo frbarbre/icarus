@@ -65,6 +65,10 @@ fn service_path() -> Result<PathBuf> {
     })
 }
 
+pub fn installed() -> bool {
+    service_path().is_ok_and(|path| path.exists())
+}
+
 fn run(program: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(program)
         .args(args)

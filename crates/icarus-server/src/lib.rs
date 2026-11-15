@@ -20,4 +20,5 @@ pub mod settings;
 pub mod state;
 pub mod terminal;
 pub mod turns;
+pub mod updates;
 pub mod workspaces;

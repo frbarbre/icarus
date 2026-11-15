@@ -6690,6 +6690,11 @@ impl Workspace {
         &self.panes
     }
 
+    /// The center split tree, so layouts can set split proportions.
+    pub fn center_pane_group(&self) -> &PaneGroup {
+        &self.center
+    }
+
     pub fn active_pane(&self) -> &Entity<Pane> {
         &self.active_pane
     }

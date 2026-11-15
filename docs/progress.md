@@ -183,10 +183,19 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - RPCs: `review.get`, `review.set_base`, `review.comment.add|edit|remove|clear|list`, `review.set_summary`, `review.submit`, `review.threads`, `review.reply`, `review.resolve|unresolve`, `review.react`, `review.upload`, plus a `review.changed` event. CLI: `icarus review show|base|comment|summary|submit|threads|reply|resolve|unresolve|react|upload`, run from inside a workspace.
 - Checked live on a private sandbox repo: two drafts with an uploaded PNG and MP4, one COMMENT review, reply, resolve, unresolve and reactions read back through `review.threads`; GitHub's refusals to approve or request changes on your own PR; a two-PR stack. Auto-merge could not be enabled on that private repo.
 
+**Releases and updates (D9):**
+- `.github/workflows/release.yml` runs on `v*` tags and by hand (`gh workflow run release.yml -f version=0.2.0`), never on normal pushes. It builds `icarus` + `icarus-server` for Linux x86_64 and aarch64 (glibc, on native Ubuntu 22.04 runners) and a universal macOS tarball, then `Icarus.app` for Apple silicon (`scripts/release/bundle-mac.sh`; Intel with the `intel_app` input) as a `.zip` and a `.dmg`. The app is ad-hoc signed (bundle id `dev.icarus.app`) and Zed's own updater is compiled off with `ZED_UPDATE_EXPLANATION`. It publishes a GitHub release with `SHA256SUMS` and generated notes, and the version is stamped into the binaries (`ICARUS_VERSION`).
+- Homebrew: `brew install --cask frbarbre/tap/icarus` installs the app and links `icarus` and `icarus-server`. The cask pins the version and sha256, which the workflow rewrites in `frbarbre/homebrew-tap` on each stable release; pinning (not `version :latest` as in §72) lets `brew upgrade --cask icarus` see new versions and checks the download.
+- `update.check` / `icarus update check` compare the running version with the newest non-prerelease on `frbarbre/icarus`, through `gh` when it is signed in, else unauthenticated HTTPS (which 404s while the repo is private). A newer version sends one `update_available` notification per version ("Update available — restart to update"). Release builds check in the background every `updates.check_interval_ms` (6 hours) unless `updates.channel` is `none`.
+- `icarus update install` runs `brew upgrade --cask icarus` for Homebrew installs. Otherwise it downloads the release asset, checks it against `SHA256SUMS` and swaps in the app bundle (macOS) or the two binaries, keeping `*.previous`. Then it stops the server gracefully (agents sleep) and starts the new one through the login service if installed. The server now also treats SIGTERM as a graceful shutdown.
+- Not yet: a Linux app tarball (Zed's `bundle-linux` needs cargo-about, a musl remote server and lld, and would double the build), and the app does not yet listen to `notification` events, so the update notice shows in `icarus notifications` only. TODO: show `update_available` in the app with a "Restart to update" action that runs `icarus update install`.
+
 ## Blocked on you
 
 Parked until you're back; work continues on other items.
-Nothing right now.
+- **Homebrew tap:** `~/Developer/homebrew-tap` holds the new `Casks/icarus.rb` and README, uncommitted (I'm not allowed to push). Commit and push them, then set the `TAP_DEPLOY_KEY` secret on frbarbre/icarus (a write deploy key on frbarbre/homebrew-tap). Without the secret, releases still publish and the cask step is skipped with a notice.
+- **Private repo:** `brew install` and unauthenticated update checks need public release downloads, so they work only once frbarbre/icarus is public. Until then `icarus update` works through a signed-in `gh`.
+- **Cost:** a release builds the Zed app on a macOS runner (roughly an hour, billed 10x while private). Cut releases deliberately.
 
 ## In progress
 

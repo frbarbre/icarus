@@ -5,7 +5,7 @@
 //! `AgentEvent`s, kept in memory and on disk, so clients can attach, detach and resume by
 //! sequence number while the agent keeps working.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -611,7 +611,15 @@ impl AgentThread {
                 state.rate_limits = Some(event.data.clone());
                 state.rate_limits_at_ms = Some(event.at_ms);
             }
-            "exit" | "sleep" => {
+            "sleep" => {
+                // An agent that never got a message has nothing to resume; waking it just starts fresh.
+                state.state = if state.killed {
+                    AgentState::Exited
+                } else {
+                    AgentState::Sleeping
+                };
+            }
+            "exit" => {
                 state.state = if state.killed || state.provider_session.is_none() {
                     AgentState::Exited
                 } else {
@@ -929,7 +937,7 @@ impl AgentManager {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return 0;
         };
-        let mut restored = 0;
+        let mut candidates = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.to_string_lossy().ends_with(".meta.json") {
@@ -941,13 +949,43 @@ impl AgentManager {
                     let killed = lock(&thread.state).killed;
                     if !killed && (thread.state() != AgentState::Exited || thread.info().turns > 0)
                     {
-                        self.adopt(&thread);
-                        lock(&self.threads).insert(thread.id().to_string(), thread);
-                        restored += 1;
+                        candidates.push(thread);
                     }
                 }
                 Err(error) => tracing::warn!("cannot restore {}: {error:#}", path.display()),
             }
+        }
+        // Unused agents hold nothing, so only the newest per workspace is kept as its warm agent.
+        let mut newest_unused: HashMap<Option<String>, (u64, String)> = HashMap::new();
+        for thread in &candidates {
+            let info = thread.info();
+            if info.turns == 0 {
+                let entry = newest_unused
+                    .entry(info.workspace.clone())
+                    .or_insert((info.created_at_ms, info.id.clone()));
+                if info.created_at_ms > entry.0 {
+                    *entry = (info.created_at_ms, info.id.clone());
+                }
+            }
+        }
+        let keep: HashSet<String> = newest_unused.into_values().map(|(_, id)| id).collect();
+        let mut restored = 0;
+        for thread in candidates {
+            let info = thread.info();
+            if info.turns == 0 && !keep.contains(&info.id) {
+                for file in [
+                    dir.join(format!("{}.meta.json", info.id)),
+                    dir.join(format!("{}.jsonl", info.id)),
+                ] {
+                    if let Err(error) = std::fs::remove_file(&file) {
+                        tracing::warn!("cannot remove {}: {error}", file.display());
+                    }
+                }
+                continue;
+            }
+            self.adopt(&thread);
+            lock(&self.threads).insert(thread.id().to_string(), thread);
+            restored += 1;
         }
         restored
     }

@@ -6,6 +6,7 @@ mod ports;
 mod review;
 mod rules;
 mod service;
+mod update;
 
 use std::path::PathBuf;
 use std::process::{Command as Process, Stdio};
@@ -155,6 +156,11 @@ enum Command {
     Account {
         #[command(subcommand)]
         command: extras::AccountCommand,
+    },
+    /// Check for and install new Icarus releases.
+    Update {
+        #[command(subcommand)]
+        command: update::UpdateCommand,
     },
 }
 
@@ -1553,6 +1559,7 @@ async fn main() -> Result<()> {
             command,
         } => extras::notifications(&cli, *unread, *limit, command.as_ref()).await?,
         Command::Account { command } => extras::account(&cli, command).await?,
+        Command::Update { command } => update::run(&cli, command).await?,
         Command::Changes { command } => {
             let client = connect(&cli).await?;
             match command {

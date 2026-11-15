@@ -921,7 +921,7 @@ fn icarus_preview_deployments() -> serde_json::Value {
     });
     serde_json::json!({
         "previews": [
-            frontend.clone(),
+            frontend,
             {
                 "app": "storybook",
                 "environment": "storybook-preview",
@@ -2694,13 +2694,30 @@ fn run_icarus_agent_tabs_tests(
 ) -> Vec<(&'static str, Result<TestResult>)> {
     match open_icarus_agent_tabs_window(app_state, cx) {
         Ok(window) => {
-            let results = run_icarus_dark_and_light(
+            let mut results = run_icarus_dark_and_light(
                 "icarus_agent_tabs",
                 "icarus_agent_tabs_light",
                 window.into(),
                 cx,
                 update_baseline,
             );
+            // The second agent has no messages yet, so its tab shows the empty state above the composer.
+            let switched = window.update(cx, |workspace, window, cx| {
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.activate_item(1, true, false, window, cx);
+                });
+            });
+            cx.run_until_parked();
+            match switched {
+                Ok(()) => results.extend(run_icarus_dark_and_light(
+                    "icarus_agent_tab_empty",
+                    "icarus_agent_tab_empty_light",
+                    window.into(),
+                    cx,
+                    update_baseline,
+                )),
+                Err(error) => results.push(("icarus_agent_tab_empty", Err(error))),
+            }
             window
                 .update(cx, |workspace, _window, cx| {
                     let project = workspace.project().clone();

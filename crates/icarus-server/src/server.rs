@@ -34,6 +34,7 @@ pub struct Server {
     pub(crate) workspace_root: PathBuf,
     pub(crate) github: crate::github::GitHubService,
     pub(crate) linear: crate::linear::LinearService,
+    pub(crate) updates: crate::updates::Updates,
     pub(crate) automation: crate::automation::Automation,
     pub(crate) ports: crate::ports::Ports,
     pub(crate) history: Arc<crate::history::HistoryIndex>,
@@ -109,6 +110,7 @@ impl Server {
             workspace_root,
             github: crate::github::GitHubService::from_env(),
             linear: crate::linear::LinearService::from_env(),
+            updates: crate::updates::Updates::from_env(),
             automation: crate::automation::Automation::default(),
             ports: crate::ports::Ports::default(),
             history: Arc::default(),
@@ -196,6 +198,10 @@ impl Server {
         crate::automation::spawn(Arc::clone(&self));
         crate::ports::spawn(Arc::clone(&self));
         crate::linear::spawn(Arc::clone(&self));
+        crate::updates::spawn(Arc::clone(&self));
+        // launchd and systemd stop the service with SIGTERM; agents must sleep, not die.
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -209,6 +215,7 @@ impl Server {
                     });
                 }
                 () = self.shutdown.notified() => break,
+                _ = terminate.recv() => break,
             }
         }
         self.terminals.kill_all();
@@ -352,7 +359,7 @@ impl Server {
                             client_id = Some(id.clone());
                             let _ = outbound.send(ServerMessage::Welcome {
                                 version: PROTOCOL_VERSION,
-                                server_version: env!("CARGO_PKG_VERSION").to_string(),
+                                server_version: crate::updates::VERSION.to_string(),
                                 client_id: id,
                                 token: issued_token,
                                 paired_client_id,
@@ -408,7 +415,7 @@ impl Server {
     ) -> Result<Value, RpcError> {
         match method {
             "server.info" => Ok(json!({
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": crate::updates::VERSION,
                 "protocol": PROTOCOL_VERSION,
                 "pid": std::process::id(),
                 "home": self.paths.home,
@@ -1021,6 +1028,7 @@ impl Server {
                 self.next_action_dispatch(method, params_value).await
             }
             "agent.history" | "agent.resume" => self.history_dispatch(method, params_value).await,
+            other if other.starts_with("update.") => self.updates_dispatch(other).await,
             other if other.starts_with("notification.") => {
                 self.notifications_dispatch(other, params_value).await
             }

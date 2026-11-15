@@ -432,7 +432,7 @@ async fn test_escape_command_palette(cx: &mut gpui::TestAppContext) {
     let mut cx = VimTestContext::new(cx, true).await;
 
     cx.set_state("aˇbc\n", Mode::Normal);
-    cx.simulate_keystrokes("i f1");
+    cx.simulate_keystrokes("i cmd-shift-p");
 
     assert!(
         cx.workspace(|workspace, _, cx| workspace.active_modal::<CommandPalette>(cx).is_some())

@@ -804,11 +804,14 @@ fn main() {
                 agent_ui::agent_tab::AgentComposer::focus(&composer, window, cx);
             });
         });
-        icarus_ui::set_review_layout_handler(cx, |workspace, window, cx| {
+        icarus_ui::set_layout_applied_handler(cx, |workspace, window, cx| {
             if let Some(composer) = agent_ui::agent_tab::AgentComposer::for_workspace(workspace) {
                 agent_ui::agent_tab::AgentComposer::focus(&composer, window, cx);
             }
         });
+        cx.set_global(icarus_ui::layout::AgentItemType(std::any::TypeId::of::<
+            agent_ui::agent_tab::AgentTab,
+        >()));
         icarus_ui::set_open_agent_handler(cx, |agent_id, pane, workspace, window, cx| {
             agent_ui::agent_tab::open_agent_tab(workspace, agent_id, pane, true, window, cx);
         });

@@ -1429,6 +1429,9 @@ impl AgentPanel {
                         }
                     }
 
+                    // With agent tabs the tabs own the sessions; a panel restoring its own would claim
+                    // another server agent per workspace before anyone opens it.
+                    let tabs_own_sessions = cx.has_global::<crate::agent_tab::AgentTabsEnabled>();
                     if let Some(metadata) = terminal_to_restore {
                         panel.restore_terminal_for_panel_load(
                             metadata,
@@ -1438,7 +1441,9 @@ impl AgentPanel {
                             window,
                             cx,
                         );
-                    } else if let Some((info, thread_id)) = thread_to_restore {
+                    } else if let Some((info, thread_id)) =
+                        thread_to_restore.filter(|_| !tabs_own_sessions)
+                    {
                         let agent = panel.selected_agent.clone();
                         panel.load_agent_thread(
                             agent,
@@ -1454,6 +1459,7 @@ impl AgentPanel {
                     if let Some(new_draft_thread_id) = serialized_panel
                         .as_ref()
                         .and_then(|p| p.new_draft_thread_id)
+                        .filter(|_| !tabs_own_sessions)
                     {
                         panel.restore_new_draft(new_draft_thread_id, window, cx);
                     }
@@ -4202,6 +4208,7 @@ impl AgentPanel {
         &mut self,
         server_override: Option<Rc<dyn AgentServer>>,
         resume_session_id: Option<acp_v2::SessionId>,
+        resume_thread_id: Option<ThreadId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ConversationView> {
@@ -4211,22 +4218,29 @@ impl AgentPanel {
             },
             None => self.selected_agent(cx),
         };
+        let initial_content = resume_thread_id
+            .and_then(|thread_id| crate::draft_prompt_store::read(thread_id, cx))
+            .filter(|blocks| !blocks.is_empty())
+            .map(|blocks| AgentInitialContent::ContentBlock {
+                blocks,
+                auto_submit: false,
+            });
         let thread = self.create_agent_thread_inner(
             agent,
             server_override,
-            None,
+            resume_thread_id,
             resume_session_id,
             None,
             None,
-            None,
+            initial_content,
             None,
             AgentThreadSource::AgentPanel,
             window,
             cx,
         );
-        thread
-            .conversation_view
-            .update(cx, |view, cx| view.set_composer_hosted_externally(true, cx));
+        thread.conversation_view.update(cx, |view, cx| {
+            view.set_composer_hosted_externally(true, window, cx)
+        });
         thread.conversation_view
     }
 

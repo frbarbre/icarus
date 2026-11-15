@@ -22,9 +22,10 @@ pub const CI_FAILED: &str = "ci_failed";
 pub const REVIEW_REQUESTED: &str = "review_requested";
 pub const PR_MERGED: &str = "pr_merged";
 pub const RULES: &str = "rules";
+pub const UPDATE_AVAILABLE: &str = "update_available";
 
 /// Every kind has a `notifications.<kind>` toggle, on by default.
-pub const KINDS: [&str; 7] = [
+pub const KINDS: [&str; 8] = [
     AGENT_TURN_DONE,
     AGENT_WAITING,
     AGENT_FAILED,
@@ -32,13 +33,14 @@ pub const KINDS: [&str; 7] = [
     REVIEW_REQUESTED,
     PR_MERGED,
     RULES,
+    UPDATE_AVAILABLE,
 ];
 
 /// Orca's burst cooldown for agent news.
 const AGENT_WINDOW_MS: u64 = 5_000;
 /// Rules may plan the same `notify` on consecutive ticks.
 const RULES_WINDOW_MS: u64 = 10 * 60 * 1000;
-/// GitHub subjects name the exact state (head sha, merge), so one notification per state is enough.
+/// GitHub subjects name the exact state (head sha, merge, release), so one notification per state is enough.
 const GITHUB_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 const BODY_MAX_CHARS: usize = 280;
@@ -53,7 +55,7 @@ fn now_ms() -> u64 {
 
 fn window_ms(kind: &str) -> u64 {
     match kind {
-        CI_FAILED | REVIEW_REQUESTED | PR_MERGED => GITHUB_WINDOW_MS,
+        CI_FAILED | REVIEW_REQUESTED | PR_MERGED | UPDATE_AVAILABLE => GITHUB_WINDOW_MS,
         RULES => RULES_WINDOW_MS,
         _ => AGENT_WINDOW_MS,
     }

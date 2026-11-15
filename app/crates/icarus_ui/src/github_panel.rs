@@ -1124,9 +1124,11 @@ impl GitHubPanel {
             .as_ref()
             .and_then(|snapshot| snapshot.status.as_ref())
             .and_then(|status| status.pull_request.as_ref());
+        // Same height as the centre's tab bar, so the bottom borders line up across the window.
         let mut toolbar = h_flex()
+            .flex_none()
+            .h(ui::Tab::container_height(cx))
             .px_2()
-            .py_1()
             .gap_1p5()
             .border_b_1()
             .border_color(cx.theme().colors().border);
