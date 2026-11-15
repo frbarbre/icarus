@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -41,8 +42,13 @@ pub struct Server {
     /// Connected clients, for requests the server forwards to editors (e.g. open a file).
     clients: std::sync::Mutex<Vec<(String, String, Outbound)>>,
     shutdown: Notify,
+    /// Set by `server.shutdown { keep_terminals }`: park terminals for the next server.
+    keep_terminals: AtomicBool,
+    /// The previous server's network listeners, when terminals were handed over.
+    inherited_listen: Option<(Vec<String>, bool)>,
     pairing: crate::remote::Pairing,
     listening: std::sync::Mutex<Vec<SocketAddr>>,
+    allow_public: AtomicBool,
     tls_fingerprint: std::sync::Mutex<Option<String>>,
     /// Live connections of paired clients, closed when the client is revoked.
     paired_connections: std::sync::Mutex<Vec<(String, Arc<Notify>)>>,
@@ -82,11 +88,34 @@ impl Server {
         }
         let listener = UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-        let token = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
+        let handed = {
+            let paths = paths.clone();
+            tokio::task::spawn_blocking(move || crate::handoff::take(&paths)).await?
+        };
+        let handed = handed.unwrap_or_else(|error| {
+            tracing::warn!("could not take over the previous server's terminals: {error:#}");
+            None
+        });
+        let (token, inherited_listen, parked) = match handed {
+            Some((mut parcel, fds)) => {
+                tracing::info!(
+                    "took over {} terminal(s) from the previous server",
+                    parcel.terminals.len()
+                );
+                let token = parcel.token.take();
+                let listen = (std::mem::take(&mut parcel.listen), parcel.allow_public);
+                (token, Some(listen), parcel.into_terminals(fds))
+            }
+            None => (None, None, Vec::new()),
+        };
+        let terminals = TerminalManager::restore(paths.terminals(), parked);
+        let token = token.unwrap_or_else(|| {
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            )
+        });
         std::fs::write(paths.token(), &token)?;
         std::fs::set_permissions(paths.token(), std::fs::Permissions::from_mode(0o600))?;
         std::fs::write(paths.pid(), std::process::id().to_string())?;
@@ -120,11 +149,14 @@ impl Server {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or_default(),
-            terminals: TerminalManager::default(),
+            terminals,
             clients: std::sync::Mutex::new(Vec::new()),
             shutdown: Notify::new(),
+            keep_terminals: AtomicBool::new(false),
+            inherited_listen,
             pairing: crate::remote::Pairing::default(),
             listening: std::sync::Mutex::new(Vec::new()),
+            allow_public: AtomicBool::new(false),
             tls_fingerprint: std::sync::Mutex::new(None),
             paired_connections: std::sync::Mutex::new(Vec::new()),
         });
@@ -143,6 +175,7 @@ impl Server {
         if addrs.is_empty() {
             return Ok(Vec::new());
         }
+        self.allow_public.store(allow_public, Ordering::Relaxed);
         let tls = crate::remote::load_or_create_tls(&self.paths)?;
         *self
             .tls_fingerprint
@@ -199,10 +232,10 @@ impl Server {
         crate::ports::spawn(Arc::clone(&self));
         crate::linear::spawn(Arc::clone(&self));
         crate::updates::spawn(Arc::clone(&self));
-        // launchd and systemd stop the service with SIGTERM; agents must sleep, not die.
+        // launchd and systemd stop (and restart) the service with SIGTERM; nothing may die.
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        loop {
+        let keep_terminals = loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
@@ -214,14 +247,26 @@ impl Server {
                         }
                     });
                 }
-                () = self.shutdown.notified() => break,
-                _ = terminate.recv() => break,
+                () = self.shutdown.notified() => break self.keep_terminals.load(Ordering::Relaxed),
+                _ = terminate.recv() => break true,
             }
-        }
-        self.terminals.kill_all();
+        };
         // Agents sleep rather than die, so the next server resumes them.
         for agent in self.agents.all() {
             let _ = agent.sleep().await;
+        }
+        if keep_terminals {
+            // The socket stays bound until the holder has everything, so no new server starts early.
+            match self.park_terminals().await {
+                Ok(count) => tracing::info!("parked {count} terminal(s) for the next server"),
+                Err(error) => {
+                    tracing::warn!("could not keep terminals running: {error:#}");
+                    self.terminals.kill_all();
+                }
+            }
+        } else {
+            self.terminals.kill_all();
+            self.terminals.forget_all();
         }
         let _ = std::fs::remove_file(self.paths.socket());
         let _ = std::fs::remove_file(self.paths.pid());
@@ -792,8 +837,16 @@ impl Server {
                 Ok(json!({ "delivered": delivered }))
             }
             "server.shutdown" => {
+                #[derive(Deserialize)]
+                struct P {
+                    #[serde(default)]
+                    keep_terminals: bool,
+                }
+                let p: P = params(params_value)?;
+                self.keep_terminals
+                    .store(p.keep_terminals, Ordering::Relaxed);
                 self.shutdown.notify_one();
-                Ok(json!({ "stopping": true }))
+                Ok(json!({ "stopping": true, "keep_terminals": p.keep_terminals }))
             }
             "terminal.create" => {
                 #[derive(Deserialize)]
@@ -1085,6 +1138,32 @@ fn default_true() -> bool {
 }
 
 impl Server {
+    /// The network listeners the previous server had, when this one took over its terminals.
+    pub fn inherited_listen(&self) -> Option<&(Vec<String>, bool)> {
+        self.inherited_listen.as_ref()
+    }
+
+    async fn park_terminals(&self) -> Result<usize> {
+        if self.terminals.list().is_empty() {
+            return Ok(0);
+        }
+        let paths = self.paths.clone();
+        tokio::task::spawn_blocking(move || crate::handoff::spawn_holder(&paths)).await??;
+        let (terminals, fds): (Vec<_>, Vec<_>) = self.terminals.park_all().into_iter().unzip();
+        let parcel = crate::handoff::Parcel {
+            version: crate::handoff::VERSION,
+            token: Some(self.token.clone()),
+            listen: self.listen_addresses(),
+            allow_public: self.allow_public.load(Ordering::Relaxed),
+            terminals,
+        };
+        let fds: Vec<_> = fds.into_iter().flatten().collect();
+        let count = parcel.terminals.len();
+        let paths = self.paths.clone();
+        tokio::task::spawn_blocking(move || crate::handoff::put(&paths, &parcel, &fds)).await??;
+        Ok(count)
+    }
+
     fn listen_addresses(&self) -> Vec<String> {
         self.listening
             .lock()

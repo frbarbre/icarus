@@ -80,6 +80,12 @@ impl Emulator {
         effects
     }
 
+    /// Rebuilds a screen from `snapshot_vt` output, e.g. after another server handed it over.
+    pub fn restore(&mut self, snapshot: &[u8], title: Option<String>) {
+        self.feed(snapshot);
+        self.title = title;
+    }
+
     pub fn resize(&mut self, columns: u16, rows: u16) {
         let size = TermSize::new(usize::from(columns.max(2)), usize::from(rows.max(1)));
         self.term.resize(size);

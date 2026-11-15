@@ -34,6 +34,9 @@ enum Command {
     },
     /// Bridge stdio to this machine's server, starting it if needed. Run over SSH by remote clients.
     Proxy,
+    /// Keep a stopping server's terminals alive until the next server takes them (internal).
+    #[command(hide = true)]
+    Hold,
 }
 
 fn configured_listen() -> Result<Vec<String>> {
@@ -129,6 +132,32 @@ async fn proxy(paths: ServerPaths) -> Result<()> {
     Ok(())
 }
 
+/// Rebinds the previous server's addresses. Never fatal: the adopted terminals matter more.
+async fn listen_inherited(
+    server: &std::sync::Arc<Server>,
+    inherited: &[String],
+    allow_public: bool,
+) -> Vec<std::net::SocketAddr> {
+    let addrs: Vec<_> = inherited
+        .iter()
+        .filter_map(|text| icarus_server::remote::parse_listen(text).ok())
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match server.listen_tcp(&addrs, allow_public).await {
+            Ok(bound) => return bound,
+            // The previous server may not have released its ports yet.
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                tracing::warn!("could not listen on {inherited:?} again: {error:#}");
+                return Vec::new();
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -159,12 +188,19 @@ async fn main() -> Result<()> {
             }
             let (server, listener) = Server::bind(paths.clone()).await?;
             tracing::info!("listening on {}", paths.socket().display());
-            for addr in server.listen_tcp(&addrs, allow_public).await? {
+            let bound = match server.inherited_listen() {
+                Some((inherited, public)) if addrs.is_empty() && !inherited.is_empty() => {
+                    listen_inherited(&server, inherited, *public).await
+                }
+                _ => server.listen_tcp(&addrs, allow_public).await?,
+            };
+            for addr in bound {
                 tracing::info!("listening on tcp://{addr}");
                 let _ = writeln!(std::io::stdout(), "listening on tcp://{addr}");
             }
             server.run(listener).await
         }
         Command::Proxy => proxy(paths).await,
+        Command::Hold => icarus_server::handoff::hold(&paths),
     }
 }

@@ -26,6 +26,7 @@ anyhow = "1.0.104"
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
+filedescriptor = "0.8.3"
 icarus-git = { version = "0.1.0", path = "../icarus-git" }
 icarus-github = { version = "0.1.0", path = "../icarus-github" }
 icarus-linear = { version = "0.1.0", path = "../icarus-linear" }
@@ -41,6 +42,13 @@ rcgen = { version = "0.14.10", default-features = false, features = [
 ] }
 regex = "1.13.1"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
+rustix = { version = "1.1.6", features = [
+  "event",
+  "net",
+  "pipe",
+  "process",
+  "termios",
+] }
 rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "std",

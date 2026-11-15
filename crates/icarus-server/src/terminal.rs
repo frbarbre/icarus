@@ -1,12 +1,21 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use serde::Serialize;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+use filedescriptor::FileDescriptor;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::io::{Errno, FdFlags, fcntl_setfd};
+use rustix::process::{Pid, Signal, kill_process};
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::emulator::Emulator;
@@ -48,6 +57,8 @@ pub struct TerminalInfo {
     pub exit_code: Option<u32>,
     pub created_at_ms: u64,
     pub next_seq: u64,
+    /// The server stopped without handing this terminal on, so its process and output are gone.
+    pub lost: bool,
 }
 
 /// What a client gets when it (re)attaches: either the missing output or a full screen snapshot.
@@ -60,6 +71,39 @@ pub struct Attachment {
     pub rows: u16,
 }
 
+/// What `terminals.json` keeps per terminal, so a server that died can still list what it lost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalRecord {
+    pub id: String,
+    pub label: Option<String>,
+    pub workspace: Option<String>,
+    pub cwd: PathBuf,
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub created_at_ms: u64,
+    pub columns: u16,
+    pub rows: u16,
+}
+
+/// A terminal as handed to the next server: its record, live state and screen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParkedTerminal {
+    #[serde(flatten)]
+    pub record: TerminalRecord,
+    pub title: Option<String>,
+    pub pid: Option<u32>,
+    pub running: bool,
+    pub exit_code: Option<u32>,
+    pub next_seq: u64,
+    /// Scrollback and screen as replayable VT.
+    pub snapshot: String,
+    /// Recent raw output (base64), so clients keep resuming by sequence number.
+    pub ring: Vec<(u64, String)>,
+    /// Whether a PTY master travels with this terminal.
+    pub has_pty: bool,
+}
+
 struct State {
     emulator: Emulator,
     ring: VecDeque<(u64, Vec<u8>)>,
@@ -70,6 +114,14 @@ struct State {
     pid: Option<u32>,
     /// Bumped by `respawn`, so the previous process's reader cannot mark the new one exited.
     generation: u64,
+    lost: bool,
+}
+
+/// The PTY master and the thread reading it.
+struct Io {
+    master: File,
+    stop: OwnedFd,
+    reader: Option<JoinHandle<()>>,
 }
 
 pub struct TerminalSession {
@@ -81,19 +133,16 @@ pub struct TerminalSession {
     env: BTreeMap<String, String>,
     created_at_ms: u64,
     state: Mutex<State>,
-    writer: Mutex<Box<dyn Write + Send>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    io: Mutex<Option<Io>>,
     events: broadcast::Sender<TerminalEvent>,
 }
 
+type Child = Box<dyn portable_pty::Child + Send + Sync>;
+
 /// A started process on a fresh PTY, before it is wired into a session.
 struct Pty {
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    reader: Box<dyn Read + Send>,
-    writer: Box<dyn Write + Send>,
-    master: Box<dyn MasterPty + Send>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    child: Child,
+    master: File,
     pid: Option<u32>,
 }
 
@@ -126,23 +175,15 @@ fn open_pty(
         .map_err(|e| anyhow!("spawn {}: {e}", command[0]))?;
     drop(pair.slave);
     let pid = child.process_id();
-    let killer = child.clone_killer();
-    let reader = pair
+    // Our own copy of the master: portable-pty's writer sends EOF to the shell when dropped.
+    let raw = pair
         .master
-        .try_clone_reader()
-        .map_err(|e| anyhow!("pty reader: {e}"))?;
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| anyhow!("pty writer: {e}"))?;
-    Ok(Pty {
-        child,
-        reader,
-        writer,
-        master: pair.master,
-        killer,
-        pid,
-    })
+        .as_raw_fd()
+        .context("the PTY has no master fd")?;
+    let master = FileDescriptor::dup(&raw)
+        .and_then(|fd| fd.as_file())
+        .context("duplicate the PTY master")?;
+    Ok(Pty { child, master, pid })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -158,18 +199,52 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn pty_size(columns: u16, rows: u16) -> PtySize {
+    PtySize {
+        rows: rows.max(1),
+        cols: columns.max(2),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
 pub fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
 }
 
 impl TerminalSession {
+    fn new(record: TerminalRecord, state: State) -> Arc<Self> {
+        let (events, _) = broadcast::channel(4096);
+        Arc::new(Self {
+            id: record.id,
+            label: record.label,
+            workspace: record.workspace,
+            cwd: record.cwd,
+            command: record.command,
+            env: record.env,
+            created_at_ms: record.created_at_ms,
+            state: Mutex::new(state),
+            io: Mutex::new(None),
+            events,
+        })
+    }
+
+    fn idle_state(emulator: Emulator) -> State {
+        State {
+            emulator,
+            ring: VecDeque::new(),
+            ring_bytes: 0,
+            next_seq: 0,
+            exit_code: None,
+            running: false,
+            pid: None,
+            generation: 0,
+            lost: false,
+        }
+    }
+
     pub fn spawn(id: String, options: SpawnOptions) -> Result<Arc<Self>> {
-        let size = PtySize {
-            rows: options.rows.max(1),
-            cols: options.columns.max(2),
-            pixel_width: 0,
-            pixel_height: 0,
-        };
+        let size = pty_size(options.columns, options.rows);
         let command = options
             .command
             .clone()
@@ -183,46 +258,77 @@ impl TerminalSession {
             &options.env,
             size,
         )?;
-        let (events, _) = broadcast::channel(4096);
-
-        let session = Arc::new(Self {
-            id,
-            label: options.label,
-            workspace: options.workspace,
-            cwd: options.cwd,
-            command,
-            env: options.env,
-            created_at_ms: now_ms(),
-            state: Mutex::new(State {
-                emulator: Emulator::new(size.cols, size.rows),
-                ring: VecDeque::new(),
-                ring_bytes: 0,
-                next_seq: 0,
-                exit_code: None,
-                running: true,
-                pid: pty.pid,
-                generation: 0,
-            }),
-            writer: Mutex::new(pty.writer),
-            master: Mutex::new(pty.master),
-            killer: Mutex::new(pty.killer),
-            events,
-        });
-        session.start_reader(pty.reader, pty.child, 0)?;
+        let mut state = Self::idle_state(Emulator::new(size.cols, size.rows));
+        state.running = true;
+        state.pid = pty.pid;
+        let session = Self::new(
+            TerminalRecord {
+                id,
+                label: options.label,
+                workspace: options.workspace,
+                cwd: options.cwd,
+                command,
+                env: options.env,
+                created_at_ms: now_ms(),
+                columns: size.cols,
+                rows: size.rows,
+            },
+            state,
+        );
+        session.start_io(pty.master, Some(pty.child), 0)?;
         Ok(session)
     }
 
-    fn start_reader(
+    /// Takes over a terminal another server parked; its process keeps running untouched.
+    pub fn adopt(parked: ParkedTerminal, master: Option<OwnedFd>) -> Result<Arc<Self>> {
+        let size = pty_size(parked.record.columns, parked.record.rows);
+        let mut emulator = Emulator::new(size.cols, size.rows);
+        emulator.restore(parked.snapshot.as_bytes(), parked.title.clone());
+        let mut state = Self::idle_state(emulator);
+        for (seq, data) in &parked.ring {
+            let data = B64.decode(data).context("decode parked output")?;
+            state.ring_bytes += data.len();
+            state.ring.push_back((*seq, data));
+        }
+        state.next_seq = parked.next_seq;
+        state.exit_code = parked.exit_code;
+        state.pid = parked.pid;
+        state.running = parked.running && master.is_some();
+        let session = Self::new(parked.record, state);
+        if let Some(master) = master.filter(|_| parked.running) {
+            session.start_io(File::from(master), None, 0)?;
+        }
+        Ok(session)
+    }
+
+    /// A terminal the previous server listed but could not hand on (it crashed or was killed).
+    pub fn lost(record: TerminalRecord) -> Arc<Self> {
+        let size = pty_size(record.columns, record.rows);
+        let mut state = Self::idle_state(Emulator::new(size.cols, size.rows));
+        state.lost = true;
+        Self::new(record, state)
+    }
+
+    fn start_io(
         self: &Arc<Self>,
-        reader: Box<dyn Read + Send>,
-        child: Box<dyn portable_pty::Child + Send + Sync>,
+        master: File,
+        child: Option<Child>,
         generation: u64,
     ) -> Result<()> {
+        let reader = master.try_clone().context("clone the PTY master")?;
+        let (stop_reader, stop) = rustix::pipe::pipe().context("create a stop pipe")?;
+        fcntl_setfd(&stop_reader, FdFlags::CLOEXEC)?;
+        fcntl_setfd(&stop, FdFlags::CLOEXEC)?;
         let reading = Arc::clone(self);
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("pty-{}", reading.id))
-            .spawn(move || reading.read_loop(reader, child, generation))
+            .spawn(move || reading.read_loop(reader, stop_reader, child, generation))
             .context("spawn pty reader thread")?;
+        *lock(&self.io) = Some(Io {
+            master,
+            stop,
+            reader: Some(handle),
+        });
         Ok(())
     }
 
@@ -232,48 +338,57 @@ impl TerminalSession {
             return Ok(());
         }
         let (columns, rows) = lock(&self.state).emulator.size();
-        let size = PtySize {
-            rows,
-            cols: columns,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
         let pty = open_pty(
             &self.id,
             &self.command,
             &self.cwd,
             self.workspace.as_deref(),
             &self.env,
-            size,
+            pty_size(columns, rows),
         )?;
-        *lock(&self.writer) = pty.writer;
-        *lock(&self.master) = pty.master;
-        *lock(&self.killer) = pty.killer;
         let generation = {
             let mut state = lock(&self.state);
             state.generation += 1;
             state.running = true;
+            state.lost = false;
             state.exit_code = None;
             state.pid = pty.pid;
             state.generation
         };
-        self.start_reader(pty.reader, pty.child, generation)
+        self.start_io(pty.master, Some(pty.child), generation)
     }
 
-    fn read_loop(
-        &self,
-        mut reader: Box<dyn Read + Send>,
-        mut child: Box<dyn portable_pty::Child + Send + Sync>,
-        generation: u64,
-    ) {
+    fn read_loop(&self, reader: File, stop: OwnedFd, child: Option<Child>, generation: u64) {
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
-            match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+            let mut fds = [
+                PollFd::new(&reader, PollFlags::IN),
+                PollFd::new(&stop, PollFlags::IN),
+            ];
+            match poll(&mut fds, None) {
+                Ok(_) => {}
+                Err(Errno::INTR) => continue,
+                Err(_) => break,
+            }
+            if !fds[1].revents().is_empty() {
+                // Parked: the next server reads from here on, and the process lives on.
+                return;
+            }
+            match (&reader).read(&mut buffer) {
+                Ok(0) => break,
                 Ok(n) => self.ingest(&buffer[..n]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(_) => break,
             }
         }
-        let code = child.wait().ok().map(|status| status.exit_code());
+        // An adopted process is not our child, so its exit code is unknown.
+        let code = child
+            .and_then(|mut child| child.wait().ok())
+            .map(|status| status.exit_code());
         {
             let mut state = lock(&self.state);
             if state.generation != generation {
@@ -288,11 +403,10 @@ impl TerminalSession {
     fn ingest(&self, bytes: &[u8]) {
         let data = Arc::new(bytes.to_vec());
         let effects;
-        let seq;
         {
             let mut state = lock(&self.state);
             effects = state.emulator.feed(bytes);
-            seq = state.next_seq;
+            let seq = state.next_seq;
             state.next_seq += 1;
             state.ring_bytes += bytes.len();
             state.ring.push_back((seq, bytes.to_vec()));
@@ -305,14 +419,66 @@ impl TerminalSession {
             // Sent under the lock so an attach can never observe a seq without its event.
             let _ = self.events.send(TerminalEvent::Output { seq, data });
         }
-        if !effects.pty_replies.is_empty() {
-            let _ = lock(&self.writer).write_all(&effects.pty_replies);
+        if !effects.pty_replies.is_empty()
+            && let Some(io) = lock(&self.io).as_ref()
+        {
+            let _ = (&io.master).write_all(&effects.pty_replies);
         }
         if let Some(title) = effects.title {
             let _ = self.events.send(TerminalEvent::Title(title));
         }
         if effects.bell {
             let _ = self.events.send(TerminalEvent::Bell);
+        }
+    }
+
+    /// Stops reading and returns the terminal's state plus its PTY master (if the process runs).
+    pub fn park(&self) -> (ParkedTerminal, Option<OwnedFd>) {
+        let io = lock(&self.io).take();
+        let master = io.map(|mut io| {
+            let _ = rustix::io::write(&io.stop, b"x");
+            if let Some(reader) = io.reader.take() {
+                let _ = reader.join();
+            }
+            io.master
+        });
+        let state = lock(&self.state);
+        let (columns, rows) = state.emulator.size();
+        let master = master.filter(|_| state.running).map(OwnedFd::from);
+        let parked = ParkedTerminal {
+            record: self.record_sized(columns, rows),
+            title: state.emulator.title().map(str::to_string),
+            pid: state.pid,
+            running: master.is_some(),
+            exit_code: state.exit_code,
+            next_seq: state.next_seq,
+            snapshot: state.emulator.snapshot_vt(),
+            ring: state
+                .ring
+                .iter()
+                .map(|(seq, data)| (*seq, B64.encode(data)))
+                .collect(),
+            has_pty: master.is_some(),
+        };
+        (parked, master)
+    }
+
+    fn record(&self) -> TerminalRecord {
+        let (columns, rows) = lock(&self.state).emulator.size();
+        self.record_sized(columns, rows)
+    }
+
+    fn record_sized(&self, columns: u16, rows: u16) -> TerminalRecord {
+        TerminalRecord {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            workspace: self.workspace.clone(),
+            cwd: self.cwd.clone(),
+            command: self.command.clone(),
+            env: self.env.clone(),
+            created_at_ms: self.created_at_ms,
+            columns,
+            rows,
         }
     }
 
@@ -337,6 +503,7 @@ impl TerminalSession {
             exit_code: state.exit_code,
             created_at_ms: self.created_at_ms,
             next_seq: state.next_seq,
+            lost: state.lost,
         }
     }
 
@@ -381,22 +548,28 @@ impl TerminalSession {
     }
 
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
-        let mut writer = lock(&self.writer);
-        writer.write_all(bytes)?;
-        writer.flush()?;
+        let io = lock(&self.io);
+        let io = io.as_ref().context("the terminal has no process")?;
+        let mut master = &io.master;
+        master.write_all(bytes)?;
+        master.flush()?;
         Ok(())
     }
 
     pub fn resize(&self, columns: u16, rows: u16) -> Result<()> {
-        let size = PtySize {
-            rows: rows.max(1),
-            cols: columns.max(2),
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        lock(&self.master)
-            .resize(size)
-            .map_err(|e| anyhow!("resize: {e}"))?;
+        let size = pty_size(columns, rows);
+        if let Some(io) = lock(&self.io).as_ref() {
+            rustix::termios::tcsetwinsize(
+                &io.master,
+                rustix::termios::Winsize {
+                    ws_row: size.rows,
+                    ws_col: size.cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                },
+            )
+            .context("resize")?;
+        }
         lock(&self.state).emulator.resize(size.cols, size.rows);
         Ok(())
     }
@@ -409,8 +582,20 @@ impl TerminalSession {
         lock(&self.state).emulator.full_text()
     }
 
+    /// Sends SIGHUP, as closing a terminal window does.
     pub fn kill(&self) -> Result<()> {
-        lock(&self.killer).kill().context("kill terminal process")
+        let state = lock(&self.state);
+        if !state.running {
+            return Ok(());
+        }
+        let pid = state
+            .pid
+            .and_then(|pid| Pid::from_raw(i32::try_from(pid).ok()?))
+            .context("the terminal has no process id")?;
+        match kill_process(pid, Signal::HUP) {
+            Ok(()) | Err(Errno::SRCH) => Ok(()),
+            Err(error) => Err(error).context("kill terminal process"),
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -421,13 +606,67 @@ impl TerminalSession {
 #[derive(Default)]
 pub struct TerminalManager {
     sessions: Mutex<BTreeMap<String, Arc<TerminalSession>>>,
+    /// `terminals.json`; absent in tests that need no persistence.
+    registry: Option<PathBuf>,
 }
 
 impl TerminalManager {
+    /// Adopts what the previous server handed over and marks the rest of its terminals lost.
+    pub fn restore(registry: PathBuf, parked: Vec<(ParkedTerminal, Option<OwnedFd>)>) -> Self {
+        let mut records: Vec<TerminalRecord> = std::fs::read(&registry)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let mut sessions = BTreeMap::new();
+        for (terminal, master) in parked {
+            let record = terminal.record.clone();
+            let session = TerminalSession::adopt(terminal, master).unwrap_or_else(|error| {
+                tracing::warn!("could not adopt terminal {}: {error:#}", record.id);
+                TerminalSession::lost(record.clone())
+            });
+            sessions.insert(record.id.clone(), session);
+        }
+        let adopted: BTreeSet<String> = sessions.keys().cloned().collect();
+        records.retain(|record| !adopted.contains(&record.id));
+        for record in records {
+            tracing::info!(
+                "terminal {} was lost when the last server stopped",
+                record.id
+            );
+            sessions.insert(record.id.clone(), TerminalSession::lost(record));
+        }
+        let manager = Self {
+            sessions: Mutex::new(sessions),
+            registry: Some(registry),
+        };
+        manager.save();
+        manager
+    }
+
+    fn save(&self) {
+        let Some(path) = &self.registry else {
+            return;
+        };
+        let records: Vec<TerminalRecord> = lock(&self.sessions)
+            .values()
+            .map(|session| session.record())
+            .collect();
+        let write = || -> Result<()> {
+            let partial = path.with_extension("json.partial");
+            std::fs::write(&partial, serde_json::to_vec(&records)?)?;
+            std::fs::rename(&partial, path)?;
+            Ok(())
+        };
+        if let Err(error) = write() {
+            tracing::warn!("could not save {}: {error:#}", path.display());
+        }
+    }
+
     pub fn create(&self, options: SpawnOptions) -> Result<Arc<TerminalSession>> {
         let id = format!("term-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
         let session = TerminalSession::spawn(id.clone(), options)?;
         lock(&self.sessions).insert(id, Arc::clone(&session));
+        self.save();
         Ok(session)
     }
 
@@ -440,13 +679,30 @@ impl TerminalManager {
     }
 
     pub fn remove(&self, id: &str) -> Option<Arc<TerminalSession>> {
-        lock(&self.sessions).remove(id)
+        let removed = lock(&self.sessions).remove(id);
+        if removed.is_some() {
+            self.save();
+        }
+        removed
     }
 
     pub fn kill_all(&self) {
         for session in lock(&self.sessions).values() {
             let _ = session.kill();
         }
+    }
+
+    /// After a deliberate stop the next server starts clean instead of listing lost terminals.
+    pub fn forget_all(&self) {
+        if let Some(path) = &self.registry {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Stops every reader and returns the terminals with the PTY masters of running ones.
+    pub fn park_all(&self) -> Vec<(ParkedTerminal, Option<OwnedFd>)> {
+        let sessions: Vec<_> = lock(&self.sessions).values().cloned().collect();
+        sessions.iter().map(|session| session.park()).collect()
     }
 }
 
@@ -553,5 +809,63 @@ mod tests {
         let info = session.info();
         assert_eq!((info.columns, info.rows), (100, 30));
         session.kill().expect("kill");
+    }
+
+    #[test]
+    fn a_parked_terminal_is_adopted_with_its_process_screen_and_sequence() {
+        let manager = TerminalManager::default();
+        let session = manager.create(options(&["/bin/cat"])).expect("spawn");
+        session.write(b"before-park\n").expect("write");
+        wait_until(|| session.screen_text().matches("before-park").count() >= 2);
+        let before = session.info();
+
+        let (parked, master) = session.park();
+        assert!(parked.has_pty);
+        let master = master.expect("master");
+        assert!(session.write(b"x").is_err(), "the parked session lets go");
+        // Typed while nobody reads; the next owner still sees the echo.
+        File::from(master.try_clone().expect("dup"))
+            .write_all(b"in-the-gap\n")
+            .expect("write");
+
+        assert_eq!(parked.next_seq, before.next_seq);
+        let adopted = TerminalSession::adopt(parked, Some(master)).expect("adopt");
+        wait_until(|| adopted.screen_text().matches("in-the-gap").count() >= 2);
+        let after = adopted.info();
+        assert_eq!(after.pid, before.pid);
+        assert!(after.running && after.next_seq > before.next_seq);
+        assert!(adopted.full_text().contains("before-park"));
+        let (resumed, _) = adopted.attach(Some(before.next_seq - 1));
+        assert!(resumed.snapshot.is_none(), "resumes by sequence");
+        assert_eq!(resumed.chunks[0].0, before.next_seq - 1);
+
+        adopted.write(b"after-park\n").expect("write");
+        wait_until(|| adopted.screen_text().matches("after-park").count() >= 2);
+        adopted.kill().expect("kill");
+        wait_until(|| !adopted.is_running());
+        assert_eq!(adopted.info().exit_code, None);
+    }
+
+    #[test]
+    fn restore_lists_unhanded_terminals_as_lost_and_they_can_respawn() {
+        let dir = tempfile::tempdir().expect("dir");
+        let registry = dir.path().join("terminals.json");
+        let first = TerminalManager::restore(registry.clone(), Vec::new());
+        let session = first.create(options(&["/bin/cat"])).expect("spawn");
+        let id = session.id().to_string();
+        session.kill().expect("kill");
+        drop(first);
+
+        let second = TerminalManager::restore(registry.clone(), Vec::new());
+        let info = second.get(&id).expect("listed").info();
+        assert!(info.lost && !info.running);
+        let lost = second.get(&id).expect("listed");
+        lost.respawn().expect("respawn");
+        assert!(!lost.info().lost && lost.is_running());
+        lost.kill().expect("kill");
+
+        second.forget_all();
+        let third = TerminalManager::restore(registry, Vec::new());
+        assert!(third.list().is_empty());
     }
 }

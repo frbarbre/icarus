@@ -41,7 +41,7 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - The Orca importer (D4, D18).
 
 **CLI** (`crates/icarus-cli`, binary `icarus`):
-- Commands: `server start|stop|status`, `terminal …`, `agent …`, `project …`, `workspace …`, all with `--json`.
+- Commands: `server start|stop|restart|status`, `terminal …`, `agent …`, `project …`, `workspace …`, all with `--json`.
 - **`icarus acp`:** an Agent Client Protocol agent on stdio, backed by server-owned sessions. It gives Zed's agent UI on top of Icarus with no Zed patch.
   - On `session/new` it reuses the workspace's warm agent.
   - `session/load` replays history, and `session/list` enables Zed's thread import.
@@ -172,6 +172,7 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - `account.select` sets the default per provider (`system` means the provider's own login). `agent.create` and `workspace.create` take an `account` override. Launches on a managed Claude account drop `ANTHROPIC_API_KEY` and the other auth variables, as Orca does.
 - `account.list` shows each account with its newest usage meters, taken from the rate-limit events of agents that ran on it.
 - CLI: `icarus account list|add|remove|use`.
+- Tested with the fake agent only (the account's dir and the stripped API key reach the process); signing in to a real second account is untested until one exists.
 
 **Review mode (server)** (github-review.md, D23):
 - The server keeps a reviewer's unsent review per workspace and pull request in `state.db`: draft comments (path, line or range, side, markdown body, file comments), the summary, the verdict, and the chosen diff base. Drafts are keyed by PR, never by commit, so they survive server restarts and pushes. A file comment keeps its kind on disk (the fork lost it).
@@ -188,19 +189,23 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - `.github/workflows/release.yml` runs on `v*` tags and by hand (`gh workflow run release.yml -f version=0.2.0`), never on normal pushes. It builds `icarus` + `icarus-server` for Linux x86_64 and aarch64 (glibc, on native Ubuntu 22.04 runners) and a universal macOS tarball, then `Icarus.app` for Apple silicon (`scripts/release/bundle-mac.sh`; Intel with the `intel_app` input) as a `.zip` and a `.dmg`. The app is ad-hoc signed (bundle id `dev.icarus.app`) and Zed's own updater is compiled off with `ZED_UPDATE_EXPLANATION`. It publishes a GitHub release with `SHA256SUMS` and generated notes, and the version is stamped into the binaries (`ICARUS_VERSION`).
 - Homebrew: `brew install --cask frbarbre/tap/icarus` installs the app and links `icarus` and `icarus-server`. The cask and the tap's README live in `scripts/release/homebrew/`; each stable release writes them into `frbarbre/homebrew-tap` with the new version and sha256, pushing with the `TAP_TOKEN` secret (set) or a `TAP_DEPLOY_KEY`. The cask pins the version; pinning (not `version :latest` as in §72) lets `brew upgrade --cask icarus` see new versions and checks the download.
 - `update.check` / `icarus update check` compare the running version with the newest non-prerelease on `frbarbre/icarus`, through `gh` when it is signed in, else unauthenticated HTTPS (which 404s while the repo is private). A newer version sends one `update_available` notification per version ("Update available — restart to update"). Release builds check in the background every `updates.check_interval_ms` (6 hours) unless `updates.channel` is `none`.
-- `icarus update install` runs `brew upgrade --cask icarus` for Homebrew installs. Otherwise it downloads the release asset, checks it against `SHA256SUMS` and swaps in the app bundle (macOS) or the two binaries, keeping `*.previous`. Then it stops the server gracefully (agents sleep) and starts the new one through the login service if installed. The server now also treats SIGTERM as a graceful shutdown.
+- `icarus update install` runs `brew upgrade --cask icarus` for Homebrew installs. Otherwise it downloads the release asset, checks it against `SHA256SUMS` and swaps in the app bundle (macOS) or the two binaries, keeping `*.previous`. Then it restarts the server gracefully (agents sleep, terminals keep running) and starts the new one through the login service if installed. The server now also treats SIGTERM as a graceful shutdown.
 - Not yet: a Linux app tarball (Zed's `bundle-linux` needs cargo-about, a musl remote server and lld, and would double the build), and the app does not yet listen to `notification` events, so the update notice shows in `icarus notifications` only. TODO: show `update_available` in the app with a "Restart to update" action that runs `icarus update install`.
+
+**Terminals survive restarts:**
+- `icarus server restart`, `icarus update install` and a SIGTERM from launchd or systemd hand terminals to the next server. Processes, pids, background jobs, scrollback and sequence numbers stay the same, so attached clients resume by sequence. Agents still sleep and resume.
+- How it works: the stopping server stops its readers and passes each PTY master over `SCM_RIGHTS` to a small `icarus-server hold` process, with the screen snapshot, recent output and the auth token. The next server takes them over on start. The master is never closed, and children run in their own sessions, so they get no SIGHUP. A holder that nobody claims gives up after 2 minutes (`ICARUS_HANDOFF_HOLD_SECS`).
+- `icarus server stop` still ends terminals. After a crash or `kill -9`, the PTYs close with the server and their shells get SIGHUP; anything detached (`nohup`, `setsid`) is orphaned. The next server lists these terminals as `lost` (from `terminals.json`), and they can be respawned.
+- Tested end to end (`crates/icarus-cli/tests/restart_e2e.rs`) on macOS and in a Linux container. The launchd and systemd restart paths have not been tested against a real service.
 
 ## Blocked on you
 
 Parked until you're back; work continues on other items.
-- **Second account login:** after `icarus account add`, signing in (`CLAUDE_CONFIG_DIR=… claude /login`) is interactive.
 - **macOS notification permission:** accept the prompt the first time the app shows a notification.
 
 ## In progress
 
 - App: the browser, explorer and diff tab types.
-- Server: terminals that survive a server restart.
 
 ## Next
 
@@ -208,5 +213,4 @@ Parked until you're back; work continues on other items.
 - App: the review mode UI on top of the `review.*` RPCs (queued comments in the diff, verdict, base picker, threads, media in comments).
 - App: notifications (sound, dock badge, the `notification` event), session history in the palette, account switching in the status bar.
 - App: a missing agent behind a tab with no messages starts a fresh one quietly instead of showing an error.
-- Server: terminals survive a server restart or update (hand the PTYs to the new server process), as agents already do.
 - Remaining plan items: LSP config import, theme conversion on import, Remote Control toggle, migration scripts for existing Orca CLI users, a live Tailscale check of remote servers, multi-server client.

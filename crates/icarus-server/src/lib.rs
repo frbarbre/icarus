@@ -6,6 +6,7 @@ pub mod changes;
 pub mod codex;
 pub mod emulator;
 pub mod github;
+pub mod handoff;
 pub mod history;
 pub mod layouts;
 pub mod linear;

@@ -20,7 +20,8 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 pub enum UpdateCommand {
     /// Compare the server's version with the newest Icarus release.
     Check,
-    /// Install the newest release and restart the server; agents sleep and resume.
+    /// Install the newest release and restart the server; terminals keep running, agents sleep
+    /// and resume.
     ///
     /// Homebrew installs run `brew upgrade --cask icarus`. Otherwise the release asset is
     /// downloaded, checked against SHA256SUMS and swapped in: the app bundle on macOS, else the
@@ -342,12 +343,27 @@ fn download_verified(check: &Value, name: &str, dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Stops the server gracefully (agents sleep), then starts the new one the way it was started.
-async fn restart_server(cli: &Cli, client: &Client, exe: &Path, server: &Path) -> Result<String> {
+/// Stops the server with its terminals parked, then starts the new one, which takes them back.
+pub async fn restart_server(
+    cli: &Cli,
+    client: &Client,
+    exe: &Path,
+    server: &Path,
+) -> Result<String> {
     let home = home(cli)?;
-    let _ = client.request("server.shutdown", json!({})).await;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Client::connect(&home, "icarus-update").await.is_ok() {
+    let _ = client
+        .request("server.shutdown", json!({ "keep_terminals": true }))
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    // A server busy parking still holds its socket but no longer answers.
+    while !matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            Client::connect(&home, "icarus-update")
+        )
+        .await,
+        Ok(Err(_))
+    ) {
         if Instant::now() > deadline {
             bail!(
                 "the old server did not stop; restart it with `icarus server stop && icarus server start`"
@@ -355,7 +371,7 @@ async fn restart_server(cli: &Cli, client: &Client, exe: &Path, server: &Path) -
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    if service::installed() {
+    if service::installed_for(&home) {
         service::install(server, &home)?;
         return Ok("restarted the login service".into());
     }

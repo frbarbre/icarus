@@ -612,6 +612,9 @@ enum ServerCommand {
     },
     /// Stop the server and every session it owns.
     Stop,
+    /// Restart the server (e.g. onto a new binary) without stopping anything: terminals keep
+    /// their processes and output, and agents sleep and resume.
+    Restart,
     /// Show whether the server is running.
     Status,
     /// Start the server at login (launchd on macOS, a systemd user unit on Linux).
@@ -906,9 +909,15 @@ async fn main() -> Result<()> {
     let home = home(&cli)?;
     match &cli.command {
         Command::Server {
-            command: ServerCommand::Start { .. } | ServerCommand::Install | ServerCommand::Uninstall,
+            command:
+                ServerCommand::Start { .. }
+                | ServerCommand::Restart
+                | ServerCommand::Install
+                | ServerCommand::Uninstall,
         } if cli.server.is_some() => {
-            bail!("--server can't start, install or uninstall a server; do that on its machine");
+            bail!(
+                "--server can't start, restart, install or uninstall a server; do that on its machine"
+            );
         }
         Command::Server { command } => match command {
             ServerCommand::Start {
@@ -964,6 +973,29 @@ async fn main() -> Result<()> {
                 let client = connect(&cli).await?;
                 let value = client.request("server.shutdown", json!({})).await?;
                 print(&cli, &value, |_| "server stopping".into());
+            }
+            ServerCommand::Restart => {
+                let client = connect(&cli).await?;
+                let before = client.request("server.info", json!({})).await?;
+                let exe = std::env::current_exe()?;
+                let how = update::restart_server(&cli, &client, &exe, &server_binary()?).await?;
+                let after = connect(&cli)
+                    .await?
+                    .request("server.info", json!({}))
+                    .await?;
+                let value = json!({
+                    "restarted": true,
+                    "how": how,
+                    "old_pid": before["pid"],
+                    "pid": after["pid"],
+                    "terminals": after["terminals"],
+                });
+                print(&cli, &value, |v| {
+                    format!(
+                        "{how} · pid {} · {} terminal(s) kept",
+                        v["pid"], v["terminals"]
+                    )
+                });
             }
             ServerCommand::Install => {
                 let path = service::install(&server_binary()?, &home)?;

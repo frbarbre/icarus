@@ -763,6 +763,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
+ "base64 0.23.1",
  "clap",
  "dirs",
  "icarus-client",
@@ -854,6 +855,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "dirs",
+ "filedescriptor",
  "icarus-client",
  "icarus-git",
  "icarus-github",
@@ -866,6 +868,7 @@ dependencies = [
  "rcgen",
  "regex",
  "rusqlite",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "serde",

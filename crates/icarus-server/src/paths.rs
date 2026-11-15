@@ -51,6 +51,15 @@ impl ServerPaths {
         self.home.join("server.addr")
     }
 
+    /// Where a holder keeps terminals between a stopping server and the next one.
+    pub fn handoff_socket(&self) -> PathBuf {
+        self.home.join("handoff.sock")
+    }
+
+    pub fn terminals(&self) -> PathBuf {
+        self.home.join("terminals.json")
+    }
+
     pub fn state_db(&self) -> PathBuf {
         self.home.join("state.db")
     }

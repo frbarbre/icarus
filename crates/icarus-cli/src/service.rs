@@ -65,8 +65,14 @@ fn service_path() -> Result<PathBuf> {
     })
 }
 
-pub fn installed() -> bool {
-    service_path().is_ok_and(|path| path.exists())
+/// Whether the login service runs the server for `home`, not some other state directory.
+pub fn installed_for(home: &Path) -> bool {
+    let Ok(text) = service_path().and_then(|path| Ok(std::fs::read_to_string(path)?)) else {
+        return false;
+    };
+    let home = home.to_string_lossy();
+    text.contains(&format!("<string>{}</string>", xml_escape(&home)))
+        || text.contains(&format!("--home \"{home}\""))
 }
 
 fn run(program: &str, args: &[&str]) -> Result<()> {
@@ -148,6 +154,10 @@ mod tests {
         assert!(plist.contains("<string>/Users/a b/.icarus</string>"));
         assert!(plist.contains("<string>serve</string>"));
         assert!(plist.contains("<key>SuccessfulExit</key>"));
+        assert!(plist.contains(&format!(
+            "<string>{}</string>",
+            xml_escape("/Users/a b/.icarus")
+        )));
     }
 
     #[test]
