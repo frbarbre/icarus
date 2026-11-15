@@ -554,6 +554,8 @@ impl Server {
                     prompt: Option<String>,
                     /// Account id or label; `system` for the provider's own login.
                     account: Option<String>,
+                    /// Claude Code's Remote Control; default `agents.remote_control`.
+                    remote_control: Option<bool>,
                 }
                 let p: P = params(params_value)?;
                 let cwd = match p.cwd {
@@ -584,6 +586,9 @@ impl Server {
                     command,
                     env: p.env,
                     account: None,
+                    remote_control: p
+                        .remote_control
+                        .unwrap_or_else(|| next_action::remote_control_default(&settings)),
                 };
                 self.apply_account(&mut options, p.account.as_deref())?;
                 let thread = self
@@ -637,6 +642,42 @@ impl Server {
                     .await
                     .map_err(|e| rpc("sleep_failed", format!("{e:#}")))?;
                 Ok(json!({ "sleeping": true }))
+            }
+            "agent.remote_control" => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: Option<String>,
+                    /// Every Claude Code agent of this workspace instead of one agent.
+                    workspace: Option<String>,
+                    enabled: bool,
+                }
+                let p: P = params(params_value)?;
+                let threads = match (&p.id, &p.workspace) {
+                    (Some(id), None) => {
+                        vec![self.agents.get(id).ok_or_else(|| rpc("not_found", id))?]
+                    }
+                    (None, Some(workspace)) => self
+                        .agents
+                        .all()
+                        .into_iter()
+                        .filter(|a| {
+                            a.options().provider == "claude"
+                                && a.options().workspace.as_deref() == Some(workspace.as_str())
+                        })
+                        .collect(),
+                    _ => return Err(rpc("invalid_params", "give an agent id or a workspace")),
+                };
+                let mut agents = Vec::new();
+                for thread in threads {
+                    let restarted = thread
+                        .set_remote_control(p.enabled)
+                        .await
+                        .map_err(|e| rpc("remote_control_failed", format!("{e:#}")))?;
+                    let mut info = to_value(thread.info())?;
+                    info["restarted"] = json!(restarted);
+                    agents.push(info);
+                }
+                Ok(json!({ "enabled": p.enabled, "agents": agents }))
             }
             "agent.interrupt" => {
                 let thread = self.agent(params_value)?;
@@ -828,6 +869,31 @@ impl Server {
                     return Err(rpc("invalid_params", "dir must be an absolute path"));
                 }
                 let delivered = self.send_to_apps("client.capture", json!({ "dir": p.dir }));
+                if delivered == 0 {
+                    return Err(rpc(
+                        "no_client",
+                        "no Icarus window is connected; open the app first",
+                    ));
+                }
+                Ok(json!({ "delivered": delivered }))
+            }
+            "client.dispatch" => {
+                #[derive(Deserialize)]
+                struct P {
+                    action: String,
+                    #[serde(default)]
+                    args: Option<Value>,
+                    /// A file the app writes the outcome to, so callers can wait for it.
+                    result: Option<PathBuf>,
+                }
+                let p: P = params(params_value)?;
+                if p.result.as_ref().is_some_and(|path| !path.is_absolute()) {
+                    return Err(rpc("invalid_params", "result must be an absolute path"));
+                }
+                let delivered = self.send_to_apps(
+                    "client.dispatch",
+                    json!({ "action": p.action, "args": p.args, "result": p.result }),
+                );
                 if delivered == 0 {
                     return Err(rpc(
                         "no_client",

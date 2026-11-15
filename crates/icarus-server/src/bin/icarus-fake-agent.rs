@@ -3,7 +3,7 @@
 //! Each user message is answered with "echo: <text>". Prefixes change behaviour:
 //! `sleep:<ms> <text>` waits first, `write:<path> <text>` emits a Write tool call and result,
 //! `fail <text>` ends the turn as an error, `ask <question>` calls AskUserQuestion first,
-//! `env:A,B` answers with those environment variables,
+//! `env:A,B` answers with those environment variables, `args` with its command-line arguments,
 //! `exit` terminates the process.
 
 use std::io::{BufRead, Write};
@@ -91,6 +91,9 @@ fn main() {
                       "input": { "questions": [{ "question": question }] } }
                 ] }, "parent_tool_use_id": null, "session_id": session_id }),
             );
+        }
+        if text == "args" {
+            text = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
         }
         if let Some(names) = text.strip_prefix("env:") {
             text = names

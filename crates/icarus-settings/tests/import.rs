@@ -84,13 +84,30 @@ fn statuses_rules_and_prompts_map_verbatim() {
         get(user, "quickCommands"),
         original.setting("terminalQuickCommands")
     );
+    assert_eq!(get(user, "presets"), None);
+    assert_eq!(get(user, "languages"), None);
     assert_eq!(
-        get(user, "languages.servers"),
+        get(&import.zed, "auto_install_extensions"),
+        Some(&json::parse(r#"{"tsgo":true,"oxc":true}"#).expect("json"))
+    );
+    for skipped in [
+        "settings.languageServers.rust",
+        "settings.formatters.typescript",
+        "settings.linters.typescript",
+    ] {
+        assert!(
+            import.report.notes.iter().any(|n| n.starts_with(skipped)),
+            "{skipped}: {:?}",
+            import.report.notes
+        );
+    }
+    assert_eq!(
+        get(user, "orca.settings.languageServers"),
         original.setting("languageServers")
     );
     assert_eq!(
-        get(user, "languages.formatters"),
-        original.setting("formatters")
+        get(user, "theme.inactivePaneOpacity"),
+        original.setting("terminalInactivePaneOpacity")
     );
     assert_eq!(get(user, "theme.mode"), Some(&Value::from("dark")));
     assert_eq!(

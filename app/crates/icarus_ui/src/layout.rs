@@ -3,19 +3,13 @@ use std::sync::Arc;
 
 use collections::HashSet;
 use editor::Editor;
-use git_ui::project_diff::ProjectDiff;
-use gpui::{
-    App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Render, SharedString,
-    Task, Window,
-};
+use gpui::{App, Context, Entity, EntityId, Focusable as _, Task, Window};
 use icarus_client::Client;
 use icarus_protocol::layout::{LayoutNode, SplitAxis, Tab};
 use project::ProjectPath;
-use project_panel::ProjectPanel;
 use terminal_view::TerminalView;
-use ui::{Tooltip, prelude::*};
+use ui::prelude::*;
 use util::ResultExt as _;
-use workspace::item::{Item, ItemEvent};
 use workspace::{Member, Pane, SaveIntent, SplitDirection, Workspace};
 
 /// A layout the server resolved for a workspace (`open_layout` event, `workspace.take_layout`).
@@ -52,33 +46,33 @@ pub async fn pending_layouts(client: Arc<Client>) -> anyhow::Result<Vec<PendingL
     Ok(serde_json::from_value(value)?)
 }
 
-/// Tabs that live in docks rather than panes; they never make a pane of their own.
-fn is_dock_tab(tab: &Tab) -> bool {
-    matches!(tab, Tab::Explorer)
+/// A diff tab's `scope` as the Changes tab understands it: base (default), uncommitted, turn[:name], commit:sha.
+fn diff_scope(scope: Option<&str>) -> crate::changes_tab::ChangesScope {
+    use crate::changes_tab::ChangesScope;
+    match scope.map(str::trim) {
+        Some("uncommitted") => ChangesScope::Uncommitted,
+        Some("turn" | "turn:latest" | "latest-turn") => ChangesScope::LatestTurn,
+        Some(other) => match other.split_once(':') {
+            Some(("turn", name)) if !name.is_empty() => ChangesScope::Turn(name.to_string()),
+            Some(("commit", sha)) if !sha.is_empty() => ChangesScope::Commit(sha.to_string()),
+            _ => ChangesScope::Base,
+        },
+        None => ChangesScope::Base,
+    }
 }
 
-/// Drops panes left with no pane tabs and splits left with one child, so the tree never builds an empty pane.
+/// Drops empty panes and splits left with one child, so the tree never builds an empty pane.
 fn prune(node: &LayoutNode) -> Option<LayoutNode> {
     match node {
         LayoutNode::Pane { tabs, active } => {
-            let kept: Vec<Tab> = tabs
-                .iter()
-                .filter(|tab| !is_dock_tab(tab))
-                .cloned()
-                .collect();
-            if kept.is_empty() {
+            if tabs.is_empty() {
                 return None;
             }
-            let active = active.and_then(|active| {
-                let target = tabs.get(active)?;
-                (!is_dock_tab(target)).then(|| {
-                    tabs[..active]
-                        .iter()
-                        .filter(|tab| !is_dock_tab(tab))
-                        .count()
-                })
-            });
-            Some(LayoutNode::Pane { tabs: kept, active })
+            let active = active.filter(|active| *active < tabs.len());
+            Some(LayoutNode::Pane {
+                tabs: tabs.clone(),
+                active,
+            })
         }
         LayoutNode::Split {
             split,
@@ -145,10 +139,6 @@ pub fn apply_layout(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if layout.tabs().iter().any(|tab| is_dock_tab(tab)) {
-        // TODO(icarus D31 explorer tab): place an explorer tab in the pane instead of opening the dock panel.
-        workspace.open_panel::<ProjectPanel>(window, cx);
-    }
     let Some(layout) = prune(layout) else {
         return;
     };
@@ -346,37 +336,14 @@ impl Build<'_> {
                 }
             }
             Tab::Browser { url } => {
-                let browser = cx.new(|cx| BrowserTab::new(url.clone(), cx));
-                workspace.add_item(
-                    pane.clone(),
-                    Box::new(browser),
-                    None,
-                    true,
-                    false,
-                    window,
-                    cx,
-                );
-                if !url.is_empty() {
-                    cx.open_url(url);
-                }
+                crate::browser::open_browser_tab(url.clone(), pane, false, workspace, window, cx);
             }
-            Tab::Diff { .. } => {
-                ProjectDiff::deploy_at(workspace, None, window, cx);
-                let diff = workspace.items_of_type::<ProjectDiff>(cx).next();
-                // `pane_for` doesn't know an item added in this same update yet, so look in the panes directly.
-                let source = diff.as_ref().and_then(|diff| {
-                    workspace
-                        .panes()
-                        .iter()
-                        .find(|pane| pane.read(cx).index_for_item(diff).is_some())
-                        .cloned()
-                });
-                if let Some(diff) = diff
-                    && let Some(source) = source
-                    && &source != pane
+            Tab::Diff { scope } => {
+                let scope = diff_scope(scope.as_deref());
+                if let Some(changes) =
+                    crate::changes_tab::open_changes_tab(pane, false, workspace, window, cx)
                 {
-                    let index = pane.read(cx).items_len();
-                    workspace::move_item(&source, pane, diff.entity_id(), index, true, window, cx);
+                    changes.update(cx, |changes, cx| changes.set_scope(scope, cx));
                 }
             }
             Tab::File { path, line } => {
@@ -400,7 +367,9 @@ impl Build<'_> {
                 );
                 self.pending.push(task);
             }
-            Tab::Explorer => {}
+            Tab::Explorer => {
+                crate::explorer_tab::open_explorer_tab(pane, false, workspace, window, cx);
+            }
         }
         self.placed.extend(
             pane.read(cx)
@@ -511,94 +480,6 @@ fn open_terminal(
     })
 }
 
-/// A web page in the pane tree. Until the embedded WebView lands it shows the address and opens it outside.
-pub struct BrowserTab {
-    url: SharedString,
-    focus_handle: FocusHandle,
-}
-
-impl BrowserTab {
-    pub fn new(url: String, cx: &mut Context<Self>) -> Self {
-        Self {
-            url: url.into(),
-            focus_handle: cx.focus_handle(),
-        }
-    }
-
-    pub fn url(&self) -> &SharedString {
-        &self.url
-    }
-}
-
-impl EventEmitter<ItemEvent> for BrowserTab {}
-
-impl Focusable for BrowserTab {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Item for BrowserTab {
-    type Event = ItemEvent;
-
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        let host = self
-            .url
-            .split("://")
-            .nth(1)
-            .and_then(|rest| rest.split('/').next())
-            .filter(|host| !host.is_empty());
-        host.map(SharedString::from)
-            .unwrap_or_else(|| "Browser".into())
-    }
-
-    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::from_path(crate::links::GLOBE_ICON).color(Color::Muted))
-    }
-
-    fn tab_tooltip_text(&self, _cx: &App) -> Option<SharedString> {
-        Some(self.url.clone())
-    }
-
-    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
-        f(*event)
-    }
-}
-
-impl Render for BrowserTab {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // TODO(icarus D31 browser tab): render the page in an embedded WebView (plan §3d).
-        let url = self.url.clone();
-        v_flex()
-            .track_focus(&self.focus_handle)
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .bg(cx.theme().colors().editor_background)
-            .child(
-                Icon::from_path(crate::links::GLOBE_ICON)
-                    .size(IconSize::Medium)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(if url.is_empty() {
-                    SharedString::from("No address")
-                } else {
-                    url.clone()
-                })
-                .color(Color::Muted),
-            )
-            .when(!url.is_empty(), |this| {
-                this.child(
-                    Button::new("open-in-browser", "Open in browser")
-                        .tooltip(Tooltip::text("Opens the page in your default browser"))
-                        .on_click(move |_, _, cx| cx.open_url(&url)),
-                )
-            })
-    }
-}
-
 /// Applies `pending` to the window showing its workspace, if one is open; returns whether it was applied.
 pub fn apply_to_open_window(pending: &PendingLayout, cx: &mut App) -> bool {
     let Some((window, workspace)) = crate::window_for_path(&pending.path, cx) else {
@@ -627,29 +508,53 @@ mod tests {
     }
 
     #[test]
-    fn explorer_only_panes_are_dropped_and_single_child_splits_collapse() {
+    fn empty_panes_are_dropped_and_single_child_splits_collapse() {
         let layout = node(json!({ "split": "row", "sizes": [1.0, 3.0], "children": [
-            { "tabs": [{ "type": "explorer" }] },
+            { "tabs": [] },
             { "tabs": [{ "type": "explorer" }, { "type": "agent", "agent_id": "a" }], "active": 1 },
         ]}));
         assert_eq!(
             prune(&layout),
-            Some(node(
-                json!({ "tabs": [{ "type": "agent", "agent_id": "a" }], "active": 0 })
-            ))
+            Some(node(json!({
+                "tabs": [{ "type": "explorer" }, { "type": "agent", "agent_id": "a" }],
+                "active": 1,
+            })))
+        );
+        assert_eq!(prune(&node(json!({ "tabs": [] }))), None);
+    }
+
+    #[test]
+    fn diff_tab_scopes_parse_like_the_server() {
+        use crate::changes_tab::ChangesScope;
+        assert_eq!(diff_scope(None), ChangesScope::Base);
+        assert_eq!(diff_scope(Some("uncommitted")), ChangesScope::Uncommitted);
+        assert_eq!(diff_scope(Some("turn")), ChangesScope::LatestTurn);
+        assert_eq!(
+            diff_scope(Some("turn:t-1")),
+            ChangesScope::Turn("t-1".into())
         );
         assert_eq!(
-            prune(&node(json!({ "tabs": [{ "type": "explorer" }] }))),
-            None
+            diff_scope(Some("commit:abc")),
+            ChangesScope::Commit("abc".into())
         );
+        assert_eq!(diff_scope(Some("nonsense")), ChangesScope::Base);
     }
 
     fn browser_urls(pane: &Entity<Pane>, cx: &App) -> Vec<String> {
         pane.read(cx)
             .items()
-            .filter_map(|item| item.downcast::<BrowserTab>())
+            .filter_map(|item| item.downcast::<crate::browser::BrowserTab>())
             .map(|tab| tab.read(cx).url().to_string())
             .collect()
+    }
+
+    fn count_of<T: 'static>(workspace: &Workspace, cx: &App) -> usize {
+        workspace
+            .panes()
+            .iter()
+            .flat_map(|pane| pane.read(cx).items().collect::<Vec<_>>())
+            .filter(|item| item.downcast::<T>().is_some())
+            .count()
     }
 
     #[gpui::test]
@@ -673,7 +578,7 @@ mod tests {
         let layout = node(json!({ "split": "row", "sizes": [1.0, 3.0], "children": [
             { "tabs": [{ "type": "browser", "url": "" }, { "type": "browser", "url": "" }], "active": 1 },
             { "split": "column", "children": [
-                { "tabs": [{ "type": "browser", "url": "" }] },
+                { "tabs": [{ "type": "diff", "scope": "uncommitted" }] },
                 { "tabs": [{ "type": "explorer" }] },
                 { "tabs": [{ "type": "browser", "url": "" }] },
             ]},
@@ -701,19 +606,20 @@ mod tests {
                 panic!("the right side is a column");
             };
             assert_eq!(column.axis, gpui::Axis::Vertical);
+            assert_eq!(column.members.len(), 3, "the explorer is a pane tab now");
+            assert_eq!(workspace.panes().len(), 4);
             assert_eq!(
-                column.members.len(),
-                2,
-                "the explorer-only pane is not built"
+                count_of::<crate::explorer_tab::ExplorerTab>(workspace, cx),
+                1
             );
-            assert_eq!(workspace.panes().len(), 3);
+            assert_eq!(count_of::<crate::changes_tab::ChangesTab>(workspace, cx), 1);
         });
 
         apply(cx);
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(
                 workspace.panes().len(),
-                3,
+                4,
                 "applying again rebuilds, not nests"
             );
             let tabs: usize = workspace
@@ -721,7 +627,20 @@ mod tests {
                 .iter()
                 .map(|pane| browser_urls(pane, cx).len())
                 .sum();
-            assert_eq!(tabs, 4, "tabs the layout doesn't place are closed");
+            assert_eq!(tabs, 3, "tabs the layout doesn't place are closed");
+            assert_eq!(
+                count_of::<crate::explorer_tab::ExplorerTab>(workspace, cx),
+                1
+            );
+            assert_eq!(count_of::<crate::changes_tab::ChangesTab>(workspace, cx), 1);
+            let changes = workspace
+                .items_of_type::<crate::changes_tab::ChangesTab>(cx)
+                .next()
+                .expect("changes tab");
+            assert_eq!(
+                changes.read(cx).scope(),
+                &crate::changes_tab::ChangesScope::Uncommitted
+            );
         });
     }
 

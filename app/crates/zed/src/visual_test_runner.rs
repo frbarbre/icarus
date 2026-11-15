@@ -455,6 +455,19 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
                 }
             }
         }
+        println!("\n--- Icarus: icarus_tab_types ---");
+        for (name, result) in
+            run_icarus_tab_types_tests(app_state.clone(), &mut cx, update_baseline)
+        {
+            match result {
+                Ok(TestResult::Passed) => passed += 1,
+                Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+                Err(error) => {
+                    eprintln!("✗ {name}: FAILED - {error}");
+                    failed += 1;
+                }
+            }
+        }
     }
     if std::env::var("ICARUS_VISUAL_ONLY").is_ok() {
         println!("\nIcarus visual tests: {passed} passed, {updated} updated, {failed} failed");
@@ -2857,6 +2870,150 @@ fn open_icarus_agent_tabs_window(
     }
     window.update(cx, |workspace, window, cx| {
         workspace.activate_item(&first, true, false, window, cx);
+    })?;
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _cx| window.refresh())?;
+    cx.run_until_parked();
+    Ok(window)
+}
+
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn run_icarus_tab_types_tests(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    match open_icarus_tab_types_window(app_state, cx) {
+        Ok(window) => {
+            let results = run_icarus_dark_and_light(
+                "icarus_tab_types",
+                "icarus_tab_types_light",
+                window.into(),
+                cx,
+                update_baseline,
+            );
+            window
+                .update(cx, |workspace, _window, cx| {
+                    let project = workspace.project().clone();
+                    project.update(cx, |project, cx| {
+                        let ids: Vec<_> = project.worktrees(cx).map(|w| w.read(cx).id()).collect();
+                        for id in ids {
+                            project.remove_worktree(id, cx);
+                        }
+                    });
+                })
+                .log_err();
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, _cx| window.remove_window())
+                .log_err();
+            cx.run_until_parked();
+            results
+        }
+        Err(error) => vec![("icarus_tab_types", Err(error))],
+    }
+}
+
+/// The Changes tab (uncommitted scope, a type filter on), the explorer tab and the browser tab's chrome in splits.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn open_icarus_tab_types_window(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+) -> Result<WindowHandle<Workspace>> {
+    use icarus_ui::browser::BrowserTab;
+    use icarus_ui::changes_tab::{ChangesScope, ChangesTab, Listing};
+
+    let project_path = tempfile::tempdir()?.keep().canonicalize()?.join("checkout");
+    std::fs::create_dir_all(project_path.join("src"))?;
+    std::fs::create_dir_all(project_path.join("docs"))?;
+    std::fs::write(project_path.join("src/login.rs"), "fn login() {}\n")?;
+    std::fs::write(project_path.join("src/session.rs"), "fn refresh() {}\n")?;
+    std::fs::write(project_path.join("docs/auth.md"), "# Auth\n")?;
+    let project = cx.update(|cx| {
+        project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    let add_worktree = project.update(cx, |project, cx| {
+        project.find_or_create_worktree(&project_path, true, cx)
+    });
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(add_worktree)
+        .context("Failed to add worktree")?;
+    cx.background_executor.forbid_parking();
+
+    let listing: Listing = serde_json::from_value(serde_json::json!({
+        "compare": { "status": "ready", "base": "origin/main" },
+        "rows": [
+            { "path": "src/login.rs", "status": "modified", "added": 18, "removed": 4 },
+            { "path": "src/session.rs", "status": "added", "added": 42 },
+            { "path": "docs/auth.md", "status": "modified", "added": 6, "removed": 2 },
+            { "path": "src/legacy_auth.rs", "status": "deleted", "removed": 57 },
+        ],
+        "totals": { "files": 4, "added": 66, "removed": 63 },
+        "unfiltered": { "files": 5, "added": 70, "removed": 63 },
+        "facets": [
+            { "id": "type", "label": "File types", "active": true, "values": [
+                { "id": "implementation", "label": "Implementation", "present": true, "hidden": false },
+                { "id": "test", "label": "Tests", "present": true, "hidden": true },
+                { "id": "documentation", "label": "Documentation", "present": true, "hidden": false },
+            ]},
+        ],
+    }))?;
+
+    let bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(1100.0), px(720.0)),
+    };
+    let window: WindowHandle<Workspace> = cx
+        .update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    cx.new(|cx| {
+                        Workspace::new(None, project.clone(), app_state.clone(), window, cx)
+                    })
+                },
+            )
+        })
+        .context("Failed to open tab types window")?;
+    cx.run_until_parked();
+
+    window.update(cx, |workspace, window, cx| {
+        let left = workspace.active_pane().clone();
+        let changes =
+            cx.new(|cx| ChangesTab::preview(listing, ChangesScope::Uncommitted, Some(0), cx));
+        workspace.add_item(
+            left.clone(),
+            Box::new(changes),
+            None,
+            true,
+            false,
+            window,
+            cx,
+        );
+        let right = workspace.split_pane(left, workspace::SplitDirection::Right, window, cx);
+        icarus_ui::explorer_tab::open_explorer_tab(&right, false, workspace, window, cx);
+        let bottom = workspace.split_pane(right, workspace::SplitDirection::Down, window, cx);
+        let browser = cx.new(|cx| {
+            BrowserTab::preview("https://github.com/acme/widgets/pull/42".into(), window, cx)
+        });
+        workspace.add_item(bottom, Box::new(browser), None, true, false, window, cx);
     })?;
     cx.run_until_parked();
     cx.update_window(window.into(), |_, window, _cx| window.refresh())?;

@@ -504,6 +504,8 @@ mod tests {
             rate_limits: None,
             rate_limits_at_ms: None,
             account: None,
+            remote_control: false,
+            remote_control_url: None,
         };
         let sleeping = BTreeMap::from([("agent-a".to_owned(), info(AgentState::Sleeping))]);
         let entry = &index.query(&HistoryQuery::default(), &sleeping)[0];

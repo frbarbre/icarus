@@ -60,6 +60,9 @@ pub struct AgentOptions {
     /// Managed account (plan D13); its config dir is already in `env`.
     #[serde(default)]
     pub account: Option<String>,
+    /// Start Claude Code with its own Remote Control (plan D21); switchable later per agent.
+    #[serde(default)]
+    pub remote_control: bool,
 }
 
 /// Agent events the server reacts to (notifications), forwarded with the agent's id.
@@ -84,6 +87,9 @@ pub struct AgentInfo {
     pub rate_limits: Option<Value>,
     pub rate_limits_at_ms: Option<u64>,
     pub account: Option<String>,
+    pub remote_control: bool,
+    /// The claude.ai page of the Remote Control session, once Claude Code has registered it.
+    pub remote_control_url: Option<String>,
 }
 
 // Hooks run on the blocking pool because snapshots shell out to git.
@@ -104,6 +110,7 @@ struct State {
     killed: bool,
     /// Set by `sleep`, so the process ending is not mistaken for a crash.
     parking: bool,
+    remote_control: bool,
 }
 
 pub struct AgentThread {
@@ -133,6 +140,50 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Claude Code's own flag (`claude --help`: "Start an interactive session with Remote Control enabled").
+pub const REMOTE_CONTROL_FLAG: &str = "--remote-control";
+
+fn claude_config_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    env.get("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+}
+
+/// The claude.ai URL of a session's Remote Control bridge, from Claude Code's `sessions/<pid>.json`.
+/// Only those JSON records are read (never the `.key` files beside them); the newest match wins.
+pub fn remote_control_url(config_dir: &Path, session_id: &str) -> Option<String> {
+    let entries = std::fs::read_dir(config_dir.join("sessions")).ok()?;
+    let mut best: Option<(u64, String)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(record) = std::fs::read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?))
+        else {
+            continue;
+        };
+        if record["sessionId"].as_str() != Some(session_id) {
+            continue;
+        }
+        let Some(bridge) = record["bridgeSessionId"].as_str().filter(|b| {
+            b.strip_prefix("session_").is_some_and(|rest| {
+                !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+        }) else {
+            continue;
+        };
+        let updated = record["updatedAt"].as_u64().unwrap_or_default();
+        if best.as_ref().is_none_or(|(at, _)| updated > *at) {
+            best = Some((updated, format!("https://claude.ai/code/{bridge}")));
+        }
+    }
+    best.map(|(_, url)| url)
+}
+
 /// The command line for a provider, built from the user's installed agent binary.
 pub fn provider_command(options: &AgentOptions) -> Result<Vec<String>> {
     if options.command.as_ref().is_some_and(Vec::is_empty) {
@@ -141,11 +192,15 @@ pub fn provider_command(options: &AgentOptions) -> Result<Vec<String>> {
     if options.provider == "codex" {
         return Ok(codex::command(options));
     }
+    // Last on the line, because `--remote-control [name]` would take a following value as its name.
+    let remote_control = (options.provider == "claude" && options.remote_control)
+        .then(|| REMOTE_CONTROL_FLAG.to_string());
     if let Some(command) = &options.command {
         let mut command = command.clone();
         if let Some(session) = &options.resume {
             command.extend(["--resume".to_string(), session.clone()]);
         }
+        command.extend(remote_control);
         return Ok(command);
     }
     match options.provider.as_str() {
@@ -169,6 +224,7 @@ pub fn provider_command(options: &AgentOptions) -> Result<Vec<String>> {
             if let Some(session) = &options.resume {
                 command.extend(["--resume".to_string(), session.clone()]);
             }
+            command.extend(remote_control);
             Ok(command)
         }
         other => Err(anyhow!("unknown agent provider {other}")),
@@ -292,9 +348,13 @@ impl AgentThread {
             rate_limits_at_ms: None,
             killed: false,
             parking: false,
+            remote_control: options.remote_control,
         };
         for event in events {
             match event.kind.as_str() {
+                "remote_control" => {
+                    state.remote_control = event.data["enabled"].as_bool().unwrap_or_default();
+                }
                 "session" => {
                     state.provider_session = event.data["session_id"].as_str().map(str::to_string);
                     state.model = event.data["model"].as_str().map(str::to_string);
@@ -418,6 +478,7 @@ impl AgentThread {
     async fn start_process(self: &Arc<Self>, resume: Option<String>) -> Result<()> {
         let mut options = self.options.clone();
         options.resume = resume;
+        options.remote_control = lock(&self.state).remote_control;
         let command = provider_command(&options)?;
         let mut process = Command::new(&command[0]);
         process
@@ -595,6 +656,9 @@ impl AgentThread {
         };
         state.last_activity_ms = event.at_ms;
         match kind {
+            "remote_control" => {
+                state.remote_control = event.data["enabled"].as_bool().unwrap_or_default();
+            }
             "session" => {
                 state.provider_session = event.data["session_id"].as_str().map(str::to_string);
                 state.model = event.data["model"].as_str().map(str::to_string);
@@ -673,6 +737,52 @@ impl AgentThread {
     }
 
     pub fn info(&self) -> AgentInfo {
+        let mut info = self.info_without_url();
+        let running = matches!(info.state, AgentState::Idle | AgentState::Working);
+        if info.remote_control
+            && running
+            && let (Some(session), Some(dir)) = (
+                info.provider_session.as_deref(),
+                claude_config_dir(&self.options.env),
+            )
+        {
+            info.remote_control_url = remote_control_url(&dir, session);
+        }
+        info
+    }
+
+    /// Switches Claude Code's Remote Control for this agent. A running, idle agent restarts on its
+    /// session right away; a busy one picks it up the next time its process starts.
+    pub async fn set_remote_control(self: &Arc<Self>, enabled: bool) -> Result<bool> {
+        if self.options.provider != "claude" {
+            return Err(anyhow!(
+                "Remote Control is a Claude Code feature; agent {} runs {}",
+                self.id,
+                self.options.provider
+            ));
+        }
+        if lock(&self.state).remote_control == enabled {
+            return Ok(false);
+        }
+        self.record("remote_control", json!({ "enabled": enabled }));
+        if !matches!(self.state(), AgentState::Idle | AgentState::Starting) {
+            return Ok(false);
+        }
+        self.sleep().await?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while matches!(self.state(), AgentState::Idle | AgentState::Starting) {
+            if std::time::Instant::now() > deadline {
+                return Err(anyhow!("agent {} did not stop to restart", self.id));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let session = lock(&self.state).provider_session.clone();
+        self.record("wake", json!({ "resume": session }));
+        self.start_process(session).await?;
+        Ok(true)
+    }
+
+    fn info_without_url(&self) -> AgentInfo {
         let state = lock(&self.state);
         AgentInfo {
             id: self.id.clone(),
@@ -690,6 +800,8 @@ impl AgentThread {
             rate_limits: state.rate_limits.clone(),
             rate_limits_at_ms: state.rate_limits_at_ms,
             account: self.options.account.clone(),
+            remote_control: state.remote_control,
+            remote_control_url: None,
         }
     }
 
@@ -1032,6 +1144,7 @@ mod tests {
             command: None,
             env: BTreeMap::new(),
             account: None,
+            remote_control: false,
         };
         let command = provider_command(&options).expect("command");
         assert_eq!(command[0], "claude");
@@ -1044,6 +1157,61 @@ mod tests {
         }
         assert!(command.windows(2).any(|w| w == ["--resume", "abc"]));
         assert!(command.windows(2).any(|w| w == ["--model", "opus"]));
+        assert!(!command.contains(&REMOTE_CONTROL_FLAG.to_string()));
+
+        let remote = AgentOptions {
+            remote_control: true,
+            ..options.clone()
+        };
+        let command = provider_command(&remote).expect("command");
+        assert_eq!(
+            command.last().map(String::as_str),
+            Some(REMOTE_CONTROL_FLAG)
+        );
+        let custom = AgentOptions {
+            command: Some(vec!["my-claude".into()]),
+            ..remote
+        };
+        assert_eq!(
+            provider_command(&custom).expect("command"),
+            ["my-claude", "--resume", "abc", REMOTE_CONTROL_FLAG]
+        );
+    }
+
+    #[test]
+    fn remote_control_url_comes_from_the_newest_matching_session_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let write = |name: &str, value: Value| {
+            std::fs::write(sessions.join(name), value.to_string()).expect("write");
+        };
+        write(
+            "1.json",
+            json!({ "sessionId": "s1", "bridgeSessionId": "session_old", "updatedAt": 1 }),
+        );
+        write(
+            "2.json",
+            json!({ "sessionId": "s1", "bridgeSessionId": "session_new", "updatedAt": 2 }),
+        );
+        write(
+            "3.json",
+            json!({ "sessionId": "s2", "bridgeSessionId": "session_other", "updatedAt": 9 }),
+        );
+        write(
+            "4.json",
+            json!({ "sessionId": "s3", "bridgeSessionId": "../evil", "updatedAt": 9 }),
+        );
+        write(
+            "2.abc.key",
+            json!({ "sessionId": "s1", "bridgeSessionId": "session_key", "updatedAt": 99 }),
+        );
+        assert_eq!(
+            remote_control_url(dir.path(), "s1").as_deref(),
+            Some("https://claude.ai/code/session_new")
+        );
+        assert_eq!(remote_control_url(dir.path(), "s3"), None);
+        assert_eq!(remote_control_url(dir.path(), "nope"), None);
     }
 
     #[test]

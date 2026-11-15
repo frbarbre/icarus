@@ -33,6 +33,8 @@ pub struct AgentTab {
     conversation_view: Entity<ConversationView>,
     requested_agent_id: Option<String>,
     observed_thread: Option<EntityId>,
+    /// What the last save said about messages, kept while a restored conversation hasn't loaded.
+    saved_had_messages: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -51,6 +53,7 @@ impl AgentTab {
             conversation_view,
             requested_agent_id,
             observed_thread: None,
+            saved_had_messages: false,
             _subscriptions: vec![subscription],
         };
         tab.observe_root_thread(cx);
@@ -59,6 +62,31 @@ impl AgentTab {
 
     pub fn conversation_view(&self) -> &Entity<ConversationView> {
         &self.conversation_view
+    }
+
+    /// Puts a fresh conversation in this tab, keeping its pane and position.
+    fn replace_conversation(
+        &mut self,
+        conversation_view: Entity<ConversationView>,
+        cx: &mut Context<Self>,
+    ) {
+        self.conversation_view = conversation_view.clone();
+        self.requested_agent_id = None;
+        self.observed_thread = None;
+        self._subscriptions = vec![cx.observe(&conversation_view, |tab, _, cx| {
+            tab.observe_root_thread(cx);
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
+        })];
+        self.observe_root_thread(cx);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// Whether the conversation has anything in it; a restore that loses an empty one loses nothing.
+    fn has_messages(&self, cx: &App) -> bool {
+        self.thread_view(cx)
+            .is_some_and(|view| !view.read(cx).thread.read(cx).entries().is_empty())
     }
 
     /// The server agent behind this tab: its ACP session id, or the one it was opened for while loading.
@@ -148,6 +176,74 @@ fn serialized_agent_key(workspace_id: WorkspaceId, item_id: ItemId) -> String {
 struct SerializedAgentTab {
     agent_id: String,
     thread_id: ThreadId,
+    // Older saves don't say; treat them as holding a conversation so nothing is replaced silently.
+    #[serde(default = "default_true")]
+    had_messages: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// How long a restored tab waits to learn whether its agent loaded.
+const RESTORE_WATCH_STEP: Duration = Duration::from_millis(100);
+const RESTORE_WATCH_STEPS: usize = 600;
+
+/// When a restored tab's agent is gone and it never had a message, starts a fresh agent in the same tab with
+/// the same draft instead of showing the load error.
+fn replace_if_lost_while_empty(
+    tab: WeakEntity<AgentTab>,
+    panel: WeakEntity<AgentPanel>,
+    workspace: WeakEntity<Workspace>,
+    thread_id: ThreadId,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window
+        .spawn(cx, async move |cx| {
+            for _ in 0..RESTORE_WATCH_STEPS {
+                cx.background_executor().timer(RESTORE_WATCH_STEP).await;
+                let state = tab.read_with(cx, |tab, cx| {
+                    if tab.conversation_view.read(cx).failed_to_load() {
+                        Some(true)
+                    } else if tab.thread_view(cx).is_some() {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                })?;
+                match state {
+                    Some(false) => return anyhow::Ok(()),
+                    Some(true) => {
+                        return cx.update(|window, cx| {
+                            let (Some(tab), Some(panel)) = (tab.upgrade(), panel.upgrade()) else {
+                                return;
+                            };
+                            let conversation_view = panel.update(cx, |panel, cx| {
+                                panel.new_tab_conversation(None, None, Some(thread_id), window, cx)
+                            });
+                            tab.update(cx, |tab, cx| {
+                                tab.replace_conversation(conversation_view, cx)
+                            });
+                            let composer = workspace.upgrade().and_then(|workspace| {
+                                AgentComposer::for_workspace(workspace.read(cx))
+                            });
+                            if let Some(composer) = composer {
+                                composer.update(cx, |composer, cx| {
+                                    if composer.target().as_ref() == Some(&tab) {
+                                        composer.observed_target = None;
+                                        composer.set_target(tab, cx);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    None => {}
+                }
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
 }
 
 impl SerializableItem for AgentTab {
@@ -179,6 +275,7 @@ impl SerializableItem for AgentTab {
             let SerializedAgentTab {
                 agent_id,
                 thread_id,
+                had_messages,
             } = serde_json::from_str(&saved)?;
             // Panels load alongside restored items, so the tab waits for the agent panel it builds on.
             for _ in 0..PANEL_WAIT_STEPS {
@@ -195,7 +292,22 @@ impl SerializableItem for AgentTab {
                                 cx,
                             )
                         });
-                        cx.new(|cx| AgentTab::new(conversation_view, Some(agent_id), cx))
+                        let tab = cx.new(|cx| {
+                            let mut tab = AgentTab::new(conversation_view, Some(agent_id), cx);
+                            tab.saved_had_messages = had_messages;
+                            tab
+                        });
+                        if !had_messages {
+                            replace_if_lost_while_empty(
+                                tab.downgrade(),
+                                panel.downgrade(),
+                                workspace.clone(),
+                                thread_id,
+                                window,
+                                cx,
+                            );
+                        }
+                        tab
                     });
                 }
                 cx.background_executor().timer(PANEL_WAIT_STEP).await;
@@ -212,9 +324,15 @@ impl SerializableItem for AgentTab {
         cx: &mut Context<Self>,
     ) -> Option<Task<anyhow::Result<()>>> {
         let workspace_id = workspace.database_id()?;
+        let had_messages = if self.thread_view(cx).is_some() {
+            self.has_messages(cx)
+        } else {
+            self.saved_had_messages
+        };
         let saved = SerializedAgentTab {
             agent_id: self.agent_id(cx)?,
             thread_id: self.conversation_view.read(cx).thread_id,
+            had_messages,
         };
         let saved = serde_json::to_string(&saved).ok()?;
         let store = KeyValueStore::global(cx);
@@ -619,6 +737,27 @@ mod tests {
         (0..count)
             .map(|_| cx.update(|cx| cx.new(|_| Probe).entity_id()))
             .collect()
+    }
+
+    #[test]
+    fn saves_from_before_message_tracking_count_as_conversations() {
+        let thread_id = ThreadId::new();
+        let old = serde_json::json!({ "agent_id": "agent-1", "thread_id": thread_id });
+        let saved: SerializedAgentTab = serde_json::from_value(old).expect("old save");
+        assert!(
+            saved.had_messages,
+            "an unknown conversation is never silently replaced"
+        );
+        let round_trip: SerializedAgentTab = serde_json::from_str(
+            &serde_json::to_string(&SerializedAgentTab {
+                agent_id: "agent-1".into(),
+                thread_id,
+                had_messages: false,
+            })
+            .expect("save"),
+        )
+        .expect("load");
+        assert!(!round_trip.had_messages);
     }
 
     #[gpui::test]

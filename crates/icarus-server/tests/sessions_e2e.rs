@@ -510,3 +510,143 @@ async fn accounts_choose_the_config_dir_a_launch_uses_and_carry_usage() {
     assert_eq!(listed.as_array().map(Vec::len), Some(1));
     assert_eq!(listed[0]["default"], true, "back to the system login");
 }
+
+#[tokio::test]
+async fn settings_import_merges_orca_tooling_and_theme_into_zed_settings() {
+    let world = World::new(&[]).await;
+    let zed_dir = tempfile::tempdir().expect("zed dir");
+    std::fs::write(
+        zed_dir.path().join("settings.json"),
+        "// my Zed settings\n{ \"buffer_font_size\": 15, \"theme\": \"Ayu Dark\", }\n",
+    )
+    .expect("zed settings");
+    let export = json!({
+        "format": "orca-settings", "version": 1, "exportedAt": "",
+        "settings": {
+            "theme": "system",
+            "openClaudeTabsInWebView": true,
+            "languageServers": { "typescript": { "enabled": true, "server": "tsgo" } },
+            "terminalThemeDark": "custom:night",
+            "terminalCustomThemes": [{ "id": "night", "name": "Night", "terminal": { "background": "#101010" } }]
+        }
+    })
+    .to_string();
+    let params =
+        |dry_run: bool| json!({ "text": export, "dry_run": dry_run, "zed_dir": zed_dir.path() });
+
+    let preview = world.request("settings.import_orca", params(true)).await;
+    assert_eq!(preview["zed"]["kept"], json!(["theme"]));
+    assert!(
+        preview["zed"]["added"]
+            .as_array()
+            .expect("added")
+            .contains(&json!("auto_install_extensions"))
+    );
+    assert_eq!(
+        preview["zed"]["fragment"]["auto_install_extensions"]["tsgo"],
+        true
+    );
+    assert!(
+        !zed_dir.path().join("themes").exists(),
+        "a dry run writes nothing"
+    );
+
+    let done = world.request("settings.import_orca", params(false)).await;
+    let written = std::fs::read_to_string(zed_dir.path().join("settings.json")).expect("read");
+    let written: Value = serde_json::from_str(&written).expect("plain JSON");
+    assert_eq!(written["theme"], "Ayu Dark", "existing keys stay");
+    assert_eq!(written["buffer_font_size"], 15);
+    assert_eq!(
+        written["languages"]["TypeScript"]["language_servers"][0],
+        "typescript-ls"
+    );
+    assert!(
+        done["zed"]["backup"].as_str().is_some(),
+        "comments kept in a backup"
+    );
+    assert!(zed_dir.path().join("themes/icarus-imported.json").is_file());
+    let user = world
+        .request("config.get", json!({ "key": "agents.remote_control" }))
+        .await;
+    assert_eq!(user, true);
+}
+
+fn remote_control_flags(transcript: &str) -> usize {
+    transcript.matches("--remote-control").count()
+}
+
+#[tokio::test]
+async fn remote_control_starts_claude_with_its_flag_and_toggles_per_agent() {
+    let world = World::new(&[]).await;
+    std::fs::write(
+        world.config.path().join("settings.json"),
+        json!({ "agents": { "commands": { "claude": [fake()] }, "remote_control": true } })
+            .to_string(),
+    )
+    .expect("settings");
+
+    let ws = world.workspace("phone", json!({})).await;
+    let ws_id = ws["id"].as_str().expect("id").to_owned();
+    let from_setting = ws["agents"][0]["id"].as_str().expect("agent").to_owned();
+    let text = world.say(&from_setting, "args").await;
+    assert_eq!(remote_control_flags(&text), 1, "{text}");
+
+    let claude_dir = tempfile::tempdir().expect("claude dir");
+    let agent = world
+        .request(
+            "agent.create",
+            json!({ "cwd": world.repo.path(), "remote_control": false,
+                    "env": { "CLAUDE_CONFIG_DIR": claude_dir.path() } }),
+        )
+        .await;
+    let id = agent["id"].as_str().expect("id").to_owned();
+    assert_eq!(agent["remote_control"], false);
+    let text = world.say(&id, "args").await;
+    assert_eq!(remote_control_flags(&text), 0, "{text}");
+
+    let switched = world
+        .request("agent.remote_control", json!({ "id": id, "enabled": true }))
+        .await;
+    assert_eq!(switched["agents"][0]["restarted"], true);
+    assert_eq!(switched["agents"][0]["remote_control"], true);
+    let text = world.say(&id, "args").await;
+    assert_eq!(remote_control_flags(&text), 1, "{text}");
+    assert!(
+        text.contains("--resume fake-"),
+        "restarted on its session: {text}"
+    );
+
+    let info = world.request("agent.info", json!({ "id": id })).await;
+    assert_eq!(info["remote_control_url"], Value::Null);
+    let session = info["provider_session"].as_str().expect("session");
+    let sessions = claude_dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    std::fs::write(
+        sessions.join("4242.json"),
+        json!({ "sessionId": session, "bridgeSessionId": "session_01Abc", "updatedAt": 1 })
+            .to_string(),
+    )
+    .expect("record");
+    let info = world.request("agent.info", json!({ "id": id })).await;
+    assert_eq!(
+        info["remote_control_url"],
+        "https://claude.ai/code/session_01Abc"
+    );
+
+    let off = world
+        .request(
+            "agent.remote_control",
+            json!({ "workspace": ws_id, "enabled": false }),
+        )
+        .await;
+    let agents = off["agents"].as_array().expect("agents");
+    assert_eq!(agents.len(), 1, "only the workspace's agents");
+    assert_eq!(agents[0]["id"], from_setting.as_str());
+    assert_eq!(agents[0]["remote_control_url"], Value::Null);
+    let text = world.say(&from_setting, "args").await;
+    assert_eq!(
+        remote_control_flags(&text),
+        1,
+        "no flag after switching off: {text}"
+    );
+}

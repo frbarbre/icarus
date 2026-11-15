@@ -407,6 +407,8 @@ mod tests {
             rate_limits: at.map(|at| json!({ "at": at })),
             rate_limits_at_ms: at,
             account: account.map(str::to_owned),
+            remote_control: false,
+            remote_control_url: None,
         }
     }
 

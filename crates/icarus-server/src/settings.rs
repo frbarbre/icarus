@@ -6,6 +6,7 @@ use std::sync::Arc;
 use icarus_protocol::RpcError;
 use icarus_settings::import::{export_orca, import_orca_text};
 use icarus_settings::layers::{self, KeyPath, Layer, LayerStack, SettingsPaths};
+use icarus_settings::zed;
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 
@@ -37,7 +38,72 @@ struct Scope {
     project: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct KeyWrite {
+    key: String,
+    value: Option<Json>,
+    layer: Option<String>,
+    project: Option<String>,
+}
+
 impl Server {
+    /// Sets (or with `None` unsets) a key in one writable layer.
+    fn write_key(
+        &self,
+        key: &str,
+        value: Option<Json>,
+        layer: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<Json, RpcError> {
+        let layer = layer_name(layer)?;
+        let root = self.project_root(project)?;
+        if layer != Layer::User && root.is_none() {
+            return Err(rpc("invalid_params", "project layers need --project"));
+        }
+        let paths = SettingsPaths::discover(root.as_deref());
+        let path = paths
+            .path(layer)
+            .ok_or_else(|| rpc("internal", "no settings path"))?
+            .to_path_buf();
+        let mut doc = layers::read_document(&path)
+            .map_err(|e| rpc("settings_invalid", format!("{e:?}")))?
+            .unwrap_or_else(icarus_settings::Value::object);
+        let key = KeyPath::parse(key).map_err(|e| rpc("invalid_key", format!("{e:?}")))?;
+        match value {
+            Some(value) => {
+                let value = from_json(&value)?;
+                layers::set(&mut doc, &key, value)
+                    .map_err(|e| rpc("invalid_key", format!("{e:?}")))?;
+            }
+            None => {
+                layers::unset(&mut doc, &key);
+            }
+        }
+        self.write_layer(layer, &path, &doc)?;
+        Ok(json!({ "layer": layer.name(), "path": path }))
+    }
+
+    fn write_layer(
+        &self,
+        layer: Layer,
+        path: &Path,
+        doc: &icarus_settings::Value,
+    ) -> Result<(), RpcError> {
+        let errors = layers::validate(doc, Some(layer));
+        if !errors.is_empty() {
+            let described: Vec<String> = errors.iter().map(|e| format!("{e:?}")).collect();
+            return Err(rpc("settings_invalid", described.join("; ")));
+        }
+        if layer == Layer::User {
+            for name in layers::preset_names(doc) {
+                if layers::preset(&name).is_none() {
+                    return Err(rpc("settings_invalid", format!("unknown preset `{name}`")));
+                }
+            }
+        }
+        layers::write_document(path, doc).map_err(|e| rpc("io", e))
+    }
+
     fn project_root(&self, project: Option<&str>) -> Result<Option<PathBuf>, RpcError> {
         match project {
             None => Ok(None),
@@ -130,46 +196,13 @@ impl Server {
                 }))
             }
             "config.set" | "config.unset" => {
-                #[derive(Deserialize)]
-                struct P {
-                    key: String,
-                    value: Option<Json>,
-                    layer: Option<String>,
-                    project: Option<String>,
-                }
-                let p: P = params(p)?;
-                let layer = layer_name(p.layer.as_deref())?;
-                let root = self.project_root(p.project.as_deref())?;
-                if layer != Layer::User && root.is_none() {
-                    return Err(rpc("invalid_params", "project layers need --project"));
-                }
-                let paths = SettingsPaths::discover(root.as_deref());
-                let path = paths
-                    .path(layer)
-                    .ok_or_else(|| rpc("internal", "no settings path"))?
-                    .to_path_buf();
-                let mut doc = layers::read_document(&path)
-                    .map_err(|e| rpc("settings_invalid", format!("{e:?}")))?
-                    .unwrap_or_else(icarus_settings::Value::object);
-                let key =
-                    KeyPath::parse(&p.key).map_err(|e| rpc("invalid_key", format!("{e:?}")))?;
-                if method == "config.set" {
-                    let value = from_json(&p.value.unwrap_or(Json::Null))?;
-                    layers::set(&mut doc, &key, value)
-                        .map_err(|e| rpc("invalid_key", format!("{e:?}")))?;
+                let p: KeyWrite = params(p)?;
+                let value = if method == "config.set" {
+                    Some(p.value.unwrap_or(Json::Null))
                 } else {
-                    layers::unset(&mut doc, &key);
-                }
-                let errors = layers::validate(&doc, Some(layer));
-                if !errors.is_empty() {
-                    let described: Vec<String> = errors.iter().map(|e| format!("{e:?}")).collect();
-                    return Err(rpc("settings_invalid", described.join("; ")));
-                }
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| rpc("io", e))?;
-                }
-                layers::write_document(&path, &doc).map_err(|e| rpc("io", e))?;
-                Ok(json!({ "layer": layer.name(), "path": path }))
+                    None
+                };
+                self.write_key(&p.key, value, p.layer.as_deref(), p.project.as_deref())
             }
             "config.schema" => Ok(to_json(&layers::json_schema())),
             "settings.import_orca" => {
@@ -179,6 +212,11 @@ impl Server {
                     text: Option<String>,
                     #[serde(default)]
                     dry_run: bool,
+                    /// Leave the Zed settings and themes alone.
+                    #[serde(default)]
+                    skip_zed: bool,
+                    /// The Zed config directory to merge into; defaults to the app's.
+                    zed_dir: Option<PathBuf>,
                 }
                 let p: P = params(p)?;
                 let text = match (p.text, p.path) {
@@ -192,18 +230,48 @@ impl Server {
                     .map_err(|e| rpc("invalid_orca_export", format!("{e:?}")))?;
                 let mut written = Vec::new();
                 let mut unmatched = Vec::new();
+                let user_path = layers::user_settings_path()
+                    .ok_or_else(|| rpc("io", "no user settings path"))?;
+                let mut user = layers::read_document(&user_path)
+                    .map_err(|e| rpc("settings_invalid", format!("{e:?}")))?
+                    .unwrap_or_else(icarus_settings::Value::object);
+                layers::deep_merge(&mut user, &import.user);
+                let zed_dir = match p.zed_dir {
+                    Some(dir) => dir,
+                    None => {
+                        zed::config_dir().ok_or_else(|| rpc("io", "no Zed config directory"))?
+                    }
+                };
+                let applied = if p.skip_zed {
+                    None
+                } else {
+                    Some(
+                        zed::apply(&zed_dir, &import.zed, import.zed_theme.as_ref(), p.dry_run)
+                            .map_err(|e| rpc("zed_settings", e))?,
+                    )
+                };
+                let zed_result = json!({
+                    "settings": applied.as_ref().map(|a| &a.settings),
+                    "theme": applied.as_ref().and_then(|a| a.theme.as_ref()),
+                    "added": applied.as_ref().map(|a| &a.added),
+                    "kept": applied.as_ref().map(|a| &a.kept),
+                    "backup": applied.as_ref().and_then(|a| a.backup.as_ref()),
+                    "fragment": to_json(&import.zed),
+                });
                 if !p.dry_run {
-                    let user_path = layers::user_settings_path()
-                        .ok_or_else(|| rpc("io", "no user settings path"))?;
-                    let mut user = layers::read_document(&user_path)
-                        .map_err(|e| rpc("settings_invalid", format!("{e:?}")))?
-                        .unwrap_or_else(icarus_settings::Value::object);
-                    layers::deep_merge(&mut user, &import.user);
                     if let Some(parent) = user_path.parent() {
                         std::fs::create_dir_all(parent).map_err(|e| rpc("io", e))?;
                     }
                     layers::write_document(&user_path, &user).map_err(|e| rpc("io", e))?;
                     written.push(json!({ "layer": "user", "path": user_path }));
+                    if let Some(applied) = &applied {
+                        if !applied.added.is_empty() {
+                            written.push(json!({ "layer": "zed", "path": applied.settings }));
+                        }
+                        if let Some(theme) = &applied.theme {
+                            written.push(json!({ "layer": "zed-theme", "path": theme }));
+                        }
+                    }
                     let projects = self.store.projects().map_err(|e| rpc("internal", e))?;
                     for (remote, doc) in &import.projects {
                         // Imported project settings are personal, so they go to the untracked local file.
@@ -228,8 +296,10 @@ impl Server {
                     "written": written,
                     "unmatched_projects": unmatched,
                     "mapped": import.report.mapped.len(),
+                    "mappings": import.report.mapped.iter().map(|m| json!({ "from": m.from, "to": m.to })).collect::<Vec<_>>(),
                     "unmapped": import.report.unmapped,
                     "notes": import.report.notes,
+                    "zed": zed_result,
                     "validation": import.report.validation.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>(),
                 }))
             }

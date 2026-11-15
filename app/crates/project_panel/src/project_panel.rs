@@ -709,7 +709,7 @@ enum RemovalKind {
 }
 
 impl ProjectPanel {
-    fn new(
+    pub fn new(
         workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,

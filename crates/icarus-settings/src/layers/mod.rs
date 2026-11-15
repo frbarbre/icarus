@@ -146,19 +146,37 @@ pub fn deep_merge(base: &mut Value, overlay: &Value) {
     }
 }
 
-pub fn user_settings_path() -> Option<PathBuf> {
+pub fn config_dir() -> Option<PathBuf> {
     // Lets a separate profile use its own settings without moving other tools' config (e.g. `gh`).
     if let Some(dir) = std::env::var_os("ICARUS_CONFIG_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
     {
-        return Some(dir.join("settings.json"));
+        return Some(dir);
     }
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(config.join("icarus").join("settings.json"))
+    Some(config.join("icarus"))
+}
+
+pub fn user_settings_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("settings.json"))
+}
+
+/// Presets named in a settings document's `presets` list, in order.
+pub fn preset_names(doc: &Value) -> Vec<String> {
+    doc.get("presets")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn read_document(path: &Path) -> Result<Option<Value>, LoadError> {

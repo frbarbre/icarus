@@ -259,19 +259,7 @@ An Orca import carries the selection over from `worktreeCardProperties`.
 - Git blame for the cursor's line.
 - **Edit mode and diff mode as two views of one tab.** Switch with ⌥⌘E / ⌥⌘D, landing on the same line.
 
-**General, file-based configuration instead of Orca's per-tool settings pane.** Use Zed's model, which the fork already gives us:
-- **Settings files.** Language tooling lives in the user settings file and in a per-project file (`icarus.json`, committed to the repo, the way `.zed/settings.json` works).
-  - `languages.<Lang>` picks the language servers, formatter, linters and format-on-save for that language.
-  - `lsp.<server>` sets each server's binary, arguments, initialization options and settings.
-- **Nothing is built in for one person's stack.** Tools like pyrefly, tsgo, oxlint, oxfmt and Ruff are entries in a server registry, not special cases. Adding a new tool is config, not code:
-  - name, command, languages
-  - how to find the binary: project `node_modules/.bin`, venv `bin/`, `PATH`, or an explicit path
-  - capabilities
-- **Sensible per-language presets** ship generic (e.g. Python with a type checker plus Ruff; TypeScript with tsgo, oxlint and oxfmt) and are opt-in. The importer translates Orca's `languageServers` and formatter settings into these files.
-- **Agents configure it easily.** They can edit the JSON file, which hot-reloads, or use `icarus config set languages.Python.language_servers '["pyrefly","ruff"]'`.
-  - Both are validated against the published schema, and errors show up in the app and in the CLI output.
-  - `icarus lsp list|status|restart|logs` shows what's running per worktree.
-- **The settings UI is a thin layer over the same files:** a searchable list of languages and servers, an "edit JSON" button, and live status per server.
+**Language tooling is Zed's own: Zed extensions plus Zed's settings files.** Icarus adds no LSP layer, schema or CLI of its own. Language servers, formatters and linters come from Zed's built-in adapters and its extensions (e.g. `tsgo`, `oxc`), configured in Zed's user `settings.json` and a project's `.zed/settings.json` (`languages.<Lang>.language_servers|formatter|format_on_save`, `lsp.<server>`, `auto_install_extensions`). Agents configure it by editing those files like any Zed user. Icarus only imports: `icarus settings import` translates Orca's `languageServers`, `formatters` and `linters` into those Zed keys and merges them into the app's Zed settings, leaving keys the user already set alone.
 - **Performance** (the slow Cmd+click in Orca, features.md §6.2): servers run on the server machine next to the repo and stay warm per project. Opening the target file is a buffer open in Zed's editor, with no IPC file copies and no editor rebuild.
 
 ## 3c. Terminals

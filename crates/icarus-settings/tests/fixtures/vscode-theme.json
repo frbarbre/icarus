@@ -1,0 +1,24 @@
+{
+  "name": "Example Dusk",
+  "type": "dark",
+  "colors": {
+    "editor.background": "#1E1E1E",
+    "editor.foreground": "#ddd",
+    "editorCursor.foreground": "#ffcc00",
+    "editor.selectionBackground": "#264F7880",
+    "editorLineNumber.foreground": "#858585",
+    "sideBar.background": "#252526",
+    "statusBar.background": "#007acc",
+    "terminal.ansiRed": "#cd3131",
+    "terminal.ansiBrightBlue": "#3b8eea",
+    "editorError.foreground": "not-a-colour"
+  },
+  "tokenColors": [
+    { "settings": { "foreground": "#aaaaaa" } },
+    { "scope": "comment", "settings": { "foreground": "#6A9955", "fontStyle": "italic" } },
+    { "scope": "string, string.quoted", "settings": { "foreground": "#ce9178" } },
+    { "scope": ["keyword.control.flow", "keyword.control"], "settings": { "foreground": "#c586c0", "fontStyle": "bold" } },
+    { "scope": "entity.name.function", "settings": { "foreground": "#dcdcaa" } },
+    { "scope": "comment", "settings": { "foreground": "#6a9956", "fontStyle": "italic" } }
+  ]
+}

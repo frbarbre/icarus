@@ -301,11 +301,18 @@ pub fn document_schema() -> Schema {
         field(
             "agents",
             "Agent defaults.",
-            open(vec![field(
-                "default",
-                "Provider for new agent sessions, e.g. claude or codex.",
-                Str,
-            )]),
+            open(vec![
+                field(
+                    "default",
+                    "Provider for new agent sessions, e.g. claude or codex.",
+                    Str,
+                ),
+                field(
+                    "remote_control",
+                    "Start new Claude Code sessions with Claude Code's own Remote Control, so they can be followed on claude.ai or the Claude app. Default false; each agent can be switched with `icarus agent remote-control`.",
+                    Bool,
+                ),
+            ]),
         ),
         field(
             "actions",
@@ -346,20 +353,9 @@ pub fn document_schema() -> Schema {
             ]),
         ),
         field(
-            "languages",
-            "Language tooling.",
-            closed(vec![
-                field(
-                    "servers",
-                    "Language servers by language id.",
-                    map_of(open(vec![
-                        field("enabled", "", Bool),
-                        field("server", "", Str),
-                    ])),
-                ),
-                field("formatters", "", map_of(Any)),
-                field("linters", "", map_of(Any)),
-            ]),
+            "presets",
+            "Shipped presets applied between the built-in defaults and your settings, e.g. `github-pr-flow`. Read from user settings only.",
+            array(Str),
         ),
         field(
             "theme",
@@ -394,6 +390,11 @@ pub fn document_schema() -> Schema {
                         field("terminalSize", "", Number),
                         field("terminalLineHeight", "", Number),
                     ]),
+                ),
+                field(
+                    "inactivePaneOpacity",
+                    "Opacity of panes that don't have focus, 0 to 1.",
+                    Number,
                 ),
             ]),
         ),

@@ -14,7 +14,12 @@ path = "src/icarus_ui.rs"
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
+db.workspace = true
+file_icons.workspace = true
+futures.workspace = true
+git.workspace = true
 gpui = { workspace = true, features = ["frame-capture"] }
+menu.workspace = true
 gpui_tokio.workspace = true
 image.workspace = true
 icarus-client = { path = "../../../crates/icarus-client" }
@@ -34,7 +39,31 @@ ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSBitmapImageRep",
+    "NSImage",
+    "NSImageRep",
+] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "NSData",
+    "NSDictionary",
+    "NSError",
+] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "WKSnapshotConfiguration",
+    "WKWebView",
+] }
+wry = { version = "0.57", default-features = false }
+
 [dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }

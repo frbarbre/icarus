@@ -359,6 +359,13 @@ enum AppCommand {
         #[arg(long, default_value_t = 15)]
         timeout: u64,
     },
+    /// Run an app action (any bindable action, e.g. `icarus::NewAgent`) in the app's frontmost window.
+    Dispatch {
+        action: String,
+        /// The action's arguments as JSON, for actions that take some.
+        #[arg(long)]
+        args: Option<String>,
+    },
 }
 
 /// Splits `path:line:column` the way editors' "open at position" conventions do.
@@ -416,11 +423,23 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum SettingsCommand {
-    /// Import an `orca settings export` file into your user settings and matching projects.
+    /// Import an `orca settings export` file into your user settings and matching projects. Its
+    /// appearance and language tooling are merged into the app's Zed settings (keys you already
+    /// set win) and its colours become the Zed theme `themes/icarus-imported.json`.
     Import {
         file: PathBuf,
+        /// Report what would change; write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Print the Zed settings the export translates to.
+        #[arg(long)]
+        print_zed: bool,
+        /// Leave the Zed settings and themes alone.
+        #[arg(long)]
+        skip_zed: bool,
+        /// Zed config directory to merge into (default: the app's, `~/.config/zed`).
+        #[arg(long)]
+        zed_dir: Option<PathBuf>,
     },
     /// Write your settings in Orca's `orca-settings` v1 format.
     Export {
@@ -478,6 +497,9 @@ enum WorkspaceCommand {
         /// Account (id or label) for the agent; `system` for the provider's own login.
         #[arg(long)]
         account: Option<String>,
+        /// Start the agent with Claude Code's Remote Control; defaults to `agents.remote_control`.
+        #[arg(long, value_name = "on|off")]
+        remote_control: Option<Switch>,
     },
     List {
         #[arg(long)]
@@ -562,6 +584,18 @@ enum AgentCommand {
         /// Account (id or label); `system` for the provider's own login.
         #[arg(long)]
         account: Option<String>,
+        /// Start with Claude Code's Remote Control; defaults to `agents.remote_control`.
+        #[arg(long, value_name = "on|off")]
+        remote_control: Option<Switch>,
+    },
+    /// Switch Claude Code's own Remote Control for an agent (or every agent of --workspace), so the
+    /// session can be followed on claude.ai or the Claude app; prints the session's claude.ai link.
+    RemoteControl {
+        state: Switch,
+        #[arg(required_unless_present = "workspace")]
+        id: Option<String>,
+        #[arg(long, conflicts_with = "id")]
+        workspace: Option<String>,
     },
     /// List agent sessions.
     List,
@@ -889,6 +923,53 @@ fn server_binary() -> Result<PathBuf> {
     Ok(PathBuf::from("icarus-server"))
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+impl Switch {
+    fn enabled(self) -> bool {
+        matches!(self, Switch::On)
+    }
+}
+
+fn remote_control_summary(v: &Value) -> String {
+    let agents = v["agents"].as_array().cloned().unwrap_or_default();
+    if agents.is_empty() {
+        return "no Claude Code agents".into();
+    }
+    agents
+        .iter()
+        .map(|a| {
+            let state = if a["remote_control"] == json!(true) {
+                "on"
+            } else {
+                "off"
+            };
+            let when = if a["restarted"] == json!(true) {
+                "restarted on its session"
+            } else if a["state"] == "working" {
+                "applies when its process next starts"
+            } else {
+                "applies on its next start"
+            };
+            let mut line = format!(
+                "{}  remote control {state} ({when})",
+                a["id"].as_str().unwrap_or_default()
+            );
+            if let Some(url) = a["remote_control_url"].as_str() {
+                line.push_str(&format!("\n    {url}"));
+            } else if a["remote_control"] == json!(true) {
+                line.push_str("\n    `icarus agent list` shows the claude.ai link once Claude Code registers the session");
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn print(cli: &Cli, value: &Value, human: impl FnOnce(&Value) -> String) {
     if cli.json {
         println!(
@@ -1163,6 +1244,44 @@ async fn main() -> Result<()> {
         Command::App { command } => {
             let client = connect(&cli).await?;
             match command {
+                AppCommand::Dispatch { action, args } => {
+                    let args: Option<Value> = args
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|e| anyhow::anyhow!("--args is not JSON: {e}"))?;
+                    let result = std::env::temp_dir().join(format!(
+                        "icarus-dispatch-{}.json",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_nanos()
+                    ));
+                    client
+                        .request(
+                            "client.dispatch",
+                            json!({ "action": action, "args": args, "result": result }),
+                        )
+                        .await?;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    let value: Value = loop {
+                        if let Ok(text) = std::fs::read_to_string(&result)
+                            && let Ok(value) = serde_json::from_str(&text)
+                        {
+                            std::fs::remove_file(&result)?;
+                            break value;
+                        }
+                        if std::time::Instant::now() > deadline {
+                            anyhow::bail!("the app did not answer within 10s");
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    };
+                    if let Some(error) = value["error"].as_str() {
+                        anyhow::bail!("{error}");
+                    }
+                    print(&cli, &value, |v| {
+                        format!("dispatched {}", v["action"].as_str().unwrap_or_default())
+                    });
+                }
                 AppCommand::Capture { out, timeout } => {
                     let dir = match out {
                         Some(dir) => {
@@ -1297,16 +1416,52 @@ async fn main() -> Result<()> {
         Command::Settings { command } => {
             let client = connect(&cli).await?;
             match command {
-                SettingsCommand::Import { file, dry_run } => {
+                SettingsCommand::Import {
+                    file,
+                    dry_run,
+                    print_zed,
+                    skip_zed,
+                    zed_dir,
+                } => {
                     let path = std::fs::canonicalize(file).unwrap_or(file.clone());
+                    let zed_dir = zed_dir
+                        .as_ref()
+                        .map(|dir| std::fs::canonicalize(dir).unwrap_or(dir.clone()));
                     let value = client
                         .request(
                             "settings.import_orca",
-                            json!({ "path": path, "dry_run": dry_run }),
+                            json!({ "path": path, "dry_run": dry_run, "skip_zed": skip_zed, "zed_dir": zed_dir }),
                         )
                         .await?;
+                    if *print_zed && !cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value["zed"]["fragment"])
+                                .unwrap_or_default()
+                        );
+                    }
                     print(&cli, &value, |v| {
                         let mut lines = vec![format!("{} settings mapped", v["mapped"])];
+                        let zed = &v["zed"];
+                        if let Some(settings) = zed["settings"].as_str() {
+                            let count = |key: &str| zed[key].as_array().map_or(0, Vec::len);
+                            lines.push(format!(
+                                "Zed settings {settings}: {} keys added, {} already set and kept",
+                                count("added"),
+                                count("kept")
+                            ));
+                            for key in zed["kept"].as_array().into_iter().flatten() {
+                                lines
+                                    .push(format!("  kept yours: {}", key.as_str().unwrap_or("?")));
+                            }
+                        }
+                        if let Some(backup) = zed["backup"].as_str() {
+                            lines
+                                .push(format!("your commented Zed settings are saved in {backup}"));
+                        }
+                        for note in v["notes"].as_array().into_iter().flatten() {
+                            lines.push(format!("note: {}", note.as_str().unwrap_or("?")));
+                        }
                         for written in v["written"].as_array().into_iter().flatten() {
                             lines.push(format!(
                                 "wrote {} ({})",
@@ -1394,6 +1549,7 @@ async fn main() -> Result<()> {
                     layout,
                     pr_url,
                     account,
+                    remote_control,
                 } => {
                     let issue = from_linear
                         .as_ref()
@@ -1405,7 +1561,7 @@ async fn main() -> Result<()> {
                                 "project": project, "name": name, "branch": branch, "base": base,
                                 "fetch": fetch, "status": status, "prompt": prompt, "issue": issue,
                                 "agent": !no_agent, "layout": layout, "pr_url": pr_url,
-                                "account": account,
+                                "account": account, "remote_control": remote_control.map(Switch::enabled),
                             }),
                             Duration::from_secs(300),
                         )
@@ -1853,6 +2009,7 @@ async fn main() -> Result<()> {
                     ask_permissions,
                     resume,
                     account,
+                    remote_control,
                 } => {
                     let cwd = match cwd {
                         Some(cwd) => cwd.clone(),
@@ -1865,12 +2022,27 @@ async fn main() -> Result<()> {
                                 "cwd": cwd, "provider": provider, "title": title, "workspace": workspace,
                                 "model": model, "prompt": prompt, "bypass_permissions": !ask_permissions,
                                 "resume": resume, "account": account,
+                                "remote_control": remote_control.map(Switch::enabled),
                             }),
                         )
                         .await?;
                     print(&cli, &value, |v| {
                         v["id"].as_str().unwrap_or_default().to_string()
                     });
+                }
+                AgentCommand::RemoteControl {
+                    state,
+                    id,
+                    workspace,
+                } => {
+                    let value = client
+                        .request_timeout(
+                            "agent.remote_control",
+                            json!({ "id": id, "workspace": workspace, "enabled": state.enabled() }),
+                            Duration::from_secs(60),
+                        )
+                        .await?;
+                    print(&cli, &value, remote_control_summary);
                 }
                 AgentCommand::List => {
                     let value = client.request("agent.list", json!({})).await?;
@@ -1880,13 +2052,19 @@ async fn main() -> Result<()> {
                                 items
                                     .iter()
                                     .map(|a| {
-                                        format!(
+                                        let mut line = format!(
                                             "{}  {}  {}  {}",
                                             a["id"].as_str().unwrap_or_default(),
                                             a["state"].as_str().unwrap_or_default(),
                                             a["provider"].as_str().unwrap_or_default(),
                                             a["title"].as_str().unwrap_or("-")
-                                        )
+                                        );
+                                        if let Some(url) = a["remote_control_url"].as_str() {
+                                            line.push_str(&format!("  {url}"));
+                                        } else if a["remote_control"] == json!(true) {
+                                            line.push_str("  (remote control)");
+                                        }
+                                        line
                                     })
                                     .collect::<Vec<_>>()
                                     .join("\n")

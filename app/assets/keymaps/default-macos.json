@@ -692,6 +692,14 @@
     },
   },
   {
+    "context": "IcarusChanges",
+    "bindings": {
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "enter": "menu::Confirm",
+    },
+  },
+  {
     "context": "Workspace",
     "use_key_equivalents": true,
     "bindings": {
@@ -699,6 +707,10 @@
       "cmd-alt-t": "icarus::NewAgent",
       "cmd-shift-b": "icarus::OpenFrontend",
       "cmd-alt-p": "icarus::OpenPreview",
+      "cmd-alt-u": "icarus::ToggleUncommittedChanges",
+      "cmd-alt-shift-t": "icarus::OpenLatestAgentTurn",
+      "alt-f7": "icarus::NextChangedFile",
+      "alt-shift-f7": "icarus::PreviousChangedFile",
       "cmd-shift-p": "command_palette::Toggle",
       "cmd-o": "workspace::Open",
       "alt-/": "which_key::ShowPendingBindings",

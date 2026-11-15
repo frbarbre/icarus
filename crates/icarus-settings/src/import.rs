@@ -7,12 +7,12 @@ use crate::layers::{self, KeyPath, ValidationError};
 use crate::orca::{
     EDITOR_THEME_FILE_NAMES, FORMAT, OrcaExport, OrcaParseError, PORTABLE_REPO_FIELDS, VERSION,
 };
+use crate::tooling;
 
-const SETTINGS_MAP: [(&str, &str); 14] = [
+const SETTINGS_MAP: [(&str, &str); 13] = [
     ("terminalQuickCommands", "quickCommands"),
-    ("languageServers", "languages.servers"),
-    ("formatters", "languages.formatters"),
-    ("linters", "languages.linters"),
+    ("openClaudeTabsInWebView", "agents.remote_control"),
+    ("terminalInactivePaneOpacity", "theme.inactivePaneOpacity"),
     ("theme", "theme.mode"),
     ("terminalThemeDark", "theme.terminal.dark"),
     ("terminalThemeLight", "theme.terminal.light"),
@@ -27,6 +27,8 @@ const SETTINGS_MAP: [(&str, &str); 14] = [
     ("terminalFontSize", "theme.fonts.terminalSize"),
     ("terminalLineHeight", "theme.fonts.terminalLineHeight"),
 ];
+
+const TRANSLATED_SETTINGS: [&str; 3] = ["languageServers", "formatters", "linters"];
 
 const UI_MAP: [(&str, &str); 13] = [
     ("workspaceStatuses", "workspace.statuses"),
@@ -84,6 +86,10 @@ pub struct ImportReport {
 pub struct OrcaImport {
     pub user: Value,
     pub projects: IndexMap<String, Value>,
+    /// Zed user settings: appearance, extensions, `languages` and `lsp`.
+    pub zed: Value,
+    /// A Zed theme family made from Orca's editor and terminal colours, if it had any.
+    pub zed_theme: Option<Value>,
     pub report: ImportReport,
 }
 
@@ -158,6 +164,7 @@ fn unembed(value: Option<&Value>, record: Option<&Value>) -> Option<String> {
 
 struct Importer {
     user: Value,
+    zed: Value,
     carry: Map,
     projects: IndexMap<String, Value>,
     report: ImportReport,
@@ -184,11 +191,35 @@ impl Importer {
                 }
                 None => {
                     rest.insert(key.clone(), value.clone());
-                    self.report.unmapped.push(format!("{section}.{key}"));
+                    if !(section == "settings" && TRANSLATED_SETTINGS.contains(&key.as_str())) {
+                        self.report.unmapped.push(format!("{section}.{key}"));
+                    }
                 }
             }
         }
         (order, rest)
+    }
+
+    // Orca's tooling choices become Zed-style settings; the originals stay carried for export.
+    fn language_tooling(&mut self, settings: &Map) {
+        let tooling = tooling::translate(settings);
+        self.zed = Value::Object(tooling.zed);
+        self.report
+            .mapped
+            .extend(tooling.mapped.into_iter().map(|(from, to)| Mapping {
+                from,
+                to: format!("zed: {to}"),
+            }));
+        self.report.notes.extend(tooling.notes);
+        if settings
+            .get("openClaudeTabsInWebView")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            self.report.notes.push(
+                "settings.openClaudeTabsInWebView: new Claude Code sessions start with Remote Control (`agents.remote_control`), so they can be followed on claude.ai".into(),
+            );
+        }
     }
 
     fn project_entry(&mut self, index: usize, entry: &Value, seen: &mut HashSet<String>) -> Value {
@@ -320,7 +351,9 @@ impl Importer {
                         to: format!("theme.editor.{slot}"),
                     });
                     self.report.notes.push(format!(
-                        "editorThemes.{name}: the theme itself stays in Orca's VS Code format under `orca.editorThemes`; conversion to a Zed theme happens elsewhere"
+                        "editorThemes.{name}: kept in Orca's VS Code format under `orca.editorThemes` and converted to the Zed theme `{}` in Zed's `themes/{}`",
+                        crate::zed::imported_theme_name(slot),
+                        crate::zed::IMPORTED_THEME_FILE
                     ));
                     record
                 }
@@ -407,6 +440,7 @@ pub fn import_orca_text(text: &str) -> Result<OrcaImport, OrcaParseError> {
 pub fn import_orca(export: &OrcaExport) -> OrcaImport {
     let mut importer = Importer {
         user: Value::object(),
+        zed: Value::object(),
         carry: Map::new(),
         projects: IndexMap::new(),
         report: ImportReport::default(),
@@ -420,6 +454,7 @@ pub fn import_orca(export: &OrcaExport) -> OrcaImport {
         match (key.as_str(), value) {
             ("settings", Value::Object(settings)) => {
                 let (order, rest) = importer.map_section("settings", settings, &SETTINGS_MAP);
+                importer.language_tooling(settings);
                 importer
                     .carry
                     .insert("settingsOrder".into(), strings(order));
@@ -467,11 +502,18 @@ pub fn import_orca(export: &OrcaExport) -> OrcaImport {
 
     let Importer {
         mut user,
+        zed: tooling,
         carry,
         projects,
         mut report,
     } = importer;
     put(&mut user, "orca", Value::Object(carry));
+    let mut resolved = layers::defaults();
+    layers::deep_merge(&mut resolved, &user);
+    let appearance = crate::zed::render(&resolved);
+    let mut zed = appearance.settings;
+    layers::deep_merge(&mut zed, &tooling);
+    report.notes.extend(appearance.notes);
     report.validation = layers::validate(&user, Some(layers::Layer::User));
     for (remote, doc) in &projects {
         report.validation.extend(
@@ -486,6 +528,8 @@ pub fn import_orca(export: &OrcaExport) -> OrcaImport {
     OrcaImport {
         user,
         projects,
+        zed,
+        zed_theme: appearance.theme_family,
         report,
     }
 }

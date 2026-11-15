@@ -632,11 +632,22 @@
     },
   },
   {
+    "context": "IcarusChanges",
+    "bindings": {
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "enter": "menu::Confirm",
+    },
+  },
+  {
     "context": "Workspace",
     "bindings": {
       "ctrl-alt-enter": "icarus::RunNextAction",
       "ctrl-shift-b": "icarus::OpenFrontend",
       "ctrl-alt-p": "icarus::OpenPreview",
+      // Ctrl+Alt is AltGr on Linux, so the Changes scope toggles have no default here (as in Orca).
+      "alt-f7": "icarus::NextChangedFile",
+      "alt-shift-f7": "icarus::PreviousChangedFile",
       "alt-/": "which_key::ShowPendingBindings",
       // Move focus between the major regions of the window (editor, open
       // panels, status bar). Accessibility navigation; mirrors VS Code's

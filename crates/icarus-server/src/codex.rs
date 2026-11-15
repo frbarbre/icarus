@@ -423,6 +423,7 @@ mod tests {
             command: None,
             env: BTreeMap::new(),
             account: None,
+            remote_control: true,
         }
     }
 

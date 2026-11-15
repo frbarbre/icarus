@@ -73,6 +73,7 @@ pub(crate) struct AgentChoice {
     pub provider: String,
     pub model: Option<String>,
     pub command: Option<Vec<String>>,
+    pub remote_control: bool,
 }
 
 /// `agents.commands.<provider>`: the provider's command line, e.g. the path to a `codex` binary.
@@ -113,7 +114,13 @@ pub(crate) fn choose_agent(
         provider,
         model,
         command,
+        remote_control: remote_control_default(settings),
     }
+}
+
+/// `agents.remote_control`: start new Claude Code sessions with Remote Control (default off).
+pub(crate) fn remote_control_default(settings: &Value) -> bool {
+    setting(settings, &["agents", "remote_control"]).and_then(Value::as_bool) == Some(true)
 }
 
 fn base_name(base: &str) -> &str {
@@ -186,6 +193,7 @@ impl Server {
             command: choice.command,
             env: Default::default(),
             account: None,
+            remote_control: choice.remote_control,
         };
         self.apply_account(&mut options, None)
             .map_err(|e| anyhow::anyhow!(e.message))?;

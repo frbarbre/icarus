@@ -1,3 +1,6 @@
+pub mod browser;
+pub mod changes_tab;
+pub mod explorer_tab;
 pub mod github_panel;
 pub mod layout;
 pub mod links;
@@ -309,9 +312,50 @@ struct CaptureRequest {
     dir: PathBuf,
 }
 
+#[derive(serde::Deserialize)]
+struct DispatchRequest {
+    action: String,
+    args: Option<serde_json::Value>,
+    result: Option<PathBuf>,
+}
+
+/// Runs a named action in the frontmost window, as its key binding would, and reports the outcome to `result`.
+fn dispatch_action(request: DispatchRequest, cx: &mut App) {
+    let outcome = cx
+        .build_action(&request.action, request.args)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .and_then(|action| {
+            let window = cx
+                .active_window()
+                .or_else(|| cx.windows().into_iter().next())
+                .ok_or_else(|| anyhow::anyhow!("no app window is open"))?;
+            cx.update_window(window, |_, window, cx| window.dispatch_action(action, cx))
+        });
+    let report = match &outcome {
+        Ok(()) => serde_json::json!({ "action": request.action }),
+        Err(error) => {
+            serde_json::json!({ "action": request.action, "error": format!("{error:#}") })
+        }
+    };
+    if let Some(path) = request.result {
+        cx.background_spawn(async move { std::fs::write(path, report.to_string()) })
+            .detach_and_log_err(cx);
+    }
+    outcome.log_err();
+}
+
 /// Saves each window's last rendered frame as a PNG, then writes `manifest.json` so the CLI knows it's done.
+/// A browser page drawn outside GPUI's frame: where it sits and its snapshot, to paste into the window image.
+struct PageCapture {
+    window_id: u64,
+    scale: f32,
+    info: browser::BrowserCapture,
+    snapshot: Option<futures::channel::oneshot::Receiver<Option<Vec<u8>>>>,
+}
+
 fn capture_windows(request: CaptureRequest, cx: &mut App) {
     let mut frames = Vec::new();
+    let mut pages = Vec::new();
     let mut errors = Vec::new();
     for handle in cx.windows() {
         let id = handle.window_id().as_u64();
@@ -320,31 +364,97 @@ fn capture_windows(request: CaptureRequest, cx: &mut App) {
             window.draw(cx).clear(cx);
             let image = window.render_to_image();
             window.refresh();
-            image
+            (image, window.scale_factor())
         });
-        match captured {
-            Ok(Ok(image)) => frames.push((id, image)),
-            Ok(Err(error)) => errors.push(format!("window {id}: {error:#}")),
-            Err(error) => errors.push(format!("window {id}: {error:#}")),
+        let scale = match captured {
+            Ok((Ok(image), scale)) => {
+                frames.push((id, image));
+                scale
+            }
+            Ok((Err(error), _)) => {
+                errors.push(format!("window {id}: {error:#}"));
+                continue;
+            }
+            Err(error) => {
+                errors.push(format!("window {id}: {error:#}"));
+                continue;
+            }
+        };
+        for tab in browser::browsers_in(handle, cx) {
+            let tab = tab.read(cx);
+            let info = tab.capture_info();
+            let snapshot = info.shown.then(|| tab.snapshot_png()).flatten();
+            pages.push(PageCapture {
+                window_id: id,
+                scale,
+                info,
+                snapshot,
+            });
         }
     }
-    cx.background_spawn(async move {
-        let mut files = Vec::new();
-        for (id, image) in frames {
-            let path = request.dir.join(format!("window-{id}.png"));
-            match image.save_with_format(&path, image::ImageFormat::Png) {
-                Ok(()) => files.push(path),
-                Err(error) => errors.push(format!("{}: {error}", path.display())),
-            }
+    cx.spawn(async move |cx| {
+        let mut snapshots = Vec::new();
+        for page in &mut pages {
+            let png = match page.snapshot.take() {
+                Some(receiver) => receiver.await.ok().flatten(),
+                None => None,
+            };
+            snapshots.push(png);
         }
-        let manifest = serde_json::json!({ "files": files, "errors": errors });
-        std::fs::write(
-            request.dir.join("manifest.json"),
-            serde_json::to_vec_pretty(&manifest)?,
-        )?;
-        anyhow::Ok(())
+        cx.background_spawn(async move {
+            let mut files = Vec::new();
+            let mut browsers = Vec::new();
+            for (index, (page, png)) in pages.iter().zip(snapshots).enumerate() {
+                let mut entry = serde_json::to_value(&page.info)?;
+                entry["window"] = serde_json::json!(page.window_id);
+                if let Some(png) = png {
+                    let path = request.dir.join(format!("browser-{index}.png"));
+                    std::fs::write(&path, &png)?;
+                    entry["snapshot"] = serde_json::json!(path);
+                    files.push(path);
+                    let decoded = image::load_from_memory(&png).map(|image| image.to_rgba8());
+                    match (decoded, page.info.bounds) {
+                        (Ok(page_image), Some(bounds)) => {
+                            if let Some((_, frame)) =
+                                frames.iter_mut().find(|(id, _)| *id == page.window_id)
+                            {
+                                paste_page(frame, &page_image, bounds, page.scale);
+                            }
+                        }
+                        (Err(error), _) => errors.push(format!("browser {index}: {error}")),
+                        _ => {}
+                    }
+                }
+                browsers.push(entry);
+            }
+            for (id, image) in &frames {
+                let path = request.dir.join(format!("window-{id}.png"));
+                match image.save_with_format(&path, image::ImageFormat::Png) {
+                    Ok(()) => files.push(path),
+                    Err(error) => errors.push(format!("{}: {error}", path.display())),
+                }
+            }
+            let manifest =
+                serde_json::json!({ "files": files, "errors": errors, "browsers": browsers });
+            std::fs::write(
+                request.dir.join("manifest.json"),
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            anyhow::Ok(())
+        })
+        .await
     })
     .detach_and_log_err(cx);
+}
+
+/// Draws a web page snapshot over the window image at the page's logical bounds.
+fn paste_page(frame: &mut image::RgbaImage, page: &image::RgbaImage, bounds: [f32; 4], scale: f32) {
+    let [x, y, width, height] = bounds.map(|value| (value * scale).round().max(0.0) as u32);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let page = image::imageops::resize(page, width, height, image::imageops::FilterType::Triangle);
+    image::imageops::overlay(frame, &page, i64::from(x), i64::from(y));
 }
 
 /// The app-wide connection to the server and the Icarus workspace paths it last listed.
@@ -441,6 +551,14 @@ fn start_app_connection(cx: &mut App) {
                         };
                         cx.update(|cx| capture_windows(request, cx));
                     }
+                    "client.dispatch" => {
+                        let Some(request) =
+                            serde_json::from_value::<DispatchRequest>(event.payload).log_err()
+                        else {
+                            continue;
+                        };
+                        cx.update(|cx| dispatch_action(request, cx));
+                    }
                     "ports.changed" => {
                         cx.update(|cx| links::ports_changed(event.payload, cx));
                     }
@@ -492,6 +610,9 @@ pub fn init(cx: &mut App) {
     links::register(cx);
     worktree_trust::register(cx);
     github_panel::register(cx);
+    browser::register(cx);
+    explorer_tab::register(cx);
+    changes_tab::register(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_some() {
             // A workspace opened after its layout was stored (e.g. the app was closed) applies it now.

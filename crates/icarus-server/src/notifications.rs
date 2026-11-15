@@ -398,6 +398,8 @@ mod tests {
             rate_limits: None,
             rate_limits_at_ms: None,
             account: None,
+            remote_control: false,
+            remote_control_url: None,
         }
     }
 

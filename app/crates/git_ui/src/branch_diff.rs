@@ -247,6 +247,67 @@ impl BranchDiff {
         }
     }
 
+    /// Opens (or focuses) the active repository's diff against the merge base with `base_ref`, adding it to
+    /// `pane`, and scrolls to `project_path`.
+    pub fn deploy_merge_base_at(
+        workspace: &mut Workspace,
+        base_ref: SharedString,
+        project_path: Option<ProjectPath>,
+        pane: Entity<workspace::Pane>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<Entity<Self>> {
+        let repo = workspace.project().read(cx).active_repository(cx)?;
+        let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+            let item = item.read(cx);
+            matches!(
+                item.diff_base(cx),
+                DiffBase::Merge { base_ref: existing } if existing == &base_ref
+            ) && item
+                .repo(cx)
+                .is_some_and(|existing| existing.read(cx).id == repo.read(cx).id)
+        });
+        let branch_diff = match existing {
+            Some(existing) => {
+                workspace.activate_item(&existing, true, true, window, cx);
+                existing
+            }
+            None => {
+                let project = workspace.project().clone();
+                let workspace_handle = cx.entity();
+                let branch_diff = cx.new(|cx| {
+                    Self::new_with_base_ref(
+                        project,
+                        workspace_handle,
+                        base_ref,
+                        Some(repo),
+                        None,
+                        window,
+                        cx,
+                    )
+                });
+                workspace.add_item(
+                    pane,
+                    Box::new(branch_diff.clone()),
+                    None,
+                    true,
+                    true,
+                    window,
+                    cx,
+                );
+                branch_diff
+            }
+        };
+        if let Some(project_path) = project_path {
+            branch_diff.update(cx, |branch_diff, cx| {
+                branch_diff.diff.update(cx, |diff, cx| {
+                    diff.move_to_project_path(&project_path, window, cx)
+                });
+            });
+        }
+        Some(branch_diff)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_default_branch(
         project: Entity<Project>,

@@ -135,6 +135,8 @@ impl Server {
                     /// A name under `layouts`, applied once the agent exists (plan D32).
                     layout: Option<String>,
                     pr_url: Option<String>,
+                    /// Start the agent with Claude Code's Remote Control; default `agents.remote_control`.
+                    remote_control: Option<bool>,
                 }
                 let p: P = params(p)?;
                 let project = self
@@ -236,6 +238,9 @@ impl Server {
                         command,
                         env: Default::default(),
                         account: None,
+                        remote_control: p
+                            .remote_control
+                            .unwrap_or_else(|| next_action::remote_control_default(&settings)),
                     };
                     self.apply_account(&mut options, p.account.as_deref())?;
                     let agent = self

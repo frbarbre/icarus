@@ -224,7 +224,7 @@ fn json_schema_describes_the_document() {
         "rules",
         "keybindings",
         "quickCommands",
-        "languages",
+        "presets",
         "theme",
         "project",
         "orca",

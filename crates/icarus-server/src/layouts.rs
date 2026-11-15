@@ -213,6 +213,7 @@ impl Server {
             command,
             env: Default::default(),
             account: None,
+            remote_control: next_action::remote_control_default(&settings),
         };
         self.apply_account(&mut options, None)?;
         let agent = self

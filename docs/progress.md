@@ -198,6 +198,16 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - `icarus server stop` still ends terminals. After a crash or `kill -9`, the PTYs close with the server and their shells get SIGHUP; anything detached (`nohup`, `setsid`) is orphaned. The next server lists these terminals as `lost` (from `terminals.json`), and they can be respawned.
 - Tested end to end (`crates/icarus-cli/tests/restart_e2e.rs`) on macOS and in a Linux container. The launchd and systemd restart paths have not been tested against a real service.
 
+**Language tooling and themes on import (§3b, D10, D28):**
+- Language tooling is Zed's own (extensions plus Zed's `settings.json`); Icarus has no LSP settings or CLI. `icarus settings import` translates Orca's `languageServers`, `formatters` and `linters` (Orca's defaults when absent) into Zed keys: `languages.<Lang>.language_servers` (the chosen server first, its rivals turned off with `!name`, then `...`), `formatter` and `format_on_save`, `lsp.<server>.binary` for a custom command, and `auto_install_extensions` for tools that need one. Zed has pyrefly, pyright, basedpyright, ty, Ruff and typescript-language-server built in; tsgo comes from the `tsgo` extension (server `typescript-ls`) and oxlint/oxfmt from `oxc` (ids checked against zed-industries/extensions).
+- Appearance becomes Zed settings too: `theme` (`mode` as in Orca, `system` by default, with a light and a dark theme), UI, buffer and terminal fonts, terminal line height, and inactive pane opacity. Orca's VS Code editor theme and custom terminal palettes become one Zed theme family, `themes/icarus-imported.json` ("Icarus Imported Dark/Light"); Orca's built-in terminal themes carry no colours and fall back to the Zed theme's.
+- The result is merged into the app's Zed config directory (`~/.config/zed`, or `--zed-dir` / `ICARUS_ZED_CONFIG_DIR`). Keys the user already set are kept and listed, comments and trailing commas are read, and the commented original is saved once as `settings.json.before-icarus-import`. `--dry-run` writes nothing, `--print-zed` prints the Zed settings, `--skip-zed` leaves Zed alone.
+
+**Remote Control (D21):**
+- `agents.remote_control` (default off; Orca's `openClaudeTabsInWebView` imports into it) starts new Claude Code sessions with Claude Code's own `--remote-control` flag, appended last to the user's unmodified `claude` command line. `agent.create` / `workspace.create` take `remote_control`, and `agent.remote_control {id | workspace, enabled}` switches it per agent or for every Claude agent of a workspace: an idle agent restarts on its session right away, a busy one on its next start. The choice survives server restarts.
+- Agent info carries `remote_control` and `remote_control_url` (`https://claude.ai/code/<bridgeSessionId>`, read from Claude Code's `sessions/<pid>.json` records only; the `.key` files beside them are never opened). CLI: `icarus agent remote-control on|off <id> | --workspace <id>`, `--remote-control on|off` on `agent create` and `workspace create`; `icarus agent list` shows the link.
+- Tested with the fake agent; Remote Control with the headless stream-JSON mode against a real account is still spike 0.
+
 ## Blocked on you
 
 Parked until you're back; work continues on other items.
@@ -213,4 +223,5 @@ Parked until you're back; work continues on other items.
 - App: the review mode UI on top of the `review.*` RPCs (queued comments in the diff, verdict, base picker, threads, media in comments).
 - App: notifications (sound, dock badge, the `notification` event), session history in the palette, account switching in the status bar.
 - App: a missing agent behind a tab with no messages starts a fresh one quietly instead of showing an error.
-- Remaining plan items: LSP config import, theme conversion on import, Remote Control toggle, migration scripts for existing Orca CLI users, a live Tailscale check of remote servers, multi-server client.
+- App: a Remote Control toggle on agent tabs (the `agent.remote_control` RPC) that shows the claude.ai link.
+- Remaining plan items: `icarus theme import vscode|warp <file>` (D10), migration scripts for existing Orca CLI users, a live Tailscale check of remote servers, multi-server client.
