@@ -12,6 +12,38 @@ pub const MAX_VIDEO_BYTES: usize = 100 * 1024 * 1024;
 const IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 const VIDEO_TYPES: &[&str] = &["video/mp4", "video/quicktime", "video/webm"];
 
+/// The content type GitHub attachments accept for a file name, from its extension.
+pub fn content_type_for(name: &str) -> Option<&'static str> {
+    let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        _ => return None,
+    })
+}
+
+pub fn is_video(content_type: &str) -> bool {
+    VIDEO_TYPES.contains(&content_type)
+}
+
+/// What to put in a comment: an image link, or a video's bare URL on its own line, which GitHub plays.
+pub fn attachment_markdown(name: &str, content_type: &str, url: &str) -> String {
+    if is_video(content_type) {
+        format!("\n{url}\n")
+    } else {
+        let alt: String = name
+            .chars()
+            .filter(|c| !matches!(c, '[' | ']' | '\n'))
+            .collect();
+        format!("![{alt}]({url})")
+    }
+}
+
 pub fn check_attachment(content_type: &str, size: usize) -> Result<()> {
     let (kind, limit) = if IMAGE_TYPES.contains(&content_type) {
         ("image", MAX_IMAGE_BYTES)

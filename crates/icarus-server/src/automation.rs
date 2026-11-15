@@ -510,6 +510,13 @@ impl Server {
                 Ok(None) => Executed::failed(format!("workspace {workspace_id} is gone")),
                 Err(error) => Executed::failed(error),
             },
+            PlannedAction::DeleteWorkspace { workspace_id, .. }
+                if self.unsent_drafts(workspace_id) > 0 =>
+            {
+                Executed::failed(format!(
+                    "workspace {workspace_id} holds unsent review comments; it stays until they are submitted or deleted"
+                ))
+            }
             PlannedAction::DeleteWorkspace {
                 workspace_id,
                 force,

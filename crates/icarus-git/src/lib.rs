@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub mod filters;
+pub mod review_base;
 pub mod turns;
 
 pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
@@ -124,7 +125,10 @@ pub fn default_base_ref(repo: &Path) -> Option<String> {
 
 /// Resolves a base name the way Orca does: names with `/` prefer remotes, bare names are branches.
 pub fn qualify_ref(repo: &Path, name: &str) -> Option<String> {
-    let candidates: Vec<String> = if name.starts_with("refs/") {
+    let candidates: Vec<String> = if name.len() == 40 && name.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        vec![name.to_ascii_lowercase()]
+    } else if name.starts_with("refs/") {
         vec![name.to_string()]
     } else if name.contains('/') {
         vec![format!("refs/remotes/{name}"), format!("refs/heads/{name}")]
@@ -743,7 +747,11 @@ pub fn changes(worktree: &Path, query: &ChangesQuery) -> Result<Changes> {
         (_, None) => CompareStatus::NoBase,
         (Some(head), Some(base)) => match qualify_ref(worktree, base) {
             None => CompareStatus::InvalidBase { base: base.clone() },
-            Some(qualified) => match git_ok(worktree, &["merge-base", &qualified, head]) {
+            Some(qualified) => match if review_base::is_review_base_ref(&qualified) {
+                git_ok(worktree, &["rev-parse", &qualified])
+            } else {
+                git_ok(worktree, &["merge-base", &qualified, head])
+            } {
                 None => CompareStatus::NoMergeBase { base: base.clone() },
                 Some(merge_base) => {
                     let counts = git_ok(

@@ -336,6 +336,16 @@ impl Server {
                 }
                 let p: P = params(p)?;
                 let workspace = self.workspace_by_key(&p.id)?;
+                let unsent = self.unsent_drafts(&workspace.id);
+                if unsent > 0 && !p.force {
+                    return Err(rpc(
+                        "unsent_review",
+                        format!(
+                            "{} holds {unsent} unsent review comment(s); submit or delete them, or remove with force",
+                            workspace.name
+                        ),
+                    ));
+                }
                 let project = self
                     .store
                     .project(&workspace.project_id)

@@ -1,5 +1,6 @@
 pub mod attachment;
 pub mod client;
+pub mod diff_lines;
 pub mod error;
 pub mod fake;
 pub mod http;
@@ -8,6 +9,8 @@ pub mod previews;
 pub mod rate;
 pub mod repo;
 pub mod review;
+pub mod review_context;
+pub mod review_threads;
 pub mod runner;
 pub mod snapshot;
 pub mod stack;

@@ -14,6 +14,7 @@ pub mod notifications;
 pub mod paths;
 pub mod ports;
 pub mod remote;
+pub mod review;
 pub mod server;
 pub mod settings;
 pub mod state;

@@ -139,9 +139,15 @@ impl GhRequest {
                 args.push("--header".to_owned());
                 args.push("Content-Type: application/json".to_owned());
             }
-            Some(Body::Raw { content_type, .. }) => {
+            Some(Body::Raw {
+                bytes,
+                content_type,
+            }) => {
                 args.push("--header".to_owned());
                 args.push(format!("Content-Type: {content_type}"));
+                // Why: gh streams stdin chunked, and the uploads host refuses a body without a length.
+                args.push("--header".to_owned());
+                args.push(format!("Content-Length: {}", bytes.len()));
             }
             None => {}
         }

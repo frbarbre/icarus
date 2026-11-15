@@ -142,6 +142,13 @@ impl Store {
                  key TEXT PRIMARY KEY,
                  last_at INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS review_sessions (
+                 workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                 pr TEXT NOT NULL,
+                 data TEXT NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY (workspace_id, pr)
+             );
              CREATE TABLE IF NOT EXISTS accounts (
                  id TEXT PRIMARY KEY,
                  provider TEXT NOT NULL,
@@ -446,6 +453,68 @@ impl Store {
             .db()
             .execute("DELETE FROM kv WHERE key = ?1", params![key])?
             > 0)
+    }
+
+    /// A workspace's review of one pull request (`owner/name#N`), as stored JSON.
+    pub fn review_session(&self, workspace_id: &str, pr: &str) -> Result<Option<Value>> {
+        let text: Option<String> = self
+            .db()
+            .query_row(
+                "SELECT data FROM review_sessions WHERE workspace_id = ?1 AND pr = ?2",
+                params![workspace_id, pr],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(parse_json(text))
+    }
+
+    /// Read-modify-write of one review session under the store lock; `None` from `f` deletes it.
+    pub fn update_review_session<R, E>(
+        &self,
+        workspace_id: &str,
+        pr: &str,
+        f: impl FnOnce(Option<Value>) -> Result<(Option<Value>, R), E>,
+    ) -> Result<Result<R, E>> {
+        let db = self.db();
+        let current: Option<String> = db
+            .query_row(
+                "SELECT data FROM review_sessions WHERE workspace_id = ?1 AND pr = ?2",
+                params![workspace_id, pr],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let (next, result) = match f(parse_json(current)) {
+            Ok(done) => done,
+            Err(error) => return Ok(Err(error)),
+        };
+        match next {
+            Some(value) => db.execute(
+                "INSERT INTO review_sessions (workspace_id, pr, data, updated_at_ms) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(workspace_id, pr) DO UPDATE SET data = excluded.data, updated_at_ms = excluded.updated_at_ms",
+                params![workspace_id, pr, value.to_string(), now_ms() as i64],
+            )?,
+            None => db.execute(
+                "DELETE FROM review_sessions WHERE workspace_id = ?1 AND pr = ?2",
+                params![workspace_id, pr],
+            )?,
+        };
+        Ok(Ok(result))
+    }
+
+    /// Every stored review session of a workspace, keyed by pull request.
+    pub fn review_sessions(&self, workspace_id: &str) -> Result<Vec<(String, Value)>> {
+        let db = self.db();
+        let mut statement = db.prepare(
+            "SELECT pr, data FROM review_sessions WHERE workspace_id = ?1 ORDER BY updated_at_ms",
+        )?;
+        let rows = statement.query_map(params![workspace_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(pr, data)| Some((pr, serde_json::from_str(&data).ok()?)))
+            .collect())
     }
 
     pub fn add_paired_client(&self, label: &str, token_hash: &str) -> Result<PairedClient> {

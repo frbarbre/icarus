@@ -14,7 +14,25 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    fn event(self) -> &'static str {
+    /// `comment`, `approve` or `request-changes` (also GitHub's `COMMENT`/`APPROVE`/`REQUEST_CHANGES`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "comment" | "only-comment" => Some(Self::Comment),
+            "approve" => Some(Self::Approve),
+            "request-changes" => Some(Self::RequestChanges),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Comment => "comment",
+            Self::Approve => "approve",
+            Self::RequestChanges => "request-changes",
+        }
+    }
+
+    pub fn event(self) -> &'static str {
         match self {
             Self::Comment => "COMMENT",
             Self::Approve => "APPROVE",
@@ -30,7 +48,15 @@ pub enum Side {
 }
 
 impl Side {
-    fn as_str(self) -> &'static str {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "LEFT" | "OLD" | "BASE" => Some(Self::Left),
+            "RIGHT" | "NEW" | "HEAD" => Some(Self::Right),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Left => "LEFT",
             Self::Right => "RIGHT",
@@ -83,6 +109,39 @@ pub enum Reaction {
 }
 
 impl Reaction {
+    pub const ALL: [Self; 8] = [
+        Self::ThumbsUp,
+        Self::ThumbsDown,
+        Self::Laugh,
+        Self::Confused,
+        Self::Heart,
+        Self::Hooray,
+        Self::Rocket,
+        Self::Eyes,
+    ];
+
+    /// Accepts GitHub's GraphQL names (`THUMBS_UP`) and REST names (`+1`), case-insensitively.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        Self::ALL.into_iter().find(|reaction| {
+            reaction.content().eq_ignore_ascii_case(value)
+                || reaction.short().eq_ignore_ascii_case(value)
+        })
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::ThumbsUp => "+1",
+            Self::ThumbsDown => "-1",
+            Self::Laugh => "laugh",
+            Self::Confused => "confused",
+            Self::Heart => "heart",
+            Self::Hooray => "hooray",
+            Self::Rocket => "rocket",
+            Self::Eyes => "eyes",
+        }
+    }
+
     pub fn content(self) -> &'static str {
         match self {
             Self::ThumbsUp => "THUMBS_UP",
@@ -196,6 +255,22 @@ fn posted(comment: PostedComment) -> Result<PostedComment> {
 const SUBMIT_REVIEW: &str = "mutation SubmitReview($input: AddPullRequestReviewInput!) {
   addPullRequestReview(input: $input) { pullRequestReview { id state url } }
 }";
+
+const REPLY_IN_THREAD: &str = "mutation ReplyInThread($threadId: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
+    comment { id databaseId url } }
+}";
+
+/// A reply posted through GraphQL, which names the thread it joined.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReply {
+    pub id: String,
+    #[serde(default)]
+    pub database_id: Option<u64>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
 
 const THREAD_RESOLVE: &str = "mutation ResolveThread($threadId: ID!) {
   resolveReviewThread(input: {threadId: $threadId}) { thread { isResolved } }
@@ -350,6 +425,30 @@ impl<G: Gh> GitHub<G> {
             )
             .await?;
         posted(comment)
+    }
+
+    pub async fn reply_in_thread(&self, thread_id: &str, body: &str) -> Result<ThreadReply> {
+        let body = non_empty(body)?;
+        #[derive(Deserialize)]
+        struct Payload {
+            comment: Option<ThreadReply>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Data {
+            add_pull_request_review_thread_reply: Option<Payload>,
+        }
+        let data: Data = self
+            .graphql_data(
+                REPLY_IN_THREAD,
+                json!({ "threadId": thread_id, "body": body }),
+            )
+            .await?;
+        data.add_pull_request_review_thread_reply
+            .and_then(|payload| payload.comment)
+            .ok_or_else(|| {
+                GitHubError::Malformed("GitHub did not return the new comment.".to_owned())
+            })
     }
 
     pub async fn add_issue_comment(

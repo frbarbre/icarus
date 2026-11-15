@@ -222,6 +222,56 @@ fn fixture_response(fixtures: &Value, request: &GhRequest) -> (u16, Value) {
             data(json!({ "repository": { "pullRequest": { "reviewThreads": {
                 "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": nodes } } } }))
         }
+        "graphql PrReviewThreads" => {
+            let number = variables["number"].to_string();
+            let nodes = match &fixtures["review_threads"][&number] {
+                Value::Array(nodes) => nodes.clone(),
+                _ => Vec::new(),
+            };
+            data(json!({ "repository": { "pullRequest": { "reviewThreads": {
+                "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": nodes } } } }))
+        }
+        "graphql ReviewContext" => {
+            let number = &variables["number"];
+            let Some(pull) = fixture_pulls(fixtures).find(|p| p["number"] == *number) else {
+                return data(json!({ "viewer": viewer, "repository": { "pullRequest": null } }));
+            };
+            let mut context = json!({
+                "id": pull["id"], "number": pull["number"], "title": pull["title"], "url": pull["url"],
+                "state": pull["state"], "isDraft": pull["isDraft"], "headRefName": pull["headRefName"],
+                "headRefOid": pull["headRefOid"], "baseRefName": pull["baseRefName"], "author": pull["author"],
+                "viewerDidAuthor": pull["author"]["login"] == viewer["login"],
+                "commits": { "nodes": [] }, "reviews": { "nodes": [] },
+            });
+            for (key, value) in fixtures["review_context"][number.to_string()]
+                .as_object()
+                .into_iter()
+                .flatten()
+            {
+                context[key] = value.clone();
+            }
+            data(json!({ "viewer": viewer, "repository": { "pullRequest": context } }))
+        }
+        "graphql SubmitReview" => {
+            let state = match variables["input"]["event"].as_str() {
+                Some("APPROVE") => "APPROVED",
+                Some("REQUEST_CHANGES") => "CHANGES_REQUESTED",
+                _ => "COMMENTED",
+            };
+            data(json!({ "addPullRequestReview": { "pullRequestReview": {
+                "id": "PRR_fixture", "state": state, "url": "https://github.com/review/fixture" } } }))
+        }
+        "graphql ReplyInThread" => data(json!({ "addPullRequestReviewThreadReply": { "comment": {
+            "id": "PRRC_reply", "databaseId": 77, "url": "https://github.com/reply/fixture" } } })),
+        "graphql ResolveThread" => {
+            data(json!({ "resolveReviewThread": { "thread": { "isResolved": true } } }))
+        }
+        "graphql UnresolveThread" => {
+            data(json!({ "unresolveReviewThread": { "thread": { "isResolved": false } } }))
+        }
+        "graphql AddReaction" | "graphql RemoveReaction" => {
+            data(json!({ "reaction": { "subject": { "id": variables["subjectId"] } } }))
+        }
         "graphql EnableAutoMerge"
         | "graphql DisableAutoMerge"
         | "graphql MarkReady"
@@ -249,8 +299,36 @@ fn fixture_response(fixtures: &Value, request: &GhRequest) -> (u16, Value) {
 }
 
 fn rest_fixture(fixtures: &Value, request: &GhRequest) -> (u16, Value) {
-    let parts: Vec<&str> = request.endpoint.split('/').collect();
+    if let Some(query) = request
+        .endpoint
+        .strip_prefix(icarus_github::attachment::UPLOAD_ENDPOINT)
+    {
+        let name = query
+            .trim_start_matches('?')
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("name="))
+            .unwrap_or("file");
+        return (
+            201,
+            json!({ "url": format!("https://github.com/user-attachments/assets/fixture-{name}") }),
+        );
+    }
+    let (path, _query) = request
+        .endpoint
+        .split_once('?')
+        .unwrap_or((request.endpoint.as_str(), ""));
+    let parts: Vec<&str> = path.split('/').collect();
     match (request.method.as_str(), parts.as_slice()) {
+        ("GET", ["repos", _, _]) => (
+            200,
+            json!({ "id": 4242, "permissions": { "push": fixtures["repo_push"].as_bool().unwrap_or(true) } }),
+        ),
+        ("GET", ["repos", _, _, "pulls", number, "files"]) => {
+            match fixtures["pr_files"].get(*number) {
+                Some(files) => (200, files.clone()),
+                None => (404, json!({ "message": "no pr_files fixture" })),
+            }
+        }
         ("GET", ["repos", _, _, "pulls", number]) => {
             if let Some(body) = fixtures["stacks"].get(*number) {
                 return (200, body.clone());

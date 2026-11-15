@@ -172,6 +172,17 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - `account.list` shows each account with its newest usage meters, taken from the rate-limit events of agents that ran on it.
 - CLI: `icarus account list|add|remove|use`.
 
+**Review mode (server)** (github-review.md, D23):
+- The server keeps a reviewer's unsent review per workspace and pull request in `state.db`: draft comments (path, line or range, side, markdown body, file comments), the summary, the verdict, and the chosen diff base. Drafts are keyed by PR, never by commit, so they survive server restarts and pushes. A file comment keeps its kind on disk (the fork lost it).
+- A draft on lines outside the PR's diff becomes a file comment that quotes the code, as in the fork; a file the PR does not touch is refused with a reason. Up to 200 drafts are kept.
+- `review.submit` sends one GitHub review with every draft (GraphQL variables, not a string-built query). On success the drafts and summary clear; on failure they stay and GitHub's message comes back word for word. Your own PR only offers "comment", and an empty "request changes" is refused (GitHub rejects it too).
+- The diff base picker: since your last review ("Review N"), any PR commit (its own changes included), reviews lost in a rebase, or the target branch. After a rebase or a merge of the target, the reviewed version is replayed onto the new base (`refs/icarus/review-base/…`), so the Changes list shows only what changed since your review. The pick is remembered.
+- Threads come back with side, file-or-line, resolved and outdated state, reactions with who reacted, and where each sits in the current file. Reply, resolve, unresolve and react go straight to GitHub.
+- `review.upload` puts images (10 MB) and videos (100 MB) into GitHub's own attachments with the `gh` login and returns the markdown to insert.
+- A workspace with unsent drafts is not removed, by hand (without force) or by the rules.
+- RPCs: `review.get`, `review.set_base`, `review.comment.add|edit|remove|clear|list`, `review.set_summary`, `review.submit`, `review.threads`, `review.reply`, `review.resolve|unresolve`, `review.react`, `review.upload`, plus a `review.changed` event. CLI: `icarus review show|base|comment|summary|submit|threads|reply|resolve|unresolve|react|upload`, run from inside a workspace.
+- Checked live on a private sandbox repo: two drafts with an uploaded PNG and MP4, one COMMENT review, reply, resolve, unresolve and reactions read back through `review.threads`; GitHub's refusals to approve or request changes on your own PR; a two-PR stack. Auto-merge could not be enabled on that private repo.
+
 ## Blocked on you
 
 Parked until you're back; work continues on other items.

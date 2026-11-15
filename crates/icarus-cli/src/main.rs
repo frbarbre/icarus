@@ -3,6 +3,7 @@ mod attach;
 mod extras;
 mod issue;
 mod ports;
+mod review;
 mod rules;
 mod service;
 
@@ -127,6 +128,13 @@ enum Command {
     Ports {
         #[command(subcommand)]
         command: ports::PortsCommand,
+    },
+    /// Review a pull request: draft comments, diff base, summary, submit, threads, replies, reactions, media.
+    Review {
+        #[command(flatten)]
+        at: review::At,
+        #[command(subcommand)]
+        command: review::ReviewCommand,
     },
     /// Linear issues linked to workspaces: show, open, refresh.
     Issue {
@@ -1738,6 +1746,10 @@ async fn main() -> Result<()> {
         Command::Issue { command } => {
             let client = connect(&cli).await?;
             issue::run(&cli, &client, command).await?;
+        }
+        Command::Review { at, command } => {
+            let client = connect(&cli).await?;
+            review::run(&cli, &client, at, command).await?;
         }
         Command::Attach { command } => {
             let (method, params) = attach::attach_request(command)?;

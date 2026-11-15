@@ -1028,6 +1028,9 @@ impl Server {
                 self.accounts_dispatch(other, params_value).await
             }
             other if other.starts_with("pr.") => self.github_dispatch(other, params_value).await,
+            other if other.starts_with("review.") => {
+                self.review_dispatch(other, params_value).await
+            }
             other if other.starts_with("issue.") => self.linear_dispatch(other, params_value).await,
             other if other.starts_with("ports.") => self.ports_dispatch(other, params_value).await,
             other if other.starts_with("attachment.") || other.starts_with("attach.") => {
