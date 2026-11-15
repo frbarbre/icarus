@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use icarus_client::Client;
+use icarus_settings::zed_import;
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -440,6 +441,24 @@ enum SettingsCommand {
         /// Zed config directory to merge into (default: the app's, `~/.config/icarus`).
         #[arg(long)]
         zed_dir: Option<PathBuf>,
+    },
+    /// Bring a normal Zed install's settings, keymap, snippets, themes and extensions into the app.
+    /// Settings the app already has win; extensions are downloaded by the app on its next start.
+    /// Runs on this machine, where the app and Zed live, even with `--server`.
+    ImportZed {
+        /// Zed config directory to read (default: `~/.config/zed`).
+        #[arg(long, value_name = "DIR")]
+        from: Option<PathBuf>,
+        /// Zed data directory holding `extensions/` (default: Zed's, e.g.
+        /// `~/Library/Application Support/Zed`).
+        #[arg(long, value_name = "DIR")]
+        from_data: Option<PathBuf>,
+        /// The app's Zed config directory to write (default: `~/.config/icarus`).
+        #[arg(long, value_name = "DIR")]
+        zed_dir: Option<PathBuf>,
+        /// Report what would change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Write your settings in Orca's `orca-settings` v1 format.
     Export {
@@ -1413,6 +1432,29 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Settings {
+            command:
+                SettingsCommand::ImportZed {
+                    from,
+                    from_data,
+                    zed_dir,
+                    dry_run,
+                },
+        } => {
+            let source = from
+                .clone()
+                .or_else(zed_import::source_config_dir)
+                .context("no Zed config directory; pass --from")?;
+            let source_data = from_data.clone().or_else(zed_import::source_data_dir);
+            let target = zed_dir
+                .clone()
+                .or_else(icarus_settings::zed::config_dir)
+                .context("no app config directory; pass --zed-dir")?;
+            let result = zed_import::import(&source, source_data.as_deref(), &target, *dry_run)?;
+            print(&cli, &serde_json::to_value(&result)?, |_| {
+                result.summary_lines().join("\n")
+            });
+        }
         Command::Settings { command } => {
             let client = connect(&cli).await?;
             match command {
@@ -1486,6 +1528,7 @@ async fn main() -> Result<()> {
                         None => print!("{text}"),
                     }
                 }
+                SettingsCommand::ImportZed { .. } => unreachable!("handled without a server"),
             }
         }
         Command::Project { command } => {

@@ -1273,9 +1273,22 @@ impl Dock {
     }
 }
 
+/// A header an app can show above the right dock's panel, such as a switcher between sibling panels.
+/// Returning `None` leaves the dock as it is.
+#[derive(Clone)]
+pub struct RightDockHeader(
+    pub Arc<dyn Fn(&Dock, &mut Window, &mut Context<Dock>) -> Option<gpui::AnyElement>>,
+);
+
+impl gpui::Global for RightDockHeader {}
+
 impl Render for Dock {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context(cx);
+        let header = (self.position == DockPosition::Right && self.is_open)
+            .then(|| cx.try_global::<RightDockHeader>().cloned())
+            .flatten()
+            .and_then(|header| (header.0)(self, window, cx));
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
             let create_resize_handle = || {
@@ -1363,11 +1376,14 @@ impl Render for Dock {
                             Axis::Horizontal => this.w_full().h_full(),
                             Axis::Vertical => this.h_full().w_full(),
                         })
+                        .when_some(header, |this, header| this.flex().flex_col().child(header))
                         .child(
-                            entry
-                                .panel
-                                .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
+                            div().flex_1().min_h_0().size_full().child(
+                                entry
+                                    .panel
+                                    .to_any()
+                                    .cached(StyleRefinement::default().v_flex().size_full()),
+                            ),
                         ),
                 )
                 .when(self.resizable(cx), |this| {

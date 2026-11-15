@@ -205,6 +205,11 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - Appearance becomes Zed settings too: `theme` (`mode` as in Orca, `system` by default, with a light and a dark theme), UI, buffer and terminal fonts, terminal line height, and inactive pane opacity. Orca's VS Code editor theme and custom terminal palettes become one Zed theme family, `themes/icarus-imported.json` ("Icarus Imported Dark/Light"); Orca's built-in terminal themes carry no colours and fall back to the Zed theme's.
 - The result is merged into the app's Zed config directory (`~/.config/icarus`, or `--zed-dir` / `ICARUS_ZED_CONFIG_DIR`). Keys the user already set are kept and listed, comments and trailing commas are read, and the commented original is saved once as `settings.json.before-icarus-import`. `--dry-run` writes nothing, `--print-zed` prints the Zed settings, `--skip-zed` leaves Zed alone.
 
+**Import from Zed:**
+- `icarus settings import-zed [--from DIR] [--from-data DIR] [--zed-dir DIR] [--dry-run] [--json]` brings a normal Zed install (`~/.config/zed`; extensions from Zed's data directory, `~/Library/Application Support/Zed` or `~/.local/share/zed`) into the app's config directory (`~/.config/icarus`). `ICARUS_ZED_SOURCE_DIR` / `ICARUS_ZED_SOURCE_DATA_DIR` override the source.
+- Zed's `settings.json` (comments and trailing commas read) is merged in; keys the app's file already sets win, and `agent.dock`, `agent.enabled`, `disable_ai` and `agent_servers.Icarus` are never imported. Theme, icon theme and fonts carry over. Every installed extension id goes into `auto_install_extensions`, so the app downloads it itself; dev extensions (symlinks to local checkouts, or `dev` in Zed's `index.json`) are reported, not imported. `keymap.json`, snippets and custom themes are copied only when the app has none of its own (Zed's empty keymap template and the Orca import's theme don't count); otherwise they're reported as skipped. Running it again changes nothing.
+- It runs where the app runs, never over RPC: both folders are on the app's machine, and a remote server would read and write its own host's. The app calls the same library: on first launch, if a Zed install has something new, a one-time notification offers "Import your Zed setup (settings, N extensions, theme)?" with Import / Not now (remembered in the app's key-value store), and `icarus: import zed setup` runs it any time. Settings, keymap, snippets and themes reload on their own; the app installs the new extensions at once.
+
 **Remote Control (D21):**
 - `agents.remote_control` (default off; Orca's `openClaudeTabsInWebView` imports into it) starts new Claude Code sessions with Claude Code's own `--remote-control` flag, appended last to the user's unmodified `claude` command line. `agent.create` / `workspace.create` take `remote_control`, and `agent.remote_control {id | workspace, enabled}` switches it per agent or for every Claude agent of a workspace: an idle agent restarts on its session right away, a busy one on its next start. The choice survives server restarts.
 - Agent info carries `remote_control` and `remote_control_url` (`https://claude.ai/code/<bridgeSessionId>`, read from Claude Code's `sessions/<pid>.json` records only; the `.key` files beside them are never opened). CLI: `icarus agent remote-control on|off <id> | --workspace <id>`, `--remote-control on|off` on `agent create` and `workspace create`; `icarus agent list` shows the link.
@@ -221,9 +226,9 @@ Parked until you're back; work continues on other items.
 
 ## Next
 
-- App: the remaining tab types (D31): an embedded browser tab (wry), an explorer tab, and the diff tab as the Source Control "Changes vs base" view with filters and Orca's toggles.
+- App (in progress): Explorer, Source Control and GitHub as right-sidebar panels switched like Orca's, and the diff tab type (one file vs base, edit/diff toggle, full LSP).
+- Before v0.1.0: release builds on a stable release channel, so saved API keys go to the Keychain rather than a plain-text dev file; user-facing "Zed" strings in the bundle.
 - App: the review mode UI on top of the `review.*` RPCs (queued comments in the diff, verdict, base picker, threads, media in comments).
 - App: notifications (sound, dock badge, the `notification` event), session history in the palette, account switching in the status bar.
-- App: a missing agent behind a tab with no messages starts a fresh one quietly instead of showing an error.
 - App: a Remote Control toggle on agent tabs (the `agent.remote_control` RPC) that shows the claude.ai link.
-- Remaining plan items: `icarus theme import vscode|warp <file>` (D10), migration scripts for existing Orca CLI users, a live Tailscale check of remote servers, multi-server client.
+- Remaining plan items: `icarus theme import vscode|warp <file>` (D10), migration scripts for existing Orca CLI users, multi-server client.

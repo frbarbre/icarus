@@ -1,14 +1,18 @@
 pub mod browser;
 pub mod changes_tab;
-pub mod explorer_tab;
+pub mod diff_tab;
 pub mod github_panel;
 pub mod layout;
 pub mod links;
 mod model;
 mod next_action;
+pub mod sidebar;
 pub mod status_style;
 mod worktree_trust;
+pub mod zed_import;
 
+pub use changes_tab::SourceControlPanel;
+pub use diff_tab::DiffTab;
 pub use github_panel::GitHubPanel;
 pub use links::{PortEntry, PortsStore, PreviewDeployment, WorkspaceLinks};
 pub use next_action::{NextAction, NextActionButton};
@@ -611,8 +615,10 @@ pub fn init(cx: &mut App) {
     worktree_trust::register(cx);
     github_panel::register(cx);
     browser::register(cx);
-    explorer_tab::register(cx);
     changes_tab::register(cx);
+    diff_tab::register(cx);
+    sidebar::register(cx);
+    zed_import::register(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_some() {
             // A workspace opened after its layout was stored (e.g. the app was closed) applies it now.

@@ -700,9 +700,19 @@
     },
   },
   {
+    // Orca's editor.showEdit / showDiff; wins over Editor's cmd-alt-e inside a diff tab.
+    "context": "IcarusDiffTab > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-alt-e": "icarus::ShowEdit",
+      "cmd-alt-d": "icarus::ShowDiff",
+    },
+  },
+  {
     "context": "Workspace",
     "use_key_equivalents": true,
     "bindings": {
+      "cmd-alt-d": "icarus::ShowDiff",
       "cmd-alt-enter": "icarus::RunNextAction",
       "cmd-alt-t": "icarus::NewAgent",
       "cmd-shift-b": "icarus::OpenFrontend",

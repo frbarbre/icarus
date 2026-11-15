@@ -46,7 +46,36 @@ pub async fn pending_layouts(client: Arc<Client>) -> anyhow::Result<Vec<PendingL
     Ok(serde_json::from_value(value)?)
 }
 
-/// A diff tab's `scope` as the Changes tab understands it: base (default), uncommitted, turn[:name], commit:sha.
+/// Reveals the sidebar panel a layout entry names: Source Control in the entry's scope, or the Explorer.
+fn show_sidebar_panel(
+    request: &Tab,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    match request {
+        Tab::Diff { scope } => {
+            let scope = diff_scope(scope.as_deref());
+            if let Some(panel) = crate::changes_tab::reveal_source_control(workspace, window, cx) {
+                panel.update(cx, |panel, cx| panel.set_scope(scope, cx));
+            }
+        }
+        Tab::Explorer => {
+            let dock = workspace.right_dock().clone();
+            dock.update(cx, |dock, cx| {
+                if let Some(index) =
+                    dock.panel_index_for_persistent_name(crate::sidebar::EXPLORER_PANEL, cx)
+                {
+                    dock.activate_panel(index, window, cx);
+                    dock.set_open(true, window, cx);
+                }
+            });
+        }
+        _ => {}
+    }
+}
+
+/// A diff entry's `scope` as Source Control understands it: base (default), uncommitted, turn[:name], commit:sha.
 fn diff_scope(scope: Option<&str>) -> crate::changes_tab::ChangesScope {
     use crate::changes_tab::ChangesScope;
     match scope.map(str::trim) {
@@ -61,18 +90,41 @@ fn diff_scope(scope: Option<&str>) -> crate::changes_tab::ChangesScope {
     }
 }
 
-/// Drops empty panes and splits left with one child, so the tree never builds an empty pane.
+/// Explorer and diff entries show sidebar panels rather than tabs (plan D31).
+fn is_sidebar_entry(tab: &Tab) -> bool {
+    matches!(tab, Tab::Explorer | Tab::Diff { .. })
+}
+
+/// The sidebar panel a layout asks for: its first explorer or diff entry, in layout order.
+fn sidebar_request(layout: &LayoutNode) -> Option<Tab> {
+    layout
+        .tabs()
+        .into_iter()
+        .find(|tab| is_sidebar_entry(tab))
+        .cloned()
+}
+
+/// Drops sidebar entries, empty panes and splits left with one child, so the tree never builds an empty pane.
 fn prune(node: &LayoutNode) -> Option<LayoutNode> {
     match node {
         LayoutNode::Pane { tabs, active } => {
-            if tabs.is_empty() {
+            let kept: Vec<Tab> = tabs
+                .iter()
+                .filter(|tab| !is_sidebar_entry(tab))
+                .cloned()
+                .collect();
+            if kept.is_empty() {
                 return None;
             }
-            let active = active.filter(|active| *active < tabs.len());
-            Some(LayoutNode::Pane {
-                tabs: tabs.clone(),
-                active,
-            })
+            let active = active
+                .filter(|active| tabs.get(*active).is_some_and(|tab| !is_sidebar_entry(tab)))
+                .map(|active| {
+                    tabs[..active]
+                        .iter()
+                        .filter(|tab| !is_sidebar_entry(tab))
+                        .count()
+                });
+            Some(LayoutNode::Pane { tabs: kept, active })
         }
         LayoutNode::Split {
             split,
@@ -139,6 +191,9 @@ pub fn apply_layout(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    if let Some(request) = sidebar_request(layout) {
+        show_sidebar_panel(&request, workspace, window, cx);
+    }
     let Some(layout) = prune(layout) else {
         return;
     };
@@ -338,14 +393,8 @@ impl Build<'_> {
             Tab::Browser { url } => {
                 crate::browser::open_browser_tab(url.clone(), pane, false, workspace, window, cx);
             }
-            Tab::Diff { scope } => {
-                let scope = diff_scope(scope.as_deref());
-                if let Some(changes) =
-                    crate::changes_tab::open_changes_tab(pane, false, workspace, window, cx)
-                {
-                    changes.update(cx, |changes, cx| changes.set_scope(scope, cx));
-                }
-            }
+            // Pruned before building: these show sidebar panels, not tabs.
+            Tab::Diff { .. } | Tab::Explorer => {}
             Tab::File { path, line } => {
                 let path = if path.is_absolute() {
                     path.clone()
@@ -366,9 +415,6 @@ impl Build<'_> {
                     cx,
                 );
                 self.pending.push(task);
-            }
-            Tab::Explorer => {
-                crate::explorer_tab::open_explorer_tab(pane, false, workspace, window, cx);
             }
         }
         self.placed.extend(
@@ -516,11 +562,35 @@ mod tests {
         assert_eq!(
             prune(&layout),
             Some(node(json!({
-                "tabs": [{ "type": "explorer" }, { "type": "agent", "agent_id": "a" }],
-                "active": 1,
-            })))
+                "tabs": [{ "type": "agent", "agent_id": "a" }],
+                "active": 0,
+            }))),
+            "the explorer is a sidebar panel, so it leaves the pane and the active index follows"
         );
         assert_eq!(prune(&node(json!({ "tabs": [] }))), None);
+        assert_eq!(
+            prune(&node(json!({ "tabs": [{ "type": "diff" }] }))),
+            None,
+            "a pane of sidebar entries builds nothing"
+        );
+    }
+
+    #[test]
+    fn the_first_explorer_or_diff_entry_picks_the_sidebar_panel() {
+        let layout = node(json!({ "split": "row", "children": [
+            { "tabs": [{ "type": "agent" }] },
+            { "tabs": [{ "type": "diff", "scope": "uncommitted" }, { "type": "explorer" }] },
+        ]}));
+        assert_eq!(
+            sidebar_request(&layout),
+            Some(Tab::Diff {
+                scope: Some("uncommitted".into())
+            })
+        );
+        assert_eq!(
+            sidebar_request(&node(json!({ "tabs": [{ "type": "agent" }] }))),
+            None
+        );
     }
 
     #[test]
@@ -574,12 +644,19 @@ mod tests {
             .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
             .expect("workspace");
         let cx = &mut gpui::VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel =
+                cx.new(|cx| crate::changes_tab::SourceControlPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
 
         let layout = node(json!({ "split": "row", "sizes": [1.0, 3.0], "children": [
             { "tabs": [{ "type": "browser", "url": "" }, { "type": "browser", "url": "" }], "active": 1 },
             { "split": "column", "children": [
                 { "tabs": [{ "type": "diff", "scope": "uncommitted" }] },
                 { "tabs": [{ "type": "explorer" }] },
+                { "tabs": [{ "type": "browser", "url": "" }] },
                 { "tabs": [{ "type": "browser", "url": "" }] },
             ]},
         ]}));
@@ -606,20 +683,31 @@ mod tests {
                 panic!("the right side is a column");
             };
             assert_eq!(column.axis, gpui::Axis::Vertical);
-            assert_eq!(column.members.len(), 3, "the explorer is a pane tab now");
-            assert_eq!(workspace.panes().len(), 4);
             assert_eq!(
-                count_of::<crate::explorer_tab::ExplorerTab>(workspace, cx),
-                1
+                column.members.len(),
+                2,
+                "the diff and explorer entries are sidebar panels, not panes"
             );
-            assert_eq!(count_of::<crate::changes_tab::ChangesTab>(workspace, cx), 1);
+            assert_eq!(workspace.panes().len(), 3);
+            let dock = workspace.right_dock().read(cx);
+            assert!(dock.is_open(), "the layout reveals Source Control");
+            assert_eq!(
+                dock.active_panel().map(|panel| panel.persistent_name()),
+                Some(crate::changes_tab::SOURCE_CONTROL_PANEL)
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.scope(),
+                &crate::changes_tab::ChangesScope::Uncommitted
+            )
         });
 
         apply(cx);
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(
                 workspace.panes().len(),
-                4,
+                3,
                 "applying again rebuilds, not nests"
             );
             let tabs: usize = workspace
@@ -627,20 +715,8 @@ mod tests {
                 .iter()
                 .map(|pane| browser_urls(pane, cx).len())
                 .sum();
-            assert_eq!(tabs, 3, "tabs the layout doesn't place are closed");
-            assert_eq!(
-                count_of::<crate::explorer_tab::ExplorerTab>(workspace, cx),
-                1
-            );
-            assert_eq!(count_of::<crate::changes_tab::ChangesTab>(workspace, cx), 1);
-            let changes = workspace
-                .items_of_type::<crate::changes_tab::ChangesTab>(cx)
-                .next()
-                .expect("changes tab");
-            assert_eq!(
-                changes.read(cx).scope(),
-                &crate::changes_tab::ChangesScope::Uncommitted
-            );
+            assert_eq!(tabs, 4, "tabs the layout doesn't place are closed");
+            assert_eq!(count_of::<crate::DiffTab>(workspace, cx), 0);
         });
     }
 

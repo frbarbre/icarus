@@ -4,30 +4,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use file_icons::FileIcons;
-use git_ui::branch_diff::BranchDiff;
 use git_ui::commit_view::{CommitView, CommitViewOptions};
-use git_ui::project_diff::ProjectDiff;
 use gpui::{
-    App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Render,
-    ScrollStrategy, SharedString, Task, UniformListScrollHandle, WeakEntity, Window, actions,
-    uniform_list,
+    Action, App, AsyncWindowContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, FontWeight, Pixels, Render, ScrollStrategy, SharedString, Task,
+    UniformListScrollHandle, WeakEntity, Window, actions, px, uniform_list,
 };
 use gpui_tokio::Tokio;
 use icarus_client::Client;
-use project::Project;
 use serde::Deserialize;
 use ui::{ButtonLike, ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
-use workspace::item::{Item, ItemEvent, SerializableItem};
-use workspace::{ItemId, Pane, SplitDirection, Workspace, WorkspaceId};
+use workspace::Workspace;
+use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
 
 use crate::AppConnection;
+use crate::diff_tab::{DiffBase, DiffTabMode, open_diff_tab};
 
 actions!(
     icarus,
     [
-        /// Shows the Changes tab, creating it if needed.
+        /// Shows and focuses the Source Control panel.
         OpenChanges,
+        /// Shows or hides the Source Control panel.
+        ToggleSourceControlPanel,
         /// Narrows the Changes list to uncommitted changes, or back to everything (⌥⌘U).
         ToggleUncommittedChanges,
         /// Shows what the newest agent turn changed, or back to everything (⌥⇧⌘T).
@@ -223,9 +223,11 @@ fn scope_badge(
     }
 }
 
-/// The Source Control "Changes" list as a tab: every file that differs from the workspace's base, one row each.
-pub struct ChangesTab {
+/// The Source Control panel in the right sidebar: every file that differs from the workspace's base, one row
+/// each. Picking a row opens that file's diff tab.
+pub struct SourceControlPanel {
     workspace: WeakEntity<Workspace>,
+    project: WeakEntity<project::Project>,
     root: PathBuf,
     icarus_workspace: Option<String>,
     scope: ChangesScope,
@@ -235,19 +237,36 @@ pub struct ChangesTab {
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     refreshing: Option<Task<()>>,
+    position: DockPosition,
+    active: bool,
     _poll: Task<()>,
 }
 
-impl ChangesTab {
-    pub fn new(
+impl SourceControlPanel {
+    pub fn load(
         workspace: WeakEntity<Workspace>,
-        root: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+        cx: AsyncWindowContext,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        cx.spawn(async move |cx| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                cx.new(|cx| Self::new(workspace, window, cx))
+            })
+        })
+    }
+
+    pub fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let project = workspace.project().downgrade();
+        let root = worktree_root(&project, cx).unwrap_or_default();
+        let workspace = workspace.weak_handle();
+        // Polls only while the panel shows; the shortcuts reveal it first.
         let poll = cx.spawn_in(window, async move |this, cx| {
             loop {
-                if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
+                let refreshed = this.update(cx, |this, cx| {
+                    if this.active {
+                        this.refresh(cx);
+                    }
+                });
+                if refreshed.is_err() {
                     break;
                 }
                 cx.background_executor().timer(REFRESH_INTERVAL).await;
@@ -255,6 +274,7 @@ impl ChangesTab {
         });
         Self {
             workspace,
+            project,
             root,
             icarus_workspace: None,
             scope: ChangesScope::Base,
@@ -264,11 +284,13 @@ impl ChangesTab {
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             refreshing: None,
+            position: DockPosition::Right,
+            active: false,
             _poll: poll,
         }
     }
 
-    /// A tab showing `listing` without a server, for visual tests.
+    /// A panel showing `listing` without a server, for visual tests.
     pub fn preview(
         listing: Listing,
         scope: ChangesScope,
@@ -277,6 +299,7 @@ impl ChangesTab {
     ) -> Self {
         Self {
             workspace: WeakEntity::new_invalid(),
+            project: WeakEntity::new_invalid(),
             root: PathBuf::new(),
             icarus_workspace: Some("preview".into()),
             scope,
@@ -286,6 +309,8 @@ impl ChangesTab {
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             refreshing: None,
+            position: DockPosition::Right,
+            active: true,
             _poll: Task::ready(()),
         }
     }
@@ -302,7 +327,6 @@ impl ChangesTab {
         if self.scope != scope {
             self.scope = scope;
             self.selected = None;
-            cx.emit(ItemEvent::UpdateTab);
         }
         self.refresh(cx);
         cx.notify();
@@ -332,6 +356,15 @@ impl ChangesTab {
             cx.notify();
             return;
         };
+        // The project may still be loading its worktree when the panel is built.
+        if self.root.as_os_str().is_empty()
+            && let Some(root) = worktree_root(&self.project, cx)
+        {
+            self.root = root;
+        }
+        if self.root.as_os_str().is_empty() {
+            return;
+        }
         let root = self.root.clone();
         let known = self.icarus_workspace.clone();
         let scope = self.scope.clone();
@@ -367,7 +400,6 @@ impl ChangesTab {
                         }
                         if this.listing.as_ref() != Some(&listing) {
                             this.listing = Some(listing);
-                            cx.emit(ItemEvent::UpdateTab);
                         }
                     }
                     Err(error) => this.error = Some(format!("{error:#}").into()),
@@ -463,11 +495,11 @@ impl ChangesTab {
         };
         let scope = self.scope.clone();
         let listing = self.listing.clone().unwrap_or_default();
-        let this = cx.entity();
+        let root = self.root.clone();
         // Deferred: the step actions run inside a Workspace update, which would double-lease it.
         window.defer(cx, move |window, cx| {
             workspace.update(cx, |workspace, cx| {
-                open_row(&row, &scope, &listing, &this, workspace, window, cx);
+                open_row(&row, &scope, &listing, &root, workspace, window, cx);
             });
         });
     }
@@ -734,7 +766,11 @@ impl ChangesTab {
     }
 }
 
-fn filter_menu(menu: ContextMenu, tab: &WeakEntity<ChangesTab>, cx: &mut App) -> ContextMenu {
+fn filter_menu(
+    menu: ContextMenu,
+    tab: &WeakEntity<SourceControlPanel>,
+    cx: &mut App,
+) -> ContextMenu {
     let Some(entity) = tab.upgrade() else {
         return menu;
     };
@@ -781,177 +817,74 @@ fn filter_menu(menu: ContextMenu, tab: &WeakEntity<ChangesTab>, cx: &mut App) ->
     menu
 }
 
-/// The pane a row's diff opens in: one beside the Changes tab, so the list stays in view.
-fn diff_pane(
-    changes: &Entity<ChangesTab>,
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) -> Entity<Pane> {
-    let home = workspace
-        .panes()
-        .iter()
-        .find(|pane| pane.read(cx).index_for_item(changes).is_some())
-        .cloned();
-    let Some(home) = home else {
-        return workspace.active_pane().clone();
-    };
-    let active = workspace.active_pane().clone();
-    if active != home {
-        return active;
-    }
-    if let Some(other) = workspace.panes().iter().find(|pane| **pane != home) {
-        return other.clone();
-    }
-    workspace.split_pane(home, SplitDirection::Right, window, cx)
-}
-
-/// Moves a just-opened item into `pane` when the opener put it elsewhere.
-fn move_into(
-    item_id: gpui::EntityId,
-    pane: &Entity<Pane>,
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    let source = workspace
-        .panes()
-        .iter()
-        .find(|candidate| {
-            candidate
-                .read(cx)
-                .items()
-                .any(|item| item.item_id() == item_id)
-        })
-        .cloned();
-    if let Some(source) = source
-        && &source != pane
-    {
-        let index = pane.read(cx).items_len();
-        workspace::move_item(&source, pane, item_id, index, true, window, cx);
+/// What a row's diff tab compares against in `scope` (§5.1): the merge base when the compare is ready,
+/// otherwise the uncommitted change, which is the only diff there is (step 4). Turns and commits have none.
+pub(crate) fn diff_base_for(scope: &ChangesScope, listing: &Listing) -> Option<DiffBase> {
+    match scope {
+        ChangesScope::Uncommitted => Some(DiffBase::Uncommitted),
+        ChangesScope::Base => Some(
+            listing
+                .compare
+                .base
+                .clone()
+                .filter(|_| listing.compare.status == "ready")
+                .map(DiffBase::MergeBase)
+                .unwrap_or(DiffBase::Uncommitted),
+        ),
+        ChangesScope::LatestTurn | ChangesScope::Turn(_) | ChangesScope::Commit(_) => None,
     }
 }
 
-fn open_uncommitted_diff(
-    project_path: project::ProjectPath,
-    pane: &Entity<Pane>,
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    ProjectDiff::deploy_at_project_path(workspace, project_path, window, cx);
-    let diff = workspace.items_of_type::<ProjectDiff>(cx).next();
-    if let Some(diff) = diff {
-        move_into(diff.entity_id(), pane, workspace, window, cx);
-    }
-}
-
-/// Opens a row's diff the way its scope defines it (§5.1): base → disk, the uncommitted change, or the turn or
-/// commit snapshot.
+/// Opens a row the way its scope defines it: a diff tab against the base or the uncommitted change, or the
+/// turn's or commit's snapshot in the commit view.
 fn open_row(
     row: &Row,
     scope: &ChangesScope,
     listing: &Listing,
-    changes: &Entity<ChangesTab>,
+    root: &Path,
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let root = changes.read(cx).root.clone();
-    let project_path = workspace
-        .project()
-        .read(cx)
-        .find_project_path(root.join(&row.path), cx);
-    let pane = diff_pane(changes, workspace, window, cx);
-    match scope {
-        ChangesScope::Uncommitted => {
-            let Some(project_path) = project_path else {
-                return;
-            };
-            open_uncommitted_diff(project_path, &pane, workspace, window, cx);
-        }
-        ChangesScope::LatestTurn | ChangesScope::Turn(_) | ChangesScope::Commit(_) => {
-            let sha = match scope {
-                ChangesScope::Commit(sha) => Some(sha.clone()),
-                _ => listing.turn.as_ref().map(|turn| turn.oid.clone()),
-            };
-            let Some(sha) = sha else {
-                return;
-            };
-            let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
-                return;
-            };
-            let reveal = git::repository::RepoPath::new(&row.path).log_err();
-            let before: Vec<gpui::EntityId> =
-                pane.read(cx).items().map(|item| item.item_id()).collect();
-            CommitView::open(
-                sha,
-                repo.downgrade(),
-                workspace.weak_handle(),
-                CommitViewOptions {
-                    reveal_file: reveal,
-                    ..Default::default()
-                },
-                window,
-                cx,
-            );
-            let pane = pane.downgrade();
-            cx.spawn_in(window, async move |workspace, cx| {
-                // The commit view opens once its diff has loaded; then it joins the diff pane.
-                for _ in 0..40 {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(50))
-                        .await;
-                    let moved = workspace.update_in(cx, |workspace, window, cx| {
-                        let Some(pane) = pane.upgrade() else {
-                            return true;
-                        };
-                        let opened = workspace
-                            .items_of_type::<CommitView>(cx)
-                            .map(|view| view.entity_id())
-                            .find(|id| !before.contains(id));
-                        match opened {
-                            Some(id) => {
-                                move_into(id, &pane, workspace, window, cx);
-                                true
-                            }
-                            None => false,
-                        }
-                    })?;
-                    if moved {
-                        break;
-                    }
-                }
-                anyhow::Ok(())
-            })
-            .detach_and_log_err(cx);
-        }
-        ChangesScope::Base => {
-            let base = listing
-                .compare
-                .base
-                .clone()
-                .filter(|_| listing.compare.status == "ready");
-            match base {
-                Some(base) => {
-                    BranchDiff::deploy_merge_base_at(
-                        workspace,
-                        base.into(),
-                        project_path,
-                        pane,
-                        window,
-                        cx,
-                    );
-                }
-                // With no usable base, the row's uncommitted change is the only diff there is (§5.1 step 4).
-                None => {
-                    if let Some(project_path) = project_path {
-                        open_uncommitted_diff(project_path, &pane, workspace, window, cx);
-                    }
-                }
-            }
-        }
+    if let Some(base) = diff_base_for(scope, listing) {
+        open_diff_tab(
+            root.join(&row.path),
+            base,
+            DiffTabMode::Diff,
+            None,
+            workspace,
+            window,
+            cx,
+        )
+        .detach_and_log_err(cx);
+        return;
     }
+    let sha = match scope {
+        ChangesScope::Commit(sha) => Some(sha.clone()),
+        _ => listing.turn.as_ref().map(|turn| turn.oid.clone()),
+    };
+    let (Some(sha), Some(repo)) = (sha, workspace.project().read(cx).active_repository(cx)) else {
+        return;
+    };
+    CommitView::open(
+        sha,
+        repo.downgrade(),
+        workspace.weak_handle(),
+        CommitViewOptions {
+            reveal_file: git::repository::RepoPath::new(&row.path).log_err(),
+            ..Default::default()
+        },
+        window,
+        cx,
+    );
+}
+
+/// The project's first worktree; read through the project because panels activate inside Workspace updates.
+fn worktree_root(project: &WeakEntity<project::Project>, cx: &App) -> Option<PathBuf> {
+    let project = project.upgrade()?;
+    let project = project.read(cx);
+    let worktree = project.visible_worktrees(cx).next()?;
+    Some(worktree.read(cx).abs_path().to_path_buf())
 }
 
 /// The Icarus workspace whose worktree is `root`, from the server's list.
@@ -971,51 +904,57 @@ async fn workspace_id_for_root(client: Arc<Client>, root: &Path) -> anyhow::Resu
         .and_then(|workspace| workspace["id"].as_str().map(str::to_string)))
 }
 
-/// Adds a Changes tab for the workspace's first worktree to `pane`.
-pub fn open_changes_tab(
-    pane: &Entity<Pane>,
-    focus: bool,
+/// The workspace's Source Control panel, revealed in the sidebar (Orca's shortcuts open it at once, PR 77).
+pub fn reveal_source_control(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> Option<Entity<ChangesTab>> {
-    let root = workspace.root_paths(cx).first()?.to_path_buf();
-    let weak = workspace.weak_handle();
-    let changes = cx.new(|cx| ChangesTab::new(weak, root, window, cx));
-    workspace.add_item(
-        pane.clone(),
-        Box::new(changes.clone()),
-        None,
-        focus,
-        focus,
-        window,
-        cx,
-    );
-    Some(changes)
+) -> Option<Entity<SourceControlPanel>> {
+    workspace.open_panel::<SourceControlPanel>(window, cx);
+    workspace.panel::<SourceControlPanel>(cx)
 }
 
-/// The workspace's Changes tab, opened in the active pane if there is none (the shortcuts work without one).
 fn changes_tab(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> Option<Entity<ChangesTab>> {
-    let existing = workspace.items_of_type::<ChangesTab>(cx).next();
-    if let Some(existing) = existing {
-        workspace.activate_item(&existing, true, false, window, cx);
-        return Some(existing);
-    }
-    let pane = workspace.active_pane().clone();
-    open_changes_tab(&pane, false, workspace, window, cx)
+) -> Option<Entity<SourceControlPanel>> {
+    reveal_source_control(workspace, window, cx)
 }
 
 pub fn register(cx: &mut App) {
-    workspace::register_serializable_item::<ChangesTab>(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &OpenChanges, window, cx| {
-            if let Some(changes) = changes_tab(workspace, window, cx) {
-                window.focus(&changes.focus_handle(cx), cx);
-            }
+            workspace.focus_panel::<SourceControlPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleSourceControlPanel, window, cx| {
+            workspace.toggle_panel_focus::<SourceControlPanel>(window, cx);
+        });
+        // Diff tabs handle ⌥⌘D themselves; from a plain editor it opens that file's diff (§5.2).
+        workspace.register_action(|workspace, _: &crate::diff_tab::ShowDiff, window, cx| {
+            let Some(path) = workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<editor::Editor>())
+                .and_then(|editor| editor.read(cx).buffer().read(cx).as_singleton())
+                .and_then(|buffer| {
+                    use language::LocalFile as _;
+                    project::File::from_dyn(buffer.read(cx).file()).map(|file| file.abs_path(cx))
+                })
+            else {
+                return;
+            };
+            let base = workspace
+                .panel::<SourceControlPanel>(cx)
+                .and_then(|panel| {
+                    let panel = panel.read(cx);
+                    panel
+                        .listing
+                        .as_ref()
+                        .and_then(|listing| diff_base_for(&panel.scope, listing))
+                })
+                .unwrap_or(DiffBase::Uncommitted);
+            open_diff_tab(path, base, DiffTabMode::Diff, None, workspace, window, cx)
+                .detach_and_log_err(cx);
         });
         workspace.register_action(|workspace, _: &ToggleUncommittedChanges, window, cx| {
             if let Some(changes) = changes_tab(workspace, window, cx) {
@@ -1077,37 +1016,89 @@ pub fn register(cx: &mut App) {
     .detach();
 }
 
-impl EventEmitter<ItemEvent> for ChangesTab {}
+impl EventEmitter<PanelEvent> for SourceControlPanel {}
 
-impl Focusable for ChangesTab {
+impl Focusable for SourceControlPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Item for ChangesTab {
-    type Event = ItemEvent;
+impl Panel for SourceControlPanel {
+    fn persistent_name() -> &'static str {
+        SOURCE_CONTROL_PANEL
+    }
 
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        let files = self.listing.as_ref().map(|listing| listing.totals.files);
-        match (scope_badge(&self.scope, self.listing.as_ref()), files) {
-            (Some((badge, _)), Some(files)) => format!("Changes · {badge} ({files})").into(),
-            (Some((badge, _)), None) => format!("Changes · {badge}").into(),
-            (None, Some(files)) => format!("Changes ({files})").into(),
-            (None, None) => "Changes".into(),
+    fn panel_key() -> &'static str {
+        SOURCE_CONTROL_PANEL
+    }
+
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+        self.position
+    }
+
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        matches!(position, DockPosition::Left | DockPosition::Right)
+    }
+
+    fn set_position(
+        &mut self,
+        position: DockPosition,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.position = position;
+        cx.notify();
+    }
+
+    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
+        px(300.)
+    }
+
+    fn initial_size_state(&self, _window: &Window, _cx: &App) -> PanelSizeState {
+        PanelSizeState {
+            size: None,
+            flex: None,
         }
     }
 
-    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::new(IconName::Diff).color(Color::Muted))
+    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
+        Some(IconName::GitBranch)
     }
 
-    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
-        f(*event)
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        Some("Source Control")
+    }
+
+    fn icon_label(&self, _window: &Window, _cx: &App) -> Option<String> {
+        self.listing
+            .as_ref()
+            .map(|listing| listing.totals.files)
+            .filter(|files| *files > 0)
+            .map(|files| files.to_string())
+    }
+
+    fn toggle_action(&self) -> Box<dyn Action> {
+        ToggleSourceControlPanel.boxed_clone()
+    }
+
+    fn activation_priority(&self) -> u32 {
+        8
+    }
+
+    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        let became_active = active && !self.active;
+        self.active = active;
+        if became_active {
+            self.refresh(cx);
+        }
     }
 }
 
-impl Render for ChangesTab {
+/// The Source Control panel's persistent name, which the sidebar switcher also looks it up by.
+pub const SOURCE_CONTROL_PANEL: &str = "IcarusSourceControlPanel";
+
+impl Render for SourceControlPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.rows().len();
         v_flex()
@@ -1152,7 +1143,7 @@ impl Render for ChangesTab {
     }
 }
 
-impl ChangesTab {
+impl SourceControlPanel {
     fn render_rows_processor(
         &mut self,
         range: Range<usize>,
@@ -1160,64 +1151,6 @@ impl ChangesTab {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         self.render_rows(range, cx)
-    }
-}
-
-fn serialized_changes_key(workspace_id: WorkspaceId, item_id: ItemId) -> String {
-    format!("icarus-changes-tab:{}:{item_id}", i64::from(workspace_id))
-}
-
-impl SerializableItem for ChangesTab {
-    fn serialized_item_kind() -> &'static str {
-        "IcarusChangesTab"
-    }
-
-    fn cleanup(
-        _workspace_id: WorkspaceId,
-        _alive_items: Vec<ItemId>,
-        _window: &mut Window,
-        _cx: &mut App,
-    ) -> Task<anyhow::Result<()>> {
-        Task::ready(Ok(()))
-    }
-
-    fn deserialize(
-        _project: Entity<Project>,
-        workspace: WeakEntity<Workspace>,
-        workspace_id: WorkspaceId,
-        item_id: ItemId,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Task<anyhow::Result<Entity<Self>>> {
-        let saved = db::kvp::KeyValueStore::global(cx)
-            .read_kvp(&serialized_changes_key(workspace_id, item_id));
-        window.spawn(cx, async move |cx| {
-            let root: PathBuf = saved?
-                .map(PathBuf::from)
-                .ok_or_else(|| anyhow::anyhow!("no worktree recorded for this Changes tab"))?;
-            cx.update(|window, cx| cx.new(|cx| ChangesTab::new(workspace, root, window, cx)))
-        })
-    }
-
-    fn serialize(
-        &mut self,
-        workspace: &mut Workspace,
-        item_id: ItemId,
-        _closing: bool,
-        cx: &mut Context<Self>,
-    ) -> Option<Task<anyhow::Result<()>>> {
-        let workspace_id = workspace.database_id()?;
-        let root = self.root.to_string_lossy().into_owned();
-        let store = db::kvp::KeyValueStore::global(cx);
-        Some(cx.background_spawn(async move {
-            store
-                .write_kvp(serialized_changes_key(workspace_id, item_id), root)
-                .await
-        }))
-    }
-
-    fn should_serialize(&self, event: &Self::Event) -> bool {
-        matches!(event, ItemEvent::UpdateTab)
     }
 }
 
@@ -1281,114 +1214,84 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    async fn a_changes_tab_restores_its_worktree(cx: &mut gpui::TestAppContext) {
-        let (workspace, mut cx) = crate::browser::tests::workspace_with_database(cx).await;
-        let cx = &mut cx;
-        let (project, workspace_id, item_id, save) =
-            workspace.update_in(cx, |workspace, window, cx| {
-                workspace.set_random_database_id();
-                let pane = workspace.active_pane().clone();
-                let tab =
-                    open_changes_tab(&pane, true, workspace, window, cx).expect("changes tab");
-                let item_id = tab.entity_id().as_u64() as ItemId;
-                let save = tab.update(cx, |tab, cx| tab.serialize(workspace, item_id, false, cx));
-                (
-                    workspace.project().clone(),
-                    workspace.database_id().expect("database id"),
-                    item_id,
-                    save,
-                )
-            });
-        save.expect("saved").await.expect("save");
-        let restore = workspace.update_in(cx, |workspace, window, cx| {
-            ChangesTab::deserialize(
-                project,
-                workspace.weak_handle(),
-                workspace_id,
-                item_id,
-                window,
-                cx,
-            )
-        });
-        let restored = restore.await.expect("restore");
-        restored.read_with(cx, |tab, _| assert_eq!(tab.root, PathBuf::from("/project")));
+    #[test]
+    fn rows_diff_against_the_ready_base_or_else_their_uncommitted_change() {
+        let mut listing = sample_listing();
+        assert_eq!(
+            diff_base_for(&ChangesScope::Base, &listing),
+            Some(DiffBase::MergeBase("origin/main".into()))
+        );
+        assert_eq!(
+            diff_base_for(&ChangesScope::Uncommitted, &listing),
+            Some(DiffBase::Uncommitted)
+        );
+        assert_eq!(diff_base_for(&ChangesScope::LatestTurn, &listing), None);
+        listing.compare.status = "no_base".into();
+        assert_eq!(
+            diff_base_for(&ChangesScope::Base, &listing),
+            Some(DiffBase::Uncommitted),
+            "§5.1 step 4"
+        );
     }
 
     #[gpui::test]
-    async fn diffs_open_beside_the_list_without_splitting_again(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-        });
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree("/project", json!({ "a.txt": "" })).await;
-        let project = project::Project::test(fs, [Path::new("/project")], cx).await;
-        let multi_workspace = cx.add_window(|window, cx| {
-            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
-        });
-        let workspace = multi_workspace
-            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
-            .expect("workspace");
-        let cx = &mut gpui::VisualTestContext::from_window(multi_workspace.into(), cx);
-
-        let (changes, home, first, second) = workspace.update_in(cx, |workspace, window, cx| {
-            let home = workspace.active_pane().clone();
-            let changes =
-                open_changes_tab(&home, true, workspace, window, cx).expect("changes tab");
-            let first = diff_pane(&changes, workspace, window, cx);
-            let second = diff_pane(&changes, workspace, window, cx);
-            (changes, home, first, second)
-        });
-        assert_ne!(first, home, "the diff never covers the list");
-        assert_eq!(first, second, "the split is made once");
-        workspace.read_with(cx, |workspace, cx| {
-            assert_eq!(workspace.panes().len(), 2);
-            assert!(home.read(cx).index_for_item(&changes).is_some());
-        });
-    }
-
-    #[gpui::test]
-    async fn stepping_through_files_by_action_opens_them_without_a_double_lease(
+    async fn stepping_by_action_opens_and_reuses_diff_tabs_without_a_double_lease(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-            register(cx);
+        let (workspace, mut cx) = crate::diff_tab::tests::git_workspace(cx).await;
+        let cx = &mut cx;
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| SourceControlPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
         });
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree("/project", json!({ "a.txt": "" })).await;
-        let project = project::Project::test(fs, [Path::new("/project")], cx).await;
-        let multi_workspace = cx.add_window(|window, cx| {
-            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        panel.update(cx, |panel, _| {
+            let mut listing = sample_listing();
+            listing.rows.truncate(2);
+            panel.listing = Some(listing);
+            panel.refreshing = Some(Task::ready(()));
         });
-        let workspace = multi_workspace
-            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
-            .expect("workspace");
-        let cx = &mut gpui::VisualTestContext::from_window(multi_workspace.into(), cx);
-        let changes = workspace.update_in(cx, |workspace, window, cx| {
-            let pane = workspace.active_pane().clone();
-            open_changes_tab(&pane, true, workspace, window, cx).expect("changes tab")
-        });
-        changes.update(cx, |changes, _| {
-            changes.listing = Some(sample_listing());
-            changes.refreshing = Some(Task::ready(()));
+
+        let opened = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .items_of_type::<crate::DiffTab>(cx)
+                    .map(|tab| tab.read(cx).path().to_path_buf())
+                    .collect::<Vec<_>>()
+            })
+        };
+        cx.dispatch_action(NextChangedFile);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| assert_eq!(panel.selected, Some(0)));
+        assert_eq!(opened(cx), [PathBuf::from("/project/src/app.rs")]);
+        workspace.read_with(cx, |workspace, cx| {
+            let dock = workspace.right_dock().read(cx);
+            assert!(dock.is_open(), "stepping reveals Source Control");
         });
 
         cx.dispatch_action(NextChangedFile);
         cx.run_until_parked();
-
-        changes.read_with(cx, |changes, _| assert_eq!(changes.selected, Some(0)));
+        cx.dispatch_action(PreviousChangedFile);
+        cx.run_until_parked();
+        assert_eq!(
+            opened(cx).len(),
+            2,
+            "stepping back returns to the first file's tab"
+        );
+        let active = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<crate::DiffTab>())
+                .map(|tab| tab.read(cx).path().to_path_buf())
+        });
+        assert_eq!(active, Some(PathBuf::from("/project/src/app.rs")));
     }
 
     #[gpui::test]
     async fn toggles_flip_back_to_everything_and_stepping_wraps(cx: &mut gpui::TestAppContext) {
         let window = cx.add_empty_window();
         let changes = window.update(|_, cx| {
-            cx.new(|cx| ChangesTab::preview(sample_listing(), ChangesScope::Base, None, cx))
+            cx.new(|cx| SourceControlPanel::preview(sample_listing(), ChangesScope::Base, None, cx))
         });
         changes.update(window, |changes, cx| {
             changes.refreshing = Some(Task::ready(()));

@@ -455,7 +455,7 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
                 }
             }
         }
-        println!("\n--- Icarus: icarus_tab_types ---");
+        println!("\n--- Icarus: icarus_sidebar ---");
         for (name, result) in
             run_icarus_tab_types_tests(app_state.clone(), &mut cx, update_baseline)
         {
@@ -2886,8 +2886,8 @@ fn run_icarus_tab_types_tests(
     match open_icarus_tab_types_window(app_state, cx) {
         Ok(window) => {
             let results = run_icarus_dark_and_light(
-                "icarus_tab_types",
-                "icarus_tab_types_light",
+                "icarus_sidebar",
+                "icarus_sidebar_light",
                 window.into(),
                 cx,
                 update_baseline,
@@ -2909,25 +2909,48 @@ fn run_icarus_tab_types_tests(
             cx.run_until_parked();
             results
         }
-        Err(error) => vec![("icarus_tab_types", Err(error))],
+        Err(error) => vec![("icarus_sidebar", Err(error))],
     }
 }
 
-/// The Changes tab (uncommitted scope, a type filter on), the explorer tab and the browser tab's chrome in splits.
+/// The right sidebar on Source Control (uncommitted scope, a type filter on) beside a diff tab in diff mode.
 #[cfg(all(target_os = "macos", feature = "visual-tests"))]
 fn open_icarus_tab_types_window(
     app_state: Arc<AppState>,
     cx: &mut VisualTestAppContext,
 ) -> Result<WindowHandle<Workspace>> {
-    use icarus_ui::browser::BrowserTab;
-    use icarus_ui::changes_tab::{ChangesScope, ChangesTab, Listing};
+    use icarus_ui::changes_tab::{ChangesScope, Listing, SourceControlPanel};
+    use icarus_ui::diff_tab::{DiffBase, DiffTabMode, open_diff_tab};
 
     let project_path = tempfile::tempdir()?.keep().canonicalize()?.join("checkout");
     std::fs::create_dir_all(project_path.join("src"))?;
     std::fs::create_dir_all(project_path.join("docs"))?;
-    std::fs::write(project_path.join("src/login.rs"), "fn login() {}\n")?;
+    let login_before =
+        "pub fn login(user: &str) -> bool {\n    user == \"admin\"\n}\n\npub fn logout() {}\n";
+    let login_after = "pub fn login(user: &str, password: &str) -> bool {\n    check_password(user, password)\n}\n\npub fn logout() {}\n";
+    std::fs::write(project_path.join("src/login.rs"), login_before)?;
     std::fs::write(project_path.join("src/session.rs"), "fn refresh() {}\n")?;
     std::fs::write(project_path.join("docs/auth.md"), "# Auth\n")?;
+    let git = |args: &[&str]| -> Result<()> {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_path)
+            .args([
+                "-c",
+                "user.name=Icarus",
+                "-c",
+                "user.email=icarus@example.com",
+            ])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .status()?;
+        anyhow::ensure!(status.success(), "git {args:?} failed");
+        Ok(())
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    git(&["add", "."])?;
+    git(&["commit", "-q", "-m", "init"])?;
+    std::fs::write(project_path.join("src/login.rs"), login_after)?;
     let project = cx.update(|cx| {
         project::Project::local(
             app_state.client.clone(),
@@ -2994,27 +3017,26 @@ fn open_icarus_tab_types_window(
         .context("Failed to open tab types window")?;
     cx.run_until_parked();
 
-    window.update(cx, |workspace, window, cx| {
-        let left = workspace.active_pane().clone();
-        let changes =
-            cx.new(|cx| ChangesTab::preview(listing, ChangesScope::Uncommitted, Some(0), cx));
-        workspace.add_item(
-            left.clone(),
-            Box::new(changes),
+    cx.update(icarus_ui::sidebar::install_switcher);
+    let open = window.update(cx, |workspace, window, cx| {
+        let panel = cx
+            .new(|cx| SourceControlPanel::preview(listing, ChangesScope::Uncommitted, Some(0), cx));
+        workspace.add_panel(panel, window, cx);
+        workspace.open_panel::<SourceControlPanel>(window, cx);
+        open_diff_tab(
+            project_path.join("src/login.rs"),
+            DiffBase::Uncommitted,
+            DiffTabMode::Diff,
             None,
-            true,
-            false,
+            workspace,
             window,
             cx,
-        );
-        let right = workspace.split_pane(left, workspace::SplitDirection::Right, window, cx);
-        icarus_ui::explorer_tab::open_explorer_tab(&right, false, workspace, window, cx);
-        let bottom = workspace.split_pane(right, workspace::SplitDirection::Down, window, cx);
-        let browser = cx.new(|cx| {
-            BrowserTab::preview("https://github.com/acme/widgets/pull/42".into(), window, cx)
-        });
-        workspace.add_item(bottom, Box::new(browser), None, true, false, window, cx);
+        )
     })?;
+    cx.background_executor.allow_parking();
+    let opened = cx.foreground_executor.block_test(open);
+    cx.background_executor.forbid_parking();
+    opened.context("Failed to open the diff tab")?;
     cx.run_until_parked();
     cx.update_window(window.into(), |_, window, _cx| window.refresh())?;
     cx.run_until_parked();

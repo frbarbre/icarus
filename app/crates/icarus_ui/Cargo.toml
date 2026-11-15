@@ -13,6 +13,7 @@ path = "src/icarus_ui.rs"
 
 [dependencies]
 anyhow.workspace = true
+buffer_diff.workspace = true
 collections.workspace = true
 db.workspace = true
 file_icons.workspace = true
@@ -24,12 +25,15 @@ gpui_tokio.workspace = true
 image.workspace = true
 icarus-client = { path = "../../../crates/icarus-client" }
 icarus-protocol = { path = "../../../crates/icarus-protocol" }
+icarus-settings = { path = "../../../crates/icarus-settings" }
 editor.workspace = true
+extension_host.workspace = true
 git_ui.workspace = true
 language.workspace = true
 log.workspace = true
+multi_buffer.workspace = true
+paths.workspace = true
 project.workspace = true
-project_panel.workspace = true
 task.workspace = true
 terminal_view.workspace = true
 serde.workspace = true
@@ -69,6 +73,7 @@ gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 remote_connection = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 workspace = { workspace = true, features = ["test-support"] }

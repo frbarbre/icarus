@@ -767,6 +767,7 @@ dependencies = [
  "clap",
  "dirs",
  "icarus-client",
+ "icarus-settings",
  "serde",
  "serde_json",
  "sha2",
