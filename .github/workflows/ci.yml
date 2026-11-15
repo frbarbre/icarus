@@ -80,7 +80,8 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Private repos pay 10x for macOS minutes; macOS runs once the repo is public (free).
+        os: ${{ github.event.repository.private && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -108,12 +109,16 @@ jobs:
       include: ${{ steps.matrix.outputs.include }}
     steps:
       - id: matrix
+        env:
+          PRIVATE_REPO: ${{ github.event.repository.private }}
         run: |
+          macos_shards="$MACOS_SHARDS"
+          if [ "$PRIVATE_REPO" = "true" ]; then macos_shards=0; fi
           {
             printf 'include=['
             sep=''
             for i in $(seq 1 "$LINUX_SHARDS"); do printf '%s{"os":"ubuntu-latest","shard":%d,"total":%d}' "$sep" "$i" "$LINUX_SHARDS"; sep=','; done
-            for i in $(seq 1 "$MACOS_SHARDS"); do printf '%s{"os":"macos-latest","shard":%d,"total":%d}' "$sep" "$i" "$MACOS_SHARDS"; done
+            for i in $(seq 1 "$macos_shards"); do printf '%s{"os":"macos-latest","shard":%d,"total":%d}' "$sep" "$i" "$macos_shards"; done
             printf ']\n'
           } >> "$GITHUB_OUTPUT"
 
