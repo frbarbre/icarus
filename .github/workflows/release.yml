@@ -223,42 +223,53 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/release/homebrew
+          path: icarus
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: sha256sums
-      - name: Push the new version to frbarbre/homebrew-tap
+      - name: Write the cask into frbarbre/homebrew-tap
         env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
-          if [ -z "$TAP_DEPLOY_KEY" ]; then
-            echo "::notice title=Homebrew cask not updated::TAP_DEPLOY_KEY is not set. Add a write deploy key on frbarbre/homebrew-tap and store its private key as the TAP_DEPLOY_KEY secret (docs/progress.md)."
-            exit 0
-          fi
           asset="Icarus-$VERSION-macos-aarch64.zip"
           sha=$(awk -v name="$asset" '$2 == name { print $1 }' SHA256SUMS)
           if [ -z "$sha" ]; then
             echo "::error::SHA256SUMS has no $asset"
             exit 1
           fi
-          key="$RUNNER_TEMP/tap_key"
-          printf '%s\n' "$TAP_DEPLOY_KEY" > "$key"
-          chmod 600 "$key"
-          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-          git clone --depth 1 git@github.com:frbarbre/homebrew-tap.git tap
-          cd tap
-          sed -i -E \
-            -e "s/^  version \"[^\"]*\"/  version \"$VERSION\"/" \
-            -e "s/^  sha256 \"[^\"]*\"/  sha256 \"$sha\"/" \
-            Casks/icarus.rb
-          git diff
-          if git diff --quiet; then
-            echo "The cask already names $VERSION."
+          if [ -n "$TAP_TOKEN" ]; then
+            auth=$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 -w0)
+            echo "::add-mask::$auth"
+            git -c http.extraheader="AUTHORIZATION: basic $auth" clone --depth 1 https://github.com/frbarbre/homebrew-tap.git tap
+            git -C tap config http.extraheader "AUTHORIZATION: basic $auth"
+          elif [ -n "$TAP_DEPLOY_KEY" ]; then
+            key="$RUNNER_TEMP/tap_key"
+            printf '%s\n' "$TAP_DEPLOY_KEY" > "$key"
+            chmod 600 "$key"
+            export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            git clone --depth 1 git@github.com:frbarbre/homebrew-tap.git tap
+          else
+            echo "::notice title=Homebrew cask not updated::Set TAP_TOKEN (a fine-grained token with Contents write on frbarbre/homebrew-tap) or TAP_DEPLOY_KEY on frbarbre/icarus."
             exit 0
           fi
+          mkdir -p tap/Casks
+          sed -e "s/@VERSION@/$VERSION/" -e "s/@SHA256@/$sha/" icarus/scripts/release/homebrew/icarus.rb > tap/Casks/icarus.rb
+          cp icarus/scripts/release/homebrew/README.md tap/README.md
+          cd tap
+          git add -A
+          if git diff --cached --quiet; then
+            echo "The tap already has icarus $VERSION."
+            exit 0
+          fi
+          git diff --cached
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "icarus $VERSION"
+          git commit -m "icarus $VERSION"
           git push origin HEAD
-          rm -f "$key"
+          rm -f "$RUNNER_TEMP/tap_key"

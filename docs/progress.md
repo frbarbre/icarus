@@ -185,7 +185,7 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 
 **Releases and updates (D9):**
 - `.github/workflows/release.yml` runs on `v*` tags and by hand (`gh workflow run release.yml -f version=0.2.0`), never on normal pushes. It builds `icarus` + `icarus-server` for Linux x86_64 and aarch64 (glibc, on native Ubuntu 22.04 runners) and a universal macOS tarball, then `Icarus.app` for Apple silicon (`scripts/release/bundle-mac.sh`; Intel with the `intel_app` input) as a `.zip` and a `.dmg`. The app is ad-hoc signed (bundle id `dev.icarus.app`) and Zed's own updater is compiled off with `ZED_UPDATE_EXPLANATION`. It publishes a GitHub release with `SHA256SUMS` and generated notes, and the version is stamped into the binaries (`ICARUS_VERSION`).
-- Homebrew: `brew install --cask frbarbre/tap/icarus` installs the app and links `icarus` and `icarus-server`. The cask pins the version and sha256, which the workflow rewrites in `frbarbre/homebrew-tap` on each stable release; pinning (not `version :latest` as in §72) lets `brew upgrade --cask icarus` see new versions and checks the download.
+- Homebrew: `brew install --cask frbarbre/tap/icarus` installs the app and links `icarus` and `icarus-server`. The cask and the tap's README live in `scripts/release/homebrew/`; each stable release writes them into `frbarbre/homebrew-tap` with the new version and sha256, pushing with the `TAP_TOKEN` secret (set) or a `TAP_DEPLOY_KEY`. The cask pins the version; pinning (not `version :latest` as in §72) lets `brew upgrade --cask icarus` see new versions and checks the download.
 - `update.check` / `icarus update check` compare the running version with the newest non-prerelease on `frbarbre/icarus`, through `gh` when it is signed in, else unauthenticated HTTPS (which 404s while the repo is private). A newer version sends one `update_available` notification per version ("Update available — restart to update"). Release builds check in the background every `updates.check_interval_ms` (6 hours) unless `updates.channel` is `none`.
 - `icarus update install` runs `brew upgrade --cask icarus` for Homebrew installs. Otherwise it downloads the release asset, checks it against `SHA256SUMS` and swaps in the app bundle (macOS) or the two binaries, keeping `*.previous`. Then it stops the server gracefully (agents sleep) and starts the new one through the login service if installed. The server now also treats SIGTERM as a graceful shutdown.
 - Not yet: a Linux app tarball (Zed's `bundle-linux` needs cargo-about, a musl remote server and lld, and would double the build), and the app does not yet listen to `notification` events, so the update notice shows in `icarus notifications` only. TODO: show `update_available` in the app with a "Restart to update" action that runs `icarus update install`.
@@ -193,17 +193,19 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 ## Blocked on you
 
 Parked until you're back; work continues on other items.
-- **Homebrew tap:** `~/Developer/homebrew-tap` holds the new `Casks/icarus.rb` and README, uncommitted (I'm not allowed to push). Commit and push them, then set the `TAP_DEPLOY_KEY` secret on frbarbre/icarus (a write deploy key on frbarbre/homebrew-tap). Without the secret, releases still publish and the cask step is skipped with a notice.
 - **Private repo:** `brew install` and unauthenticated update checks need public release downloads, so they work only once frbarbre/icarus is public. Until then `icarus update` works through a signed-in `gh`.
 - **Cost:** a release builds the Zed app on a macOS runner (roughly an hour, billed 10x while private). Cut releases deliberately.
 
 ## In progress
 
-- Rules engine (`crates/icarus-rules`): Orca's status automations as a general engine, with Orca's tests ported.
-- Client: Icarus crates inside the Zed fork (workspace sidebar, status menu, docked composer), verified with offscreen visual tests.
+- App: the browser, explorer and diff tab types.
+- Server: terminals that survive a server restart.
 
 ## Next
 
-- Server: GitHub provider (PR facts, reviews, checks, stacks, merge queue), the rules engine wired to it, CI triage, the review inbox.
-- Server: `launchd`/`systemd` service install, and `serve --stdio` for remote servers.
-- Client: composer with attachments (§3-0), next-action button (§7d), GitHub panel and review, the source control panel with filters, the browser tab.
+- App: the remaining tab types (D31): an embedded browser tab (wry), an explorer tab, and the diff tab as the Source Control "Changes vs base" view with filters and Orca's toggles.
+- App: the review mode UI on top of the `review.*` RPCs (queued comments in the diff, verdict, base picker, threads, media in comments).
+- App: notifications (sound, dock badge, the `notification` event), session history in the palette, account switching in the status bar.
+- App: a missing agent behind a tab with no messages starts a fresh one quietly instead of showing an error.
+- Server: terminals survive a server restart or update (hand the PTYs to the new server process), as agents already do.
+- Remaining plan items: LSP config import, theme conversion on import, Remote Control toggle, migration scripts for existing Orca CLI users, a live Tailscale check of remote servers, multi-server client.
