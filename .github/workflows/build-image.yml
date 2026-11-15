@@ -30,7 +30,7 @@ jobs:
           else
             VERSION="v$(date +%Y%m%d)-${GITHUB_SHA::7}"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Generated version: $VERSION"
 
       - name: Log in to Container Registry

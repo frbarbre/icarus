@@ -118,7 +118,14 @@ impl Store {
                  created_at INTEGER NOT NULL,
                  sent_at INTEGER
              );
-             CREATE INDEX IF NOT EXISTS attachments_by_workspace ON attachments(workspace_id, created_at);",
+             CREATE INDEX IF NOT EXISTS attachments_by_workspace ON attachments(workspace_id, created_at);
+             CREATE TABLE IF NOT EXISTS paired_clients (
+                 id TEXT PRIMARY KEY,
+                 label TEXT NOT NULL,
+                 token_hash TEXT NOT NULL UNIQUE,
+                 created_at_ms INTEGER NOT NULL,
+                 last_seen_ms INTEGER NOT NULL
+             );",
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -417,6 +424,77 @@ impl Store {
             .execute("DELETE FROM kv WHERE key = ?1", params![key])?
             > 0)
     }
+
+    pub fn add_paired_client(&self, label: &str, token_hash: &str) -> Result<PairedClient> {
+        let client = PairedClient {
+            id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
+            label: label.to_string(),
+            created_at_ms: now_ms(),
+            last_seen_ms: now_ms(),
+        };
+        self.db().execute(
+            "INSERT INTO paired_clients (id, label, token_hash, created_at_ms, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                client.id,
+                client.label,
+                token_hash,
+                client.created_at_ms as i64,
+                client.last_seen_ms as i64
+            ],
+        )?;
+        Ok(client)
+    }
+
+    fn paired_client_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PairedClient> {
+        Ok(PairedClient {
+            id: row.get(0)?,
+            label: row.get(1)?,
+            created_at_ms: row.get::<_, i64>(2)? as u64,
+            last_seen_ms: row.get::<_, i64>(3)? as u64,
+        })
+    }
+
+    pub fn touch_paired_client(&self, token_hash: &str) -> Result<Option<PairedClient>> {
+        let db = self.db();
+        db.execute(
+            "UPDATE paired_clients SET last_seen_ms = ?1 WHERE token_hash = ?2",
+            params![now_ms() as i64, token_hash],
+        )?;
+        Ok(db
+            .query_row(
+                "SELECT id, label, created_at_ms, last_seen_ms FROM paired_clients
+                 WHERE token_hash = ?1",
+                params![token_hash],
+                Self::paired_client_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn paired_clients(&self) -> Result<Vec<PairedClient>> {
+        let db = self.db();
+        let mut statement = db.prepare(
+            "SELECT id, label, created_at_ms, last_seen_ms FROM paired_clients
+             ORDER BY created_at_ms",
+        )?;
+        let rows = statement.query_map([], Self::paired_client_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn remove_paired_client(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .db()
+            .execute("DELETE FROM paired_clients WHERE id = ?1", params![id])?
+            > 0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PairedClient {
+    pub id: String,
+    pub label: String,
+    pub created_at_ms: u64,
+    pub last_seen_ms: u64,
 }
 
 /// A DNS-safe worktree slug, so `<slug>.localhost` dev URLs keep resolving (plan D3).

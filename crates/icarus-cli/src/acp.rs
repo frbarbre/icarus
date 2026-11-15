@@ -463,8 +463,10 @@ impl Bridge {
     }
 }
 
-pub async fn run(home: PathBuf, provider: Option<String>) -> Result<()> {
-    let (client, mut events) = Client::connect(&home, "icarus-acp").await?;
+pub async fn run(
+    (client, mut events): (Arc<Client>, mpsc::UnboundedReceiver<icarus_client::Event>),
+    provider: Option<String>,
+) -> Result<()> {
     let (out, mut outbox) = mpsc::unbounded_channel::<Value>();
     let bridge = Arc::new(Bridge {
         client,

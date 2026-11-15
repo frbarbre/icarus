@@ -28,7 +28,7 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
   - Bypass maps to Orca's Full access (`never` + `danger-full-access`); otherwise Orca's Ask (`on-request` + read-only), with approval requests declined.
   - Sleep, wake and restart restore resume the Codex thread id. Auth is the user's own `codex login`; Icarus never reads its tokens.
   - The binary comes from `agents.commands.codex`, else `ICARUS_CODEX_BIN`, else `codex` on `PATH`. A fake app-server (`icarus-fake-codex`) backs the end-to-end tests.
-  - Not yet checked against a live Codex: that needs `codex` installed and `codex login`.
+  - Checked live against codex-cli 0.169 with a ChatGPT login (ignored test `live_codex`): streaming, sleep and `thread/resume`, and replay through `icarus acp`. Tool calls, approvals and interrupt are checked only against the fake and Codex's own generated schema.
 
 **Git** (`crates/icarus-git`):
 - Worktree list, create and remove; repo info; canonical remotes.
@@ -132,12 +132,25 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 
 **CI:** fail-fast phases plus sharded nextest (`.github/workflows/ci.yml`).
 
+**Remote servers:**
+- `icarus-server serve --listen <ip:port>` (repeatable, or the `server.listen` setting) accepts clients over TLS next to the local socket. The certificate is self-signed and stays in the server's state directory.
+- It only binds loopback, private and Tailscale addresses unless `--allow-public` is given, and the error says why.
+- `icarus server pair` prints a one-time code: 8 characters, single use, valid 10 minutes. Failed attempts are rate-limited per address. A client trades the code for its own token, which is stored hashed in `state.db`.
+- `icarus server clients` lists paired clients, and `icarus server revoke <id>` drops one and closes its live connections. These, and `pair`, only work on the server's own machine.
+- `icarus remote add <name> <addr> --code <code>` pairs, pins the certificate fingerprint and saves the server in `~/.config/icarus/servers.json`. `ssh://host` servers can be saved too. `remote list|remove` manage the list, and `--server <name>` points any command at a saved server.
+- The local socket and its token work as before, and the protocol only gained optional fields.
+
+**Linear** (`crates/icarus-linear`, plan D12 and D3):
+- A small read-only client for Linear's GraphQL API. Several issues come back in one query, rate limits pause requests until Linear's reset time, and a rejected key is reported clearly.
+- The key comes from `LINEAR_API_KEY`, else from the `linear.api_key_command` user setting (for example a `bw get …` command). The command runs once and its output is kept in memory only; it runs again if Linear rejects the key. The key is never logged or written to disk.
+- Workspace cards get the issue's title, state, labels, assignee and description from a cache, so listing never waits on Linear. The server refreshes linked issues every 5 minutes (`linear.poll_interval_ms`) and sends `workspace.changed` when a card changed.
+- `icarus workspace create --from-linear ABC-12` names the workspace after the issue and uses Linear's branch name. `icarus issue show|open|refresh|status` look issues up.
+- Without a key everything still works: cards keep the stored issue id and title.
+- The read-only live test (`crates/icarus-linear/tests/live.rs`, key from `ICARUS_LINEAR_LIVE_KEY_COMMAND`) passes against the real API: viewer, team, recent issues by identifier, and not-found handling.
+
 ## Blocked on you
 
 Parked until you're back; work continues on other items.
-- **Codex:** deferred by you. The provider is nearly complete but untested; a live check needs Codex installed and `codex login` on the build machine.
-- **Linear titles and hover cards:** need a Linear API key (or the Linear MCP authorized in this session).
-- **Zed fork's GitHub home:** fork repo or submodule; it lives only on the build machine for now.
 - **⌘⇧P:** taken by "Open preview"; the command palette moved to F1. Say if you want it back.
 
 ## In progress
@@ -148,5 +161,5 @@ Parked until you're back; work continues on other items.
 ## Next
 
 - Server: GitHub provider (PR facts, reviews, checks, stacks, merge queue), the rules engine wired to it, CI triage, the review inbox.
-- Server: `launchd`/`systemd` service install, and `serve --stdio` / `--listen` for remote servers.
+- Server: `launchd`/`systemd` service install, and `serve --stdio` for remote servers.
 - Client: composer with attachments (§3-0), next-action button (§7d), GitHub panel and review, the source control panel with filters, the browser tab.

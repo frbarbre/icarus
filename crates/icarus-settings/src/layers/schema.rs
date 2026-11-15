@@ -503,6 +503,31 @@ pub fn document_schema() -> Schema {
             ports_schema(),
         ),
         field(
+            "linear",
+            "Linear issue titles and details on workspace cards. `LINEAR_API_KEY` in the server's environment wins over these.",
+            closed(vec![
+                field(
+                    "api_key_command",
+                    "Command the server runs to print the API key (argv array, or a string run with `sh -c`), e.g. `bw get notes <item-id>`. Output is trimmed and kept in memory only; re-run when Linear rejects the key. Read from user settings only.",
+                    Any,
+                ),
+                field(
+                    "poll_interval_ms",
+                    "How often linked issues are refreshed. Default 300000 (5 minutes); at least 1000.",
+                    Integer,
+                ),
+            ]),
+        ),
+        field(
+            "server",
+            "The server process.",
+            closed(vec![field(
+                "listen",
+                "TCP addresses (`ip:port`) to accept paired clients on, besides the local socket, e.g. a Tailscale address. Used when `icarus-server serve` gets no `--listen`.",
+                array(Str),
+            )]),
+        ),
+        field(
             "orca",
             "Orca compatibility data kept so an export reproduces the original file.",
             Any,

@@ -82,7 +82,7 @@ pub fn turn_params(
         .iter()
         .map(|(media_type, data)| json!({ "type": "image", "url": format!("data:{media_type};base64,{data}") }))
         .collect();
-    input.push(json!({ "type": "text", "text": text }));
+    input.push(json!({ "type": "text", "text": text, "text_elements": [] }));
     let mut params = turn_policy(bypass);
     params["threadId"] = json!(thread_id);
     params["input"] = json!(input);
@@ -434,12 +434,12 @@ mod tests {
         let ask = turn_params("t", "hi", &[], false);
         assert_eq!(ask["approvalPolicy"], "on-request");
         assert_eq!(ask["sandboxPolicy"]["type"], "readOnly");
-        let resume = resume_params(&options(true), "thr");
+        let resume = resume_params(&options(true), "thread-1");
         assert!(
             resume.get("model").is_none(),
             "a resumed thread keeps its model"
         );
-        assert_eq!(resume["threadId"], "thr");
+        assert_eq!(resume["threadId"], "thread-1");
     }
 
     #[test]

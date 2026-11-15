@@ -1,5 +1,5 @@
 [tools]
-rust = "1.100.0"
+rust = { version = "1.100.0", components = "rustfmt,clippy,llvm-tools-preview", profile = "minimal" }
 "aqua:moonrepo/moon" = "2.6.5"
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.152"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"

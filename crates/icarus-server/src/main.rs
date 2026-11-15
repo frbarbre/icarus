@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -22,9 +23,38 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the server in the foreground on the local socket.
-    Serve,
+    Serve {
+        /// Also accept paired clients over TLS on this ip:port (repeatable; port 0 picks one).
+        /// Defaults to the `server.listen` setting.
+        #[arg(long, value_name = "ADDR")]
+        listen: Vec<String>,
+        /// Allow --listen on addresses outside loopback, private and Tailscale ranges.
+        #[arg(long)]
+        allow_public: bool,
+    },
     /// Bridge stdio to this machine's server, starting it if needed. Run over SSH by remote clients.
     Proxy,
+}
+
+fn configured_listen() -> Result<Vec<String>> {
+    use icarus_settings::layers;
+    let Some(path) = layers::user_settings_path() else {
+        return Ok(Vec::new());
+    };
+    let doc = layers::read_document(&path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e:?}", path.display()))?;
+    Ok(doc
+        .as_ref()
+        .and_then(|d| d.get("server"))
+        .and_then(|s| s.get("listen"))
+        .and_then(|l| l.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 async fn start_detached(paths: &ServerPaths) -> Result<()> {
@@ -111,9 +141,28 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = ServerPaths::resolve(cli.home.as_deref())?;
     match cli.command {
-        Command::Serve => {
+        Command::Serve {
+            listen,
+            allow_public,
+        } => {
+            let listen = if listen.is_empty() {
+                configured_listen()?
+            } else {
+                listen
+            };
+            let addrs = listen
+                .iter()
+                .map(|text| icarus_server::remote::parse_listen(text))
+                .collect::<Result<Vec<_>>>()?;
+            for addr in &addrs {
+                icarus_server::remote::check_listen(*addr, allow_public)?;
+            }
             let (server, listener) = Server::bind(paths.clone()).await?;
             tracing::info!("listening on {}", paths.socket().display());
+            for addr in server.listen_tcp(&addrs, allow_public).await? {
+                tracing::info!("listening on tcp://{addr}");
+                let _ = writeln!(std::io::stdout(), "listening on tcp://{addr}");
+            }
             server.run(listener).await
         }
         Command::Proxy => proxy(paths).await,

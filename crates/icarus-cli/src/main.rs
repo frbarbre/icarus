@@ -1,5 +1,6 @@
 mod acp;
 mod attach;
+mod issue;
 mod ports;
 mod rules;
 mod service;
@@ -23,6 +24,9 @@ struct Cli {
     /// Server state directory (defaults to $ICARUS_HOME or ~/.icarus).
     #[arg(long, global = true)]
     home: Option<PathBuf>,
+    /// Talk to a saved server (see `icarus remote list`) instead of this machine's.
+    #[arg(long, global = true, value_name = "NAME")]
+    server: Option<String>,
     /// Print machine-readable JSON.
     #[arg(long, global = true)]
     json: bool,
@@ -36,6 +40,11 @@ enum Command {
     Server {
         #[command(subcommand)]
         command: ServerCommand,
+    },
+    /// Servers on other machines this CLI can talk to with `--server <name>`.
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
     },
     /// Manage terminal sessions owned by the server.
     Terminal {
@@ -117,6 +126,11 @@ enum Command {
     Ports {
         #[command(subcommand)]
         command: ports::PortsCommand,
+    },
+    /// Linear issues linked to workspaces: show, open, refresh.
+    Issue {
+        #[command(subcommand)]
+        command: issue::IssueCommand,
     },
 }
 
@@ -308,7 +322,7 @@ fn layout_summary(node: &Value) -> String {
 enum AppCommand {
     /// Save each app window's current frame as a PNG; needs no screen-recording permission.
     Capture {
-        /// Directory for the PNGs (default: a new temporary directory).
+        /// Directory for the images (default: a new temporary directory).
         #[arg(long)]
         out: Option<PathBuf>,
         /// Seconds to wait for the app to finish writing.
@@ -407,7 +421,9 @@ enum WorkspaceCommand {
     Create {
         #[arg(long)]
         project: String,
-        name: String,
+        /// Defaults to the Linear issue's identifier and title with --from-linear.
+        #[arg(required_unless_present = "from_linear")]
+        name: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
@@ -418,7 +434,7 @@ enum WorkspaceCommand {
         status: Option<String>,
         #[arg(long)]
         prompt: Option<String>,
-        /// Link a Linear issue by identifier, e.g. ABC-12.
+        /// Link a Linear issue by identifier, e.g. ABC-12; its title and branch name fill in the rest.
         #[arg(long)]
         from_linear: Option<String>,
         #[arg(long)]
@@ -528,7 +544,14 @@ enum AgentCommand {
 #[derive(Subcommand)]
 enum ServerCommand {
     /// Start the server in the background if it isn't running.
-    Start,
+    Start {
+        /// Also accept paired clients on this ip:port, e.g. your Tailscale address (repeatable).
+        #[arg(long, value_name = "ADDR")]
+        listen: Vec<String>,
+        /// Allow --listen on addresses outside loopback, private and Tailscale ranges.
+        #[arg(long)]
+        allow_public: bool,
+    },
     /// Stop the server and every session it owns.
     Stop,
     /// Show whether the server is running.
@@ -537,6 +560,46 @@ enum ServerCommand {
     Install,
     /// Stop starting the server at login.
     Uninstall,
+    /// Print a one-time code another machine uses to pair (`icarus remote add … --code`).
+    Pair {
+        /// Seconds the code stays valid (at most an hour).
+        #[arg(long, default_value_t = 600)]
+        ttl: u64,
+    },
+    /// List the clients paired over the network.
+    Clients,
+    /// Revoke a paired client's token and close its connections.
+    Revoke { id: String },
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// Save a server: pair with a `--listen` address using a code from `icarus server pair`,
+    /// or save `ssh://host` to reach it over SSH.
+    ///
+    /// Examples:
+    ///   icarus remote add desk 100.101.102.103:7878 --code ABCD-EFGH
+    ///   icarus remote add devbox ssh://devbox
+    Add {
+        name: String,
+        address: String,
+        /// The one-time code printed by `icarus server pair` on the server's machine.
+        #[arg(long)]
+        code: Option<String>,
+        /// Require this certificate fingerprint (as printed by `icarus server pair`).
+        #[arg(long)]
+        fingerprint: Option<String>,
+        /// How the server lists this machine; defaults to the host name.
+        #[arg(long)]
+        label: Option<String>,
+        /// For SSH servers: the remote command instead of `icarus-server proxy`.
+        #[arg(long)]
+        command: Option<String>,
+    },
+    /// List saved servers.
+    List,
+    /// Forget a saved server. The server keeps the pairing until `icarus server revoke`.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -596,11 +659,142 @@ fn home(cli: &Cli) -> Result<PathBuf> {
     }
 }
 
-async fn connect(home: &std::path::Path) -> Result<std::sync::Arc<Client>> {
-    let (client, _events) = Client::connect(home, "icarus-cli")
-        .await
-        .context("no Icarus server is running (start one with `icarus server start`)")?;
-    Ok(client)
+type Connection = (
+    std::sync::Arc<Client>,
+    tokio::sync::mpsc::UnboundedReceiver<icarus_client::Event>,
+);
+
+/// Connects to the `--server` saved server, or else the local one.
+async fn open(cli: &Cli, client_name: &str) -> Result<Connection> {
+    match &cli.server {
+        Some(name) => {
+            let saved = icarus_client::servers::SavedServers::load()?;
+            let server = saved.get(name).with_context(|| {
+                format!("no saved server named {name} (see `icarus remote list`)")
+            })?;
+            Client::connect_saved(server, client_name).await
+        }
+        None => Client::connect(&home(cli)?, client_name)
+            .await
+            .context("no Icarus server is running (start one with `icarus server start`)"),
+    }
+}
+
+async fn connect(cli: &Cli) -> Result<std::sync::Arc<Client>> {
+    Ok(open(cli, "icarus-cli").await?.0)
+}
+
+fn host_name() -> String {
+    Process::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "client".into())
+}
+
+async fn remote_command(cli: &Cli, command: &RemoteCommand) -> Result<()> {
+    use icarus_client::servers::{SavedServer, SavedServers, Target, parse_address};
+    match command {
+        RemoteCommand::Add {
+            name,
+            address,
+            code,
+            fingerprint,
+            label,
+            command,
+        } => {
+            let mut saved = SavedServers::load()?;
+            let server = match parse_address(address)? {
+                Target::Ssh(_) => SavedServer {
+                    name: name.clone(),
+                    address: address.clone(),
+                    token: None,
+                    fingerprint: None,
+                    client_id: None,
+                    command: command.clone(),
+                },
+                Target::Tcp(addr) => {
+                    let code = code.as_deref().context(
+                        "pairing needs --code; run `icarus server pair` on the server's machine",
+                    )?;
+                    let credentials = icarus_client::Credentials::PairCode {
+                        code: code.to_string(),
+                        fingerprint: fingerprint.clone(),
+                        label: Some(label.clone().unwrap_or_else(host_name)),
+                    };
+                    let (client, _) = Client::connect_tcp(&addr, &credentials, "icarus-cli")
+                        .await
+                        .with_context(|| format!("pair with {addr}"))?;
+                    SavedServer {
+                        name: name.clone(),
+                        address: addr,
+                        token: Some(
+                            client
+                                .issued_token
+                                .clone()
+                                .context("the server accepted the code but sent no token")?,
+                        ),
+                        fingerprint: client.server_fingerprint.clone(),
+                        client_id: client.paired_client_id.clone(),
+                        command: None,
+                    }
+                }
+            };
+            saved.upsert(server.clone());
+            saved.save()?;
+            let value = json!({
+                "name": server.name,
+                "address": server.address,
+                "client_id": server.client_id,
+                "fingerprint": server.fingerprint,
+            });
+            print(cli, &value, |_| match &server.fingerprint {
+                Some(fp) => format!(
+                    "paired with {} as client {}; certificate sha256 {fp}",
+                    server.address,
+                    server.client_id.as_deref().unwrap_or("?")
+                ),
+                None => format!("saved {} ({})", server.name, server.address),
+            });
+        }
+        RemoteCommand::List => {
+            let saved = SavedServers::load()?;
+            let value = json!(
+                saved
+                    .servers
+                    .iter()
+                    .map(|s| json!({
+                        "name": s.name,
+                        "address": s.address,
+                        "paired": s.token.is_some(),
+                        "client_id": s.client_id,
+                        "fingerprint": s.fingerprint,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            print(cli, &value, |_| {
+                saved
+                    .servers
+                    .iter()
+                    .map(|s| format!("{}\t{}", s.name, s.address))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        }
+        RemoteCommand::Remove { name } => {
+            let mut saved = SavedServers::load()?;
+            if saved.remove(name).is_none() {
+                bail!("no saved server named {name}");
+            }
+            saved.save()?;
+            print(cli, &json!({ "removed": name }), |_| {
+                format!("removed {name}")
+            });
+        }
+    }
+    Ok(())
 }
 
 fn open_in_browser(url: &str) -> Result<()> {
@@ -653,8 +847,16 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = home(&cli)?;
     match &cli.command {
+        Command::Server {
+            command: ServerCommand::Start { .. } | ServerCommand::Install | ServerCommand::Uninstall,
+        } if cli.server.is_some() => {
+            bail!("--server can't start, install or uninstall a server; do that on its machine");
+        }
         Command::Server { command } => match command {
-            ServerCommand::Start => {
+            ServerCommand::Start {
+                listen,
+                allow_public,
+            } => {
                 if Client::connect(&home, "icarus-cli").await.is_ok() {
                     print(&cli, &json!({ "running": true, "started": false }), |_| {
                         "server already running".into()
@@ -663,9 +865,20 @@ async fn main() -> Result<()> {
                 }
                 std::fs::create_dir_all(&home)?;
                 let log = std::fs::File::create(home.join("server.log"))?;
+                let mut args = vec![
+                    "--home".to_string(),
+                    home.to_string_lossy().into_owned(),
+                    "serve".to_string(),
+                ];
+                for addr in listen {
+                    args.extend(["--listen".to_string(), addr.clone()]);
+                }
+                if *allow_public {
+                    args.push("--allow-public".into());
+                }
                 use std::os::unix::process::CommandExt;
-                Process::new(server_binary()?)
-                    .args(["--home", &home.to_string_lossy(), "serve"])
+                let mut child = Process::new(server_binary()?)
+                    .args(&args)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(log)
@@ -677,7 +890,7 @@ async fn main() -> Result<()> {
                     if Client::connect(&home, "icarus-cli").await.is_ok() {
                         break;
                     }
-                    if Instant::now() > deadline {
+                    if child.try_wait()?.is_some() || Instant::now() > deadline {
                         bail!(
                             "server did not come up; see {}",
                             home.join("server.log").display()
@@ -690,7 +903,7 @@ async fn main() -> Result<()> {
                 });
             }
             ServerCommand::Stop => {
-                let client = connect(&home).await?;
+                let client = connect(&cli).await?;
                 let value = client.request("server.shutdown", json!({})).await?;
                 print(&cli, &value, |_| "server stopping".into());
             }
@@ -710,7 +923,71 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-            ServerCommand::Status => match Client::connect(&home, "icarus-cli").await {
+            ServerCommand::Pair { ttl } => {
+                let client = connect(&cli).await?;
+                let value = client
+                    .request("server.pair", json!({ "ttl_secs": ttl }))
+                    .await?;
+                print(&cli, &value, |v| {
+                    let code = v["code"].as_str().unwrap_or("?");
+                    let minutes = v["expires_in_secs"].as_u64().unwrap_or(0).div_ceil(60);
+                    let listen: Vec<&str> = v["listen"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    let mut text =
+                        format!("Pairing code: {code} (single use, valid {minutes} minute(s))\n");
+                    match listen.first() {
+                        Some(addr) => {
+                            text += &format!(
+                                "On the other machine: icarus remote add <name> {addr} --code {code}\n"
+                            );
+                            if let Some(fp) = v["tls_fingerprint"].as_str() {
+                                text += &format!("Certificate sha256: {fp}");
+                            }
+                        }
+                        None => {
+                            text += "The server isn't listening on the network yet: restart it with \
+                             `icarus server start --listen <tailscale-ip>:<port>` or set `server.listen`."
+                        }
+                    }
+                    text.trim_end().to_string()
+                });
+            }
+            ServerCommand::Clients => {
+                let client = connect(&cli).await?;
+                let value = client.request("server.clients", json!({})).await?;
+                print(&cli, &value, |v| {
+                    v.as_array()
+                        .map(|clients| {
+                            clients
+                                .iter()
+                                .map(|c| {
+                                    format!(
+                                        "{}\t{}\tlast seen {}\t{} connection(s)",
+                                        c["id"].as_str().unwrap_or("?"),
+                                        c["label"].as_str().unwrap_or("?"),
+                                        c["last_seen_ms"],
+                                        c["connections"]
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default()
+                });
+            }
+            ServerCommand::Revoke { id } => {
+                let client = connect(&cli).await?;
+                let value = client.request("server.revoke", json!({ "id": id })).await?;
+                print(&cli, &value, |v| {
+                    format!(
+                        "revoked {id}; closed {} connection(s)",
+                        v["closed_connections"]
+                    )
+                });
+            }
+            ServerCommand::Status => match open(&cli, "icarus-cli").await {
                 Ok((client, _)) => {
                     let value = client.request("server.info", json!({})).await?;
                     print(&cli, &value, |v| {
@@ -729,10 +1006,11 @@ async fn main() -> Result<()> {
             },
         },
         Command::Acp { provider } => {
-            acp::run(home.clone(), provider.clone()).await?;
+            acp::run(open(&cli, "icarus-acp").await?, provider.clone()).await?;
         }
+        Command::Remote { command } => remote_command(&cli, command).await?,
         Command::File { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             match command {
                 FileCommand::Open {
                     target,
@@ -761,7 +1039,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Layout { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             match command {
                 LayoutCommand::List { project } => {
                     let value = client
@@ -793,7 +1071,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::App { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             match command {
                 AppCommand::Capture { out, timeout } => {
                     let dir = match out {
@@ -850,7 +1128,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Config { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
             match command {
                 ConfigCommand::Get { key, project } => {
@@ -927,7 +1205,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Settings { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             match command {
                 SettingsCommand::Import { file, dry_run } => {
                     let path = std::fs::canonicalize(file).unwrap_or(file.clone());
@@ -966,7 +1244,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Project { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             let value = match command {
                 ProjectCommand::Add { path, name, base } => {
                     let path = std::fs::canonicalize(path).unwrap_or(path.clone());
@@ -1002,7 +1280,7 @@ async fn main() -> Result<()> {
             });
         }
         Command::Workspace { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             let summary = |w: &Value| {
                 format!(
                     "{}  {}  {}  {}",
@@ -1193,7 +1471,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Changes { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             match command {
                 ChangesCommand::List {
                     workspace,
@@ -1327,7 +1605,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Pr { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             match command {
                 PrCommand::Status { workspace, refresh } => {
                     let value = client
@@ -1379,19 +1657,23 @@ async fn main() -> Result<()> {
             }
         }
         Command::Ports { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             ports::run(&cli, &client, command).await?;
+        }
+        Command::Issue { command } => {
+            let client = connect(&cli).await?;
+            issue::run(&cli, &client, command).await?;
         }
         Command::Attach { command } => {
             let (method, params) = attach::attach_request(command)?;
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             let value = client
                 .request_timeout(method, params, Duration::from_secs(180))
                 .await?;
             print(&cli, &value, attach::attached);
         }
         Command::Composer { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             match command {
                 attach::ComposerCommand::Show { workspace, all } => {
                     let value = client
@@ -1413,7 +1695,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Rules { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             match command {
                 RulesCommand::Status => {
                     let value = client.request("rules.status", json!({})).await?;
@@ -1433,7 +1715,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Agent { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             match command {
                 AgentCommand::Create {
                     cwd,
@@ -1524,7 +1806,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Terminal { command } => {
-            let client = connect(&home).await?;
+            let client = connect(&cli).await?;
             match command {
                 TerminalCommand::Create {
                     cwd,

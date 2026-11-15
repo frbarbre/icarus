@@ -1,5 +1,10 @@
 //! Async client for an Icarus server, shared by the CLI, tests and the GUI.
 
+pub mod servers;
+mod tls;
+
+pub use tls::fingerprint;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +33,42 @@ pub struct Client {
     pending: Pending,
     next_id: AtomicU64,
     pub server_version: String,
+    /// The per-client token a pairing code was exchanged for; save it, it isn't shown again.
+    pub issued_token: Option<String>,
+    pub paired_client_id: Option<String>,
+    /// SHA-256 of the server's TLS certificate, for TCP connections.
+    pub server_fingerprint: Option<String>,
+}
+
+/// How a TCP client proves who it is.
+#[derive(Debug, Clone)]
+pub enum Credentials {
+    /// A token from an earlier pairing, with the certificate fingerprint pinned then.
+    Token { token: String, fingerprint: String },
+    /// A one-time code from `icarus server pair`. Without a fingerprint the certificate is trusted on first use.
+    PairCode {
+        code: String,
+        fingerprint: Option<String>,
+        label: Option<String>,
+    },
+}
+
+struct Hello<'a> {
+    token: &'a str,
+    pair_code: Option<&'a str>,
+    label: Option<&'a str>,
+    server_fingerprint: Option<String>,
+}
+
+impl Hello<'_> {
+    fn token(token: &str) -> Hello<'_> {
+        Hello {
+            token,
+            pair_code: None,
+            label: None,
+            server_fingerprint: None,
+        }
+    }
 }
 
 /// Default state directory, matching the server's resolution.
@@ -53,7 +94,13 @@ impl Client {
             .await
             .with_context(|| format!("connect {}", socket.display()))?;
         let (reader, writer) = stream.into_split();
-        Self::handshake(reader, Box::new(writer), token.trim(), client_name).await
+        Self::handshake(
+            reader,
+            Box::new(writer),
+            Hello::token(token.trim()),
+            client_name,
+        )
+        .await
     }
 
     /// Connects to a server on another machine by running `icarus-server proxy` there over SSH.
@@ -77,7 +124,7 @@ impl Client {
         tokio::spawn(async move {
             let _ = child.wait().await;
         });
-        Self::handshake(reader, Box::new(writer), "", client_name).await
+        Self::handshake(reader, Box::new(writer), Hello::token(""), client_name).await
     }
 
     /// Runs a local command that speaks the server protocol on stdio (used by tests and custom transports).
@@ -98,13 +145,81 @@ impl Client {
         tokio::spawn(async move {
             let _ = child.wait().await;
         });
-        Self::handshake(reader, Box::new(writer), "", client_name).await
+        Self::handshake(reader, Box::new(writer), Hello::token(""), client_name).await
+    }
+
+    /// Connects to a server's `--listen` address over TLS, pinning its certificate.
+    pub async fn connect_tcp(
+        addr: &str,
+        credentials: &Credentials,
+        client_name: &str,
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Event>)> {
+        let addr = addr.trim_start_matches("tcp://");
+        let (expected, hello) = match credentials {
+            Credentials::Token { token, fingerprint } => {
+                (Some(fingerprint.as_str()), Hello::token(token))
+            }
+            Credentials::PairCode {
+                code,
+                fingerprint,
+                label,
+            } => (
+                fingerprint.as_deref(),
+                Hello {
+                    token: "",
+                    pair_code: Some(code),
+                    label: label.as_deref(),
+                    server_fingerprint: None,
+                },
+            ),
+        };
+        let stream = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| anyhow!("connect {addr} timed out"))?
+        .with_context(|| format!("connect {addr}"))?;
+        let (stream, fingerprint) = tls::connect(stream, expected).await?;
+        let (reader, writer) = tokio::io::split(stream);
+        let hello = Hello {
+            server_fingerprint: Some(fingerprint),
+            ..hello
+        };
+        Self::handshake(reader, Box::new(writer), hello, client_name).await
+    }
+
+    /// Connects to a saved server (see [`servers`]).
+    pub async fn connect_saved(
+        server: &servers::SavedServer,
+        client_name: &str,
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Event>)> {
+        match server.target()? {
+            servers::Target::Ssh(destination) => {
+                Self::connect_ssh(&destination, server.command.as_deref(), client_name).await
+            }
+            servers::Target::Tcp(addr) => {
+                let (Some(token), Some(fingerprint)) = (&server.token, &server.fingerprint) else {
+                    bail!(
+                        "server {} has no saved token; pair again with `icarus remote add`",
+                        server.name
+                    );
+                };
+                let credentials = Credentials::Token {
+                    token: token.clone(),
+                    fingerprint: fingerprint.clone(),
+                };
+                Self::connect_tcp(&addr, &credentials, client_name)
+                    .await
+                    .with_context(|| format!("connect to {} ({addr})", server.name))
+            }
+        }
     }
 
     async fn handshake<R>(
         mut reader: R,
         mut writer: Box<dyn AsyncWrite + Send + Unpin>,
-        token: &str,
+        hello: Hello<'_>,
         client_name: &str,
     ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Event>)>
     where
@@ -113,14 +228,16 @@ impl Client {
         writer
             .write_all(&encode_frame(&ClientMessage::Hello {
                 version: PROTOCOL_VERSION,
-                token: token.to_string(),
+                token: hello.token.to_string(),
                 client_name: client_name.to_string(),
+                pair_code: hello.pair_code.map(str::to_string),
+                client_label: hello.label.map(str::to_string),
             })?)
             .await?;
 
         let mut buffer = Vec::new();
         let mut chunk = vec![0u8; 64 * 1024];
-        let server_version = loop {
+        let (server_version, issued_token, paired_client_id) = loop {
             let n = reader.read(&mut chunk).await?;
             if n == 0 {
                 bail!("server closed the connection during hello");
@@ -128,7 +245,12 @@ impl Client {
             buffer.extend_from_slice(&chunk[..n]);
             let mut messages = decode_frames::<ServerMessage>(&mut buffer)?.into_iter();
             match messages.next() {
-                Some(ServerMessage::Welcome { server_version, .. }) => break server_version,
+                Some(ServerMessage::Welcome {
+                    server_version,
+                    token,
+                    paired_client_id,
+                    ..
+                }) => break (server_version, token, paired_client_id),
                 Some(ServerMessage::Response {
                     error: Some(error), ..
                 }) => {
@@ -177,6 +299,9 @@ impl Client {
                 pending,
                 next_id: AtomicU64::new(1),
                 server_version,
+                issued_token,
+                paired_client_id,
+                server_fingerprint: hello.server_fingerprint,
             }),
             events_rx,
         ))

@@ -63,6 +63,7 @@ impl Server {
             .as_deref()
             .map(|branch| self.github.cached_pr_author(&workspace.project_id, branch))
             .unwrap_or(Value::Null);
+        self.enrich_issue(&mut value["issue"]);
         value
     }
 
@@ -109,7 +110,8 @@ impl Server {
                 #[derive(Deserialize)]
                 struct P {
                     project: String,
-                    name: String,
+                    /// Optional when `issue` links a Linear issue: then it comes from the issue.
+                    name: Option<String>,
                     branch: Option<String>,
                     base: Option<String>,
                     #[serde(default)]
@@ -134,13 +136,40 @@ impl Server {
                     .project(&p.project)
                     .map_err(internal)?
                     .ok_or_else(|| rpc("not_found", format!("project {}", p.project)))?;
-                let slug = workspace_slug(&p.name, SLUG_MAX);
+                let mut issue = p.issue;
+                let linked = issue.as_ref().and_then(crate::linear::linear_issue_id);
+                let from_linear = match &linked {
+                    Some(identifier) => self.linear_issue_for_create(identifier).await,
+                    None => None,
+                };
+                if let (Some(stored), Some(identifier)) = (issue.as_mut(), &linked) {
+                    stored["id"] = json!(identifier);
+                    if let Some(found) = &from_linear
+                        && stored["title"].as_str().is_none_or(str::is_empty)
+                    {
+                        stored["title"] = json!(found.title);
+                    }
+                }
+                let name = p
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .or_else(|| {
+                        from_linear
+                            .as_ref()
+                            .map(|found| format!("{} {}", found.identifier, found.title))
+                    })
+                    .or_else(|| linked.clone())
+                    .ok_or_else(|| rpc("invalid_params", "name is required"))?;
+                let slug = workspace_slug(&name, SLUG_MAX);
                 let repo_dir = workspace_slug(&project.name, SLUG_MAX);
                 let path = self.workspace_root.join(repo_dir).join(&slug);
                 if path.exists() {
                     return Err(rpc("exists", format!("{} already exists", path.display())));
                 }
-                let branch = p.branch.unwrap_or_else(|| slug.clone());
+                let branch = p
+                    .branch
+                    .or_else(|| from_linear.as_ref()?.branch_name.clone())
+                    .unwrap_or_else(|| slug.clone());
                 let base = p
                     .base
                     .or_else(|| project.base_ref.clone())
@@ -169,7 +198,7 @@ impl Server {
                     base_ref: Some(base),
                     status: p.status,
                     title: p.title,
-                    issue: p.issue,
+                    issue,
                     pull_request: None,
                     created_at_ms: now_ms(),
                 };

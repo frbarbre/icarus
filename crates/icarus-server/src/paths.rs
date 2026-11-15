@@ -38,6 +38,19 @@ impl ServerPaths {
         self.home.join("server.log")
     }
 
+    pub fn tls_cert(&self) -> PathBuf {
+        self.home.join("tls-cert.der")
+    }
+
+    pub fn tls_key(&self) -> PathBuf {
+        self.home.join("tls-key.der")
+    }
+
+    /// The TCP addresses the running server listens on, one per line.
+    pub fn listen_addrs(&self) -> PathBuf {
+        self.home.join("server.addr")
+    }
+
     pub fn state_db(&self) -> PathBuf {
         self.home.join("state.db")
     }

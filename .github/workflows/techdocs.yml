@@ -45,7 +45,7 @@ jobs:
         env:
           REPO_NAME: ${{ github.event.repository.name }}
         run: |
-          aws s3 sync ./site s3://$AWS_BUCKET_NAME/default/component/$REPO_NAME/ \
-            --endpoint-url $AWS_ENDPOINT_URL \
-            --region $AWS_REGION \
+          aws s3 sync ./site "s3://$AWS_BUCKET_NAME/default/component/$REPO_NAME/" \
+            --endpoint-url "$AWS_ENDPOINT_URL" \
+            --region "$AWS_REGION" \
             --delete

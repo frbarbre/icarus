@@ -25,10 +25,14 @@ impl Drop for Guard {
 }
 
 fn start_server(home: &Path) -> Guard {
+    start_server_with(home, &sibling("icarus-fake-codex"))
+}
+
+fn start_server_with(home: &Path, codex: &Path) -> Guard {
     let child = Command::new(sibling("icarus-server"))
         .args(["--home", home.to_str().expect("utf8"), "serve"])
         .env("ICARUS_WORKSPACE_ROOT", home.join("workspaces"))
-        .env("ICARUS_CODEX_BIN", sibling("icarus-fake-codex"))
+        .env("ICARUS_CODEX_BIN", codex)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -82,12 +86,16 @@ impl Editor {
     }
 
     fn call(&mut self, method: &str, params: Value) -> (Value, Vec<Value>) {
+        self.call_within(method, params, Duration::from_secs(15))
+    }
+
+    fn call_within(&mut self, method: &str, params: Value, wait: Duration) -> (Value, Vec<Value>) {
         let id = self.next_id;
         self.next_id += 1;
         let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         writeln!(self.stdin, "{message}").expect("write");
         let mut notifications = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + wait;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let message = self
@@ -204,5 +212,119 @@ fn cli_creates_codex_agents_and_the_acp_bridge_renders_them() {
     assert!(
         kinds.contains(&"tool_call") && kinds.contains(&"agent_message_chunk"),
         "{kinds:?}"
+    );
+}
+
+fn reply_text(notifications: &[Value]) -> String {
+    updates(notifications)
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|u| u["content"]["text"].as_str())
+        .collect()
+}
+
+/// Needs a real `codex` signed in with `codex login`; costs two tiny turns.
+/// `ICARUS_LIVE_CODEX=$(which codex) cargo nextest run -p icarus-cli --run-ignored only live_codex`
+#[test]
+#[ignore = "talks to the real Codex service"]
+fn live_codex_streams_ends_turns_and_resumes_its_thread() {
+    let codex =
+        PathBuf::from(std::env::var("ICARUS_LIVE_CODEX").unwrap_or_else(|_| "codex".into()));
+    let home = tempfile::tempdir().expect("home");
+    let work = tempfile::tempdir().expect("work");
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(work.path())
+        .status()
+        .expect("git");
+    assert!(git.success());
+    let _server = start_server_with(home.path(), &codex);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let (client, _) = runtime
+        .block_on(icarus_client::Client::connect(home.path(), "test"))
+        .expect("connect");
+    let request = |method: &str, params: Value| {
+        runtime
+            .block_on(client.request(method, params))
+            .unwrap_or_else(|e| panic!("{method}: {e:#}"))
+    };
+
+    let mut editor = Editor::start(home.path());
+    editor.call(
+        "initialize",
+        json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+    );
+    let (new, _) = editor.call_within(
+        "session/new",
+        json!({ "cwd": work.path(), "mcpServers": [] }),
+        Duration::from_secs(60),
+    );
+    let session = new["sessionId"].as_str().expect("session").to_string();
+    let prompt =
+        |text: &str| json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] });
+
+    let (result, notifications) = editor.call_within(
+        "session/prompt",
+        prompt("Reply with the single word: pong"),
+        Duration::from_secs(180),
+    );
+    assert_eq!(result["stopReason"], "end_turn");
+    let reply = reply_text(&notifications);
+    assert!(reply.to_lowercase().contains("pong"), "{reply:?}");
+    let info = request("agent.info", json!({ "id": session }));
+    assert_eq!(info["provider"], "codex");
+    let thread = info["provider_session"]
+        .as_str()
+        .expect("thread")
+        .to_string();
+
+    request("agent.sleep", json!({ "id": session }));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while request("agent.info", json!({ "id": session }))["state"] != "sleeping" {
+        assert!(Instant::now() < deadline, "never slept");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (result, notifications) = editor.call_within(
+        "session/prompt",
+        prompt("Reply with the single word: ping"),
+        Duration::from_secs(180),
+    );
+    assert_eq!(result["stopReason"], "end_turn");
+    let reply = reply_text(&notifications);
+    assert!(reply.to_lowercase().contains("ping"), "{reply:?}");
+    let info = request("agent.info", json!({ "id": session }));
+    assert_eq!(
+        info["provider_session"],
+        thread.as_str(),
+        "resumed the thread"
+    );
+    assert_eq!(info["turns"], 2);
+    let events = request("agent.events", json!({ "id": session }));
+    let kinds: Vec<&str> = events
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|e| e["kind"].as_str())
+        .collect();
+    for kind in ["session", "wake", "text_delta", "message", "turn_end"] {
+        assert!(kinds.contains(&kind), "{kind} missing from {kinds:?}");
+    }
+    eprintln!("live codex events: {kinds:?}");
+
+    drop(editor);
+    let mut editor = Editor::start(home.path());
+    editor.call(
+        "initialize",
+        json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+    );
+    let (_, replay) = editor.call(
+        "session/load",
+        json!({ "sessionId": session, "cwd": work.path(), "mcpServers": [] }),
+    );
+    let replayed = reply_text(&replay).to_lowercase();
+    assert!(
+        replayed.contains("pong") && replayed.contains("ping"),
+        "{replayed:?}"
     );
 }

@@ -15,8 +15,13 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub enum ClientMessage {
     Hello {
         version: u32,
+        #[serde(default)]
         token: String,
         client_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pair_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_label: Option<String>,
     },
     Request {
         id: u64,
@@ -33,6 +38,10 @@ pub enum ServerMessage {
         version: u32,
         server_version: String,
         client_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paired_client_id: Option<String>,
     },
     Response {
         id: u64,
@@ -126,6 +135,21 @@ mod tests {
         let decoded: Vec<ClientMessage> = decode_frames(&mut stream).expect("decode");
         assert_eq!(decoded, vec![request.clone(), request]);
         assert_eq!(stream, tail[..5].to_vec());
+    }
+
+    #[test]
+    fn hello_without_pairing_fields_matches_the_original_shape() {
+        let old = json!({"type": "hello", "version": 1, "token": "t", "client_name": "c"});
+        let hello: ClientMessage = serde_json::from_value(old.clone()).expect("decode");
+        assert_eq!(serde_json::to_value(&hello).expect("encode"), old);
+        let pairing: ClientMessage = serde_json::from_value(
+            json!({"type": "hello", "version": 1, "client_name": "c", "pair_code": "ABCD2345"}),
+        )
+        .expect("decode");
+        assert!(matches!(
+            pairing,
+            ClientMessage::Hello { ref token, pair_code: Some(_), .. } if token.is_empty()
+        ));
     }
 
     #[test]

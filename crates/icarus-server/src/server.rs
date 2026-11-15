@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,14 +33,28 @@ pub struct Server {
     pub(crate) store: Store,
     pub(crate) workspace_root: PathBuf,
     pub(crate) github: crate::github::GitHubService,
+    pub(crate) linear: crate::linear::LinearService,
     pub(crate) automation: crate::automation::Automation,
     pub(crate) ports: crate::ports::Ports,
     /// Connected clients, for requests the server forwards to editors (e.g. open a file).
     clients: std::sync::Mutex<Vec<(String, String, Outbound)>>,
     shutdown: Notify,
+    pairing: crate::remote::Pairing,
+    listening: std::sync::Mutex<Vec<SocketAddr>>,
+    tls_fingerprint: std::sync::Mutex<Option<String>>,
+    /// Live connections of paired clients, closed when the client is revoked.
+    paired_connections: std::sync::Mutex<Vec<(String, Arc<Notify>)>>,
 }
 
 type Outbound = mpsc::UnboundedSender<ServerMessage>;
+
+#[derive(Clone, Copy)]
+enum Origin {
+    Local,
+    Network(SocketAddr),
+}
+
+const LOCAL_ONLY_METHODS: &[&str] = &["server.pair", "server.clients", "server.revoke"];
 
 pub(crate) fn rpc(code: &str, message: impl std::fmt::Display) -> RpcError {
     RpcError::new(code, message.to_string())
@@ -92,6 +107,7 @@ impl Server {
             store,
             workspace_root,
             github: crate::github::GitHubService::from_env(),
+            linear: crate::linear::LinearService::from_env(),
             automation: crate::automation::Automation::default(),
             ports: crate::ports::Ports::default(),
             paths,
@@ -103,20 +119,88 @@ impl Server {
             terminals: TerminalManager::default(),
             clients: std::sync::Mutex::new(Vec::new()),
             shutdown: Notify::new(),
+            pairing: crate::remote::Pairing::default(),
+            listening: std::sync::Mutex::new(Vec::new()),
+            tls_fingerprint: std::sync::Mutex::new(None),
+            paired_connections: std::sync::Mutex::new(Vec::new()),
         });
         Ok((server, listener))
+    }
+
+    /// Accepts TLS connections from paired clients on each address; returns the bound addresses.
+    pub async fn listen_tcp(
+        self: &Arc<Self>,
+        addrs: &[SocketAddr],
+        allow_public: bool,
+    ) -> Result<Vec<SocketAddr>> {
+        for addr in addrs {
+            crate::remote::check_listen(*addr, allow_public)?;
+        }
+        if addrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tls = crate::remote::load_or_create_tls(&self.paths)?;
+        *self
+            .tls_fingerprint
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(tls.fingerprint.clone());
+        let mut bound = Vec::new();
+        for addr in addrs {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("listen on {addr}"))?;
+            bound.push(listener.local_addr()?);
+            let server = Arc::clone(self);
+            let acceptor = tls.acceptor.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, peer)) = listener.accept().await else {
+                        // Running out of file descriptors fails every accept; don't spin on it.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    };
+                    let server = Arc::clone(&server);
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        let handshake =
+                            tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
+                                .await;
+                        let Ok(Ok(stream)) = handshake else {
+                            tracing::debug!("TLS handshake with {peer} failed");
+                            return;
+                        };
+                        let (reader, writer) = tokio::io::split(stream);
+                        if let Err(error) = server
+                            .serve_connection(reader, writer, Origin::Network(peer))
+                            .await
+                        {
+                            tracing::debug!("connection from {peer} ended: {error:#}");
+                        }
+                    });
+                }
+            });
+        }
+        let lines: String = bound.iter().map(|a| format!("{a}\n")).collect();
+        std::fs::write(self.paths.listen_addrs(), lines)?;
+        self.listening
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(&bound);
+        Ok(bound)
     }
 
     pub async fn run(self: Arc<Self>, listener: UnixListener) -> Result<()> {
         crate::automation::spawn(Arc::clone(&self));
         crate::ports::spawn(Arc::clone(&self));
+        crate::linear::spawn(Arc::clone(&self));
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
                     let server = Arc::clone(&self);
                     tokio::spawn(async move {
-                        if let Err(error) = server.serve_connection(stream).await {
+                        let (reader, writer) = stream.into_split();
+                        if let Err(error) = server.serve_connection(reader, writer, Origin::Local).await {
                             tracing::debug!("connection ended: {error:#}");
                         }
                     });
@@ -131,11 +215,66 @@ impl Server {
         }
         let _ = std::fs::remove_file(self.paths.socket());
         let _ = std::fs::remove_file(self.paths.pid());
+        let _ = std::fs::remove_file(self.paths.listen_addrs());
         Ok(())
     }
 
-    async fn serve_connection(self: Arc<Self>, stream: UnixStream) -> Result<()> {
-        let (mut reader, mut writer) = stream.into_split();
+    /// Checks a hello, returning the paired client id (if any) and a token to hand out (when pairing).
+    fn authenticate(
+        &self,
+        origin: Origin,
+        token: &str,
+        pair_code: Option<&str>,
+        label: &str,
+    ) -> Result<(Option<String>, Option<String>), RpcError> {
+        let peer = match origin {
+            Origin::Local if token == self.token => return Ok((None, None)),
+            Origin::Local => return Err(rpc("unauthorized", "bad token")),
+            Origin::Network(peer) => peer.ip(),
+        };
+        if !self.pairing.allowed(peer) {
+            return Err(rpc(
+                "rate_limited",
+                "too many failed attempts from this address; wait a minute",
+            ));
+        }
+        let failed = |message: &str| {
+            self.pairing.record_failure(peer);
+            Err(rpc("unauthorized", message))
+        };
+        if let Some(code) = pair_code {
+            if !self.pairing.redeem(code) {
+                return failed("pairing code is wrong, expired or already used");
+            }
+            let token = crate::remote::new_token();
+            let client = self
+                .store
+                .add_paired_client(label, &crate::remote::sha256_hex(token.as_bytes()))
+                .map_err(|e| rpc("internal", e))?;
+            tracing::info!("paired client {} ({label}) from {peer}", client.id);
+            return Ok((Some(client.id), Some(token)));
+        }
+        match self
+            .store
+            .touch_paired_client(&crate::remote::sha256_hex(token.as_bytes()))
+        {
+            Ok(Some(client)) => Ok((Some(client.id), None)),
+            Ok(None) => failed("unknown or revoked client token; pair again"),
+            Err(error) => Err(rpc("internal", error)),
+        }
+    }
+
+    async fn serve_connection<R, W>(
+        self: Arc<Self>,
+        mut reader: R,
+        mut writer: W,
+        origin: Origin,
+    ) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let closed = Arc::new(Notify::new());
         let (outbound, mut outbox) = mpsc::unbounded_channel::<ServerMessage>();
         let writer_task = tokio::spawn(async move {
             while let Some(message) = outbox.recv().await {
@@ -151,34 +290,57 @@ impl Server {
         let mut buffer = Vec::new();
         let mut chunk = vec![0u8; 64 * 1024];
         let mut authenticated = false;
+        let mut remote = false;
         let mut client_id: Option<String> = None;
         let mut subscriptions: HashMap<String, JoinHandle<()>> = HashMap::new();
         let result = async {
             loop {
-                let n = reader.read(&mut chunk).await?;
+                let n = tokio::select! {
+                    read = reader.read(&mut chunk) => read?,
+                    () = closed.notified() => return Ok(()),
+                };
                 if n == 0 {
                     return Ok(());
                 }
                 buffer.extend_from_slice(&chunk[..n]);
                 for message in decode_frames::<ClientMessage>(&mut buffer)? {
                     match message {
+                        ClientMessage::Hello { .. } if authenticated => {}
                         ClientMessage::Hello {
                             version,
                             token,
                             client_name,
+                            pair_code,
+                            client_label,
                         } => {
-                            if version != PROTOCOL_VERSION || token != self.token {
-                                let _ = outbound.send(ServerMessage::Response {
-                                    id: 0,
-                                    result: None,
-                                    error: Some(rpc(
-                                        "unauthorized",
-                                        "bad token or protocol version",
-                                    )),
-                                });
-                                bail!("rejected client {client_name}");
-                            }
+                            let label = client_label.as_deref().unwrap_or(&client_name);
+                            let verdict = if version == PROTOCOL_VERSION {
+                                self.authenticate(origin, &token, pair_code.as_deref(), label)
+                            } else {
+                                Err(rpc(
+                                    "unauthorized",
+                                    format!("protocol version {version} is not {PROTOCOL_VERSION}"),
+                                ))
+                            };
+                            let (paired_client_id, issued_token) = match verdict {
+                                Ok(granted) => granted,
+                                Err(error) => {
+                                    let _ = outbound.send(ServerMessage::Response {
+                                        id: 0,
+                                        result: None,
+                                        error: Some(error),
+                                    });
+                                    bail!("rejected client {client_name}");
+                                }
+                            };
                             authenticated = true;
+                            remote = matches!(origin, Origin::Network(_));
+                            if let Some(paired) = &paired_client_id {
+                                self.paired_connections
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .push((paired.clone(), Arc::clone(&closed)));
+                            }
                             let id = uuid::Uuid::new_v4().simple().to_string();
                             self.clients
                                 .lock()
@@ -189,14 +351,21 @@ impl Server {
                                 version: PROTOCOL_VERSION,
                                 server_version: env!("CARGO_PKG_VERSION").to_string(),
                                 client_id: id,
+                                token: issued_token,
+                                paired_client_id,
                             });
                         }
                         ClientMessage::Request { id, method, params } => {
-                            let reply = if authenticated {
+                            let reply = if !authenticated {
+                                Err(rpc("unauthorized", "send hello first"))
+                            } else if remote && LOCAL_ONLY_METHODS.contains(&method.as_str()) {
+                                Err(rpc(
+                                    "forbidden",
+                                    format!("{method} only works on the server's own machine"),
+                                ))
+                            } else {
                                 self.dispatch(&method, params, &outbound, &mut subscriptions)
                                     .await
-                            } else {
-                                Err(rpc("unauthorized", "send hello first"))
                             };
                             let (result, error) = match reply {
                                 Ok(value) => (Some(value), None),
@@ -215,6 +384,10 @@ impl Server {
                 .unwrap_or_else(|p| p.into_inner())
                 .retain(|(client, _, _)| *client != id);
         }
+        self.paired_connections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(_, signal)| !Arc::ptr_eq(signal, &closed));
         for (_, task) in subscriptions {
             task.abort();
         }
@@ -239,7 +412,75 @@ impl Server {
                 "started_at_ms": self.started_at_ms,
                 "terminals": self.terminals.list().len(),
                 "agents": self.agents.list().len(),
+                "listen": self.listen_addresses(),
+                "tls_fingerprint": self.tls_fingerprint(),
             })),
+            "server.pair" => {
+                #[derive(Deserialize)]
+                struct P {
+                    ttl_secs: Option<u64>,
+                }
+                let p: P = params(params_value)?;
+                let (code, ttl) = self
+                    .pairing
+                    .issue(p.ttl_secs.map(|s| Duration::from_secs(s.max(1))));
+                Ok(json!({
+                    "code": crate::remote::format_code(&code),
+                    "expires_in_secs": ttl.as_secs(),
+                    "listen": self.listen_addresses(),
+                    "tls_fingerprint": self.tls_fingerprint(),
+                }))
+            }
+            "server.clients" => {
+                let live = self
+                    .paired_connections
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                let clients = self
+                    .store
+                    .paired_clients()
+                    .map_err(|e| rpc("internal", e))?;
+                Ok(json!(
+                    clients
+                        .into_iter()
+                        .map(|c| {
+                            let connections = live.iter().filter(|id| **id == c.id).count();
+                            let mut value = json!(c);
+                            value["connections"] = json!(connections);
+                            value
+                        })
+                        .collect::<Vec<_>>()
+                ))
+            }
+            "server.revoke" => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                }
+                let p: P = params(params_value)?;
+                if !self
+                    .store
+                    .remove_paired_client(&p.id)
+                    .map_err(|e| rpc("internal", e))?
+                {
+                    return Err(rpc("not_found", format!("paired client {}", p.id)));
+                }
+                let mut closed = 0;
+                self.paired_connections
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retain(|(id, signal)| {
+                        if *id == p.id {
+                            signal.notify_one();
+                            closed += 1;
+                        }
+                        *id != p.id
+                    });
+                Ok(json!({ "revoked": true, "closed_connections": closed }))
+            }
             "agent.create" => {
                 #[derive(Deserialize)]
                 struct P {
@@ -772,6 +1013,7 @@ impl Server {
                 self.next_action_dispatch(method, params_value).await
             }
             other if other.starts_with("pr.") => self.github_dispatch(other, params_value).await,
+            other if other.starts_with("issue.") => self.linear_dispatch(other, params_value).await,
             other if other.starts_with("ports.") => self.ports_dispatch(other, params_value).await,
             other if other.starts_with("attachment.") || other.starts_with("attach.") => {
                 self.attachments_dispatch(other, params_value).await
@@ -817,6 +1059,22 @@ fn default_true() -> bool {
 }
 
 impl Server {
+    fn listen_addresses(&self) -> Vec<String> {
+        self.listening
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn tls_fingerprint(&self) -> Option<String> {
+        self.tls_fingerprint
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     pub(crate) fn client_count(&self) -> usize {
         self.clients.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
