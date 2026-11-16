@@ -585,6 +585,7 @@ pub(crate) fn handle_view_event(topic: &str, payload: serde_json::Value, cx: &mu
         "review.changed" | "note.changed" => review::review_changed(cx),
         "git.changed" => changes_tab::git_changed(payload, cx),
         "ports.changed" => links::ports_changed(payload, cx),
+        "config.changed" => settings_view::config_changed(cx),
         _ => {}
     }
 }
@@ -720,7 +721,8 @@ fn start_app_connection(cx: &mut App) {
                         };
                         cx.update(|cx| dispatch_action(request, cx));
                     }
-                    "review.changed" | "note.changed" | "git.changed" | "ports.changed" => {
+                    "review.changed" | "note.changed" | "git.changed" | "ports.changed"
+                    | "config.changed" => {
                         cx.update(|cx| handle_view_event(&event.topic, event.payload, cx));
                     }
                     "notification" | "notifications.changed" => {

@@ -369,4 +369,70 @@ impl Server {
             other => Err(rpc("unknown_method", other)),
         }
     }
+
+    fn settings_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = SettingsPaths::discover(None).user.into_iter().collect();
+        for project in self.store.projects().unwrap_or_default() {
+            let paths = SettingsPaths::discover(Some(&project.root));
+            files.extend(paths.project);
+            files.extend(paths.project_local);
+        }
+        files
+    }
+}
+
+const SETTINGS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+type Fingerprint = Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>;
+
+fn fingerprint(files: &[PathBuf]) -> Fingerprint {
+    files
+        .iter()
+        .map(|path| {
+            let stamp = std::fs::metadata(path)
+                .ok()
+                .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+            (path.clone(), stamp)
+        })
+        .collect()
+}
+
+/// Announces `config.changed` when any settings file changes, whoever wrote it (CLI, agent, editor).
+pub(crate) fn spawn(server: Arc<Server>) {
+    tokio::spawn(async move {
+        let mut last: Option<Fingerprint> = None;
+        loop {
+            tokio::time::sleep(SETTINGS_POLL_INTERVAL).await;
+            if server.client_count() == 0 {
+                last = None;
+                continue;
+            }
+            let files = server.settings_files();
+            let current = tokio::task::spawn_blocking(move || fingerprint(&files))
+                .await
+                .unwrap_or_default();
+            if last.as_ref().is_some_and(|last| *last != current) {
+                server.broadcast("config.changed", json!({}));
+            }
+            last = Some(current);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fingerprint;
+
+    #[test]
+    fn fingerprint_changes_when_a_file_is_written_or_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("icarus.json");
+        let files = vec![path.clone()];
+        let missing = fingerprint(&files);
+        std::fs::write(&path, "{}").expect("write");
+        let created = fingerprint(&files);
+        assert_ne!(missing, created);
+        std::fs::write(&path, "{\"a\": 1}").expect("write");
+        assert_ne!(created, fingerprint(&files));
+    }
 }

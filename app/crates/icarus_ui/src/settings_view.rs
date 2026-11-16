@@ -251,6 +251,29 @@ pub struct SettingsView {
     _subscriptions: Vec<Subscription>,
 }
 
+#[derive(Default)]
+struct OpenSettingsViews(Vec<(gpui::AnyWindowHandle, WeakEntity<SettingsView>)>);
+
+impl gpui::Global for OpenSettingsViews {}
+
+/// Handles the server's `config.changed`: settings were written somewhere (CLI, an agent, an editor).
+pub(crate) fn config_changed(cx: &mut App) {
+    let views = cx
+        .try_global::<OpenSettingsViews>()
+        .map(|views| views.0.clone())
+        .unwrap_or_default();
+    for (handle, view) in views {
+        handle
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| view.reload(window, cx))
+            })
+            .ok();
+    }
+    cx.update_global::<OpenSettingsViews, _>(|views, _| {
+        views.0.retain(|(_, view)| view.upgrade().is_some());
+    });
+}
+
 impl EventEmitter<ItemEvent> for SettingsView {}
 
 impl Focusable for SettingsView {
@@ -313,6 +336,11 @@ impl SettingsView {
             renaming: None,
             _subscriptions: subscriptions,
         };
+        let handle = window.window_handle();
+        let weak = cx.weak_entity();
+        cx.default_global::<OpenSettingsViews>()
+            .0
+            .push((handle, weak));
         view.reload(window, cx);
         view
     }
@@ -437,6 +465,10 @@ impl SettingsView {
 
     fn apply(&mut self, snapshot: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
         for (key, editor) in &self.editors {
+            // A reload from a change elsewhere must not overwrite what is being typed.
+            if editor.focus_handle(cx).is_focused(window) {
+                continue;
+            }
             let text = match lookup(&snapshot.resolved, key) {
                 Some(Value::String(text)) => text.clone(),
                 Some(Value::Number(number)) => number.to_string(),
@@ -1577,6 +1609,67 @@ mod tests {
             calls_to(&calls, "config.unset")[0],
             json!({ "key": "rules.orca_compat.statusByCondition.conflicts", "layer": "project", "project": "p-1" })
         );
+    }
+
+    #[gpui::test]
+    async fn a_settings_change_elsewhere_reloads_the_view_but_not_mid_edit(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let current = Arc::new(std::sync::Mutex::new(resolved()));
+        cx.update(|cx| {
+            let current = current.clone();
+            stub_rpc(cx, move |method, _| match method {
+                "config.get" => Ok(current.lock().expect("lock").clone()),
+                "config.explain" => Ok(json!({ "from": { "layer": "default" } })),
+                _ => Ok(json!({})),
+            })
+        });
+        // Rendered, so the field's blur event fires.
+        let (view, window) = cx.add_window_view(|window, cx| {
+            SettingsView::new(WeakEntity::new_invalid(), None, window, cx)
+        });
+        window.run_until_parked();
+        view.read_with(window, |view, _| assert_eq!(view.statuses().len(), 2));
+
+        let add_status = |label: &str| {
+            current.lock().expect("lock")["workspace"]["statuses"]
+                .as_array_mut()
+                .expect("statuses")
+                .push(json!({ "id": label.to_lowercase(), "label": label }));
+        };
+        // The app handles events outside any window update, as here.
+        let changed = |window: &mut gpui::VisualTestContext| {
+            let app: &mut TestAppContext = window;
+            app.update(config_changed);
+        };
+        add_status("Shipped");
+        changed(window);
+        window.run_until_parked();
+        view.read_with(window, |view, _| assert_eq!(view.statuses().len(), 3));
+
+        let editor = view.read_with(window, |view, _| {
+            view.editors.values().next().expect("a text field").clone()
+        });
+        window.update(|window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+            editor.update(cx, |editor, cx| editor.set_text("half typed", window, cx));
+        });
+        add_status("Archived");
+        changed(window);
+        window.run_until_parked();
+        view.read_with(window, |view, _| assert_eq!(view.statuses().len(), 4));
+        window.update(|_, cx| {
+            assert_eq!(
+                editor.read(cx).text(cx),
+                "half typed",
+                "the field being typed in keeps its text"
+            )
+        });
     }
 
     #[test]

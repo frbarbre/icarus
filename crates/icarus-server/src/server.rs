@@ -288,6 +288,7 @@ impl Server {
         crate::notifications::spawn(Arc::clone(&self));
         crate::automation::spawn(Arc::clone(&self));
         crate::ports::spawn(Arc::clone(&self));
+        crate::settings::spawn(Arc::clone(&self));
         crate::linear::spawn(Arc::clone(&self));
         crate::updates::spawn(Arc::clone(&self));
         self.resume_setups();
