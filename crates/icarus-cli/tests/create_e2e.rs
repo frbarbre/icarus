@@ -265,3 +265,111 @@ fn an_untrusted_setup_names_the_trust_command_and_trust_runs_it() {
     );
     assert!(rank("first") > rank("second"), "reordered");
 }
+
+#[test]
+fn workspaces_are_marked_read_and_unread() {
+    let env = Env::start(json!({}));
+    let (repo, _) = env.project(&[]);
+    let project = env.json(&["project", "add", repo.to_str().expect("utf8")])["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    env.ok(&[
+        "workspace",
+        "create",
+        "--project",
+        &project,
+        "quiet",
+        "--no-agent",
+    ]);
+    assert_eq!(
+        env.ok(&["workspace", "mark-unread", "quiet"]).trim(),
+        "unread"
+    );
+    assert!(
+        env.ok(&["workspace", "list"]).contains("  unread"),
+        "the list says which workspaces are unread"
+    );
+    assert_eq!(
+        env.json(&["workspace", "show", "quiet"])["unread"]["kind"],
+        "done"
+    );
+    assert_eq!(env.ok(&["workspace", "mark-read", "quiet"]).trim(), "read");
+    assert!(!env.ok(&["workspace", "list"]).contains("unread"));
+}
+
+/// Stands in for the app: answers `client.config` by writing what it would hold.
+#[tokio::test]
+async fn app_config_reaches_the_app_and_prints_its_answer() {
+    let env = Env::start(json!({}));
+    assert!(
+        !env.icarus(&["app", "config", "get"]).status.success(),
+        "no app connected"
+    );
+    let (_app, mut events) = icarus_client::Client::connect(env.home.path(), "icarus-app")
+        .await
+        .expect("app");
+    let answering = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some(event) = events.recv().await {
+            if event.topic != "client.config" {
+                continue;
+            }
+            let payload = event.payload;
+            let value = match payload["op"].as_str() {
+                Some("set") => payload["value"].clone(),
+                _ => Value::Null,
+            };
+            let result = payload["result"].as_str().expect("result").to_owned();
+            std::fs::write(result, json!({ "value": value }).to_string()).expect("answer");
+            seen.push(payload);
+            if seen.len() == 2 {
+                return seen;
+            }
+        }
+        seen
+    });
+    let home = env.home.path().to_owned();
+    let run = move |args: &'static [&'static str]| {
+        let home = home.clone();
+        tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_icarus"))
+                .arg("--home")
+                .arg(home)
+                .args(args)
+                .output()
+                .expect("icarus")
+        })
+    };
+    let set = run(&[
+        "app",
+        "config",
+        "set",
+        "workspace.cardFields",
+        r#"["pr","unread"]"#,
+    ])
+    .await
+    .expect("join");
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    assert!(String::from_utf8_lossy(&set.stdout).contains("\"unread\""));
+    let unset = run(&["app", "config", "unset", "workspace.cardFields"])
+        .await
+        .expect("join");
+    assert!(
+        String::from_utf8_lossy(&unset.stdout).contains("server's value applies"),
+        "{}",
+        String::from_utf8_lossy(&unset.stdout)
+    );
+    let seen = answering.await.expect("answered");
+    assert_eq!(seen[0]["op"], "set");
+    assert_eq!(
+        seen[0]["value"],
+        json!(["pr", "unread"]),
+        "the value is JSON"
+    );
+    assert_eq!(seen[1]["op"], "unset");
+}

@@ -106,6 +106,10 @@ pub(crate) struct ProjectHooks {
     pub archive_timeout_ms: u64,
     pub default_tabs: Vec<DefaultTab>,
     pub shared_directories: Vec<String>,
+    /// The template run for a workspace linked to a GitHub item (`{{artifact_url}}`, `{{issue}}`).
+    pub issue_command: Option<Script>,
+    pub recipes: Vec<crate::recipes::Recipe>,
+    pub recipe_problems: Vec<crate::recipes::RecipeProblem>,
 }
 
 /// One of `orca.yaml`'s `defaultTabs`: a terminal a new workspace opens with.
@@ -115,6 +119,8 @@ pub(crate) struct DefaultTab {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
 }
 
 /// The parts of `orca.yaml` Icarus honours.
@@ -125,10 +131,20 @@ pub(crate) struct OrcaYaml {
     pub wait_for_setup: bool,
     pub default_tabs: Vec<DefaultTab>,
     pub shared_directories: Vec<String>,
+    pub issue_command: Option<String>,
+    pub recipes: Vec<crate::recipes::Recipe>,
+    pub recipe_problems: Vec<crate::recipes::RecipeProblem>,
 }
 
 const MAX_SHARED_DIRECTORIES: usize = 100;
-const MAX_DEFAULT_TABS: usize = 100;
+const MAX_DEFAULT_TABS: usize = 256;
+
+/// Orca's `#RGB` / `#RRGGBB` tab colours.
+pub(crate) fn is_tab_color(text: &str) -> bool {
+    text.strip_prefix('#').is_some_and(|hex| {
+        matches!(hex.len(), 3 | 6) && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
 
 /// Orca's rule: repo-relative, no `..`, `.` or `.git` segments, never absolute.
 pub(crate) fn safe_relative_path(raw: &str) -> Option<String> {
@@ -179,10 +195,12 @@ pub(crate) fn parse_orca_yaml(text: &str) -> Option<OrcaYaml> {
             let tab = DefaultTab {
                 title: text_of(&tab["title"]),
                 command: text_of(&tab["command"]),
+                color: text_of(&tab["color"]).filter(|color| is_tab_color(color)),
             };
-            (tab.title.is_some() || tab.command.is_some()).then_some(tab)
+            (tab.title.is_some() || tab.command.is_some() || tab.color.is_some()).then_some(tab)
         })
         .collect();
+    let (recipes, recipe_problems) = crate::recipes::parse(&root["environmentRecipes"]);
     let mut shared_directories: Vec<String> = Vec::new();
     for entry in root["worktree"]["sharedDirectories"]
         .as_vec()
@@ -202,6 +220,9 @@ pub(crate) fn parse_orca_yaml(text: &str) -> Option<OrcaYaml> {
         wait_for_setup: root["setupAgentStartupPolicy"].as_str() == Some("wait-for-setup"),
         default_tabs,
         shared_directories,
+        issue_command: text_of(&root["issueCommand"]),
+        recipes,
+        recipe_problems,
     })
 }
 
@@ -309,6 +330,27 @@ pub(crate) fn project_hooks(
             .as_ref()
             .is_some_and(|s| matches!(s.source, ScriptSource::Shared | ScriptSource::Both))
     };
+    // Orca's `.orca/issue-command` is the user's own override and wins over the repository's template.
+    let local_issue_command = yaml_dir
+        .and_then(|dir| std::fs::read_to_string(dir.join(".orca").join("issue-command")).ok())
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            [Layer::ProjectLocal, Layer::User]
+                .into_iter()
+                .find_map(|wanted| trimmed(layer(wanted).map(|doc| &hooks_in(doc)["issueCommand"])))
+        });
+    let issue_command = match (local_issue_command, yaml.issue_command) {
+        (Some(command), _) => Some(Script {
+            command,
+            source: ScriptSource::Local,
+        }),
+        (None, Some(command)) => Some(Script {
+            command,
+            source: ScriptSource::Shared,
+        }),
+        (None, None) => None,
+    };
     ProjectHooks {
         shared_setup: shared_setup.filter(|_| uses_shared(&setup)),
         shared_archive: shared_archive.filter(|_| uses_shared(&archive)),
@@ -316,6 +358,9 @@ pub(crate) fn project_hooks(
         archive,
         default_tabs: yaml.default_tabs,
         shared_directories: yaml.shared_directories,
+        issue_command,
+        recipes: yaml.recipes,
+        recipe_problems: yaml.recipe_problems,
         run_policy: match hooks["setupRunPolicy"].as_str() {
             Some("ask") => RunPolicy::Ask,
             Some("skip-by-default") => RunPolicy::SkipByDefault,
@@ -467,10 +512,17 @@ pub(crate) enum ScriptKind {
     Setup,
     Archive,
     DefaultTabs,
+    IssueCommand,
+    VmRecipe,
 }
 
 fn trust_key(project_id: &str) -> String {
     format!("project.trust.{project_id}")
+}
+
+/// Orca's "Always trust": every committed script of the project runs, whatever it says now or later.
+fn trust_all_key(project_id: &str) -> String {
+    format!("project.trust_all.{project_id}")
 }
 
 /// Keeps the store bounded; the newest approvals win.
@@ -498,12 +550,41 @@ fn default_tab_commands(hooks: &ProjectHooks) -> Option<String> {
     (!commands.is_empty()).then(|| commands.join("\n"))
 }
 
+fn shared_issue_command(hooks: &ProjectHooks) -> Option<String> {
+    hooks
+        .issue_command
+        .as_ref()
+        .filter(|script| script.source == ScriptSource::Shared)
+        .map(|script| script.command.clone())
+}
+
+/// Orca's `renderIssueCommandTemplate`: `{{artifact_url}}` is the linked item's URL, `{{issue}}` its number.
+pub(crate) fn render_issue_command(
+    template: &str,
+    number: Option<u64>,
+    url: Option<&str>,
+) -> String {
+    let mut rendered = template.to_owned();
+    if let Some(url) = url {
+        rendered = rendered.replace("{{artifact_url}}", url);
+    }
+    if let Some(number) = number {
+        rendered = rendered.replace("{{issue}}", &number.to_string());
+    }
+    rendered
+}
+
 /// The committed scripts in `hooks` that need the user's trust before they run.
 pub(crate) fn committed_scripts(hooks: &ProjectHooks) -> Vec<(ScriptKind, String)> {
     [
         (ScriptKind::Setup, hooks.shared_setup.clone()),
         (ScriptKind::Archive, hooks.shared_archive.clone()),
         (ScriptKind::DefaultTabs, default_tab_commands(hooks)),
+        (ScriptKind::IssueCommand, shared_issue_command(hooks)),
+        (
+            ScriptKind::VmRecipe,
+            Some(crate::recipes::trust_content(&hooks.recipes)).filter(|text| !text.is_empty()),
+        ),
     ]
     .into_iter()
     .filter_map(|(kind, content)| Some((kind, content?)))
@@ -781,6 +862,7 @@ impl Server {
                 rows: 32,
                 label: Some("Setup".into()),
                 workspace: Some(workspace.id.clone()),
+                color: None,
             })
             .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
         let status = SetupStatus {
@@ -948,8 +1030,28 @@ impl Server {
     }
 
     pub(crate) fn is_trusted(&self, project_id: &str, kind: ScriptKind, content: &str) -> bool {
-        self.trusted_digests(project_id)
-            .contains(&digest(kind, content))
+        self.always_trusted(project_id)
+            || self
+                .trusted_digests(project_id)
+                .contains(&digest(kind, content))
+    }
+
+    pub(crate) fn always_trusted(&self, project_id: &str) -> bool {
+        self.store
+            .kv_get(&trust_all_key(project_id))
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Trusts every committed script of the project from now on, including later changes.
+    pub(crate) fn trust_always(&self, project_id: &str) -> Result<(), RpcError> {
+        self.store
+            .kv_set(
+                &trust_all_key(project_id),
+                &json!({ "approved_at_ms": now_ms() }),
+            )
+            .map_err(|e| rpc("internal", e))
     }
 
     /// Trusts every committed script in `hooks` as it is now; a later change asks again.
@@ -972,10 +1074,10 @@ impl Server {
     }
 
     pub(crate) fn untrust_project(&self, project_id: &str) -> Result<(), RpcError> {
-        self.store
-            .kv_delete(&trust_key(project_id))
-            .map(|_| ())
-            .map_err(|e| rpc("internal", e))
+        for key in [trust_key(project_id), trust_all_key(project_id)] {
+            self.store.kv_delete(&key).map_err(|e| rpc("internal", e))?;
+        }
+        Ok(())
     }
 
     /// What `project.scripts` reports: each committed script, whether it's trusted, and the setup policy.
@@ -1002,9 +1104,13 @@ impl Server {
             "project": project_id,
             "setup": entry(&hooks.setup, &hooks.shared_setup, ScriptKind::Setup),
             "archive": entry(&hooks.archive, &hooks.shared_archive, ScriptKind::Archive),
+            "issue_command": entry(&hooks.issue_command, &shared_issue_command(hooks), ScriptKind::IssueCommand),
             "default_tabs": hooks.default_tabs,
             "default_tabs_trusted": tabs_trusted,
+            "recipes": hooks.recipes,
+            "recipe_problems": hooks.recipe_problems,
             "shared_directories": hooks.shared_directories,
+            "always_trusted": self.always_trusted(project_id),
             "run_policy": match hooks.run_policy {
                 RunPolicy::Ask => "ask",
                 RunPolicy::RunByDefault => "run-by-default",
@@ -1052,12 +1158,58 @@ impl Server {
                 rows: 32,
                 label: Some(label),
                 workspace: Some(workspace.id.clone()),
+                color: tab.color.clone(),
             }) {
                 Ok(session) => terminals.push(session.id().to_owned()),
                 Err(error) => tracing::warn!("default tab for {}: {error:#}", workspace.name),
             }
         }
         terminals
+    }
+
+    /// Starts the project's issue command for a workspace linked to a GitHub item, in its own
+    /// terminal beside the agent, as Orca's issue-command split does; it doesn't wait for setup.
+    /// An untrusted repository template doesn't run, and the reason comes back instead.
+    pub(crate) fn start_issue_command(
+        &self,
+        workspace: &Workspace,
+        project_root: &Path,
+        number: Option<u64>,
+        url: &str,
+    ) -> Result<Option<String>, String> {
+        let hooks = self.hooks_for(project_root, project_root);
+        let Some(script) = hooks.issue_command.clone() else {
+            return Ok(None);
+        };
+        if script.source == ScriptSource::Shared
+            && !self.is_trusted(
+                &workspace.project_id,
+                ScriptKind::IssueCommand,
+                &script.command,
+            )
+        {
+            return Err(untrusted_message(&workspace.project_id, "issue command"));
+        }
+        let shell = default_shell();
+        let command = render_issue_command(&script.command, number, Some(url));
+        let session = self
+            .terminals
+            .create(SpawnOptions {
+                cwd: workspace.path.clone(),
+                command: Some(vec![
+                    shell.clone(),
+                    "-lc".into(),
+                    format!("{command}\nexec {} -l", single_quoted(&shell)),
+                ]),
+                env: hook_env(project_root, &workspace.path, &workspace.id),
+                columns: 120,
+                rows: 32,
+                label: Some("Issue command".into()),
+                workspace: Some(workspace.id.clone()),
+                color: None,
+            })
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(Some(session.id().to_owned()))
     }
 }
 
@@ -1109,9 +1261,42 @@ mod tests {
     }
 
     #[test]
+    fn a_local_issue_command_wins_and_needs_no_trust() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("orca.yaml"),
+            "issueCommand: shared {{issue}}\n",
+        )
+        .expect("yaml");
+        let got = project_hooks(&[], &json!({}), Some(dir.path()));
+        assert_eq!(
+            got.issue_command,
+            Some(Script {
+                command: "shared {{issue}}".into(),
+                source: ScriptSource::Shared,
+            })
+        );
+        assert_eq!(
+            committed_scripts(&got),
+            [(ScriptKind::IssueCommand, "shared {{issue}}".to_owned())]
+        );
+        std::fs::create_dir(dir.path().join(".orca")).expect("dir");
+        std::fs::write(dir.path().join(".orca/issue-command"), "  mine\n").expect("local");
+        let got = project_hooks(&[], &json!({}), Some(dir.path()));
+        assert_eq!(
+            got.issue_command,
+            Some(Script {
+                command: "mine".into(),
+                source: ScriptSource::Local,
+            })
+        );
+        assert!(committed_scripts(&got).is_empty());
+    }
+
+    #[test]
     fn default_tabs_and_shared_paths_parse_like_orca() {
         let parsed = parse_orca_yaml(
-            "defaultTabs:\n  - title: Dev\n    command: pnpm dev\n  - color: '#fff'\n  - command: ' '\n  - title: Logs\nworktree:\n  sharedDirectories: [node_modules, ./node_modules/, /abs, ../up, a/./b, .git/x, C:/win, packages/web/.next]\n",
+            "defaultTabs:\n  - title: Dev\n    command: pnpm dev\n    color: '#22aa88'\n  - color: '#fff'\n  - color: red\n  - command: ' '\n  - title: Logs\n    color: '#12345'\nworktree:\n  sharedDirectories: [node_modules, ./node_modules/, /abs, ../up, a/./b, .git/x, C:/win, packages/web/.next]\nissueCommand: |\n  claude \"Fix {{artifact_url}}\"\n",
         )
         .expect("parses");
         assert_eq!(
@@ -1119,13 +1304,32 @@ mod tests {
             [
                 DefaultTab {
                     title: Some("Dev".into()),
-                    command: Some("pnpm dev".into())
+                    command: Some("pnpm dev".into()),
+                    color: Some("#22aa88".into()),
+                },
+                DefaultTab {
+                    title: None,
+                    command: None,
+                    color: Some("#fff".into()),
                 },
                 DefaultTab {
                     title: Some("Logs".into()),
-                    command: None
+                    command: None,
+                    color: None,
                 },
             ]
+        );
+        assert_eq!(
+            parsed.issue_command.as_deref(),
+            Some("claude \"Fix {{artifact_url}}\"")
+        );
+        assert_eq!(
+            render_issue_command(
+                "fix {{artifact_url}} (#{{issue}}) {{artifact_url}}",
+                Some(7),
+                Some("https://github.com/o/r/pull/7")
+            ),
+            "fix https://github.com/o/r/pull/7 (#7) https://github.com/o/r/pull/7"
         );
         assert_eq!(
             parsed.shared_directories,

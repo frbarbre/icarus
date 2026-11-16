@@ -2509,7 +2509,7 @@ fn row_menu(
                 menu = menu.separator();
             }
             previous_group = Some(group);
-            if action == RowAction::RevealInFileManager && !open_in.is_empty() {
+            if action == RowAction::RevealInFileManager {
                 let apps = open_in.clone();
                 let panel = panel.clone();
                 menu = menu.item(
@@ -2525,7 +2525,13 @@ fn row_menu(
                                     .log_err();
                             });
                         }
-                        submenu
+                        if !apps.is_empty() {
+                            submenu = submenu.separator();
+                        }
+                        submenu.action(
+                            "Customize apps…",
+                            Box::new(crate::settings_view::CustomizeOpenInApps),
+                        )
                     })
                     .id("changes-row-open-in"),
                 );

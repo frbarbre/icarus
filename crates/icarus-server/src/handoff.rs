@@ -341,6 +341,7 @@ mod tests {
                     columns: 80,
                     rows: 24,
                     task: false,
+                    color: None,
                 },
                 title: None,
                 pid: None,

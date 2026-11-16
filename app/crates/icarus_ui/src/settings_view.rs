@@ -10,8 +10,8 @@ use anyhow::Result;
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, SharedString, Styled, Subscription, Task, WeakEntity, Window, actions,
-    div,
+    ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, Task, WeakEntity,
+    Window, actions, div,
 };
 use icarus_client::Client;
 use serde_json::{Value, json};
@@ -32,9 +32,24 @@ actions!(
     icarus,
     [
         /// Opens Icarus's own settings: statuses, rules, agents, integrations and more.
-        OpenSettings
+        OpenSettings,
+        /// Opens Icarus's settings at the apps in Source Control's "Open in" menu.
+        CustomizeOpenInApps,
     ]
 );
+
+const OPEN_IN: &str = "sourceControl.openIn";
+
+/// The scrolled blocks of the view, so a block can be scrolled into view.
+const OPEN_IN_BLOCK: usize = 1;
+
+/// One app in the "Open in" list editor.
+struct OpenInRow {
+    id: String,
+    label: Entity<Editor>,
+    command: Entity<Editor>,
+    _subscriptions: [Subscription; 2],
+}
 
 /// The layer edits go to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +77,8 @@ enum Control {
     /// A prompt template: several lines, blank means the built-in one.
     Prompt,
     Integer,
+    /// One of the user's status columns, or none.
+    Status,
 }
 
 struct Field {
@@ -69,6 +86,7 @@ struct Field {
     label: &'static str,
     help: &'static str,
     control: Control,
+    placeholder: Option<&'static str>,
 }
 
 const fn field(
@@ -82,8 +100,20 @@ const fn field(
         label,
         help,
         control,
+        placeholder: None,
     }
 }
+
+impl Field {
+    const fn placeholder(self, placeholder: &'static str) -> Self {
+        Field {
+            placeholder: Some(placeholder),
+            ..self
+        }
+    }
+}
+
+const NEW_WORKSPACE_STATUS: &str = "rules.orca_compat.newWorkspaceStatus";
 
 const AGENTS: &[Field] = &[
     field(
@@ -128,6 +158,39 @@ const AUTOMATION: &[Field] = &[
 ];
 
 const RULE_OPTIONS: &[Field] = &[
+    field(
+        NEW_WORKSPACE_STATUS,
+        "New workspaces start in",
+        "Where a new workspace goes before it has a pull request; existing ones keep their column.",
+        Control::Status,
+    ),
+    field(
+        "rules.orca_compat.holdStatus",
+        "Hold workspaces in",
+        "The rules never move, remove or update a workspace in this column.",
+        Control::Status,
+    ),
+    field(
+        "rules.orca_compat.mergingCheckName",
+        "Merge gate check name",
+        "The check run or commit status that decides \"Merge gate passed\".",
+        Control::Text,
+    )
+    .placeholder("Reviews satisfied"),
+    field(
+        "rules.orca_compat.pmApprovalTeam",
+        "PM approval team",
+        "As org/team-slug; empty skips the PM approval column.",
+        Control::Text,
+    )
+    .placeholder("org/team-slug"),
+    field(
+        "rules.orca_compat.reviewEnteredCommand",
+        "Command when your PR enters Review",
+        "Runs once in the workspace's folder each time it moves into the review column.",
+        Control::Text,
+    )
+    .placeholder("Run nothing"),
     field(
         "rules.orca_compat.onResolved",
         "When your PR is merged or closed",
@@ -180,6 +243,34 @@ const RULE_OPTIONS: &[Field] = &[
         "rules.orca_compat.reviewInbox.rereviewPromptTemplate",
         "Re-review prompt",
         "After new commits; blank uses the built-in prompt.",
+        Control::Prompt,
+    ),
+];
+
+/// Orca's top bar action prompts (`actionPrompts`), used by the next-action button.
+const ACTION_PROMPTS: &[Field] = &[
+    field(
+        "rules.orca_compat.actionPrompts.commitAndPush",
+        "Commit & push",
+        "Blank uses the built-in prompt.",
+        Control::Prompt,
+    ),
+    field(
+        "rules.orca_compat.actionPrompts.createPullRequest",
+        "Create PR",
+        "Blank uses the built-in prompt.",
+        Control::Prompt,
+    ),
+    field(
+        "rules.orca_compat.actionPrompts.readyForReview",
+        "Ready for review",
+        "Blank uses the built-in prompt.",
+        Control::Prompt,
+    ),
+    field(
+        "rules.orca_compat.actionPrompts.reviewPullRequest",
+        "Review",
+        "Blank uses the built-in prompt.",
         Control::Prompt,
     ),
 ];
@@ -307,6 +398,10 @@ pub struct SettingsView {
     editors: HashMap<&'static str, Entity<Editor>>,
     status_editor: Entity<Editor>,
     renaming: Option<String>,
+    open_in_rows: Vec<OpenInRow>,
+    scroll_handle: ScrollHandle,
+    /// Scroll to the "Open in" apps once the settings have loaded.
+    reveal_open_in: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -352,16 +447,21 @@ impl SettingsView {
     ) -> Self {
         let mut editors = HashMap::new();
         let mut subscriptions = Vec::new();
-        for field in [AUTOMATION, RULE_OPTIONS, INTEGRATIONS, PORTS]
-            .into_iter()
-            .flatten()
-            .filter(|f| {
-                matches!(
-                    f.control,
-                    Control::Text | Control::Prompt | Control::Integer
-                )
-            })
-        {
+        for field in [
+            AUTOMATION,
+            RULE_OPTIONS,
+            ACTION_PROMPTS,
+            INTEGRATIONS,
+            PORTS,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|f| {
+            matches!(
+                f.control,
+                Control::Text | Control::Prompt | Control::Integer
+            )
+        }) {
             let prompt = field.control == Control::Prompt;
             let editor = cx.new(|cx| {
                 let mut editor = if prompt {
@@ -372,7 +472,9 @@ impl SettingsView {
                     Editor::single_line(window, cx)
                 };
                 editor.set_placeholder_text(
-                    if prompt { "Built-in prompt" } else { "Not set" },
+                    field
+                        .placeholder
+                        .unwrap_or(if prompt { "Built-in prompt" } else { "Not set" }),
                     window,
                     cx,
                 );
@@ -411,6 +513,9 @@ impl SettingsView {
             editors,
             status_editor,
             renaming: None,
+            open_in_rows: Vec::new(),
+            scroll_handle: ScrollHandle::new(),
+            reveal_open_in: false,
             _subscriptions: subscriptions,
         };
         let handle = window.window_handle();
@@ -445,6 +550,7 @@ impl SettingsView {
             AGENTS,
             AUTOMATION,
             RULE_OPTIONS,
+            ACTION_PROMPTS,
             INTEGRATIONS,
             NOTIFICATIONS,
             PORTS,
@@ -457,6 +563,7 @@ impl SettingsView {
             "workspace.statuses",
             "workspace.cardFields",
             STATUS_BY_CONDITION,
+            OPEN_IN,
         ])
         .collect();
         let project = self.project.clone();
@@ -564,7 +671,175 @@ impl SettingsView {
             });
         }
         self.snapshot = Some(snapshot);
+        self.sync_open_in_rows(window, cx);
+        if std::mem::take(&mut self.reveal_open_in) {
+            self.scroll_handle.scroll_to_top_of_item(OPEN_IN_BLOCK);
+        }
         cx.notify();
+    }
+
+    /// Scrolls to the "Open in" apps, now or once the settings have loaded.
+    pub fn reveal_open_in(&mut self, cx: &mut Context<Self>) {
+        if self.snapshot.is_some() {
+            self.scroll_handle.scroll_to_top_of_item(OPEN_IN_BLOCK);
+            cx.notify();
+        } else {
+            self.reveal_open_in = true;
+        }
+    }
+
+    /// The apps as saved (unknown fields kept), or Orca's default while none are.
+    pub fn open_in_apps(&self) -> Vec<Value> {
+        match self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| lookup(&snapshot.resolved, OPEN_IN))
+        {
+            Some(Value::Array(apps)) => {
+                apps.iter().filter(|app| app.is_object()).cloned().collect()
+            }
+            _ => crate::source_control_settings::default_open_in()
+                .into_iter()
+                .map(|app| json!({ "id": app.id, "label": app.label, "command": app.command }))
+                .collect(),
+        }
+    }
+
+    fn open_in_editor(
+        text: &str,
+        placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<Editor>, Subscription) {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text(placeholder, window, cx);
+            editor.set_text(text, window, cx);
+            editor
+        });
+        let subscription = cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
+            if matches!(event, EditorEvent::Blurred) {
+                this.commit_open_in(window, cx);
+            }
+        });
+        (editor, subscription)
+    }
+
+    /// Rebuilds the rows when the saved apps changed, unless one is being typed in.
+    fn sync_open_in_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typing = self.open_in_rows.iter().any(|row| {
+            row.label.focus_handle(cx).is_focused(window)
+                || row.command.focus_handle(cx).is_focused(window)
+        });
+        if typing {
+            return;
+        }
+        let text = |app: &Value, key: &str| app[key].as_str().unwrap_or_default().to_owned();
+        let apps = self.open_in_apps();
+        let current: Vec<(String, String, String)> = self
+            .open_in_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    row.label.read(cx).text(cx),
+                    row.command.read(cx).text(cx),
+                )
+            })
+            .collect();
+        let saved: Vec<(String, String, String)> = apps
+            .iter()
+            .map(|app| (text(app, "id"), text(app, "label"), text(app, "command")))
+            .collect();
+        if current == saved {
+            return;
+        }
+        self.open_in_rows = saved
+            .into_iter()
+            .map(|(id, label, command)| {
+                let (label, label_subscription) =
+                    Self::open_in_editor(&label, "Menu label", window, cx);
+                let (command, command_subscription) =
+                    Self::open_in_editor(&command, "Command, e.g. code", window, cx);
+                OpenInRow {
+                    id,
+                    label,
+                    command,
+                    _subscriptions: [label_subscription, command_subscription],
+                }
+            })
+            .collect();
+    }
+
+    fn write_open_in(&mut self, apps: Vec<Value>, window: &mut Window, cx: &mut Context<Self>) {
+        if apps == self.open_in_apps() {
+            return;
+        }
+        // The Source Control panel reads the app's own user settings, so this list lives there.
+        self.write_to(Scope::User, OPEN_IN, Some(Value::Array(apps)), window, cx);
+    }
+
+    /// Saves what the rows say, keeping fields of each app that the editor doesn't show.
+    pub fn commit_open_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let saved = self.open_in_apps();
+        let apps: Vec<Value> = self
+            .open_in_rows
+            .iter()
+            .map(|row| {
+                let mut app = saved
+                    .iter()
+                    .find(|app| app["id"].as_str() == Some(row.id.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "id": row.id }));
+                app["label"] = json!(row.label.read(cx).text(cx).trim());
+                app["command"] = json!(row.command.read(cx).text(cx).trim());
+                app
+            })
+            .collect();
+        self.write_open_in(apps, window, cx);
+    }
+
+    pub fn add_open_in_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut apps = self.open_in_apps();
+        let id = (1..)
+            .map(|n| format!("custom-{n}"))
+            .find(|id| !apps.iter().any(|app| app["id"].as_str() == Some(id)))
+            .unwrap_or_default();
+        apps.push(json!({ "id": id, "label": "New app", "command": "" }));
+        self.write_open_in(apps, window, cx);
+    }
+
+    pub fn move_open_in_app(
+        &mut self,
+        index: usize,
+        up: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut apps = self.open_in_apps();
+        let Some(other) = (if up {
+            index.checked_sub(1)
+        } else {
+            Some(index + 1)
+        })
+        .filter(|other| *other < apps.len() && index < apps.len()) else {
+            return;
+        };
+        apps.swap(index, other);
+        self.write_open_in(apps, window, cx);
+    }
+
+    pub fn remove_open_in_app(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut apps = self.open_in_apps();
+        if index < apps.len() {
+            apps.remove(index);
+            self.write_open_in(apps, window, cx);
+        }
     }
 
     fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
@@ -580,16 +855,27 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.write_to(self.scope, key, value, window, cx);
+    }
+
+    fn write_to(
+        &mut self,
+        scope: Scope,
+        key: &str,
+        value: Option<Value>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let method = if value.is_some() {
             "config.set"
         } else {
             "config.unset"
         };
-        let mut params = json!({ "key": key, "layer": self.scope.layer() });
+        let mut params = json!({ "key": key, "layer": scope.layer() });
         if let Some(value) = value {
             params["value"] = value;
         }
-        if self.scope != Scope::User {
+        if scope != Scope::User {
             params["project"] = json!(self.project);
         }
         let Some(task) = request(self.client.clone(), method, params, cx) else {
@@ -768,6 +1054,29 @@ impl SettingsView {
         self.write_statuses(&statuses, window, cx);
     }
 
+    /// A status column setting; a new-workspace column also stamps when it took effect, as Orca does,
+    /// so only workspaces created afterwards start there.
+    pub fn choose_status(
+        &mut self,
+        key: &str,
+        status: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if key == NEW_WORKSPACE_STATUS {
+            let since = status.as_ref().map(|_| {
+                json!(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_millis() as u64)
+                        .unwrap_or_default()
+                )
+            });
+            self.write(&format!("{NEW_WORKSPACE_STATUS}Since"), since, window, cx);
+        }
+        self.write(key, status.map(|status| json!(status)), window, cx);
+    }
+
     pub fn toggle_card_field(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let mut fields: Vec<String> = self
             .snapshot
@@ -926,6 +1235,51 @@ impl SettingsView {
                                 menu = menu.entry(*option, None, move |window, cx| {
                                     weak.update(cx, |view, cx| {
                                         view.write(key, Some(json!(option)), window, cx)
+                                    })
+                                    .log_err();
+                                });
+                            }
+                            menu
+                        }))
+                    })
+                    .into_any_element()
+            }
+            Control::Status => {
+                let statuses = self.statuses();
+                let current: SharedString = value
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .map(|id| {
+                        statuses
+                            .iter()
+                            .find(|status| status.id == id)
+                            .map_or_else(|| id.to_owned(), |status| status.label.clone())
+                    })
+                    .unwrap_or_else(|| "Do nothing".to_owned())
+                    .into();
+                PopoverMenu::new(SharedString::from(format!("status-choice-{key}")))
+                    .trigger(
+                        ui::Button::new(
+                            SharedString::from(format!("status-choice-button-{key}")),
+                            current,
+                        )
+                        .label_size(LabelSize::Small)
+                        .end_icon(ui::Icon::new(IconName::ChevronDown).size(ui::IconSize::XSmall)),
+                    )
+                    .menu(move |window, cx| {
+                        let weak = weak.clone();
+                        let statuses = statuses.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            let choices = std::iter::once((None, "Do nothing".to_owned())).chain(
+                                statuses
+                                    .iter()
+                                    .map(|status| (Some(status.id.clone()), status.label.clone())),
+                            );
+                            for (id, label) in choices {
+                                let weak = weak.clone();
+                                menu = menu.entry(label, None, move |window, cx| {
+                                    weak.update(cx, |view, cx| {
+                                        view.choose_status(key, id.clone(), window, cx)
                                     })
                                     .log_err();
                                 });
@@ -1329,6 +1683,105 @@ impl SettingsView {
         }))
     }
 
+    fn render_open_in(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.open_in_rows.len();
+        let field = |editor: &Entity<Editor>, width: f32, cx: &App| {
+            div()
+                .w(px(width))
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(editor.clone())
+        };
+        let reset = self.set_here(OPEN_IN).then(|| {
+            ui::Button::new("open-in-reset", "Use the default")
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(|view, _, window, cx| {
+                    view.write_to(Scope::User, OPEN_IN, None, window, cx)
+                }))
+        });
+        v_flex()
+            .child(
+                h_flex()
+                    .py_1p5()
+                    .gap_4()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(Label::new("Open in apps"))
+                            .child(
+                                Label::new(
+                                    "A changed file's \"Open in\" menu. A plain command gets the file's \
+                                     path; a command with spaces runs through the shell. Saved in your settings.",
+                                )
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_none()
+                            .children(reset)
+                            .child(
+                                ui::Button::new("open-in-add", "Add app")
+                                    .label_size(LabelSize::Small)
+                                    .start_icon(
+                                        ui::Icon::new(IconName::Plus).size(ui::IconSize::XSmall),
+                                    )
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.add_open_in_app(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .when(count == 0, |this| {
+                this.child(
+                    Label::new("No apps: the menu offers only Customize apps…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .children(self.open_in_rows.iter().enumerate().map(|(index, row)| {
+                let id = |suffix: &str| SharedString::from(format!("open-in-{suffix}-{index}"));
+                h_flex()
+                    .py_1()
+                    .gap_2()
+                    .child(field(&row.label, 160., cx))
+                    .child(field(&row.command, 240., cx))
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new(id("up"), IconName::ArrowUp)
+                            .icon_size(ui::IconSize::XSmall)
+                            .disabled(index == 0)
+                            .tooltip(Tooltip::text("Move up"))
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.move_open_in_app(index, true, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new(id("down"), IconName::ArrowDown)
+                            .icon_size(ui::IconSize::XSmall)
+                            .disabled(index + 1 == count)
+                            .tooltip(Tooltip::text("Move down"))
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.move_open_in_app(index, false, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new(id("remove"), IconName::Trash)
+                            .icon_size(ui::IconSize::XSmall)
+                            .tooltip(Tooltip::text("Remove app"))
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.remove_open_in_app(index, window, cx)
+                            })),
+                    )
+            }))
+    }
+
     fn render_cards(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let shown: Vec<String> = self
             .snapshot
@@ -1376,6 +1829,8 @@ impl Render for SettingsView {
         let agents = rows(AGENTS, self, cx);
         let automation = rows(AUTOMATION, self, cx);
         let rule_options = rows(RULE_OPTIONS, self, cx);
+        let action_prompts = rows(ACTION_PROMPTS, self, cx);
+        let column = || v_flex().mx_auto().max_w(px(760.)).w_full().px_6();
         let integrations = rows(INTEGRATIONS, self, cx);
         let notifications = rows(NOTIFICATIONS, self, cx);
         let ports = rows(PORTS, self, cx);
@@ -1391,14 +1846,11 @@ impl Render for SettingsView {
             .track_focus(&self.focus_handle)
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
             .bg(cx.theme().colors().editor_background)
             .child(
-                v_flex()
-                    .mx_auto()
-                    .max_w(px(760.))
-                    .w_full()
-                    .px_6()
-                    .py_5()
+                column()
+                    .pt_5()
                     .child(
                         h_flex()
                             .justify_between()
@@ -1473,6 +1925,17 @@ impl Render for SettingsView {
                     .child(self.render_conditions(cx))
                     .child(Self::section("PULL REQUEST RULES", cx))
                     .children(rule_options)
+                    .child(Self::section("TOP BAR ACTION PROMPTS", cx))
+                    .child(
+                        Label::new(
+                            "The next-action button's prompts. They can use {{branch}}, {{baseRef}}, \
+                             {{worktreePath}}, {{prNumber}}, {{prUrl}}, {{prTitle}}, {{draftMode}}, \
+                             {{templateRule}} and {{prInstructions}}.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .children(action_prompts)
                     .child(Self::section("AGENTS", cx))
                     .children(agents)
                     .child(Self::section("INTEGRATIONS", cx))
@@ -1520,7 +1983,16 @@ impl Render for SettingsView {
                                     .label_size(LabelSize::Small)
                                     .on_click(cx.listener(|view, _, window, cx| view.open_layer_file(window, cx))),
                             ),
-                    )
+                    ),
+            )
+            .child(
+                column()
+                    .child(Self::section("SOURCE CONTROL", cx))
+                    .child(self.render_open_in(cx)),
+            )
+            .child(
+                column()
+                    .pb_5()
                     .child(Self::section("UPDATES", cx))
                     .children(updates),
             )
@@ -1543,22 +2015,35 @@ impl Item for SettingsView {
     }
 }
 
+/// Shows the settings tab, reusing an open one.
+fn open_settings(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<SettingsView> {
+    let existing = workspace.items_of_type::<SettingsView>(cx).next();
+    if let Some(existing) = existing {
+        workspace.activate_item(&existing, true, true, window, cx);
+        return existing;
+    }
+    let root = workspace
+        .root_paths(cx)
+        .into_iter()
+        .next()
+        .map(|path| path.to_path_buf());
+    let weak = workspace.weak_handle();
+    let view = cx.new(|cx| SettingsView::new(weak, root, window, cx));
+    workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+    view
+}
+
 pub fn register(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
-            let existing = workspace.items_of_type::<SettingsView>(cx).next();
-            if let Some(existing) = existing {
-                workspace.activate_item(&existing, true, true, window, cx);
-                return;
-            }
-            let root = workspace
-                .root_paths(cx)
-                .into_iter()
-                .next()
-                .map(|path| path.to_path_buf());
-            let weak = workspace.weak_handle();
-            let view = cx.new(|cx| SettingsView::new(weak, root, window, cx));
-            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+            open_settings(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &CustomizeOpenInApps, window, cx| {
+            open_settings(workspace, window, cx).update(cx, |view, cx| view.reveal_open_in(cx));
         });
     })
     .detach();
@@ -1854,6 +2339,267 @@ mod tests {
                 "the field being typed in keeps its text"
             )
         });
+    }
+
+    fn init_settings(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn the_remaining_orca_rule_options_have_controls(cx: &mut TestAppContext) {
+        init_settings(cx);
+        let calls = cx.update(|cx| {
+            stub_rpc(cx, |method, _| match method {
+                "config.get" => {
+                    let mut value = resolved();
+                    value["rules"]["orca_compat"]["mergingCheckName"] = json!("Merge gate");
+                    value["rules"]["orca_compat"]["actionPrompts"] =
+                        json!({ "readyForReview": "Polish #{{prNumber}}." });
+                    Ok(value)
+                }
+                "config.explain" => Ok(json!({ "from": { "layer": "default" } })),
+                _ => Ok(json!({})),
+            })
+        });
+        let window = cx.add_empty_window();
+        let view = window.update(|window, cx| {
+            cx.new(|cx| SettingsView::new(WeakEntity::new_invalid(), None, window, cx))
+        });
+        window.run_until_parked();
+        for key in [
+            NEW_WORKSPACE_STATUS,
+            "rules.orca_compat.holdStatus",
+            "rules.orca_compat.pmApprovalTeam",
+            "rules.orca_compat.actionPrompts.commitAndPush",
+        ] {
+            assert!(
+                calls_to(&calls, "config.explain")
+                    .iter()
+                    .any(|call| call["key"] == key),
+                "{key} shows where it comes from"
+            );
+        }
+        view.read_with(window, |view, cx| {
+            let text = |key: &str| view.editors[key].read(cx).text(cx);
+            assert_eq!(text("rules.orca_compat.mergingCheckName"), "Merge gate");
+            assert_eq!(
+                text("rules.orca_compat.actionPrompts.readyForReview"),
+                "Polish #{{prNumber}}."
+            );
+            assert_eq!(
+                text("rules.orca_compat.actionPrompts.reviewPullRequest"),
+                "",
+                "blank is the built-in prompt"
+            );
+        });
+
+        view.update_in(window, |view, window, cx| {
+            view.choose_status(NEW_WORKSPACE_STATUS, Some("todo".into()), window, cx);
+            view.choose_status(
+                "rules.orca_compat.holdStatus",
+                Some("review".into()),
+                window,
+                cx,
+            );
+            view.commit_text(
+                "rules.orca_compat.pmApprovalTeam",
+                "acme/pm",
+                false,
+                window,
+                cx,
+            );
+            view.commit_text(
+                "rules.orca_compat.reviewEnteredCommand",
+                "mise run stop",
+                false,
+                window,
+                cx,
+            );
+            view.commit_text(
+                "rules.orca_compat.actionPrompts.commitAndPush",
+                "Commit it.\nPush it.",
+                false,
+                window,
+                cx,
+            );
+        });
+        window.run_until_parked();
+        let sets = calls_to(&calls, "config.set");
+        let set = |key: &str| {
+            sets.iter()
+                .find(|call| call["key"] == key)
+                .map(|call| call["value"].clone())
+        };
+        assert_eq!(set(NEW_WORKSPACE_STATUS), Some(json!("todo")));
+        assert!(
+            set("rules.orca_compat.newWorkspaceStatusSince")
+                .is_some_and(|since| since.as_u64().is_some_and(|since| since > 0)),
+            "Orca stamps when the column took effect"
+        );
+        assert_eq!(set("rules.orca_compat.holdStatus"), Some(json!("review")));
+        assert_eq!(
+            set("rules.orca_compat.pmApprovalTeam"),
+            Some(json!("acme/pm"))
+        );
+        assert_eq!(
+            set("rules.orca_compat.reviewEnteredCommand"),
+            Some(json!("mise run stop"))
+        );
+        assert_eq!(
+            set("rules.orca_compat.actionPrompts.commitAndPush"),
+            Some(json!("Commit it.\nPush it."))
+        );
+
+        view.update_in(window, |view, window, cx| {
+            view.choose_status(NEW_WORKSPACE_STATUS, None, window, cx)
+        });
+        window.run_until_parked();
+        let unset: Vec<Value> = calls_to(&calls, "config.unset")
+            .into_iter()
+            .map(|call| call["key"].clone())
+            .collect();
+        assert!(unset.contains(&json!(NEW_WORKSPACE_STATUS)));
+        assert!(unset.contains(&json!("rules.orca_compat.newWorkspaceStatusSince")));
+    }
+
+    #[gpui::test]
+    async fn the_open_in_apps_are_edited_as_a_list_in_the_user_settings(cx: &mut TestAppContext) {
+        init_settings(cx);
+        let current = Arc::new(std::sync::Mutex::new(resolved()));
+        let calls = cx.update(|cx| {
+            let current = current.clone();
+            stub_rpc(cx, move |method, params| match method {
+                "config.get" => Ok(current.lock().expect("lock").clone()),
+                "config.set" if params["key"] == OPEN_IN => {
+                    current.lock().expect("lock")["sourceControl"] =
+                        json!({ "openIn": params["value"].clone() });
+                    Ok(json!({}))
+                }
+                "config.explain" => Ok(json!({ "from": { "layer": "default" } })),
+                _ => Ok(json!({})),
+            })
+        });
+        let (view, window) = cx.add_window_view(|window, cx| {
+            SettingsView::new(WeakEntity::new_invalid(), None, window, cx)
+        });
+        window.run_until_parked();
+        let rows = |view: &Entity<SettingsView>, window: &mut gpui::VisualTestContext| {
+            view.read_with(window, |view, cx| {
+                view.open_in_rows
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "{}={}",
+                            row.label.read(cx).text(cx),
+                            row.command.read(cx).text(cx)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(rows(&view, window), ["VS Code=code"], "Orca's default");
+
+        view.update_in(window, |view, window, cx| {
+            view.project = Some("p-1".into());
+            view.set_scope(Scope::Project, cx);
+            view.add_open_in_app(window, cx);
+        });
+        window.run_until_parked();
+        assert_eq!(rows(&view, window), ["VS Code=code", "New app="]);
+        let saved = calls_to(&calls, "config.set");
+        assert_eq!(
+            saved[0]["layer"], "user",
+            "the panel reads the user settings"
+        );
+        assert_eq!(saved[0]["project"], Value::Null);
+
+        current.lock().expect("lock")["sourceControl"]["openIn"][0]["icon"] = json!("vscode");
+        {
+            let app: &mut TestAppContext = window;
+            app.update(config_changed);
+        }
+        window.run_until_parked();
+        view.update_in(window, |view, window, cx| {
+            let row = &view.open_in_rows[1];
+            let (label, command) = (row.label.clone(), row.command.clone());
+            label.update(cx, |editor, cx| editor.set_text("Xcode", window, cx));
+            command.update(cx, |editor, cx| {
+                editor.set_text(" open -a Xcode ", window, cx)
+            });
+            view.commit_open_in(window, cx);
+        });
+        window.run_until_parked();
+        assert_eq!(rows(&view, window), ["VS Code=code", "Xcode=open -a Xcode"]);
+        let apps = view.read_with(window, |view, _| view.open_in_apps());
+        assert_eq!(
+            apps[0]["icon"], "vscode",
+            "fields the editor doesn't show stay"
+        );
+        assert_eq!(apps[1]["id"], "custom-1");
+
+        view.update_in(window, |view, window, cx| {
+            view.move_open_in_app(1, true, window, cx)
+        });
+        window.run_until_parked();
+        assert_eq!(rows(&view, window), ["Xcode=open -a Xcode", "VS Code=code"]);
+        view.update_in(window, |view, window, cx| {
+            view.remove_open_in_app(1, window, cx)
+        });
+        window.run_until_parked();
+        assert_eq!(rows(&view, window), ["Xcode=open -a Xcode"]);
+        let parsed = crate::source_control_settings::SourceControlSettings::from_settings(
+            &current.lock().expect("lock")["sourceControl"],
+        );
+        assert_eq!(
+            parsed.open_in[0].command, "open -a Xcode",
+            "the menu reads it"
+        );
+    }
+
+    #[gpui::test]
+    async fn customize_apps_opens_the_settings_tab_at_the_open_in_apps(cx: &mut TestAppContext) {
+        init_settings(cx);
+        cx.update(|cx| {
+            register(cx);
+            stub_rpc(cx, |method, _| match method {
+                "config.get" => Ok(resolved()),
+                "config.explain" => Ok(json!({ "from": { "layer": "default" } })),
+                _ => Ok(json!({})),
+            });
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "a.txt": "a" })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window
+            .read_with(cx, |multi, _| multi.workspace().clone())
+            .expect("workspace");
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.dispatch_action(CustomizeOpenInApps);
+        cx.run_until_parked();
+        let open = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .items_of_type::<SettingsView>(cx)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let views = open(&mut cx);
+        assert_eq!(views.len(), 1);
+        views[0].read_with(&cx, |view, _| {
+            assert!(view.snapshot().is_some());
+            assert!(!view.reveal_open_in, "scrolled once the settings loaded");
+            assert_eq!(view.open_in_rows.len(), 1);
+        });
+        cx.dispatch_action(CustomizeOpenInApps);
+        cx.run_until_parked();
+        assert_eq!(open(&mut cx).len(), 1, "the open tab is reused");
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod issue;
 mod notes;
 mod orca_state;
 mod ports;
+mod recipe;
 mod review;
 mod rules;
 mod service;
@@ -60,6 +61,12 @@ enum Command {
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
+    },
+    /// Per-workspace environments from orca.yaml's `environmentRecipes` (create one with
+    /// `icarus workspace create --recipe <id>`).
+    Recipe {
+        #[command(subcommand)]
+        command: recipe::RecipeCommand,
     },
     /// Manage terminal sessions owned by the server.
     Terminal {
@@ -401,6 +408,51 @@ enum AppCommand {
         #[arg(long)]
         args: Option<String>,
     },
+    /// The app's own settings (its `client.json`), which override the server's for this app only.
+    /// Today that is `workspace.cardFields`.
+    Config {
+        #[command(subcommand)]
+        command: AppConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AppConfigCommand {
+    /// Print the app's own value of a dotted key (or all of them).
+    Get { key: Option<String> },
+    /// Set a dotted key for this app; the value is parsed as JSON when it can be.
+    Set { key: String, value: String },
+    /// Go back to the server's value.
+    Unset { key: String },
+}
+
+/// Waits for the app to write its answer to `path`, then removes the file.
+async fn app_answer(path: &std::path::Path) -> Result<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(value) = serde_json::from_str::<Value>(&text)
+        {
+            std::fs::remove_file(path)?;
+            if let Some(error) = value["error"].as_str() {
+                anyhow::bail!("{error}");
+            }
+            return Ok(value);
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("the app did not answer within 10s");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn answer_path(kind: &str) -> Result<PathBuf> {
+    Ok(std::env::temp_dir().join(format!(
+        "icarus-{kind}-{}.json",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    )))
 }
 
 /// Splits `path:line:column` the way editors' "open at position" conventions do.
@@ -559,13 +611,18 @@ enum ProjectCommand {
         /// Also trust the scripts in this workspace's checkout.
         #[arg(long)]
         workspace: Option<String>,
+        /// Always trust this repository's scripts, including later changes (Orca's "Always trust").
+        #[arg(long)]
+        always: bool,
     },
-    /// Forget every trusted version of the project's committed scripts.
+    /// Forget every trusted version of the project's committed scripts, and "always trust".
     Untrust {
         id: String,
     },
 }
 
+// Parsed once per process, so the size of `Create` costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum WorkspaceCommand {
     /// Create a worktree workspace; it starts with an agent, optionally with a prompt.
@@ -615,6 +672,18 @@ enum WorkspaceCommand {
         /// Trust the project's committed scripts (see `icarus project scripts`) and run them.
         #[arg(long)]
         trust: bool,
+        /// Always trust the project's committed scripts, including later changes.
+        #[arg(long)]
+        always_trust: bool,
+        /// Link a GitHub issue by URL; the project's `issueCommand` runs for it.
+        #[arg(long, value_name = "URL")]
+        from_issue: Option<String>,
+        /// Don't run the project's `issueCommand` for the linked pull request or issue.
+        #[arg(long)]
+        no_issue_command: bool,
+        /// Create it in a new environment from one of orca.yaml's `environmentRecipes`.
+        #[arg(long, value_name = "ID")]
+        recipe: Option<String>,
     },
     List {
         #[arg(long)]
@@ -655,6 +724,14 @@ enum WorkspaceCommand {
     Reorder {
         #[arg(required = true)]
         ids: Vec<String>,
+    },
+    /// Clear the unread mark an agent left (focusing the workspace in the app does the same).
+    MarkRead {
+        id: String,
+    },
+    /// Mark the workspace unread, as a finished agent turn does.
+    MarkUnread {
+        id: String,
     },
     /// List changed files against the base (or only uncommitted ones).
     Changes {
@@ -979,28 +1056,15 @@ async fn remote_command(cli: &Cli, command: &RemoteCommand) -> Result<()> {
                     let code = code.as_deref().context(
                         "pairing needs --code; run `icarus server pair` on the server's machine",
                     )?;
-                    let credentials = icarus_client::Credentials::PairCode {
-                        code: code.to_string(),
-                        fingerprint: fingerprint.clone(),
-                        label: Some(label.clone().unwrap_or_else(host_name)),
-                    };
-                    let (client, _) = Client::connect_tcp(&addr, &credentials, "icarus-cli")
-                        .await
-                        .with_context(|| format!("pair with {addr}"))?;
-                    SavedServer {
-                        name: name.clone(),
-                        address: addr,
-                        token: Some(
-                            client
-                                .issued_token
-                                .clone()
-                                .context("the server accepted the code but sent no token")?,
-                        ),
-                        fingerprint: client.server_fingerprint.clone(),
-                        client_id: client.paired_client_id.clone(),
-                        command: None,
-                        ssh: ssh.clone(),
-                    }
+                    recipe::pair(
+                        name,
+                        &addr,
+                        code,
+                        fingerprint.clone(),
+                        label.clone(),
+                        ssh.clone(),
+                    )
+                    .await?
                 }
             };
             saved.upsert(server.clone());
@@ -1164,6 +1228,7 @@ fn scripts_summary(value: &Value) -> String {
     };
     script("setup", &value["setup"]);
     script("archive", &value["archive"]);
+    script("issue command", &value["issue_command"]);
     if let Some(tabs) = value["default_tabs"].as_array().filter(|t| !t.is_empty()) {
         let trust = if value["default_tabs_trusted"] == true {
             "trusted"
@@ -1172,12 +1237,44 @@ fn scripts_summary(value: &Value) -> String {
         };
         lines.push(format!("default tabs ({trust}):"));
         for tab in tabs {
+            let color = tab["color"]
+                .as_str()
+                .map(|color| format!(" [{color}]"))
+                .unwrap_or_default();
             lines.push(format!(
-                "  {}: {}",
+                "  {}{color}: {}",
                 tab["title"].as_str().unwrap_or("Terminal"),
                 tab["command"].as_str().unwrap_or("(shell)")
             ));
         }
+    }
+    if let Some(recipes) = value["recipes"].as_array().filter(|r| !r.is_empty()) {
+        lines.push(format!(
+            "environment recipes ({}):",
+            if value["untrusted"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "vm_recipe"))
+            {
+                "NOT TRUSTED"
+            } else {
+                "trusted"
+            }
+        ));
+        for recipe in recipes {
+            lines.push(format!(
+                "  {}: {} ({})",
+                recipe["id"].as_str().unwrap_or("?"),
+                recipe["name"].as_str().unwrap_or(""),
+                recipe["create"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    for problem in value["recipe_problems"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "  recipe {}: {}",
+            problem["index"],
+            problem["message"].as_str().unwrap_or("")
+        ));
     }
     if lines.is_empty() {
         lines.push("no scripts".into());
@@ -1186,7 +1283,12 @@ fn scripts_summary(value: &Value) -> String {
         "setup policy: {}",
         value["run_policy"].as_str().unwrap_or("?")
     ));
-    if value["trusted"] != true {
+    if value["always_trusted"] == true {
+        lines.push(format!(
+            "always trusted (undo with `icarus project untrust {}`)",
+            value["project"].as_str().unwrap_or("<id>")
+        ));
+    } else if value["trusted"] != true {
         lines.push(format!(
             "trust them with `icarus project trust {}`",
             value["project"].as_str().unwrap_or("<id>")
@@ -1432,6 +1534,7 @@ async fn main() -> Result<()> {
             acp::run(open(&cli, "icarus-acp").await?, provider.clone()).await?;
         }
         Command::Remote { command } => remote_command(&cli, command).await?,
+        Command::Recipe { command } => recipe::run(&cli, command).await?,
         Command::File { command } => {
             let client = connect(&cli).await?;
             match command {
@@ -1502,36 +1605,43 @@ async fn main() -> Result<()> {
                         .map(serde_json::from_str)
                         .transpose()
                         .map_err(|e| anyhow::anyhow!("--args is not JSON: {e}"))?;
-                    let result = std::env::temp_dir().join(format!(
-                        "icarus-dispatch-{}.json",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)?
-                            .as_nanos()
-                    ));
+                    let result = answer_path("dispatch")?;
                     client
                         .request(
                             "client.dispatch",
                             json!({ "action": action, "args": args, "result": result }),
                         )
                         .await?;
-                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                    let value: Value = loop {
-                        if let Ok(text) = std::fs::read_to_string(&result)
-                            && let Ok(value) = serde_json::from_str(&text)
-                        {
-                            std::fs::remove_file(&result)?;
-                            break value;
-                        }
-                        if std::time::Instant::now() > deadline {
-                            anyhow::bail!("the app did not answer within 10s");
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    };
-                    if let Some(error) = value["error"].as_str() {
-                        anyhow::bail!("{error}");
-                    }
+                    let value = app_answer(&result).await?;
                     print(&cli, &value, |v| {
                         format!("dispatched {}", v["action"].as_str().unwrap_or_default())
+                    });
+                }
+                AppCommand::Config { command } => {
+                    let (op, key, value) = match command {
+                        AppConfigCommand::Get { key } => ("get", key.clone(), None),
+                        AppConfigCommand::Set { key, value } => (
+                            "set",
+                            Some(key.clone()),
+                            Some(
+                                serde_json::from_str::<Value>(value)
+                                    .unwrap_or_else(|_| Value::String(value.clone())),
+                            ),
+                        ),
+                        AppConfigCommand::Unset { key } => ("unset", Some(key.clone()), None),
+                    };
+                    let result = answer_path("app-config")?;
+                    client
+                        .request(
+                            "client.config",
+                            json!({ "op": op, "key": key, "value": value, "result": result }),
+                        )
+                        .await?;
+                    let answer = app_answer(&result).await?;
+                    print(&cli, &answer["value"], |v| match v {
+                        Value::Null => "(not set; the server's value applies)".to_owned(),
+                        Value::String(text) => text.clone(),
+                        other => serde_json::to_string_pretty(other).unwrap_or_default(),
                     });
                 }
                 AppCommand::Capture { out, timeout } => {
@@ -1849,15 +1959,26 @@ async fn main() -> Result<()> {
                         .request("project.remove", json!({ "id": id }))
                         .await?
                 }
-                ProjectCommand::Scripts { id, workspace }
-                | ProjectCommand::Trust { id, workspace } => {
-                    let method = if matches!(command, ProjectCommand::Trust { .. }) {
-                        "project.trust"
-                    } else {
-                        "project.scripts"
-                    };
+                ProjectCommand::Scripts { id, workspace } => {
                     let value = client
-                        .request(method, json!({ "id": id, "workspace": workspace }))
+                        .request(
+                            "project.scripts",
+                            json!({ "id": id, "workspace": workspace }),
+                        )
+                        .await?;
+                    print(&cli, &value, scripts_summary);
+                    return Ok(());
+                }
+                ProjectCommand::Trust {
+                    id,
+                    workspace,
+                    always,
+                } => {
+                    let value = client
+                        .request(
+                            "project.trust",
+                            json!({ "id": id, "workspace": workspace, "always": always }),
+                        )
                         .await?;
                     print(&cli, &value, scripts_summary);
                     return Ok(());
@@ -1902,8 +2023,13 @@ async fn main() -> Result<()> {
                     _ => String::new(),
                 };
                 let pinned = if w["pinned"] == true { "  pinned" } else { "" };
+                let unread = match w["unread"]["kind"].as_str() {
+                    Some("needs_input") => "  needs input",
+                    Some(_) => "  unread",
+                    None => "",
+                };
                 format!(
-                    "{}  {}  {}  {}{setup}{pinned}",
+                    "{}  {}  {}  {}{setup}{pinned}{unread}",
                     w["id"].as_str().unwrap_or_default(),
                     w["name"].as_str().unwrap_or_default(),
                     w["status"].as_str().unwrap_or("-"),
@@ -1929,10 +2055,24 @@ async fn main() -> Result<()> {
                     no_setup,
                     from_pr,
                     trust,
+                    always_trust,
+                    from_issue,
+                    no_issue_command,
+                    recipe,
                 } => {
-                    let issue = from_linear
-                        .as_ref()
-                        .map(|id| json!({ "provider": "linear", "id": id }));
+                    let issue = match (from_linear, from_issue) {
+                        (Some(id), _) => Some(json!({ "provider": "linear", "id": id })),
+                        (None, Some(url)) => Some(json!({
+                            "provider": "github",
+                            "id": url.rsplit('/').next().map(|n| format!("#{n}")),
+                            "url": url,
+                        })),
+                        (None, None) => None,
+                    };
+                    let trust = match (always_trust, trust) {
+                        (true, _) => json!("always"),
+                        (false, trust) => json!(trust),
+                    };
                     let setup = match (setup, no_setup) {
                         (true, _) => json!("run"),
                         (_, true) => json!("skip"),
@@ -1946,15 +2086,29 @@ async fn main() -> Result<()> {
                             .map(|d| d.as_nanos())
                             .unwrap_or_default()
                     );
+                    let params = json!({
+                        "project": project, "name": name, "branch": branch, "base": base,
+                        "fetch": fetch, "status": status, "prompt": prompt, "issue": issue,
+                        "agent": !no_agent, "layout": layout, "pr_url": pr_url,
+                        "account": account, "remote_control": remote_control.map(Switch::enabled),
+                        "setup": setup, "pr": from_pr, "trust": trust, "create_id": create_id,
+                        "issue_command": !no_issue_command,
+                    });
+                    if let Some(recipe) = recipe {
+                        let value = recipe::create(&client, recipe, params, trust != false).await?;
+                        print(&cli, &value, |v| {
+                            format!(
+                                "environment {} on saved server {}\n{}",
+                                v["environment"].as_str().unwrap_or("?"),
+                                v["server"].as_str().unwrap_or("?"),
+                                summary(&v["workspace"])
+                            )
+                        });
+                        return Ok(());
+                    }
                     let create = client.request_timeout(
                         "workspace.create",
-                        json!({
-                            "project": project, "name": name, "branch": branch, "base": base,
-                            "fetch": fetch, "status": status, "prompt": prompt, "issue": issue,
-                            "agent": !no_agent, "layout": layout, "pr_url": pr_url,
-                            "account": account, "remote_control": remote_control.map(Switch::enabled),
-                            "setup": setup, "pr": from_pr, "trust": trust, "create_id": create_id,
-                        }),
+                        params,
                         Duration::from_secs(300),
                     );
                     tokio::pin!(create);
@@ -2041,6 +2195,22 @@ async fn main() -> Result<()> {
                             "ordered {} workspace(s)",
                             v["ordered"].as_u64().unwrap_or(0)
                         )
+                    });
+                }
+                WorkspaceCommand::MarkRead { id } | WorkspaceCommand::MarkUnread { id } => {
+                    let unread = matches!(command, WorkspaceCommand::MarkUnread { .. });
+                    let value = client
+                        .request(
+                            "workspace.set_unread",
+                            json!({ "id": id, "unread": unread }),
+                        )
+                        .await?;
+                    print(&cli, &value, |v| {
+                        if v["unread"].is_null() {
+                            "read".to_owned()
+                        } else {
+                            "unread".to_owned()
+                        }
                     });
                 }
                 WorkspaceCommand::Changes { id, uncommitted } => {

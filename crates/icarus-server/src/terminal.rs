@@ -19,7 +19,7 @@ use rustix::process::{Pid, Signal, kill_process};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::emulator::Emulator;
+use crate::emulator::{Emulator, SnapshotMode};
 
 /// Raw output kept in memory so a reconnecting client can resume without a full snapshot.
 const RING_BYTES: usize = 4 * 1024 * 1024;
@@ -61,12 +61,16 @@ pub struct SpawnOptions {
     pub rows: u16,
     pub label: Option<String>,
     pub workspace: Option<String>,
+    /// The tab colour (`#rgb` / `#rrggbb`), as `orca.yaml`'s `defaultTabs` give one.
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TerminalInfo {
     pub id: String,
     pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     pub workspace: Option<String>,
     pub cwd: PathBuf,
     pub command: Vec<String>,
@@ -116,6 +120,8 @@ pub struct TerminalRecord {
     pub rows: u16,
     #[serde(default)]
     pub task: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
 }
 
 /// A terminal as handed to the next server: its record, live state and screen.
@@ -159,6 +165,7 @@ struct Io {
 pub struct TerminalSession {
     id: String,
     label: Mutex<Option<String>>,
+    color: Option<String>,
     workspace: Option<String>,
     cwd: PathBuf,
     command: Vec<String>,
@@ -253,6 +260,7 @@ impl TerminalSession {
         Arc::new(Self {
             id: record.id,
             label: Mutex::new(record.label),
+            color: record.color,
             workspace: record.workspace,
             cwd: record.cwd,
             command: record.command,
@@ -330,6 +338,7 @@ impl TerminalSession {
                 columns: size.cols,
                 rows: size.rows,
                 task: false,
+                color: options.color,
             },
             state,
         );
@@ -545,6 +554,7 @@ impl TerminalSession {
             columns,
             rows,
             task: self.task.load(Ordering::Relaxed),
+            color: self.color.clone(),
         }
     }
 
@@ -598,6 +608,7 @@ impl TerminalSession {
             busy,
             id: self.id.clone(),
             label: lock(&self.label).clone(),
+            color: self.color.clone(),
             workspace: self.workspace.clone(),
             cwd: self.cwd.clone(),
             command: self.command.clone(),
@@ -619,6 +630,15 @@ impl TerminalSession {
     pub fn attach(
         &self,
         since_seq: Option<u64>,
+    ) -> (Attachment, broadcast::Receiver<TerminalEvent>) {
+        self.attach_with(since_seq, SnapshotMode::Replace)
+    }
+
+    /// `attach`, with the snapshot (if one is needed) written as `mode` says.
+    pub fn attach_with(
+        &self,
+        since_seq: Option<u64>,
+        mode: SnapshotMode,
     ) -> (Attachment, broadcast::Receiver<TerminalEvent>) {
         let state = lock(&self.state);
         let receiver = self.events.subscribe();
@@ -645,7 +665,7 @@ impl TerminalSession {
             }
         } else {
             Attachment {
-                snapshot: Some(state.emulator.snapshot_vt()),
+                snapshot: Some(state.emulator.snapshot(mode)),
                 chunks: Vec::new(),
                 next_seq: state.next_seq,
                 columns,
@@ -866,6 +886,7 @@ mod tests {
             rows: 10,
             label: None,
             workspace: None,
+            color: None,
         }
     }
 

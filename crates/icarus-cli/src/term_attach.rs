@@ -90,10 +90,24 @@ struct Session {
 
 impl Session {
     async fn attach(&mut self, client: &Client) -> Result<Next> {
+        // Sized first, so the snapshot fits this window instead of scrolling part of it away.
+        if let Some((columns, rows)) = local_size() {
+            client
+                .request(
+                    "terminal.resize",
+                    json!({ "id": self.id, "columns": columns, "rows": rows }),
+                )
+                .await
+                .ok();
+        }
         let response = client
             .request(
                 "terminal.attach",
-                json!({ "id": self.id, "since_seq": self.next_seq }),
+                json!({
+                    "id": self.id,
+                    "since_seq": self.next_seq,
+                    "inline": self.next_seq.is_none(),
+                }),
             )
             .await
             .with_context(|| format!("terminal {} is not on the server", self.id))?;
@@ -105,14 +119,6 @@ impl Session {
         }
         if let Some(next) = response["next_seq"].as_u64() {
             self.next_seq = Some(self.next_seq.map_or(next, |seen| seen.max(next)));
-        }
-        if let Some((columns, rows)) = local_size() {
-            client
-                .request(
-                    "terminal.resize",
-                    json!({ "id": self.id, "columns": columns, "rows": rows }),
-                )
-                .await?;
         }
         let info = client
             .request("terminal.info", json!({ "id": self.id }))

@@ -45,9 +45,36 @@ pub struct WorkspaceSummary {
     /// The server's last agent turn, terminal output or git change.
     #[serde(default)]
     pub activity_at_ms: Option<u64>,
+    /// Set by the server when an agent finished or needs input while no client showed the workspace.
+    #[serde(default)]
+    pub unread: Option<Unread>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadKind {
+    Done,
+    NeedsInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Unread {
+    pub kind: UnreadKind,
+    #[serde(default)]
+    pub at_ms: u64,
 }
 
 impl WorkspaceSummary {
+    /// Agent Activity's tiers: needs you, then working, then finished unseen, then the rest.
+    pub fn attention_tier(&self) -> u8 {
+        match &self.unread {
+            Some(unread) if unread.kind == UnreadKind::NeedsInput => 0,
+            _ if self.working_agents() > 0 => 1,
+            Some(_) => 2,
+            None => 3,
+        }
+    }
+
     /// What Recent sorts by: the last activity, or the creation when nothing happened since.
     pub fn recent_at_ms(&self) -> u64 {
         self.activity_at_ms
@@ -355,8 +382,12 @@ pub fn sort_workspaces(
             workspaces.sort_by(|a, b| newest_first(a, b).then_with(|| by_label(a, b)))
         }
         SortBy::Smart => workspaces.sort_by(|a, b| {
-            (b.working_agents() > 0)
-                .cmp(&(a.working_agents() > 0))
+            let unread_at = |workspace: &WorkspaceSummary| {
+                workspace.unread.as_ref().map_or(0, |unread| unread.at_ms)
+            };
+            a.attention_tier()
+                .cmp(&b.attention_tier())
+                .then_with(|| unread_at(b).cmp(&unread_at(a)))
                 .then_with(|| newest_first(a, b))
                 .then_with(|| by_label(a, b))
         }),
@@ -448,6 +479,7 @@ mod tests {
             created_at_ms: 0,
             manual_order: None,
             activity_at_ms: None,
+            unread: None,
         }
     }
 
@@ -581,6 +613,39 @@ mod tests {
             "gamma,beta,Alpha",
             "higher ranks first, unranked last"
         );
+    }
+
+    #[test]
+    fn agent_activity_puts_needs_you_then_working_then_unread_done_first() {
+        let unread = |kind, at_ms| Some(Unread { kind, at_ms });
+        let mut quiet = workspace("quiet", None);
+        quiet.activity_at_ms = Some(100);
+        let mut done_old = workspace("done-old", None);
+        done_old.unread = unread(UnreadKind::Done, 5);
+        let mut done_new = workspace("done-new", None);
+        done_new.unread = unread(UnreadKind::Done, 9);
+        let mut asking = workspace("asking", None);
+        asking.unread = unread(UnreadKind::NeedsInput, 1);
+        let mut working = workspace("working", None);
+        working.agents.push(AgentSummary {
+            id: "a1".into(),
+            title: None,
+            state: "working".into(),
+            provider: "claude".into(),
+        });
+        let mut items = vec![quiet, done_old, working, done_new, asking];
+        sort_workspaces(&mut items, SortBy::Smart, |_| String::new());
+        assert_eq!(
+            order(&items),
+            ["asking", "working", "done-new", "done-old", "quiet"]
+        );
+        let parsed: WorkspaceSummary = serde_json::from_value(serde_json::json!({
+            "id": "ws-1", "project_id": "p", "name": "n", "path": "/w/n",
+            "branch": null, "status": null, "title": null, "issue": null,
+            "unread": { "kind": "needs_input", "at_ms": 7 },
+        }))
+        .expect("the server's shape");
+        assert_eq!(parsed.unread, unread(UnreadKind::NeedsInput, 7));
     }
 
     #[test]

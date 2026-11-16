@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use collections::HashSet;
+use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, WeakEntity, Window, actions};
 use gpui_tokio::Tokio;
 use icarus_client::Client;
 use project::terminals::{RoutedShell, ShellRequest, ShellRouter, TaskRequest};
 use terminal_view::{
-    ExternalKeyContext, ExternalTerminalCloser, ExternalTerminalRetitled, TerminalView,
+    ExternalKeyContext, ExternalKeyboardFlags, ExternalTabColor, ExternalTerminalCloser,
+    ExternalTerminalRetitled, TerminalView,
 };
 use util::ResultExt as _;
 use util::shell::Shell;
@@ -214,21 +215,51 @@ fn route(request: ShellRequest, cx: &mut App) -> Option<gpui::Task<Result<Routed
             external_id: qualified_id(&id, server.as_deref()),
             fallback_title: fallback_title(&info),
         };
-        anyhow::Ok((routed, info["kitty_keyboard_flags"].as_u64().unwrap_or(0)))
+        let flags = info["kitty_keyboard_flags"]
+            .as_u64()
+            .and_then(|flags| u8::try_from(flags).ok())
+            .unwrap_or(0);
+        let color = info["color"].as_str().and_then(tab_color);
+        anyhow::Ok((routed, flags, color))
     });
     Some(cx.spawn(async move |cx| {
-        let (routed, kitty_flags) = task.await?;
+        let (routed, kitty_flags, color) = task.await?;
         let external_id = routed.external_id.clone();
-        cx.update(|cx| set_kitty_keyboard(&external_id, kitty_flags > 0, cx));
+        cx.update(|cx| {
+            set_kitty_keyboard(&external_id, kitty_flags, cx);
+            let colors = &mut cx.default_global::<TabColors>().0;
+            match color {
+                Some(color) => colors.insert(external_id, color),
+                None => colors.remove(&external_id),
+            };
+        });
         Ok(routed)
     }))
 }
 
-/// Server terminals whose program turned on the kitty keyboard protocol, by tab terminal id.
+/// `#rgb` / `#rrggbb`, as `orca.yaml`'s `defaultTabs` colour tabs.
+fn tab_color(text: &str) -> Option<gpui::Hsla> {
+    let hex = text.strip_prefix('#')?;
+    let hex = match hex.len() {
+        3 => hex.chars().flat_map(|c| [c, c]).collect::<String>(),
+        6 => hex.to_owned(),
+        _ => return None,
+    };
+    let value = u32::from_str_radix(&hex, 16).ok()?;
+    Some(gpui::rgb(value).into())
+}
+
+/// The kitty keyboard flags of server terminals whose program turned the protocol on, by tab terminal id.
 #[derive(Default)]
-struct KittyKeyboardTerminals(HashSet<String>);
+struct KittyKeyboardTerminals(HashMap<String, u8>);
 
 impl gpui::Global for KittyKeyboardTerminals {}
+
+/// Server terminals' tab colours, by tab terminal id.
+#[derive(Default)]
+struct TabColors(HashMap<String, gpui::Hsla>);
+
+impl gpui::Global for TabColors {}
 
 /// Terminal tabs, so a server's terminal events reach the tabs showing that terminal.
 #[derive(Default)]
@@ -246,12 +277,12 @@ fn views_showing(external_id: &str, cx: &mut App) -> Vec<Entity<TerminalView>> {
         .collect()
 }
 
-fn set_kitty_keyboard(external_id: &str, on: bool, cx: &mut App) {
-    let set = &mut cx.default_global::<KittyKeyboardTerminals>().0;
-    let changed = if on {
-        set.insert(external_id.to_owned())
+fn set_kitty_keyboard(external_id: &str, flags: u8, cx: &mut App) {
+    let terminals = &mut cx.default_global::<KittyKeyboardTerminals>().0;
+    let changed = if flags > 0 {
+        terminals.insert(external_id.to_owned(), flags) != Some(flags)
     } else {
-        set.remove(external_id)
+        terminals.remove(external_id).is_some()
     };
     if changed {
         for view in views_showing(external_id, cx) {
@@ -273,8 +304,11 @@ pub(crate) fn terminal_changed(
     let external_id = qualified_id(id, server);
     match topic {
         "terminal.keyboard" => {
-            let on = payload["flags"].as_u64().unwrap_or(0) > 0;
-            set_kitty_keyboard(&external_id, on, cx);
+            let flags = payload["flags"]
+                .as_u64()
+                .and_then(|flags| u8::try_from(flags).ok())
+                .unwrap_or(0);
+            set_kitty_keyboard(&external_id, flags, cx);
         }
         "terminal.label" => {
             let label = payload["label"].as_str().map(str::to_owned);
@@ -354,12 +388,23 @@ pub(crate) fn register(cx: &mut App) {
     cx.set_global(ExternalKeyContext(Arc::new(|external_id, context, cx| {
         if cx
             .try_global::<KittyKeyboardTerminals>()
-            .is_some_and(|terminals| terminals.0.contains(external_id))
+            .is_some_and(|terminals| terminals.0.contains_key(external_id))
         {
             context.add("kitty_keyboard");
         }
     })));
+    cx.set_global(ExternalKeyboardFlags(Arc::new(keyboard_flags)));
+    cx.set_global(ExternalTabColor(Arc::new(|external_id, cx| {
+        cx.try_global::<TabColors>()
+            .and_then(|colors| colors.0.get(external_id).copied())
+    })));
     register_views(cx);
+}
+
+fn keyboard_flags(external_id: &str, cx: &App) -> u8 {
+    cx.try_global::<KittyKeyboardTerminals>()
+        .and_then(|terminals| terminals.0.get(external_id).copied())
+        .unwrap_or(0)
 }
 
 /// The parts that need no server: tracking tabs and the pane-title actions.
@@ -388,6 +433,14 @@ mod tests {
     fn the_bundled_cli_wins_over_path_only_when_it_exists() {
         let program = icarus_program();
         assert!(program == "icarus" || Path::new(&program).is_file());
+    }
+
+    #[test]
+    fn orca_tab_colours_parse_in_both_lengths() {
+        assert_eq!(tab_color("#fff"), Some(gpui::rgb(0xffffff).into()));
+        assert_eq!(tab_color("#22aa88"), Some(gpui::rgb(0x22aa88).into()));
+        assert_eq!(tab_color("red"), None);
+        assert_eq!(tab_color("#12345"), None);
     }
 
     #[test]
@@ -586,7 +639,19 @@ mod tests {
         remote.read_with(&cx, |view, _| assert_eq!(view.custom_title(), None));
         cx.update(|_, cx| {
             let kitty = &cx.global::<KittyKeyboardTerminals>().0;
-            assert!(kitty.contains("term-1@desk") && !kitty.contains("term-1"));
+            assert!(kitty.get("term-1@desk") == Some(&1) && !kitty.contains_key("term-1"));
+            terminal_changed(
+                Some("desk"),
+                "terminal.keyboard",
+                &serde_json::json!({ "id": "term-1", "flags": 9 }),
+                cx,
+            );
+            assert_eq!(
+                keyboard_flags("term-1@desk", cx),
+                9,
+                "the flags reach key encoding"
+            );
+            assert_eq!(keyboard_flags("term-1", cx), 0);
             terminal_changed(
                 None,
                 "terminal.label",

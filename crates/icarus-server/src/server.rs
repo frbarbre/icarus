@@ -105,6 +105,8 @@ pub struct Server {
     tls_fingerprint: std::sync::Mutex<Option<String>>,
     /// Live connections of paired clients, closed when the client is revoked.
     paired_connections: std::sync::Mutex<Vec<(String, Arc<Notify>)>>,
+    /// The workspace each connected client shows, by connection id (`client.focus`).
+    pub(crate) focus: std::sync::Mutex<HashMap<String, String>>,
 }
 
 type Outbound = mpsc::UnboundedSender<ServerMessage>;
@@ -219,6 +221,7 @@ impl Server {
             allow_public: AtomicBool::new(false),
             tls_fingerprint: std::sync::Mutex::new(None),
             paired_connections: std::sync::Mutex::new(Vec::new()),
+            focus: std::sync::Mutex::new(HashMap::new()),
         });
         Ok((server, listener))
     }
@@ -489,6 +492,16 @@ impl Server {
                                     outbound.send(ServerMessage::Response { id, result, error });
                             });
                         }
+                        ClientMessage::Request { id, method, params }
+                            if authenticated && method == "client.focus" =>
+                        {
+                            let connection = client_id.clone().unwrap_or_default();
+                            let (result, error) = match self.set_focus(&connection, params) {
+                                Ok(value) => (Some(value), None),
+                                Err(error) => (None, Some(error)),
+                            };
+                            let _ = outbound.send(ServerMessage::Response { id, result, error });
+                        }
                         ClientMessage::Request { id, method, params } => {
                             let reply = if !authenticated {
                                 Err(rpc("unauthorized", "send hello first"))
@@ -513,6 +526,7 @@ impl Server {
         }
         .await;
         if let Some(id) = client_id {
+            self.forget_focus(&id);
             self.clients
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -981,6 +995,42 @@ impl Server {
                 }
                 Ok(json!({ "delivered": delivered }))
             }
+            "client.config" => {
+                #[derive(Deserialize)]
+                struct P {
+                    /// get, set or unset.
+                    op: String,
+                    key: Option<String>,
+                    #[serde(default)]
+                    value: Option<Value>,
+                    /// A file the app writes the outcome to, so callers can wait for it.
+                    result: Option<PathBuf>,
+                }
+                let p: P = params(params_value)?;
+                if !matches!(p.op.as_str(), "get" | "set" | "unset") {
+                    return Err(rpc("invalid_params", "op must be get, set or unset"));
+                }
+                if p.op != "get" && p.key.is_none() {
+                    return Err(rpc("invalid_params", "set and unset need a key"));
+                }
+                if p.op == "set" && p.value.is_none() {
+                    return Err(rpc("invalid_params", "set needs a value"));
+                }
+                if p.result.as_ref().is_some_and(|path| !path.is_absolute()) {
+                    return Err(rpc("invalid_params", "result must be an absolute path"));
+                }
+                let delivered = self.send_to_apps(
+                    "client.config",
+                    json!({ "op": p.op, "key": p.key, "value": p.value, "result": p.result }),
+                );
+                if delivered == 0 {
+                    return Err(rpc(
+                        "no_client",
+                        "no Icarus window is connected; open the app first",
+                    ));
+                }
+                Ok(json!({ "delivered": delivered }))
+            }
             "server.shutdown" => {
                 #[derive(Deserialize)]
                 struct P {
@@ -1006,8 +1056,15 @@ impl Server {
                     workspace: Option<String>,
                     #[serde(default)]
                     task: bool,
+                    color: Option<String>,
                 }
                 let p: P = params(params_value)?;
+                if p.color
+                    .as_deref()
+                    .is_some_and(|color| !crate::hooks::is_tab_color(color))
+                {
+                    return Err(rpc("invalid_params", "color must be #rgb or #rrggbb"));
+                }
                 let cwd = match p.cwd {
                     Some(cwd) => cwd,
                     None => dirs::home_dir().ok_or_else(|| rpc("invalid_params", "no cwd"))?,
@@ -1026,6 +1083,7 @@ impl Server {
                     rows: p.rows.unwrap_or(32),
                     label: p.label,
                     workspace: p.workspace,
+                    color: p.color,
                 };
                 let session = if p.task {
                     self.terminals.create_task(options)
@@ -1045,13 +1103,21 @@ impl Server {
                 struct P {
                     id: String,
                     since_seq: Option<u64>,
+                    /// The client's screen is fresh but may hold its own lines (an editor's task header).
+                    #[serde(default)]
+                    inline: bool,
                 }
                 let p: P = params(params_value)?;
                 let session = self
                     .terminals
                     .get(&p.id)
                     .ok_or_else(|| rpc("not_found", &p.id))?;
-                let (attachment, mut receiver) = session.attach(p.since_seq);
+                let mode = if p.inline {
+                    crate::emulator::SnapshotMode::Inline
+                } else {
+                    crate::emulator::SnapshotMode::Replace
+                };
+                let (attachment, mut receiver) = session.attach_with(p.since_seq, mode);
                 let id = p.id.clone();
                 let out = outbound.clone();
                 let task = tokio::spawn(async move {
@@ -1247,6 +1313,9 @@ impl Server {
                 self.next_action_dispatch(method, params_value).await
             }
             "agent.history" | "agent.resume" => self.history_dispatch(method, params_value).await,
+            other if other.starts_with("recipe.") => {
+                self.recipes_dispatch(other, params_value).await
+            }
             other if other.starts_with("update.") => self.updates_dispatch(other).await,
             other if other.starts_with("notification.") => {
                 self.notifications_dispatch(other, params_value).await

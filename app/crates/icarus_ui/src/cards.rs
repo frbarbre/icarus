@@ -10,7 +10,7 @@ use ui::prelude::*;
 use util::ResultExt as _;
 
 use crate::WorkspacesPanel;
-use crate::model::{WorkspaceSummary, matches_filter, sort_workspaces};
+use crate::model::{Unread, UnreadKind, WorkspaceSummary, matches_filter, sort_workspaces};
 use crate::routing::ServerRef;
 
 /// A card field the panel can draw, under Orca's `worktreeCardProperties` id.
@@ -21,6 +21,10 @@ pub struct CardField {
 
 /// The fields the panel draws, in menu order. Other ids in the setting are kept but have no effect.
 pub const CARD_FIELDS: &[CardField] = &[
+    CardField {
+        id: "unread",
+        label: "Unread dot",
+    },
     CardField {
         id: "workspace-status",
         label: "Status chip (other groupings)",
@@ -160,6 +164,8 @@ pub struct CardView {
     pub group_by: GroupBy,
     pub sort_by: SortBy,
     pub stack_ascending: bool,
+    /// This app's own fields (`client.json`), which win over `fields` when set.
+    pub local_fields: Option<Vec<String>>,
     /// The status the rules give someone else's PR; stack grouping lists it first.
     pub reviewing_status: Option<String>,
 }
@@ -171,6 +177,7 @@ impl Default for CardView {
             group_by: GroupBy::Status,
             sort_by: SortBy::default(),
             stack_ascending: false,
+            local_fields: None,
             reviewing_status: None,
         }
     }
@@ -229,31 +236,38 @@ impl CardView {
                 .map(SortBy::parse)
                 .unwrap_or_default(),
             stack_ascending: sidebar["stackOrder"].as_str() == Some("asc"),
+            local_fields: None,
             reviewing_status,
         }
     }
 
-    pub fn shows(&self, field: &str) -> bool {
-        self.fields.iter().any(|id| id == field)
+    /// The fields drawn: this app's own, else the server's.
+    pub fn shown_fields(&self) -> &[String] {
+        self.local_fields.as_deref().unwrap_or(&self.fields)
     }
 
-    /// The setting value after flipping `field`, keeping every other id and their order.
+    pub fn shows(&self, field: &str) -> bool {
+        self.shown_fields().iter().any(|id| id == field)
+    }
+
+    /// The fields after flipping `field`, keeping every other id and their order.
     pub fn toggled(&self, field: &str) -> Vec<String> {
+        let shown = self.shown_fields();
         if self.shows(field) {
-            self.fields
+            shown
                 .iter()
                 .filter(|id| id.as_str() != field)
                 .cloned()
                 .collect()
         } else {
-            let mut fields = self.fields.clone();
+            let mut fields = shown.to_vec();
             fields.push(field.to_string());
             fields
         }
     }
 }
 
-/// Shows or hides one part of the workspace cards (an id from `workspace.cardFields`).
+/// Shows or hides one part of the workspace cards in this app only (an id from `workspace.cardFields`).
 #[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
 #[action(namespace = icarus)]
 #[serde(deny_unknown_fields)]
@@ -288,8 +302,22 @@ gpui::actions!(
         ToggleGroupByStack,
         /// Opens the linked Linear issue of the workspace in this window.
         OpenLinearIssue,
+        /// Drops this app's own card fields, so the cards follow `workspace.cardFields` again.
+        UseSharedCardFields,
     ]
 );
+
+/// The card's unread dot: accent for a finished agent, warning when it needs you.
+pub fn render_unread_dot(workspace_id: &str, unread: &Unread, cx: &App) -> impl IntoElement {
+    let (color, tooltip) = match unread.kind {
+        UnreadKind::NeedsInput => (Color::Warning, "An agent needs your input"),
+        UnreadKind::Done => (Color::Accent, "An agent finished while you were away"),
+    };
+    div()
+        .id(SharedString::from(format!("icarus-unread-{workspace_id}")))
+        .tooltip(ui::Tooltip::text(tooltip))
+        .child(div().size_2().rounded_full().bg(color.color(cx)))
+}
 
 /// A card in the panel: its server and workspace id.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -746,6 +774,32 @@ mod tests {
         assert_eq!(
             disabled_rules.reviewing_status, None,
             "Orca only gives reviewing its lane while the rules are on"
+        );
+    }
+
+    #[test]
+    fn every_card_field_has_a_default_hotkey_and_this_apps_fields_win() {
+        for keymap in [
+            include_str!("../../../assets/keymaps/default-macos.json"),
+            include_str!("../../../assets/keymaps/default-linux.json"),
+        ] {
+            for field in CARD_FIELDS {
+                let binding = format!(
+                    r#"["icarus::ToggleCardField", {{ "field": "{}" }}]"#,
+                    field.id
+                );
+                assert!(keymap.contains(&binding), "no hotkey for {}", field.id);
+            }
+        }
+
+        let mut view = CardView::from_settings(&json!(["pr"]), &json!(null), &json!(null));
+        assert_eq!(view.toggled("ports"), ["pr", "ports"]);
+        view.local_fields = Some(vec!["ports".into()]);
+        assert!(view.shows("ports") && !view.shows("pr"));
+        assert_eq!(
+            view.toggled("ports"),
+            Vec::<String>::new(),
+            "toggling edits this app's list"
         );
     }
 

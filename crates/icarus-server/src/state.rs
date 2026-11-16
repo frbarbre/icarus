@@ -553,6 +553,23 @@ impl Store {
         Ok(())
     }
 
+    pub fn kv_prefix(&self, prefix: &str) -> Result<Vec<(String, Value)>> {
+        let db = self.db();
+        let mut statement =
+            db.prepare("SELECT key, value FROM kv WHERE substr(key, 1, ?2) = ?1")?;
+        let rows = statement.query_map(params![prefix, prefix.len() as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, text) = row?;
+            if let Some(value) = parse_json(Some(text)) {
+                out.push((key, value));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn kv_delete(&self, key: &str) -> Result<bool> {
         Ok(self
             .db()

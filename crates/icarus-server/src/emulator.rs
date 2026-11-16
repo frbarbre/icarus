@@ -33,6 +33,16 @@ pub struct Effects {
     pub keyboard: Option<u8>,
 }
 
+/// How a snapshot meets the screen it's written to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotMode {
+    /// Clears the screen and scrollback first, then places the cursor absolutely.
+    Replace,
+    /// Writes from where the cursor is, keeping what's above it (a client's own header lines), and
+    /// moves the cursor relatively.
+    Inline,
+}
+
 /// Headless terminal state kept by the server so it can answer "what is on screen" without a client.
 pub struct Emulator {
     term: Term<Collector>,
@@ -72,8 +82,6 @@ impl Emulator {
         }
         for event in drained {
             match event {
-                // The app encodes keys the legacy way, so claiming kitty support would mislead programs.
-                Event::PtyWrite(text) if is_keyboard_mode_report(&text) => {}
                 Event::PtyWrite(text) => effects.pty_replies.extend_from_slice(text.as_bytes()),
                 Event::Title(title) => {
                     self.title = Some(title.clone());
@@ -164,10 +172,28 @@ impl Emulator {
 
     /// Serializes scrollback and screen as VT sequences a fresh emulator of the same size can replay.
     pub fn snapshot_vt(&self) -> String {
+        self.snapshot(SnapshotMode::Replace)
+    }
+
+    pub fn snapshot(&self, mode: SnapshotMode) -> String {
         let grid = self.term.grid();
-        let top = -(grid.history_size() as i32);
-        let bottom = grid.screen_lines() as i32;
-        let mut out = String::from("\x1b[0m\x1b[H\x1b[2J\x1b[3J");
+        let history = grid.history_size() as i32;
+        let top = -history;
+        let cursor = grid.cursor.point;
+        let mut bottom = grid.screen_lines() as i32;
+        // Blank rows under the cursor would only scroll a shorter client window and push the screen into its scrollback.
+        if history == 0 {
+            while bottom - 1 > cursor.line.0
+                && (0..grid.columns())
+                    .all(|column| is_blank(&grid[Line(bottom - 1)][Column(column)]))
+            {
+                bottom -= 1;
+            }
+        }
+        let mut out = String::from(match mode {
+            SnapshotMode::Replace => "\x1b[0m\x1b[H\x1b[2J\x1b[3J",
+            SnapshotMode::Inline => "\x1b[0m",
+        });
         for line in top..bottom {
             let row = &grid[Line(line)];
             let mut last = SgrState::default();
@@ -198,8 +224,21 @@ impl Emulator {
                 }
             }
         }
-        let cursor = self.term.grid().cursor.point;
-        let _ = write!(out, "\x1b[{};{}H", cursor.line.0 + 1, cursor.column.0 + 1);
+        match mode {
+            SnapshotMode::Replace => {
+                let _ = write!(out, "\x1b[{};{}H", cursor.line.0 + 1, cursor.column.0 + 1);
+            }
+            SnapshotMode::Inline => {
+                let up = bottom - 1 - cursor.line.0;
+                if up > 0 {
+                    let _ = write!(out, "\x1b[{up}A");
+                }
+                out.push('\r');
+                if cursor.column.0 > 0 {
+                    let _ = write!(out, "\x1b[{}C", cursor.column.0);
+                }
+            }
+        }
         let keyboard = self.keyboard_flags();
         if keyboard != 0 {
             let _ = write!(out, "\x1b[>{keyboard}u");
@@ -210,13 +249,6 @@ impl Emulator {
         }
         out
     }
-}
-
-/// `CSI ? flags u`, the answer to a program asking which kitty keyboard flags are on.
-fn is_keyboard_mode_report(text: &str) -> bool {
-    text.strip_prefix("\x1b[?")
-        .and_then(|rest| rest.strip_suffix('u'))
-        .is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn is_blank(cell: &Cell) -> bool {
@@ -345,21 +377,21 @@ mod tests {
     }
 
     #[test]
-    fn kitty_keyboard_push_and_pop_are_tracked_without_answering_queries() {
+    fn kitty_keyboard_push_pop_and_queries_are_handled() {
         let mut emulator = Emulator::new(10, 3);
         assert_eq!(emulator.keyboard_flags(), 0);
+        assert_eq!(
+            emulator.feed(b"\x1b[?u").pty_replies,
+            b"\x1b[?0u",
+            "a program asking first learns the protocol is supported"
+        );
         let effects = emulator.feed(b"\x1b[>1u");
         assert_eq!(effects.keyboard, Some(1));
         assert_eq!(emulator.keyboard_flags(), 1);
         let effects = emulator.feed(b"\x1b[>3u");
         assert_eq!(effects.keyboard, Some(3));
         assert_eq!(emulator.feed(b"plain").keyboard, None, "unchanged flags");
-        let effects = emulator.feed(b"\x1b[?u");
-        assert!(
-            effects.pty_replies.is_empty(),
-            "the query goes unanswered: {:?}",
-            effects.pty_replies
-        );
+        assert_eq!(emulator.feed(b"\x1b[?u").pty_replies, b"\x1b[?3u");
         assert_eq!(emulator.feed(b"\x1b[<u").keyboard, Some(1));
         assert_eq!(emulator.feed(b"\x1b[<u").keyboard, Some(0));
     }
@@ -373,6 +405,29 @@ mod tests {
         assert_eq!(replica.keyboard_flags(), 1);
         assert_eq!(replica.title(), Some("claude"));
         assert_eq!(replica.screen_text(), "hello\n");
+    }
+
+    #[test]
+    fn blank_rows_under_the_cursor_stay_out_of_the_snapshot() {
+        let mut source = Emulator::new(20, 30);
+        source.feed(b"$ ");
+        let snapshot = source.snapshot_vt();
+        assert!(!snapshot.contains("\r\n"), "{snapshot:?}");
+        let mut shorter = Emulator::new(20, 5);
+        shorter.feed(snapshot.as_bytes());
+        assert_eq!(shorter.screen_text(), "$\n");
+        assert_eq!(shorter.full_text(), "$\n", "nothing scrolled away");
+    }
+
+    #[test]
+    fn an_inline_snapshot_keeps_the_clients_header_and_lands_the_cursor_relatively() {
+        let mut source = Emulator::new(20, 6);
+        source.feed(b"one\r\ntwo\r\nthree\x1b[2;2H");
+        let mut client = Emulator::new(20, 6);
+        client.feed(b"# header\r\n");
+        client.feed(source.snapshot(SnapshotMode::Inline).as_bytes());
+        client.feed(b"X");
+        assert_eq!(client.screen_text(), "# header\none\ntXo\nthree\n");
     }
 
     #[test]

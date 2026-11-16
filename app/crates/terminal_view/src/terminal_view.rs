@@ -461,9 +461,8 @@ impl TerminalView {
     /// Commits (sends) the given text to the PTY. Called by InputHandler::replace_text_in_range.
     pub(crate) fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if !self.read_only && !text.is_empty() {
-            self.terminal.update(cx, |term, _| {
-                term.input(text.to_string().into_bytes());
-            });
+            self.sync_keyboard_flags(cx);
+            self.terminal.update(cx, |term, _| term.input_text(text));
         }
     }
 
@@ -1399,10 +1398,23 @@ impl TerminalView {
     /// In vi mode, explicitly triggers a re-render because vi navigation (like j/k)
     /// updates the cursor locally without sending data to the shell, so there's no
     /// shell output to automatically trigger a re-render.
+    fn sync_keyboard_flags(&self, cx: &mut Context<Self>) {
+        let Some(flags) = cx.try_global::<ExternalKeyboardFlags>().cloned() else {
+            return;
+        };
+        let Some(external_id) = self.terminal.read(cx).external_id().map(str::to_owned) else {
+            return;
+        };
+        let flags = (flags.0)(&external_id, cx);
+        self.terminal
+            .update(cx, |terminal, _| terminal.set_kitty_keyboard_flags(flags));
+    }
+
     fn process_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
         if self.read_only && !self.terminal.read(cx).vi_mode_enabled() {
             return false;
         }
+        self.sync_keyboard_flags(cx);
         let (handled, vi_mode_enabled) = self.terminal.update(cx, |term, cx| {
             (
                 term.try_keystroke(keystroke, TerminalSettings::get_global(cx).option_as_meta),
@@ -1678,6 +1690,10 @@ impl Item for TerminalView {
             },
             None => (IconName::Terminal, Color::Muted, None),
         };
+        let tab_color = terminal.external_id().and_then(|external_id| {
+            let color = cx.try_global::<ExternalTabColor>()?;
+            (color.0)(external_id, cx)
+        });
 
         let self_handle = self.self_handle.clone();
         h_flex()
@@ -1710,6 +1726,9 @@ impl Item for TerminalView {
                         )
                     }),
             )
+            .when_some(tab_color, |this, color| {
+                this.child(div().size(px(6.)).rounded_full().flex_none().bg(color))
+            })
             .child(
                 div()
                     .relative()
@@ -2335,6 +2354,18 @@ impl gpui::Global for ExternalTerminalRetitled {}
 pub struct ExternalKeyContext(pub std::sync::Arc<dyn Fn(&str, &mut KeyContext, &App)>);
 
 impl gpui::Global for ExternalKeyContext {}
+
+/// The kitty keyboard flags a routed terminal's program enabled, so keys are encoded for it.
+#[derive(Clone)]
+pub struct ExternalKeyboardFlags(pub std::sync::Arc<dyn Fn(&str, &App) -> u8>);
+
+impl gpui::Global for ExternalKeyboardFlags {}
+
+/// A routed terminal's tab colour, shown as a dot in its tab.
+#[derive(Clone)]
+pub struct ExternalTabColor(pub std::sync::Arc<dyn Fn(&str, &App) -> Option<gpui::Hsla>>);
+
+impl gpui::Global for ExternalTabColor {}
 
 /// Gets the working directory for the given workspace, respecting the user's settings.
 /// Falls back to home directory when no project directory is available.
@@ -2974,6 +3005,54 @@ mod tests {
             sent(&terminal, "cmd-left", &mut cx),
             vec![b"\x01".to_vec()],
             "⌘ keys still translate"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_kitty_keyboard_program_gets_every_key_in_its_encoding(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let flags = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        cx.update(|cx| {
+            load_default_keymap(cx);
+            let flags = flags.clone();
+            cx.set_global(ExternalKeyboardFlags(std::sync::Arc::new(move |id, _| {
+                if id == "term-1" {
+                    flags.load(std::sync::atomic::Ordering::SeqCst)
+                } else {
+                    0
+                }
+            })));
+        });
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        terminal.update(cx, |terminal, _| {
+            terminal.set_external_id(Some("term-1".into()))
+        });
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(sent(&terminal, "ctrl-r", &mut cx), vec![b"\x12".to_vec()]);
+        flags.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            sent(&terminal, "ctrl-r", &mut cx),
+            vec![b"\x1b[114;5u".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "escape", &mut cx),
+            vec![b"\x1b[27u".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "shift-enter", &mut cx),
+            vec![b"\x1b[13;2u".to_vec()]
+        );
+        flags.store(8, std::sync::atomic::Ordering::SeqCst);
+        terminal_view.update(&mut cx, |view, cx| view.commit_text("hi", cx));
+        cx.run_until_parked();
+        assert_eq!(
+            terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
+            vec![b"\x1b[104u\x1b[105u".to_vec()]
         );
     }
 

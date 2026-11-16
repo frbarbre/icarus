@@ -544,3 +544,219 @@ async fn shared_directories_are_linked_and_worktreeinclude_paths_copied() {
         "removing the workspace keeps the shared directory"
     );
 }
+
+#[tokio::test]
+async fn always_trusting_a_repository_runs_later_changes_until_untrusted() {
+    let world = World::new(
+        &[(
+            "orca.yaml",
+            "scripts:\n  setup: echo one > setup-ran.txt\ndefaultTabs:\n  - title: Dev\n    color: '#22aa88'\n",
+        )],
+        json!({}),
+    )
+    .await;
+    let first = world
+        .create(json!({ "name": "first", "trust": "always", "layout": "default", "agent": true }))
+        .await
+        .expect("always trust and create");
+    let mut labelled = Vec::new();
+    for tab in first["layout"]["layout"]["tabs"].as_array().expect("tabs") {
+        if let Some(id) = tab["terminal_id"].as_str() {
+            let info = world.request("terminal.info", json!({ "id": id })).await;
+            labelled.push((info["label"].clone(), info["color"].clone()));
+        }
+    }
+    assert!(
+        labelled.contains(&(json!("Dev"), json!("#22aa88"))),
+        "the default tab keeps its orca.yaml colour: {labelled:?}"
+    );
+    let scripts = world
+        .request("project.scripts", json!({ "id": world.project }))
+        .await;
+    assert_eq!(scripts["always_trusted"], true);
+
+    commit_file(
+        &world.repo,
+        "orca.yaml",
+        "scripts:\n  setup: echo two > setup-ran.txt\n",
+    );
+    let changed = world
+        .create(json!({ "name": "changed" }))
+        .await
+        .expect("a changed script runs without asking");
+    let worktree = path_of(&changed);
+    wait_for("the changed setup", || {
+        std::fs::read_to_string(worktree.join("setup-ran.txt")).is_ok_and(|t| t == "two\n")
+    })
+    .await;
+
+    world
+        .request("project.untrust", json!({ "id": world.project }))
+        .await;
+    let refused = world
+        .create(json!({ "name": "after" }))
+        .await
+        .expect_err("untrusting revokes always");
+    assert!(refused.contains("untrusted_scripts"), "{refused}");
+    world
+        .request(
+            "project.trust",
+            json!({ "id": world.project, "always": true }),
+        )
+        .await;
+    commit_file(
+        &world.repo,
+        "orca.yaml",
+        "scripts:\n  setup: echo three > setup-ran.txt\n",
+    );
+    world
+        .create(json!({ "name": "after" }))
+        .await
+        .expect("project.trust --always");
+}
+
+#[tokio::test]
+async fn the_issue_command_runs_beside_the_agent_for_a_linked_github_item_once_trusted() {
+    let world = World::new(
+        &[(
+            "orca.yaml",
+            "issueCommand: |\n  echo \"{{artifact_url}} #{{issue}}\" > issue-ran.txt\n",
+        )],
+        json!({}),
+    )
+    .await;
+    let url = "https://github.com/acme/widgets/issues/12";
+    let untrusted = world
+        .create(json!({ "name": "untrusted", "issue": { "provider": "github", "id": "#12", "url": url } }))
+        .await
+        .expect("an untrusted issue command doesn't stop the create");
+    assert!(
+        untrusted["warnings"][0]
+            .as_str()
+            .is_some_and(|w| w.contains("issue command")),
+        "{untrusted}"
+    );
+    let plain = world
+        .create(json!({ "name": "plain", "trust": true }))
+        .await
+        .expect("no linked item");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(!path_of(&plain).join("issue-ran.txt").exists());
+
+    let linked = world
+        .create(json!({ "name": "linked", "layout": "default", "agent": true, "issue": { "provider": "github", "id": "#12", "url": url } }))
+        .await
+        .expect("trusted now");
+    let worktree = path_of(&linked);
+    wait_for("the issue command", || {
+        std::fs::read_to_string(worktree.join("issue-ran.txt"))
+            .is_ok_and(|t| t == format!("{url} #12\n"))
+    })
+    .await;
+    let tabs = linked["layout"]["layout"]["tabs"]
+        .as_array()
+        .expect("tabs")
+        .clone();
+    let terminal = tabs
+        .iter()
+        .find_map(|tab| tab["terminal_id"].as_str())
+        .expect("the issue command's terminal is in the layout");
+    let info = world
+        .request("terminal.info", json!({ "id": terminal }))
+        .await;
+    assert_eq!(info["label"], "Issue command");
+
+    let opted_out = world
+        .create(json!({ "name": "opted-out", "issue_command": false, "issue": { "provider": "github", "url": url } }))
+        .await
+        .expect("create");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(!path_of(&opted_out).join("issue-ran.txt").exists());
+}
+
+#[tokio::test]
+async fn an_environment_recipe_runs_with_orcas_contract_and_is_destroyed_with_its_instance() {
+    let world = World::new(
+        &[(
+            "orca.yaml",
+            "environmentRecipes:\n  - id: sandbox\n    name: Sandbox\n    create: ./create.sh\n    suspend: cat > suspended.json\n    destroy: cat > destroyed.json\n",
+        ), (
+            "create.sh",
+            "#!/bin/sh\necho \"$ORCA_VM_MODE $ORCA_WORKSPACE_NAME\" > created.txt\nprintf '{\"schemaVersion\":1,\"pairingCode\":\"icarus://pair?address=127.0.0.1:1&code=ABCD-EFGH\",\"projectRoot\":\"/srv/widgets\",\"userData\":{\"vm\":\"v1\"}}'\n",
+        )],
+        json!({}),
+    )
+    .await;
+    std::fs::set_permissions(
+        world.repo.join("create.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("chmod");
+    let listed = world
+        .request("recipe.list", json!({ "project": world.project }))
+        .await;
+    assert_eq!(listed["recipes"][0]["id"], "sandbox");
+    assert_eq!(listed["trusted"], false);
+    let refused = world
+        .client
+        .request(
+            "recipe.create",
+            json!({ "project": world.project, "recipe": "sandbox", "name": "feat" }),
+        )
+        .await
+        .expect_err("recipes need trust");
+    assert!(format!("{refused:#}").contains("untrusted_scripts"));
+
+    let created = world
+        .request(
+            "recipe.create",
+            json!({ "project": world.project, "recipe": "sandbox", "name": "feat", "trust": true }),
+        )
+        .await;
+    let environment = &created["environment"];
+    assert_eq!(environment["connection"]["type"], "icarus-server");
+    assert_eq!(environment["connection"]["projectRoot"], "/srv/widgets");
+    assert_eq!(
+        std::fs::read_to_string(world.repo.join("created.txt")).expect("ran"),
+        "create feat\n"
+    );
+    let instance = environment["context"]["instance_id"]
+        .as_str()
+        .expect("instance")
+        .to_owned();
+    world
+        .request(
+            "recipe.bind",
+            json!({ "instance": instance, "server": "env-feat" }),
+        )
+        .await;
+    let suspended = world
+        .request("recipe.suspend", json!({ "instance": instance }))
+        .await;
+    assert_eq!(suspended["environment"]["suspended"], true);
+    let payload: Value = serde_json::from_str(
+        &std::fs::read_to_string(world.repo.join("suspended.json")).expect("payload"),
+    )
+    .expect("json");
+    assert_eq!(payload["mode"], "suspend");
+    assert_eq!(payload["instanceId"], instance.as_str());
+    assert_eq!(payload["recipeResult"]["userData"]["vm"], "v1");
+    let resumed = world
+        .request("recipe.resume", json!({ "instance": instance }))
+        .await;
+    assert_eq!(resumed["skipped"], true, "no resume command");
+    let envs = world.request("recipe.environments", json!({})).await;
+    assert_eq!(envs[0]["server"], "env-feat");
+    world
+        .request("recipe.destroy", json!({ "instance": instance }))
+        .await;
+    let payload: Value = serde_json::from_str(
+        &std::fs::read_to_string(world.repo.join("destroyed.json")).expect("payload"),
+    )
+    .expect("json");
+    assert_eq!(payload["mode"], "destroy");
+    assert_eq!(
+        world.request("recipe.environments", json!({})).await,
+        json!([])
+    );
+}

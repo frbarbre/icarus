@@ -821,6 +821,7 @@ impl Server {
             rows: 32,
             label: Some(format!("Rule: {command}")),
             workspace: Some(workspace_id.to_owned()),
+            color: None,
         }) {
             Ok(session) => session,
             Err(error) => return Executed::failed(format!("{error:#}")),

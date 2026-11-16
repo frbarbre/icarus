@@ -8,7 +8,9 @@ use gpui::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use ui::{CommonAnimationExt as _, ContextMenu, ContextMenuEntry, PopoverMenu, prelude::*};
+use ui::{
+    Checkbox, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, PopoverMenu, prelude::*,
+};
 use util::ResultExt as _;
 use workspace::notifications::NotificationId;
 use workspace::{ModalView, OpenOptions, Toast, Workspace};
@@ -531,6 +533,9 @@ pub struct ProjectScripts {
     pub default_tabs_trusted: bool,
     #[serde(default)]
     pub run_policy: String,
+    /// Runs for a workspace started from a pull request (Orca's `issueCommand`).
+    #[serde(default)]
+    pub issue_command: Option<ProjectScript>,
 }
 
 fn trusted_by_default() -> bool {
@@ -712,6 +717,8 @@ pub struct NewWorkspaceModal {
     /// The choice for a project whose setup policy is `ask`.
     run_setup: bool,
     trust_prompt: bool,
+    /// Orca's "Always trust" in the trust prompt.
+    always_trust: bool,
     create_id: Option<String>,
     cancelling: bool,
     load_task: Task<()>,
@@ -795,6 +802,7 @@ impl NewWorkspaceModal {
             scripts: None,
             run_setup: true,
             trust_prompt: false,
+            always_trust: false,
             create_id: None,
             cancelling: false,
             load_task: Task::ready(()),
@@ -1072,6 +1080,12 @@ impl NewWorkspaceModal {
                 .into_iter()
                 .map(str::to_owned),
         );
+        if let Some(issue_command) = &scripts.issue_command
+            && !issue_command.trusted
+            && self.start == StartPoint::PullRequest
+        {
+            untrusted.push(issue_command.command.clone());
+        }
         untrusted
     }
 
@@ -1182,6 +1196,7 @@ impl NewWorkspaceModal {
         };
         if !self.untrusted_scripts().is_empty() {
             self.trust_prompt = true;
+            self.always_trust = false;
             self.error = None;
             cx.notify();
             return;
@@ -1197,9 +1212,18 @@ impl NewWorkspaceModal {
         let Ok(mut params) = self.create_params(cx) else {
             return;
         };
-        params["trust"] = json!(true);
+        params["trust"] = if self.always_trust {
+            json!("always")
+        } else {
+            json!(true)
+        };
         self.trust_prompt = false;
         self.start_create(params, window, cx);
+    }
+
+    pub fn set_always_trust(&mut self, always: bool, cx: &mut Context<Self>) {
+        self.always_trust = always;
+        cx.notify();
     }
 
     /// The trust prompt's "Create without running them": setup is skipped and default tabs open as plain shells.
@@ -1359,6 +1383,21 @@ impl NewWorkspaceModal {
                     .max_h(rems(10.))
                     .overflow_hidden()
                     .child(scripts),
+            )
+            .child(
+                Checkbox::new(
+                    "icarus-trust-always",
+                    if self.always_trust {
+                        ToggleState::Selected
+                    } else {
+                        ToggleState::Unselected
+                    },
+                )
+                .label(format!("Always trust scripts from {project}"))
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
+                    this.set_always_trust(*state == ToggleState::Selected, cx)
+                })),
             )
             .child(
                 h_flex()
@@ -2817,6 +2856,46 @@ mod tests {
         let created = calls_to(&calls, "workspace.create");
         assert_eq!(created[1]["trust"], true);
         assert_eq!(created[1]["setup"], "run");
+
+        let modal = open_dialog(&workspace, cx).await;
+        let name = modal.read_with(cx, |modal, _| modal.name.clone());
+        type_into(&name, "always", cx);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        modal.update_in(cx, |modal, window, cx| {
+            modal.set_always_trust(true, cx);
+            modal.trust_and_create(window, cx)
+        });
+        cx.run_until_parked();
+        let created = calls_to(&calls, "workspace.create");
+        assert_eq!(
+            created[2]["trust"], "always",
+            "Always trust covers later changes too"
+        );
+    }
+
+    #[gpui::test]
+    async fn an_untrusted_issue_command_asks_only_for_a_pull_request_start(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, _, mut cx) = panel_window(Vec::new(), cx).await;
+        let cx = &mut cx;
+        scripts_stub(
+            cx,
+            json!({
+                "run_policy": "run-by-default",
+                "issue_command": { "command": "claude {{artifact_url}}", "source": "shared", "trusted": false },
+            }),
+        );
+        let modal = open_dialog(&workspace, cx).await;
+        assert!(modal.read_with(cx, |modal, _| modal.untrusted_scripts().is_empty()));
+        modal.update_in(cx, |modal, window, cx| {
+            modal.set_start(StartPoint::PullRequest, window, cx)
+        });
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.untrusted_scripts()),
+            ["claude {{artifact_url}}"]
+        );
     }
 
     #[gpui::test]

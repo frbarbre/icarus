@@ -63,6 +63,109 @@ impl Server {
         }
     }
 
+    /// Marks the workspace unread after an agent finished or needs input, unless a client shows it.
+    pub(crate) fn agent_news(&self, workspace_key: &str, kind: UnreadKind) {
+        let workspace_id = match self.store.workspace(workspace_key) {
+            Ok(Some(workspace)) => workspace.id,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!("unread for {workspace_key}: {error:#}");
+                return;
+            }
+        };
+        if self.focused_anywhere(&workspace_id) {
+            return;
+        }
+        // A question ends its turn right after it is asked; the turn's end must not hide the question.
+        let waiting = self
+            .unread(&workspace_id)
+            .is_some_and(|unread| unread.kind == UnreadKind::NeedsInput);
+        if waiting && kind == UnreadKind::Done {
+            return;
+        }
+        self.set_unread(&workspace_id, Some(kind));
+    }
+
+    fn focused_anywhere(&self, workspace_id: &str) -> bool {
+        self.focus
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|focused| focused == workspace_id)
+    }
+
+    pub(crate) fn unread(&self, workspace_id: &str) -> Option<Unread> {
+        self.store
+            .kv_get(&unread_key(workspace_id))
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    /// Sets or clears the unread state and tells clients when it changed.
+    pub(crate) fn set_unread(&self, workspace_id: &str, kind: Option<UnreadKind>) {
+        let previous = self.unread(workspace_id);
+        let next = kind.map(|kind| Unread {
+            kind,
+            at_ms: now_ms(),
+        });
+        let stored = match &next {
+            Some(unread) => self
+                .store
+                .kv_set(&unread_key(workspace_id), &json!(unread))
+                .map(|()| true),
+            None => self.store.kv_delete(&unread_key(workspace_id)),
+        };
+        match stored {
+            Ok(changed) if changed && (previous.is_some() || next.is_some()) => {
+                self.broadcast(
+                    "workspace.changed",
+                    json!({ "workspaces": [workspace_id], "source": "unread", "unread": next }),
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("unread for {workspace_id}: {error:#}"),
+        }
+    }
+
+    /// `client.focus`: the workspace a client shows now (by id, name or a path inside it), or none.
+    pub(crate) fn set_focus(&self, connection: &str, p: Value) -> Result<Value, RpcError> {
+        #[derive(Deserialize)]
+        struct P {
+            workspace: Option<String>,
+            path: Option<PathBuf>,
+        }
+        let p: P = params(p)?;
+        let workspace = match (p.workspace, p.path) {
+            (Some(key), _) => Some(self.workspace_by_key(&key)?),
+            (None, Some(path)) => self
+                .store
+                .workspaces(None)
+                .map_err(internal)?
+                .into_iter()
+                .filter(|workspace| path.starts_with(&workspace.path))
+                .max_by_key(|workspace| workspace.path.components().count()),
+            (None, None) => None,
+        };
+        let mut focus = self.focus.lock().unwrap_or_else(|p| p.into_inner());
+        match &workspace {
+            Some(workspace) => focus.insert(connection.to_owned(), workspace.id.clone()),
+            None => focus.remove(connection),
+        };
+        drop(focus);
+        if let Some(workspace) = &workspace {
+            self.set_unread(&workspace.id, None);
+        }
+        Ok(json!({ "workspace": workspace.map(|workspace| workspace.id) }))
+    }
+
+    pub(crate) fn forget_focus(&self, connection: &str) {
+        self.focus
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(connection);
+    }
+
     pub(crate) fn workspace_by_key(&self, key: &str) -> Result<Workspace, RpcError> {
         self.store
             .workspace(key)
@@ -89,6 +192,7 @@ impl Server {
         value["agents"] = json!(agents);
         value["terminals"] = json!(terminals);
         value["setup"] = json!(self.setup_status(&workspace.id));
+        value["unread"] = json!(self.unread(&workspace.id));
         value["sleeping"] = json!(matches!(
             self.store.kv_get(&sleep_key(&workspace.id)),
             Ok(Some(_))
@@ -193,6 +297,9 @@ impl Server {
                     id: String,
                     /// Read `orca.yaml` from this workspace's checkout as well as the project root.
                     workspace: Option<String>,
+                    /// Orca's "Always trust": every committed script, now and after it changes.
+                    #[serde(default)]
+                    always: bool,
                 }
                 let p: P = params(p)?;
                 let project = self
@@ -206,6 +313,9 @@ impl Server {
                 };
                 let hooks = self.hooks_for(&project.root, &yaml_dir);
                 if method == "project.trust" {
+                    if p.always {
+                        self.trust_always(&project.id)?;
+                    }
                     self.trust_hooks(&project.id, &hooks)?;
                     if p.workspace.is_some() {
                         self.trust_hooks(
@@ -319,6 +429,17 @@ impl Server {
                     json!({ "workspaces": ids, "source": "order" }),
                 );
                 Ok(json!({ "ordered": ids.len() }))
+            }
+            "workspace.set_unread" => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                    unread: bool,
+                }
+                let p: P = params(p)?;
+                let workspace = self.workspace_by_key(&p.id)?;
+                self.set_unread(&workspace.id, p.unread.then_some(UnreadKind::Done));
+                Ok(json!({ "unread": self.unread(&workspace.id) }))
             }
             "workspace.remove" => {
                 #[derive(Deserialize)]
@@ -563,6 +684,51 @@ impl Server {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(from = "Value")]
+enum Trust {
+    #[default]
+    No,
+    AsTheyAre,
+    Always,
+}
+
+impl From<Value> for Trust {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Bool(true) => Self::AsTheyAre,
+            Value::String(text) if text == "always" => Self::Always,
+            Value::String(text) if text == "once" => Self::AsTheyAre,
+            _ => Self::No,
+        }
+    }
+}
+
+impl Trust {
+    fn granted(self) -> bool {
+        self != Self::No
+    }
+}
+
+/// The GitHub item a new workspace is linked to (Orca's linked work item): its number and URL.
+fn linked_github_item(
+    issue: Option<&Value>,
+    pr: Option<(u64, &str)>,
+) -> Option<(Option<u64>, String)> {
+    if let Some((number, url)) = pr {
+        return Some((Some(number), url.to_owned()));
+    }
+    let url = issue?["url"].as_str()?;
+    let rest = url.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split('/');
+    let (_owner, _repo, kind, number) =
+        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if !matches!(kind, "issues" | "pull") {
+        return None;
+    }
+    Some((number.parse().ok(), url.to_owned()))
+}
+
 #[derive(Deserialize)]
 struct CreateParams {
     project: String,
@@ -591,9 +757,12 @@ struct CreateParams {
     remote_control: Option<bool>,
     /// The project's setup script: run, skip, inherit (its `setupRunPolicy`) or auto.
     setup: Option<Value>,
-    /// Trust the project's committed scripts as they are now (`project.trust`).
+    /// Trust the project's committed scripts as they are now (`true`), or always (`"always"`).
     #[serde(default)]
-    trust: bool,
+    trust: Trust,
+    /// Run the project's issue command for a linked GitHub item (Orca's issue automation).
+    #[serde(default = "yes")]
+    issue_command: bool,
     /// Start from this pull request (number or URL): its head branch, with its base as the base.
     pr: Option<Value>,
     /// Chosen by the client so `workspace.create_cancel` can name this create.
@@ -671,7 +840,10 @@ impl Server {
             Some(_) => should_run_setup(root_hooks.run_policy, setup_decision)?,
             None => false,
         };
-        if p.trust {
+        if p.trust == Trust::Always {
+            self.trust_always(&project.id)?;
+        }
+        if p.trust.granted() {
             self.trust_hooks(&project.id, &root_hooks)?;
         } else if runs_setup
             && setup_decision != SetupDecision::Auto
@@ -770,7 +942,7 @@ impl Server {
         for warning in &warnings {
             tracing::warn!("shared paths for {slug}: {warning}");
         }
-        if p.trust {
+        if p.trust.granted() {
             self.trust_hooks(&project.id, &self.hooks_for(&project.root, &path))?;
         }
         let workspace = Workspace {
@@ -850,11 +1022,24 @@ impl Server {
                 .then(|| icarus_protocol::layout::DEFAULT_LAYOUT.to_owned())
         });
         // Orca opens `defaultTabs` when the workspace first opens, so only a workspace with a layout gets them.
-        let default_tabs = if layout.is_some() {
+        let mut default_tabs = if layout.is_some() {
             self.start_default_tabs(&workspace, &project.root)
         } else {
             Vec::new()
         };
+        let mut warnings = warnings;
+        if p.issue_command
+            && let Some((number, url)) = linked_github_item(
+                workspace.issue.as_ref(),
+                pr.as_ref().map(|pr| (pr.head.number, pr.url.as_str())),
+            )
+        {
+            match self.start_issue_command(&workspace, &project.root, number, &url) {
+                Ok(Some(terminal)) => default_tabs.push(terminal),
+                Ok(None) => {}
+                Err(reason) => warnings.push(format!("the issue command didn't run: {reason}")),
+            }
+        }
         let mut value = self.workspace_json(&workspace);
         if let Some(layout) = layout {
             value["layout"] = self
@@ -885,6 +1070,25 @@ fn default_project_name(root: &std::path::Path) -> String {
 
 fn sleep_key(workspace_id: &str) -> String {
     format!("workspace.sleep.{workspace_id}")
+}
+
+fn unread_key(workspace_id: &str) -> String {
+    format!("workspace.unread.{workspace_id}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadKind {
+    /// A turn ended (or failed) while nobody looked.
+    Done,
+    /// The agent asked a question or hit a permission it could not get.
+    NeedsInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unread {
+    pub kind: UnreadKind,
+    pub at_ms: u64,
 }
 
 /// What `workspace.sleep` stopped, so `workspace.wake` restarts exactly that.

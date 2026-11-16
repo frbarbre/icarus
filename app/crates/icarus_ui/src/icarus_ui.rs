@@ -2,9 +2,11 @@ pub mod accounts;
 pub mod browser;
 pub mod cards;
 pub mod changes_tab;
+pub mod client_settings;
 pub mod comment_input;
 pub mod commit_modal;
 pub mod diff_tab;
+mod focus;
 pub mod github_panel;
 pub mod history;
 pub mod layout;
@@ -60,8 +62,8 @@ use crate::github_panel::{AvatarKind, render_avatar};
 
 pub use model::{
     AgentSummary, IssueLabel, PrAuthor, PrGroup, PrSummary, SetupBadge, SetupSummary, StackGroup,
-    StackLane, StackPlace, StatusColumn, StatusGroup, WorkspaceSummary, group_by_pr,
-    group_by_stack, group_by_status, pinned_first,
+    StackLane, StackPlace, StatusColumn, StatusGroup, Unread, UnreadKind, WorkspaceSummary,
+    group_by_pr, group_by_stack, group_by_status, pinned_first,
 };
 
 actions!(
@@ -670,6 +672,7 @@ fn start_app_connection(cx: &mut App) {
                 });
             }
             apply_pending_for_open_windows(client.clone(), cx).await;
+            cx.update(focus::connected);
             notifications::connected(client.clone(), cx).await;
             loop {
                 let next = Tokio::spawn(cx, async move {
@@ -717,6 +720,15 @@ fn start_app_connection(cx: &mut App) {
                             continue;
                         };
                         cx.update(|cx| capture_windows(request, cx));
+                    }
+                    "client.config" => {
+                        let Some(request) =
+                            serde_json::from_value::<client_settings::ConfigRequest>(event.payload)
+                                .log_err()
+                        else {
+                            continue;
+                        };
+                        cx.update(|cx| client_settings::handle_request(request, cx));
                     }
                     "client.dispatch" => {
                         let Some(request) =
@@ -822,6 +834,8 @@ pub fn init(cx: &mut App) {
     accounts::register(cx);
     remote_control::register(cx);
     settings_view::register(cx);
+    client_settings::init(cx);
+    focus::register(cx);
     pane_nav::register(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_some() {
@@ -897,6 +911,11 @@ pub fn register_panel_actions(workspace: &mut Workspace) {
     workspace.register_action(|workspace, action: &cards::ToggleCardField, _, cx| {
         if let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) {
             panel.update(cx, |panel, cx| panel.toggle_card_field(&action.field, cx));
+        }
+    });
+    workspace.register_action(|workspace, _: &cards::UseSharedCardFields, _, cx| {
+        if let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) {
+            panel.update(cx, |panel, cx| panel.set_local_card_fields(None, cx));
         }
     });
     workspace.register_action(|workspace, action: &cards::SetWorkspaceGrouping, _, cx| {
@@ -1193,7 +1212,8 @@ impl WorkspacesPanel {
         cx.notify();
     }
 
-    fn apply_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+    fn apply_snapshot(&mut self, mut snapshot: Snapshot, cx: &mut Context<Self>) {
+        snapshot.view.local_fields = client_settings::card_fields(cx);
         if self.workspaces != snapshot.workspaces
             || self.statuses != snapshot.statuses
             || self.view != snapshot.view
@@ -1251,11 +1271,21 @@ impl WorkspacesPanel {
         .detach_and_log_err(cx);
     }
 
+    /// Card fields are per app: toggling one saves this app's own list, starting from the server's.
     pub fn toggle_card_field(&mut self, field: &str, cx: &mut Context<Self>) {
         let fields = self.view.toggled(field);
-        self.view.fields = fields.clone();
+        self.set_local_card_fields(Some(fields), cx);
+    }
+
+    pub fn set_local_card_fields(&mut self, fields: Option<Vec<String>>, cx: &mut Context<Self>) {
+        self.view.local_fields = fields.clone();
         cx.notify();
-        self.save_setting("workspace.cardFields", serde_json::json!(fields), cx);
+        client_settings::set(
+            client_settings::CARD_FIELDS,
+            fields.map(|fields| serde_json::json!(fields)),
+            cx,
+        )
+        .log_err();
     }
 
     pub fn set_group_by(&mut self, group_by: cards::GroupBy, cx: &mut Context<Self>) {
@@ -1886,7 +1916,11 @@ impl WorkspacesPanel {
                             },
                         );
                     }
-                    menu = menu.separator().header("Card");
+                    menu = menu.separator().header(if view.local_fields.is_some() {
+                        "Card (this app)"
+                    } else {
+                        "Card"
+                    });
                     for field in cards::CARD_FIELDS {
                         let panel = panel.clone();
                         menu = menu.toggleable_entry(
@@ -1899,6 +1933,17 @@ impl WorkspacesPanel {
                             move |_, cx| {
                                 panel
                                     .update(cx, |panel, cx| panel.toggle_card_field(field.id, cx))
+                                    .log_err();
+                            },
+                        );
+                    }
+                    if view.local_fields.is_some() {
+                        menu = menu.entry(
+                            "Use Shared Card Fields",
+                            Some(Box::new(cards::UseSharedCardFields)),
+                            move |_, cx| {
+                                panel
+                                    .update(cx, |panel, cx| panel.set_local_card_fields(None, cx))
                                     .log_err();
                             },
                         );
@@ -2064,6 +2109,12 @@ impl WorkspacesPanel {
                             .color(Color::Muted),
                     )
                     .child(Label::new(workspace.display_title()).size(LabelSize::Default))
+                    .when_some(
+                        workspace.unread.as_ref().filter(|_| view.shows("unread")),
+                        |row, unread| {
+                            row.child(cards::render_unread_dot(&workspace.id, unread, cx))
+                        },
+                    )
                     .when(workspace.pinned, |row| {
                         row.child(
                             Icon::new(IconName::Pin)
@@ -2848,6 +2899,7 @@ mod tests {
             created_at_ms: 0,
             manual_order: None,
             activity_at_ms: None,
+            unread: None,
         }
     }
 
@@ -2941,8 +2993,33 @@ mod tests {
         assert!(panel.read_with(&cx, |panel, _| panel.view().shows("pr")));
         cx.dispatch_action(cards::ToggleCardField { field: "pr".into() });
         assert!(!panel.read_with(&cx, |panel, _| panel.view().shows("pr")));
+        let local = cx.update(|_, cx| client_settings::card_fields(cx));
+        assert!(
+            local.as_ref().is_some_and(
+                |fields| !fields.is_empty() && !fields.iter().any(|field| field == "pr")
+            ),
+            "the toggle starts this app's own list from the shown fields: {local:?}"
+        );
+        assert!(
+            panel.read_with(&cx, |panel, _| panel
+                .view()
+                .fields
+                .iter()
+                .any(|f| f == "pr")),
+            "the server's fields stay as they were"
+        );
         cx.dispatch_action(cards::ToggleCardField { field: "pr".into() });
         assert!(panel.read_with(&cx, |panel, _| panel.view().shows("pr")));
+        cx.dispatch_action(cards::ToggleCardField {
+            field: "ports".into(),
+        });
+        cx.dispatch_action(cards::UseSharedCardFields);
+        assert_eq!(cx.update(|_, cx| client_settings::card_fields(cx)), None);
+        assert!(
+            panel.read_with(&cx, |panel, _| panel.view().local_fields.is_none()
+                && panel.view().shows("ports")),
+            "back on the server's fields"
+        );
 
         cx.dispatch_action(cards::SetWorkspaceGrouping {
             group_by: "stack".into(),

@@ -1038,6 +1038,7 @@ impl TerminalBuilder {
             title_override: None,
             external_id: None,
             fallback_title: None,
+            kitty_keyboard_flags: 0,
             events: VecDeque::with_capacity(10),
             last_content: Content {
                 terminal_bounds,
@@ -1330,6 +1331,7 @@ impl TerminalBuilder {
                 title_override: terminal_title_override,
                 external_id: None,
                 fallback_title: None,
+                kitty_keyboard_flags: 0,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
                 last_mouse: None,
@@ -1550,6 +1552,8 @@ pub struct Terminal {
     external_id: Option<String>,
     /// A routed shell's title until its program sets one; the local process is only the attaching client.
     fallback_title: Option<String>,
+    /// The kitty keyboard flags a routed shell's program enabled; this terminal's own emulator doesn't track them.
+    kitty_keyboard_flags: u8,
     scroll_px: Pixels,
     next_link_id: usize,
     selection_phase: SelectionPhase,
@@ -1655,6 +1659,22 @@ impl Terminal {
 
     pub fn set_fallback_title(&mut self, fallback_title: Option<String>) {
         self.fallback_title = fallback_title;
+    }
+
+    pub fn set_kitty_keyboard_flags(&mut self, flags: u8) {
+        self.kitty_keyboard_flags = flags;
+    }
+
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        self.kitty_keyboard_flags
+    }
+
+    /// Typed text, as kitty key escapes when the program asked for every key that way.
+    pub fn input_text(&mut self, text: &str) {
+        match crate::mappings::kitty::encode_text(text, self.kitty_keyboard_flags) {
+            Some(encoded) => self.input(encoded.into_bytes()),
+            None => self.input(text.to_owned().into_bytes()),
+        }
     }
 
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
@@ -2482,6 +2502,16 @@ impl Terminal {
     pub fn try_keystroke(&mut self, keystroke: &Keystroke, option_as_meta: bool) -> bool {
         if self.vi_mode_enabled {
             self.vi_motion(keystroke);
+            return true;
+        }
+
+        if let Some(encoded) = crate::mappings::kitty::encode(
+            keystroke,
+            self.kitty_keyboard_flags,
+            self.last_content.mode,
+            option_as_meta,
+        ) {
+            self.input(encoded.into_bytes());
             return true;
         }
 

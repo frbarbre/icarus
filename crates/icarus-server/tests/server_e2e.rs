@@ -816,6 +816,207 @@ async fn capture_requests_reach_only_the_app() {
 }
 
 #[tokio::test]
+async fn client_config_requests_reach_the_app_with_their_operation() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _server = start_server(home.path());
+    let (cli, _) = Client::connect(home.path(), "icarus-cli")
+        .await
+        .expect("cli");
+    let get = json!({ "op": "get", "result": "/tmp/r.json" });
+    assert!(
+        cli.request("client.config", get.clone()).await.is_err(),
+        "no app connected yet"
+    );
+    let (_app, mut app_events) = Client::connect(home.path(), "icarus-app")
+        .await
+        .expect("app");
+    for bad in [
+        json!({ "op": "drop", "key": "a" }),
+        json!({ "op": "set", "value": 1 }),
+        json!({ "op": "set", "key": "workspace.cardFields" }),
+        json!({ "op": "unset", "key": "a", "result": "relative.json" }),
+    ] {
+        let error = cli
+            .request("client.config", bad.clone())
+            .await
+            .expect_err("invalid");
+        assert!(format!("{error:#}").contains("invalid_params"), "{bad}");
+    }
+    let delivered = cli
+        .request(
+            "client.config",
+            json!({ "op": "set", "key": "workspace.cardFields", "value": ["pr"], "result": "/tmp/r.json" }),
+        )
+        .await
+        .expect("set");
+    assert_eq!(delivered["delivered"], 1);
+    let event = tokio::time::timeout(Duration::from_secs(5), app_events.recv())
+        .await
+        .expect("event in time")
+        .expect("open stream");
+    assert_eq!(event.topic, "client.config");
+    assert_eq!(
+        event.payload,
+        json!({ "op": "set", "key": "workspace.cardFields", "value": ["pr"], "result": "/tmp/r.json" })
+    );
+}
+
+async fn wait_for_unread(client: &Client, workspace: &Value, want: Value) -> Value {
+    let mut info = Value::Null;
+    for _ in 0..100 {
+        info = client
+            .request("workspace.info", json!({ "id": workspace["id"] }))
+            .await
+            .expect("info");
+        if info["unread"]["kind"] == want || (want.is_null() && info["unread"].is_null()) {
+            return info;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("unread never became {want}: {}", info["unread"]);
+}
+
+#[tokio::test]
+async fn a_finished_or_waiting_agent_marks_its_workspace_unread_until_a_client_shows_it() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let repo = tempfile::tempdir().expect("repo");
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    git(repo.path(), &["config", "user.email", "t@example.com"]);
+    git(repo.path(), &["config", "user.name", "T"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.path().join("readme.md"), "hello\n").expect("write");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "init"]);
+    let _server = start_server(home.path());
+    let fake = env!("CARGO_BIN_EXE_icarus-fake-agent");
+    let (client, mut events) = Client::connect(home.path(), "test").await.expect("connect");
+    let project = client
+        .request("project.add", json!({ "path": repo.path() }))
+        .await
+        .expect("add project");
+    let workspace = client
+        .request(
+            "workspace.create",
+            json!({ "project": project["id"], "name": "unread", "agent_command": [fake], "prompt": "hello" }),
+        )
+        .await
+        .expect("create workspace");
+    let agent = workspace["agents"][0]["id"].clone();
+    let path = PathBuf::from(workspace["path"].as_str().expect("path"));
+    client
+        .request("agent.wait", json!({ "id": agent, "timeout_ms": 10000 }))
+        .await
+        .expect("turn");
+    let info = wait_for_unread(&client, &workspace, json!("done")).await;
+    assert!(info["unread"]["at_ms"].as_u64().is_some());
+    let listed = client
+        .request("workspace.list", json!({}))
+        .await
+        .expect("list");
+    assert_eq!(
+        listed[0]["unread"]["kind"], "done",
+        "the list carries it too"
+    );
+
+    let mut saw_event = false;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+    {
+        if event.topic == "workspace.changed" && event.payload["source"] == "unread" {
+            assert_eq!(event.payload["workspaces"][0], workspace["id"]);
+            saw_event = true;
+        }
+    }
+    assert!(saw_event, "clients hear about it");
+
+    let (app, _) = Client::connect(home.path(), "icarus-app")
+        .await
+        .expect("app");
+    let focused = app
+        .request("client.focus", json!({ "path": path.join("src") }))
+        .await
+        .expect("focus");
+    assert_eq!(focused["workspace"], workspace["id"]);
+    wait_for_unread(&client, &workspace, Value::Null).await;
+
+    client
+        .request("agent.send", json!({ "id": agent, "text": "again" }))
+        .await
+        .expect("send");
+    client
+        .request("agent.wait", json!({ "id": agent, "timeout_ms": 10000 }))
+        .await
+        .expect("turn");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let info = client
+        .request("workspace.info", json!({ "id": workspace["id"] }))
+        .await
+        .expect("info");
+    assert!(
+        info["unread"].is_null(),
+        "a turn in the workspace a client shows is seen"
+    );
+
+    app.request("client.focus", json!({}))
+        .await
+        .expect("unfocus");
+    client
+        .request(
+            "agent.send",
+            json!({ "id": agent, "text": "ask Which one?" }),
+        )
+        .await
+        .expect("send");
+    client
+        .request("agent.wait", json!({ "id": agent, "timeout_ms": 10000 }))
+        .await
+        .expect("turn");
+    wait_for_unread(&client, &workspace, json!("needs_input")).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let info = client
+        .request("workspace.info", json!({ "id": workspace["id"] }))
+        .await
+        .expect("info");
+    assert_eq!(
+        info["unread"]["kind"], "needs_input",
+        "the end of the asking turn does not hide the question"
+    );
+
+    let read = client
+        .request(
+            "workspace.set_unread",
+            json!({ "id": "unread", "unread": false }),
+        )
+        .await
+        .expect("mark read");
+    assert!(read["unread"].is_null());
+    let marked = client
+        .request(
+            "workspace.set_unread",
+            json!({ "id": workspace["id"], "unread": true }),
+        )
+        .await
+        .expect("mark unread");
+    assert_eq!(marked["unread"]["kind"], "done");
+
+    app.request("client.focus", json!({ "workspace": "unread" }))
+        .await
+        .expect("focus by name");
+    wait_for_unread(&client, &workspace, Value::Null).await;
+    drop(app);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client
+        .request("agent.send", json!({ "id": agent, "text": "after" }))
+        .await
+        .expect("send");
+    client
+        .request("agent.wait", json!({ "id": agent, "timeout_ms": 10000 }))
+        .await
+        .expect("turn");
+    wait_for_unread(&client, &workspace, json!("done")).await;
+}
+
+#[tokio::test]
 async fn wrong_token_is_rejected() {
     let home = tempfile::tempdir().expect("tempdir");
     let _server = start_server(home.path());

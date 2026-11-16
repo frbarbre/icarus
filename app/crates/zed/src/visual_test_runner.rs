@@ -849,7 +849,15 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
             created_at_ms: 0,
             manual_order: None,
             activity_at_ms: None,
+            unread: None,
         }
+    };
+    let with_unread = |mut workspace: icarus_ui::WorkspaceSummary| {
+        workspace.unread = Some(icarus_ui::Unread {
+            kind: icarus_ui::UnreadKind::Done,
+            at_ms: 0,
+        });
+        workspace
     };
     let with_author = |mut workspace: icarus_ui::WorkspaceSummary, login: &str| {
         workspace.pr_author = Some(icarus_ui::PrAuthor {
@@ -875,7 +883,7 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
             None,
             &["working"],
         ),
-        with_author(
+        with_unread(with_author(
             card(
                 "pr-412",
                 None,
@@ -884,7 +892,7 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
                 &["idle"],
             ),
             "maria",
-        ),
+        )),
         with_setup(
             card(
                 "abc-98",

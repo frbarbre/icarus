@@ -14,6 +14,7 @@ use crate::agent::{AgentEvent, AgentInfo};
 use crate::next_action::setting;
 use crate::server::{Server, params, rpc, to_value};
 use crate::state::Notification;
+use crate::workspaces::UnreadKind;
 
 pub const AGENT_TURN_DONE: &str = "agent_turn_done";
 pub const AGENT_WAITING: &str = "agent_waiting";
@@ -254,6 +255,14 @@ pub(crate) fn spawn(server: Arc<Server>) {
                 .or_else(|| info.title.clone())
                 .unwrap_or_else(|| "Agent".to_owned());
             if let Some(new) = from_agent_event(&info, &label, &event) {
+                if let Some(workspace) = &info.workspace {
+                    let kind = if new.kind == AGENT_WAITING {
+                        UnreadKind::NeedsInput
+                    } else {
+                        UnreadKind::Done
+                    };
+                    server.agent_news(workspace, kind);
+                }
                 server.notify(new);
             }
         }
