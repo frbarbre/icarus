@@ -219,7 +219,7 @@ mod tests {
         store.update(&mut cx, |store, cx| {
             store.set_saved(
                 &[
-                    saved("athena", "100.64.0.2:4000"),
+                    saved("studio", "100.64.0.2:4000"),
                     saved("box", "ssh://box"),
                 ],
                 cx,
@@ -227,7 +227,7 @@ mod tests {
         });
         store.read_with(&cx, |store, _| {
             let names: Vec<_> = store.servers().iter().map(|s| s.name.clone()).collect();
-            assert_eq!(names, ["athena", "box"]);
+            assert_eq!(names, ["studio", "box"]);
             assert!(
                 store
                     .servers()
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn status_labels_come_from_that_servers_columns() {
-        let mut server = RemoteServer::new(&saved("athena", "100.64.0.2:4000"));
+        let mut server = RemoteServer::new(&saved("studio", "100.64.0.2:4000"));
         server.statuses = vec![StatusColumn {
             id: "in-review".into(),
             label: "In review".into(),
