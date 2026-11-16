@@ -844,13 +844,14 @@ impl AgentThread {
         let line = json!({ "type": "user", "message": { "role": "user", "content": content } });
         let mut stdin = self.stdin.lock().await;
         let pipe = stdin.as_mut().context("agent input is closed")?;
-        pipe.write_all(format!("{line}\n").as_bytes()).await?;
-        pipe.flush().await?;
-        drop(stdin);
+        // Recorded before the write: a fast agent's reply must not land ahead of the message in the log.
         self.record(
             "user_message",
             json!({ "text": text, "images": images.len() }),
         );
+        pipe.write_all(format!("{line}\n").as_bytes()).await?;
+        pipe.flush().await?;
+        drop(stdin);
         Ok(())
     }
 
@@ -875,11 +876,11 @@ impl AgentThread {
             "turn/start",
             codex::turn_params(&thread_id, text, images, self.options.bypass_permissions),
         );
-        self.write_line(&request).await?;
         self.record(
             "user_message",
             json!({ "text": text, "images": images.len() }),
         );
+        self.write_line(&request).await?;
         let error = match tokio::time::timeout(CODEX_REQUEST_TIMEOUT, reply).await {
             Ok(Ok(Ok(_))) => return Ok(()),
             Ok(Ok(Err(message))) => anyhow!("codex turn/start: {message}"),
