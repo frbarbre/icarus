@@ -16,6 +16,7 @@ pub mod quick_commands;
 pub mod remote_control;
 pub mod review;
 pub mod servers;
+pub mod settings_view;
 pub mod sidebar;
 pub mod status_style;
 mod terminals;
@@ -727,6 +728,7 @@ pub fn init(cx: &mut App) {
     history::register(cx);
     accounts::register(cx);
     remote_control::register(cx);
+    settings_view::register(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_some() {
             // A workspace opened after its layout was stored (e.g. the app was closed) applies it now.

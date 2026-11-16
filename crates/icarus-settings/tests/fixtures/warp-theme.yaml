@@ -1,0 +1,27 @@
+# A made-up Warp theme for tests.
+name: Harbor Night
+accent: '#3fa7ff'
+background:
+  top: '#10141c'
+  bottom: '#0b0e14'
+foreground: '#d7dce4'
+details: darker
+terminal_colors:
+  normal:
+    black: '#1b2029'
+    red: '#e5534b'
+    green: '#57ab5a'
+    yellow: '#c69026'
+    blue: '#539bf5'
+    magenta: '#b083f0'
+    cyan: '#39c5cf'
+    white: '#adbac7'
+  bright:
+    black: '#545d68'
+    red: '#ff938a'
+    green: '#6bc46d'
+    yellow: '#daaa3f'
+    blue: '#6cb6ff'
+    magenta: '#dcbdfb'
+    cyan: '#56d4dd'
+    white: '#cdd9e5'

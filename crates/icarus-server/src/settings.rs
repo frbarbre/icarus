@@ -209,6 +209,20 @@ impl Server {
                 self.write_key(&p.key, value, p.layer.as_deref(), p.project.as_deref())
             }
             "config.schema" => Ok(to_json(&layers::json_schema())),
+            "config.paths" => {
+                #[derive(Deserialize)]
+                struct P {
+                    project: Option<String>,
+                }
+                let p: P = params(p)?;
+                let root = self.project_root(p.project.as_deref())?;
+                let paths = SettingsPaths::discover(root.as_deref());
+                Ok(json!({
+                    "user": paths.user,
+                    "project": paths.project,
+                    "local": paths.project_local,
+                }))
+            }
             "settings.import_orca" => {
                 #[derive(Deserialize)]
                 struct P {

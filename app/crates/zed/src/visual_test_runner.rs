@@ -177,6 +177,21 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     cx.update(|cx| {
         gpui_tokio::init(cx);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
+        // Baselines are dark; without this, windows opened later follow the machine's appearance.
+        gpui::BorrowAppContext::update_global::<settings::SettingsStore, _>(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.theme.theme = Some(settings::ThemeSelection::Dynamic {
+                    mode: settings::ThemeAppearanceMode::Dark,
+                    light: settings::ThemeName(settings::DEFAULT_LIGHT_THEME.into()),
+                    dark: settings::ThemeName(settings::DEFAULT_DARK_THEME.into()),
+                });
+            });
+        });
+        // Lets a dark-mode machine prove the pin above: the baselines must still pass assuming a light system.
+        if std::env::var("ICARUS_VISUAL_ASSUME_APPEARANCE").as_deref() == Ok("light") {
+            *theme::SystemAppearance::global_mut(cx) =
+                theme::SystemAppearance(theme::Appearance::Light);
+        }
         client::init(&app_state.client, cx);
         audio::init(cx);
         workspace::init(app_state.clone(), cx);
@@ -431,6 +446,17 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     }
     println!("\n--- Icarus: icarus_notifications and icarus_agent_history ---");
     for (name, result) in run_icarus_notifications_and_history_tests(&mut cx, update_baseline) {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\n--- Icarus: icarus_settings ---");
+    for (name, result) in run_icarus_settings_tests(&mut cx, update_baseline) {
         match result {
             Ok(TestResult::Passed) => passed += 1,
             Ok(TestResult::BaselineUpdated(_)) => updated += 1,
@@ -1205,6 +1231,102 @@ fn run_icarus_dark_and_light(
         result
     });
     vec![(dark_name, dark), (light_name, light)]
+}
+
+/// Icarus's settings tab, filled from a fixed snapshot.
+fn run_icarus_settings_tests(
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    use icarus_ui::settings_view::{SettingsView, Snapshot, Source};
+    let resolved = serde_json::json!({
+        "workspace": {
+            "statuses": [
+                { "id": "todo", "label": "Todo", "color": "neutral", "icon": "circle" },
+                { "id": "in-progress", "label": "In progress", "color": "amber", "icon": "circle-dashed" },
+                { "id": "review", "label": "In review", "color": "blue" },
+                { "id": "done", "label": "Done", "color": "green", "icon": "circle-check" },
+            ],
+            "cardFields": ["pr", "inline-agents", "linear-title"],
+        },
+        "rules": {
+            "enabled": true,
+            "armed": false,
+            "interval_ms": 60000,
+            "orca_compat": {
+                "enabled": true,
+                "statusByCondition": { "merged": "done", "draft": "in-progress", "review": "review" },
+            },
+        },
+        "agents": { "default": "claude", "remote_control": false },
+        "linear": { "api_key_command": "op read op://Private/Linear/key" },
+        "notifications": { "enabled": true, "sound": true },
+        "ports": { "labels_command": "./scripts/print-urls" },
+        "previews": { "primary_app": "frontend" },
+        "updates": { "channel": "stable" },
+    });
+    let mut sources = std::collections::HashMap::new();
+    for key in [
+        "rules.armed",
+        "linear.api_key_command",
+        "workspace.statuses",
+    ] {
+        sources.insert(
+            key.to_owned(),
+            Source {
+                layer: "user".into(),
+                path: Some("~/.config/icarus/icarus.json".into()),
+            },
+        );
+    }
+    sources.insert(
+        "ports.labels_command".to_owned(),
+        Source {
+            layer: "project".into(),
+            path: Some("icarus.json".into()),
+        },
+    );
+    let snapshot = Snapshot {
+        resolved,
+        sources,
+        kinds: vec![
+            ("agent_turn_done".into(), true),
+            ("agent_waiting".into(), true),
+            ("ci_failed".into(), true),
+            ("review_requested".into(), false),
+        ],
+        layouts: vec!["default".into(), "review".into(), "triage".into()],
+        paths: serde_json::json!({ "user": "/tmp/icarus.json" }),
+    };
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(800.0), px(1400.0)),
+        })),
+        focus: false,
+        show: false,
+        ..Default::default()
+    };
+    match cx.update(|cx| {
+        cx.open_window(options, |window, cx| {
+            cx.new(|cx| SettingsView::preview(snapshot, window, cx))
+        })
+    }) {
+        Ok(view) => {
+            cx.run_until_parked();
+            let results = run_icarus_dark_and_light(
+                "icarus_settings",
+                "icarus_settings_light",
+                view.into(),
+                cx,
+                update_baseline,
+            );
+            cx.update_window(view.into(), |_, window, _cx| window.remove_window())
+                .log_err();
+            results
+        }
+        Err(error) => vec![("icarus_settings", Err(error))],
+    }
 }
 
 /// The status-bar notifications list and the session history palette, each in its own window.

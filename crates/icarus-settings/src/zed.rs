@@ -275,7 +275,7 @@ fn font_family(css: &str) -> Option<String> {
     }
 }
 
-fn color(value: Option<&Value>) -> Option<Value> {
+pub(crate) fn color(value: Option<&Value>) -> Option<Value> {
     let hex = value?.as_str()?.trim().strip_prefix('#')?;
     if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
@@ -372,7 +372,7 @@ const VSCODE_COLORS: &[(&str, &[&str])] = &[
     ("terminal.foreground", &["terminal.foreground"]),
 ];
 
-const ANSI: [(&str, &str); 16] = [
+pub(crate) const ANSI: [(&str, &str); 16] = [
     ("Black", "black"),
     ("Red", "red"),
     ("Green", "green"),

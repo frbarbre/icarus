@@ -4,11 +4,13 @@ mod extras;
 mod git_ops;
 mod issue;
 mod notes;
+mod orca_state;
 mod ports;
 mod review;
 mod rules;
 mod service;
 mod term_attach;
+mod theme;
 mod update;
 
 use std::path::PathBuf;
@@ -89,6 +91,11 @@ enum Command {
     Settings {
         #[command(subcommand)]
         command: SettingsCommand,
+    },
+    /// Import colour themes (VS Code, Warp) for the app.
+    Theme {
+        #[command(subcommand)]
+        command: theme::ThemeCommand,
     },
     /// Manage projects (git repositories).
     Project {
@@ -451,6 +458,17 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum SettingsCommand {
+    /// Bring Orca's per-workspace state over: statuses, pinned names, linked Linear issues, diff
+    /// notes and agent notes, matched to Icarus workspaces by path or by repository and name.
+    /// Reads Orca's `profile-state.db` read-only; workspace values you already set win.
+    ImportOrcaState {
+        /// Orca's `profile-state.db` (default: the one in Orca's profile folder on this machine).
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
+        /// Report what would change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Import an `orca settings export` file into your user settings and matching projects. Its
     /// appearance and language tooling are merged into the app's Zed settings (keys you already
     /// set win) and its colours become the Zed theme `themes/icarus-imported.json`.
@@ -1526,6 +1544,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Theme { command } => {
+            let value = theme::run(command)?;
+            print(&cli, &value, theme::summary);
+        }
         Command::Settings {
             command:
                 SettingsCommand::ImportZed {
@@ -1665,6 +1687,19 @@ async fn main() -> Result<()> {
                         Some(path) => std::fs::write(path, text)?,
                         None => print!("{text}"),
                     }
+                }
+                SettingsCommand::ImportOrcaState { from, dry_run } => {
+                    let documents = orca_state::read(from.as_deref())?;
+                    let mut request = documents;
+                    request["dry_run"] = json!(dry_run);
+                    let value = client
+                        .request_timeout(
+                            "settings.import_orca_state",
+                            request,
+                            Duration::from_secs(120),
+                        )
+                        .await?;
+                    print(&cli, &value, orca_state::summary);
                 }
                 SettingsCommand::ImportZed { .. } | SettingsCommand::ImportKeybindings { .. } => {
                     unreachable!("handled without a server")

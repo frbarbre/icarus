@@ -94,8 +94,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           # A baseline mismatch fails the job after a complete build; keep that build.
           cache-on-failure: true
-      # The dark baselines follow the system appearance once One Light is registered; runners default to light.
-      - run: osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to true'
       - run: cargo build -p zed --bin zed-visual-test-runner --features visual-tests
       - run: cargo run -p zed --bin zed-visual-test-runner --features visual-tests
         env:

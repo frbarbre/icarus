@@ -769,6 +769,7 @@ dependencies = [
  "icarus-client",
  "icarus-settings",
  "portable-pty",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",
