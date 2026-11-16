@@ -778,10 +778,14 @@ fn show_software_emulation_warning_if_needed(
 fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
     cx.spawn_in(window, async move |workspace_handle, cx| {
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
-        let icarus_panel = icarus_ui::WorkspacesPanel::load(workspace_handle.clone(), cx.clone());
-        let icarus_github_panel = icarus_ui::GitHubPanel::load(workspace_handle.clone(), cx.clone());
-        let icarus_source_control =
-            icarus_ui::SourceControlPanel::load(workspace_handle.clone(), cx.clone());
+        // Upstream tests build workspaces without Icarus, whose open-by-default panels would take their dock space.
+        let icarus_panels = cx.update(|_, cx| icarus_ui::enabled(cx))?.then(|| {
+            (
+                icarus_ui::WorkspacesPanel::load(workspace_handle.clone(), cx.clone()),
+                icarus_ui::GitHubPanel::load(workspace_handle.clone(), cx.clone()),
+                icarus_ui::SourceControlPanel::load(workspace_handle.clone(), cx.clone()),
+            )
+        });
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
@@ -806,9 +810,25 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
 
         futures::join!(
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(icarus_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(icarus_github_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(icarus_source_control, workspace_handle.clone(), cx.clone()),
+            async {
+                if let Some((icarus_panel, icarus_github_panel, icarus_source_control)) =
+                    icarus_panels
+                {
+                    futures::join!(
+                        add_panel_when_ready(icarus_panel, workspace_handle.clone(), cx.clone()),
+                        add_panel_when_ready(
+                            icarus_github_panel,
+                            workspace_handle.clone(),
+                            cx.clone()
+                        ),
+                        add_panel_when_ready(
+                            icarus_source_control,
+                            workspace_handle.clone(),
+                            cx.clone()
+                        ),
+                    );
+                }
+            },
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
@@ -6300,6 +6320,8 @@ mod tests {
                 "git_picker",
                 "go_to_line",
                 "highlights_tree_view",
+                // The Icarus fork's own actions (icarus_ui, agent tabs) live here.
+                "icarus",
                 "icon_theme_selector",
                 "image_viewer",
                 "inline_assistant",

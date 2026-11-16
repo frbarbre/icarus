@@ -403,6 +403,9 @@ impl WorkspaceLinks {
             .0
             .insert(handle, weak_self);
         let mut links = Self::empty(cx);
+        if !crate::enabled(cx) {
+            return links;
+        }
         let project = project.downgrade();
         links._poll = cx.spawn(async move |this, cx| {
             let mut tick: u32 = 0;

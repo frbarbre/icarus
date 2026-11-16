@@ -608,7 +608,17 @@ fn start_app_connection(cx: &mut App) {
     .detach();
 }
 
+struct IcarusEnabled;
+
+impl gpui::Global for IcarusEnabled {}
+
+/// Whether `init` ran; components built without it (e.g. in upstream Zed tests) must not reach for the server.
+pub fn enabled(cx: &App) -> bool {
+    cx.has_global::<IcarusEnabled>()
+}
+
 pub fn init(cx: &mut App) {
+    cx.set_global(IcarusEnabled);
     start_app_connection(cx);
     next_action::register(cx);
     links::register(cx);
@@ -713,6 +723,9 @@ impl WorkspacesPanel {
 
     pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let mut panel = Self::preview(workspace, cx);
+        if !enabled(cx) {
+            return panel;
+        }
         panel._poll = cx.spawn(async move |this, cx| {
             loop {
                 let client = match this.read_with(cx, |panel, _| panel.client.clone()) {

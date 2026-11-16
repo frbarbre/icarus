@@ -923,6 +923,9 @@ impl GitHubPanel {
     pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let mut panel = Self::empty(workspace, cx);
         panel.animate = true;
+        if !crate::enabled(cx) {
+            return panel;
+        }
         panel._poll = cx.spawn(async move |this, cx| {
             loop {
                 let Ok(client) = this.read_with(cx, |panel, _| panel.client.clone()) else {

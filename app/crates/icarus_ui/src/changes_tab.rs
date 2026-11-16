@@ -259,19 +259,23 @@ impl SourceControlPanel {
         let root = worktree_root(&project, cx).unwrap_or_default();
         let workspace = workspace.weak_handle();
         // Polls only while the panel shows; the shortcuts reveal it first.
-        let poll = cx.spawn_in(window, async move |this, cx| {
-            loop {
-                let refreshed = this.update(cx, |this, cx| {
-                    if this.active {
-                        this.refresh(cx);
+        let poll = if !crate::enabled(cx) {
+            Task::ready(())
+        } else {
+            cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    let refreshed = this.update(cx, |this, cx| {
+                        if this.active {
+                            this.refresh(cx);
+                        }
+                    });
+                    if refreshed.is_err() {
+                        break;
                     }
-                });
-                if refreshed.is_err() {
-                    break;
+                    cx.background_executor().timer(REFRESH_INTERVAL).await;
                 }
-                cx.background_executor().timer(REFRESH_INTERVAL).await;
-            }
-        });
+            })
+        };
         Self {
             workspace,
             project,

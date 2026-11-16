@@ -92,6 +92,15 @@ impl NextActionButton {
         cx.default_global::<NextActionButtons>()
             .0
             .insert(handle, weak_self);
+        if !crate::enabled(cx) {
+            return Self {
+                client: None,
+                workspace_id: None,
+                action: None,
+                running: false,
+                _poll: Task::ready(()),
+            };
+        }
         let project = project.downgrade();
         let poll = cx.spawn(async move |this, cx| {
             loop {
