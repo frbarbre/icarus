@@ -21,6 +21,9 @@ pub struct SavedServer {
     /// For SSH servers: the remote command, if not `icarus-server proxy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// For TCP servers: an SSH destination for the same machine, so the app can open its worktrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +52,19 @@ pub fn parse_address(address: &str) -> Result<Target> {
 impl SavedServer {
     pub fn target(&self) -> Result<Target> {
         parse_address(&self.address)
+    }
+
+    /// Where the server's worktrees can be opened over SSH: an `ssh://` address, else the `ssh` field.
+    pub fn ssh_destination(&self) -> Option<String> {
+        match self.target() {
+            Ok(Target::Ssh(destination)) => Some(destination),
+            _ => self
+                .ssh
+                .as_deref()
+                .map(|destination| destination.trim().trim_start_matches("ssh://"))
+                .filter(|destination| !destination.is_empty())
+                .map(str::to_owned),
+        }
     }
 }
 
@@ -163,6 +179,7 @@ mod tests {
             fingerprint: Some("ab".into()),
             client_id: None,
             command: None,
+            ssh: Some("desk.example".into()),
         };
         servers.upsert(desk.clone());
         servers.upsert(SavedServer {
@@ -178,6 +195,41 @@ mod tests {
             loaded.get("desk").and_then(|s| s.token.as_deref()),
             Some("t2")
         );
+        assert_eq!(
+            loaded.get("desk").and_then(|s| s.ssh.as_deref()),
+            Some("desk.example")
+        );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worktrees_open_over_the_ssh_address_or_the_ssh_field() {
+        let server = |address: &str, ssh: Option<&str>| SavedServer {
+            name: "s".into(),
+            address: address.into(),
+            token: None,
+            fingerprint: None,
+            client_id: None,
+            command: None,
+            ssh: ssh.map(str::to_owned),
+        };
+        assert_eq!(
+            server("ssh://me@devbox", None).ssh_destination().as_deref(),
+            Some("me@devbox")
+        );
+        assert_eq!(
+            server("100.64.0.2:7878", Some("ssh://devbox"))
+                .ssh_destination()
+                .as_deref(),
+            Some("devbox")
+        );
+        assert_eq!(server("100.64.0.2:7878", None).ssh_destination(), None);
+        assert_eq!(server("100.64.0.2:7878", Some(" ")).ssh_destination(), None);
+        assert!(
+            serde_json::from_str::<SavedServer>(r#"{"name":"old","address":"h:1"}"#)
+                .expect("files saved before the ssh field still load")
+                .ssh
+                .is_none()
+        );
     }
 }

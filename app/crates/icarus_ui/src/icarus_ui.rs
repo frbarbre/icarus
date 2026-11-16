@@ -13,13 +13,15 @@ mod next_action;
 pub mod notifications;
 pub mod palettes;
 pub mod quick_commands;
+pub mod remote_agent;
 pub mod remote_control;
 pub mod review;
+pub mod routing;
 pub mod servers;
 pub mod settings_view;
 pub mod sidebar;
 pub mod status_style;
-mod terminals;
+pub(crate) mod terminals;
 mod worktree_trust;
 pub mod zed_import;
 
@@ -543,11 +545,26 @@ fn paste_page(frame: &mut image::RgbaImage, page: &image::RgbaImage, bounds: [f3
     image::imageops::overlay(frame, &page, i64::from(x), i64::from(y));
 }
 
+/// Refreshes the views a server event concerns; every connected server's events come through here.
+pub(crate) fn handle_view_event(topic: &str, payload: serde_json::Value, cx: &mut App) {
+    match topic {
+        // Notes render in the same diff-tab layer, so one reload covers both.
+        "review.changed" | "note.changed" => review::review_changed(cx),
+        "git.changed" => changes_tab::git_changed(payload, cx),
+        "ports.changed" => links::ports_changed(payload, cx),
+        _ => {}
+    }
+}
+
 /// The app-wide connection to the server and the Icarus workspace paths it last listed.
 #[derive(Default)]
 pub(crate) struct AppConnection {
     pub(crate) client: Option<Arc<Client>>,
     pub(crate) workspace_paths: Vec<PathBuf>,
+    /// The saved server the app's own connection uses instead of this machine's, if the user picked one.
+    pub(crate) primary: Option<String>,
+    /// Ends the current connection so the next one goes to a newly picked primary server.
+    pub(crate) reconnect: Option<futures::channel::oneshot::Sender<()>>,
 }
 
 impl gpui::Global for AppConnection {}
@@ -574,15 +591,35 @@ pub fn fetch_attachment_text(id: String, cx: &mut App) -> Task<Result<String>> {
 fn start_app_connection(cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
+            let primary = cx.update(|cx| cx.default_global::<AppConnection>().primary.clone());
             let connect = Tokio::spawn_result(cx, async move {
-                let home = server_home().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-                Client::connect(&home, "icarus-app").await
+                match primary {
+                    Some(name) => {
+                        let saved = icarus_client::servers::SavedServers::load()?;
+                        let entry = saved.get(&name).cloned().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "no saved server named {name}; see `icarus remote list`"
+                            )
+                        })?;
+                        Client::connect_saved(&entry, "icarus-app").await
+                    }
+                    None => {
+                        let home =
+                            server_home().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+                        Client::connect(&home, "icarus-app").await
+                    }
+                }
             });
             let Ok((client, mut events)) = connect.await else {
                 cx.background_executor().timer(REFRESH_INTERVAL * 2).await;
                 continue;
             };
-            cx.update(|cx| cx.default_global::<AppConnection>().client = Some(client.clone()));
+            let (reconnect, mut switched) = futures::channel::oneshot::channel();
+            cx.update(|cx| {
+                let connection = cx.default_global::<AppConnection>();
+                connection.client = Some(client.clone());
+                connection.reconnect = Some(reconnect);
+            });
             let listed =
                 Tokio::spawn_result(cx, worktree_trust::list_workspace_paths(client.clone())).await;
             if let Some(listed) = listed.log_err() {
@@ -599,8 +636,12 @@ fn start_app_connection(cx: &mut App) {
                 let next = Tokio::spawn(cx, async move {
                     let event = events.recv().await;
                     (events, event)
-                })
-                .await;
+                });
+                let next = match futures::future::select(next, &mut switched).await {
+                    futures::future::Either::Left((next, _)) => next,
+                    // A newly picked primary server: drop this connection and connect to that one.
+                    futures::future::Either::Right(_) => break,
+                };
                 let Ok((returned, Some(event))) = next else {
                     break;
                 };
@@ -646,13 +687,8 @@ fn start_app_connection(cx: &mut App) {
                         };
                         cx.update(|cx| dispatch_action(request, cx));
                     }
-                    // Notes render in the same diff-tab layer, so one reload covers both.
-                    "review.changed" | "note.changed" => cx.update(review::review_changed),
-                    "git.changed" => {
-                        cx.update(|cx| changes_tab::git_changed(event.payload, cx));
-                    }
-                    "ports.changed" => {
-                        cx.update(|cx| links::ports_changed(event.payload, cx));
+                    "review.changed" | "note.changed" | "git.changed" | "ports.changed" => {
+                        cx.update(|cx| handle_view_event(&event.topic, event.payload, cx));
                     }
                     "notification" | "notifications.changed" => {
                         cx.update(|cx| {
@@ -712,6 +748,8 @@ pub fn enabled(cx: &App) -> bool {
 
 pub fn init(cx: &mut App) {
     cx.set_global(IcarusEnabled);
+    routing::load_primary(cx);
+    servers::store(cx, true);
     start_app_connection(cx);
     next_action::register(cx);
     links::register(cx);
@@ -999,33 +1037,20 @@ impl WorkspacesPanel {
         panel.view = cards::CardView::default();
         panel._poll = cx.spawn(async move |this, cx| {
             loop {
-                let client = match this.read_with(cx, |panel, _| panel.client.clone()) {
-                    Ok(client) => client,
-                    Err(_) => return,
-                };
-                let client = match client {
-                    Some(client) => client,
-                    None => {
-                        let connect = Tokio::spawn_result(cx, async move {
-                            let home = server_home()
-                                .ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-                            let (client, _events) = Client::connect(&home, "icarus-panel").await?;
-                            Ok(client)
-                        });
-                        match connect.await {
-                            Ok(client) => client,
-                            Err(error) => {
-                                if this
-                                    .update(cx, |panel, cx| panel.set_unavailable(error, cx))
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                cx.background_executor().timer(REFRESH_INTERVAL).await;
-                                continue;
-                            }
-                        }
+                if this.upgrade().is_none() {
+                    return;
+                }
+                // The app's own connection: this machine, or the saved server picked in the Servers menu.
+                let Some(client) = cx.update(|cx| app_client(cx)) else {
+                    let unavailable = anyhow::anyhow!("not connected to the Icarus server");
+                    if this
+                        .update(cx, |panel, cx| panel.set_unavailable(unavailable, cx))
+                        .is_err()
+                    {
+                        return;
                     }
+                    cx.background_executor().timer(REFRESH_INTERVAL).await;
+                    continue;
                 };
                 let snapshot = Tokio::spawn_result(cx, fetch_snapshot(client.clone())).await;
                 let updated = this.update(cx, |panel, cx| match snapshot {
@@ -1973,11 +1998,12 @@ impl WorkspacesPanel {
             );
         }
         for (index, workspace) in server.workspaces.iter().enumerate() {
-            let status = server.status_label(workspace.status.as_deref());
             let working = workspace.working_agents();
             let path = workspace.path.clone();
             let server_name = server.name.clone();
+            let ssh = server.ssh_destination();
             let weak = cx.entity().downgrade();
+            let status_menu = self.render_remote_status_menu(server, workspace, index);
             section = section.child(
                 v_flex()
                     .id(SharedString::from(format!(
@@ -2004,31 +2030,108 @@ impl WorkspacesPanel {
                             }),
                     )
                     .child(
-                        Label::new(format!(
-                            "{status}{}",
-                            workspace
-                                .branch
-                                .as_ref()
-                                .map(|branch| format!(" · {branch}"))
-                                .unwrap_or_default()
-                        ))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                        h_flex().gap_1().child(status_menu).child(
+                            Label::new(
+                                workspace
+                                    .branch
+                                    .as_ref()
+                                    .map(|branch| format!("· {branch}"))
+                                    .unwrap_or_default(),
+                            )
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        ),
                     )
                     .on_click(move |_, _, cx| {
-                        open_remote_workspace(&server_name, path.clone(), weak.clone(), cx);
+                        open_remote_workspace(
+                            &server_name,
+                            ssh.clone(),
+                            path.clone(),
+                            weak.clone(),
+                            cx,
+                        );
                     }),
             );
         }
         section
     }
 
+    /// The status chip of a remote card: shows the server's label and moves the card on that server.
+    fn render_remote_status_menu(
+        &self,
+        server: &servers::RemoteServer,
+        workspace: &WorkspaceSummary,
+        index: usize,
+    ) -> impl IntoElement {
+        let label = server.status_label(workspace.status.as_deref());
+        let columns: Vec<(String, String)> = server
+            .statuses
+            .iter()
+            .map(|column| (column.id.clone(), column.label.clone()))
+            .collect();
+        let current = workspace.status.clone();
+        let store = self.remote.downgrade();
+        let server_name = server.name.clone();
+        let workspace_id = workspace.id.clone();
+        ui::PopoverMenu::new(SharedString::from(format!(
+            "icarus-remote-status-{}-{index}",
+            server.name
+        )))
+        .menu(move |window, cx| {
+            let columns = columns.clone();
+            let current = current.clone();
+            let store = store.clone();
+            let server_name = server_name.clone();
+            let workspace_id = workspace_id.clone();
+            Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                menu = menu.header("Move to");
+                for (id, label) in columns {
+                    let store = store.clone();
+                    let server_name = server_name.clone();
+                    let workspace_id = workspace_id.clone();
+                    let checked = current.as_deref() == Some(id.as_str());
+                    menu = menu.toggleable_entry(
+                        label,
+                        checked,
+                        ui::IconPosition::Start,
+                        None,
+                        move |_, cx| {
+                            store
+                                .update(cx, |store, cx| {
+                                    store.set_status(
+                                        &server_name,
+                                        workspace_id.clone(),
+                                        Some(id.clone()),
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+                        },
+                    );
+                }
+                menu
+            }))
+        })
+        .trigger(
+            ui::Button::new(
+                SharedString::from(format!(
+                    "icarus-remote-status-button-{}-{index}",
+                    server.name
+                )),
+                label,
+            )
+            .label_size(LabelSize::XSmall)
+            .color(Color::Muted),
+        )
+    }
+
     /// The servers this window watches: the local one and every saved remote.
     fn render_servers_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let own = routing::primary(cx).unwrap_or_else(|| "This machine".to_owned());
         let local = match &self.connection {
-            Connection::Connected { server_version } => format!("This machine — {server_version}"),
-            Connection::Connecting => "This machine — connecting…".to_owned(),
-            Connection::Unavailable(_) => "This machine — offline".to_owned(),
+            Connection::Connected { server_version } => format!("{own} — {server_version}"),
+            Connection::Connecting => format!("{own} — connecting…"),
+            Connection::Unavailable(_) => format!("{own} — offline"),
         };
         let remote: Vec<(String, String)> = self
             .remote
@@ -2041,19 +2144,46 @@ impl WorkspacesPanel {
                     servers::RemoteState::Connected { server_version } => server_version.clone(),
                     servers::RemoteState::Unavailable(_) => "offline".to_owned(),
                 };
-                (server.name.clone(), format!("{} — {state}", server.address))
+                let ssh = server
+                    .ssh_destination()
+                    .map(|ssh| format!(", opens over SSH as {ssh}"))
+                    .unwrap_or_default();
+                (
+                    server.name.clone(),
+                    format!("{} — {state}{ssh}", server.address),
+                )
             })
             .collect();
+        let primary = routing::primary(cx);
         let workspace = self.workspace.clone();
         ui::PopoverMenu::new("icarus-servers-menu")
             .menu(move |window, cx| {
                 let local = local.clone();
                 let remote = remote.clone();
+                let primary = primary.clone();
                 let workspace = workspace.clone();
                 Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
                     menu = menu.header("Servers").label(local);
                     for (name, detail) in &remote {
                         menu = menu.label(format!("{name}: {detail}"));
+                    }
+                    menu = menu.separator().header("This app connects to");
+                    menu = menu.toggleable_entry(
+                        "This machine",
+                        primary.is_none(),
+                        ui::IconPosition::Start,
+                        None,
+                        |_, cx| routing::set_primary(None, cx),
+                    );
+                    for (name, _) in &remote {
+                        let pick = name.clone();
+                        menu = menu.toggleable_entry(
+                            name.clone(),
+                            primary.as_deref() == Some(name.as_str()),
+                            ui::IconPosition::Start,
+                            None,
+                            move |_, cx| routing::set_primary(Some(pick.clone()), cx),
+                        );
                     }
                     menu.separator().entry("Add a server…", None, move |_, cx| {
                         show_add_server_help(workspace.clone(), cx);
@@ -2069,22 +2199,47 @@ impl WorkspacesPanel {
     }
 }
 
-/// Opens a remote server's workspace when its folder is reachable from here (same machine or a
-/// shared disk); otherwise says so, since editing over the network isn't supported yet.
+/// How a saved server's workspace opens here: over SSH as a Zed remote project when the server
+/// has an SSH destination, else as a local folder when it's reachable (same machine, shared disk).
+#[derive(Debug, PartialEq)]
+enum RemoteOpen {
+    Ssh(String),
+    Local,
+    Unreachable,
+}
+
+fn remote_open_plan(ssh: Option<&str>, folder_exists: bool) -> RemoteOpen {
+    match ssh {
+        Some(destination) => RemoteOpen::Ssh(destination.to_owned()),
+        None if folder_exists => RemoteOpen::Local,
+        None => RemoteOpen::Unreachable,
+    }
+}
+
 fn open_remote_workspace(
     server: &str,
+    ssh: Option<String>,
     path: PathBuf,
     panel: WeakEntity<WorkspacesPanel>,
     cx: &mut App,
 ) {
-    if path.is_dir() {
-        with_workspace_window(path, cx, |_, _, _| {});
-        return;
-    }
-    let message = format!(
-        "{} is on {server}. Opening another machine's workspaces isn't supported yet; use `icarus --server {server} …` from a terminal.",
-        path.display()
-    );
+    let message = match remote_open_plan(ssh.as_deref(), path.is_dir()) {
+        RemoteOpen::Local => {
+            with_workspace_window(path, cx, |_, _, _| {});
+            return;
+        }
+        RemoteOpen::Ssh(destination) => match open_over_ssh(&destination, path.clone(), cx) {
+            Ok(()) => return,
+            Err(error) => format!(
+                "Couldn't open {} on {server} over SSH: {error:#}",
+                path.display()
+            ),
+        },
+        RemoteOpen::Unreachable => format!(
+            "{} is on {server}, and this machine can't reach that folder. Save an SSH destination for it to open it here: `icarus remote add {server} <host:port> --code <code> --ssh <ssh host>`, or save it as `ssh://<host>`.",
+            path.display()
+        ),
+    };
     panel
         .update(cx, |panel, cx| {
             panel
@@ -2104,6 +2259,27 @@ fn open_remote_workspace(
                 .log_err();
         })
         .log_err();
+}
+
+/// Opens `path` on `destination` as a Zed remote project, reusing a window that already shows it.
+/// Inside it Zed runs `icarus acp` and terminals on that host, so they reach that host's server.
+fn open_over_ssh(destination: &str, path: PathBuf, cx: &mut App) -> Result<()> {
+    let options = remote::SshConnectionOptions::parse_command_line(destination)?;
+    let app_state = AppState::try_global(cx)
+        .ok_or_else(|| anyhow::anyhow!("the app isn't ready to open windows"))?;
+    cx.spawn(async move |cx| {
+        recent_projects::open_remote_project(
+            remote::RemoteConnectionOptions::Ssh(options),
+            vec![path],
+            app_state,
+            OpenOptions::default(),
+            cx,
+        )
+        .await
+        .map(|_| ())
+    })
+    .detach_and_log_err(cx);
+    Ok(())
 }
 
 fn show_add_server_help(workspace: WeakEntity<Workspace>, cx: &mut App) {
@@ -2288,6 +2464,17 @@ impl Panel for WorkspacesPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_workspaces_open_over_ssh_first_then_locally() {
+        assert_eq!(
+            remote_open_plan(Some("devbox"), true),
+            RemoteOpen::Ssh("devbox".into()),
+            "a folder with the same path here may be a different checkout"
+        );
+        assert_eq!(remote_open_plan(None, true), RemoteOpen::Local);
+        assert_eq!(remote_open_plan(None, false), RemoteOpen::Unreachable);
+    }
 
     pub(crate) fn summary(name: &str, path: &str, status: Option<&str>) -> WorkspaceSummary {
         WorkspaceSummary {

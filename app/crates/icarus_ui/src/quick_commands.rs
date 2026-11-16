@@ -312,7 +312,7 @@ fn with_target(
     cx: &mut Context<Workspace>,
     then: impl FnOnce(Arc<Target>, &mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
 ) {
-    let Some(client) = crate::review::app_client(cx) else {
+    let Some(client) = crate::routing::client_for_project(workspace.project().read(cx), cx) else {
         log::warn!("quick commands need the Icarus server");
         return;
     };

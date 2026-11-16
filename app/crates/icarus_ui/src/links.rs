@@ -19,7 +19,7 @@ use workspace::notifications::NotificationId;
 use workspace::{Toast, Workspace};
 
 use crate::github_panel::{format_relative, parse_timestamp};
-use crate::{CopyPullRequestUrl, OpenFrontend, OpenPreview, OpenPullRequest, server_home};
+use crate::{CopyPullRequestUrl, OpenFrontend, OpenPreview, OpenPullRequest};
 
 pub const GLOBE_ICON: &str = "icons/icarus/globe.svg";
 const LINKS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -410,29 +410,12 @@ impl WorkspaceLinks {
         links._poll = cx.spawn(async move |this, cx| {
             let mut tick: u32 = 0;
             loop {
-                let Ok((client, previous_workspace_id)) = this.read_with(cx, |links, _| {
-                    (links.client.clone(), links.target.workspace_id.clone())
-                }) else {
+                let Ok(previous_workspace_id) =
+                    this.read_with(cx, |links, _| links.target.workspace_id.clone())
+                else {
                     return;
                 };
-                let client = match client {
-                    Some(client) => Some(client),
-                    None => {
-                        let connect = Tokio::spawn_result(cx, async move {
-                            let home = server_home()
-                                .ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-                            let (client, _events) = Client::connect(&home, "icarus-links").await?;
-                            Ok(client)
-                        });
-                        match connect.await {
-                            Ok(client) => Some(client),
-                            Err(error) => {
-                                log::debug!("icarus server unavailable: {error:#}");
-                                None
-                            }
-                        }
-                    }
-                };
+                let client = cx.update(|cx| crate::routing::client_for_weak_project(&project, cx));
                 if let Some(client) = client {
                     let paths = cx.update(|cx| project_paths(&project, cx));
                     let previews_due = tick.is_multiple_of(PREVIEWS_REFRESH_EVERY);

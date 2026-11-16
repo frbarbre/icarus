@@ -122,7 +122,7 @@ fn pairing_with_a_code_saves_a_token_that_later_commands_reuse() {
     let code = server.pair_code(None);
     assert_eq!(code.len(), 9, "XXXX-XXXX: {code}");
     let added = laptop.json(&[
-        "remote", "add", "desk", &addr, "--code", &code, "--label", "laptop",
+        "remote", "add", "desk", &addr, "--code", &code, "--label", "laptop", "--ssh", "desk.lan",
     ]);
     assert_eq!(added["address"], json!(addr));
     let fingerprint = added["fingerprint"].as_str().expect("fingerprint");
@@ -134,6 +134,11 @@ fn pairing_with_a_code_saves_a_token_that_later_commands_reuse() {
     assert!(saved.contains("\"token\""));
     let listed = laptop.json(&["remote", "list"]);
     assert_eq!(listed[0]["name"], json!("desk"));
+    assert_eq!(
+        listed[0]["ssh"],
+        json!("desk.lan"),
+        "the app opens this server's worktrees over SSH"
+    );
     assert!(listed[0].get("token").is_none(), "list never prints tokens");
 
     // The laptop has no server of its own, so these can only succeed over TCP.

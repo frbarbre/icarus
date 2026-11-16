@@ -11,7 +11,7 @@ use project::Project;
 use serde::Deserialize;
 use ui::{Tooltip, prelude::*};
 
-use crate::{RunNextAction, server_home};
+use crate::RunNextAction;
 
 const NEXT_ACTION_REFRESH: Duration = Duration::from_secs(3);
 
@@ -104,21 +104,10 @@ impl NextActionButton {
         let project = project.downgrade();
         let poll = cx.spawn(async move |this, cx| {
             loop {
-                let Ok(client) = this.read_with(cx, |button, _| button.client.clone()) else {
+                if this.upgrade().is_none() {
                     return;
-                };
-                let client = match client {
-                    Some(client) => Some(client),
-                    None => Tokio::spawn_result(cx, async move {
-                        let home =
-                            server_home().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-                        let (client, _events) =
-                            Client::connect(&home, "icarus-next-action").await?;
-                        Ok(client)
-                    })
-                    .await
-                    .ok(),
-                };
+                }
+                let client = cx.update(|cx| crate::routing::client_for_weak_project(&project, cx));
                 if let Some(client) = client {
                     let paths = cx.update(|cx| project_paths(&project, cx));
                     let result = Tokio::spawn_result(cx, lookup(client.clone(), paths)).await;

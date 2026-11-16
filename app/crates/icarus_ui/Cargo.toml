@@ -12,6 +12,8 @@ workspace = true
 path = "src/icarus_ui.rs"
 
 [dependencies]
+acp_thread.workspace = true
+agent_servers.workspace = true
 anyhow.workspace = true
 buffer_diff.workspace = true
 collections.workspace = true
@@ -36,6 +38,8 @@ multi_buffer.workspace = true
 paths.workspace = true
 picker.workspace = true
 project.workspace = true
+recent_projects.workspace = true
+remote.workspace = true
 schemars.workspace = true
 task.workspace = true
 terminal.workspace = true
@@ -81,6 +85,7 @@ fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 remote_connection = { workspace = true, features = ["test-support"] }
+recent_projects = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 theme.workspace = true

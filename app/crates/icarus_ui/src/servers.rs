@@ -2,10 +2,13 @@
 //! `icarus remote add`, each with its own connection, listed in the Workspaces panel next to the
 //! local server's workspaces.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, AppContext as _, Context, Entity, Global, Task};
+use gpui::{App, AppContext as _, Context, Entity, Global, Task, TaskExt as _};
 use gpui_tokio::Tokio;
 use icarus_client::Client;
 use icarus_client::servers::{SavedServer, SavedServers};
@@ -30,7 +33,12 @@ pub struct RemoteServer {
     pub state: RemoteState,
     pub workspaces: Vec<WorkspaceSummary>,
     pub statuses: Vec<StatusColumn>,
+    saved: SavedServer,
+    /// The workspace folders from the last listing, kept across launches for routing at startup.
+    known_paths: Vec<PathBuf>,
     client: Option<Arc<Client>>,
+    /// Forwards the server's refresh events (review, notes, git, ports) to the open views.
+    _events: Option<Rc<Task<()>>>,
 }
 
 impl RemoteServer {
@@ -41,12 +49,49 @@ impl RemoteServer {
             state: RemoteState::Connecting,
             workspaces: Vec::new(),
             statuses: Vec::new(),
+            saved: saved.clone(),
+            known_paths: Vec::new(),
             client: None,
+            _events: None,
+        }
+    }
+
+    /// Folders of this server's workspaces: the current listing, else the last one seen.
+    pub fn workspace_paths(&self) -> Vec<&Path> {
+        if self.workspaces.is_empty() {
+            self.known_paths.iter().map(PathBuf::as_path).collect()
+        } else {
+            self.workspaces
+                .iter()
+                .map(|workspace| workspace.path.as_path())
+                .collect()
         }
     }
 
     pub fn client(&self) -> Option<Arc<Client>> {
         self.client.clone()
+    }
+
+    pub fn saved(&self) -> &SavedServer {
+        &self.saved
+    }
+
+    /// Where this server's worktrees open over SSH, if anywhere.
+    pub fn ssh_destination(&self) -> Option<String> {
+        self.saved.ssh_destination()
+    }
+
+    /// Whether a project opened over SSH as `options` is on this server's machine.
+    pub fn serves_ssh_host(&self, options: &remote::SshConnectionOptions) -> bool {
+        let Some(destination) = self.ssh_destination() else {
+            return false;
+        };
+        let Ok(saved) = remote::SshConnectionOptions::parse_command_line(&destination) else {
+            return false;
+        };
+        saved.host.to_string() == options.host.to_string()
+            && saved.port.is_none_or(|port| Some(port) == options.port)
+            && (saved.username.is_none() || saved.username == options.username)
     }
 
     /// The status's label on this server, e.g. "In review" for `in-review`.
@@ -66,6 +111,7 @@ impl RemoteServer {
 #[derive(Default)]
 pub struct RemoteServers {
     servers: Vec<RemoteServer>,
+    cached_paths: HashMap<String, Vec<PathBuf>>,
     _poll: Option<Task<()>>,
 }
 
@@ -83,8 +129,20 @@ impl RemoteServers {
                 .iter()
                 .position(|server| server.name == entry.name && server.address == entry.address);
             next.push(match existing {
-                Some(index) => self.servers[index].clone(),
-                None => RemoteServer::new(entry),
+                Some(index) => {
+                    let mut server = self.servers[index].clone();
+                    server.saved = entry.clone();
+                    server
+                }
+                None => {
+                    let mut server = RemoteServer::new(entry);
+                    server.known_paths = self
+                        .cached_paths
+                        .get(&entry.name)
+                        .cloned()
+                        .unwrap_or_default();
+                    server
+                }
             });
         }
         self.servers = next;
@@ -106,15 +164,98 @@ impl RemoteServers {
                     server_version: client.server_version.clone(),
                 };
                 server.client = Some(client);
+                let new_folder = workspaces.iter().any(|workspace| {
+                    !server
+                        .workspaces
+                        .iter()
+                        .any(|known| known.path == workspace.path)
+                });
                 server.workspaces = workspaces;
                 server.statuses = statuses;
+                let paths: Vec<PathBuf> = server
+                    .workspaces
+                    .iter()
+                    .map(|workspace| workspace.path.clone())
+                    .collect();
+                let paths_changed = server.known_paths != paths;
+                server.known_paths = paths.clone();
+                if paths_changed && crate::enabled(cx) {
+                    self.cached_paths.insert(name.to_owned(), paths);
+                    save_cached_paths(&self.cached_paths, cx);
+                }
+                if new_folder && crate::enabled(cx) {
+                    // Deferred: trusting reads this store, which is being updated right now.
+                    cx.defer(crate::worktree_trust::recheck_open_windows);
+                }
             }
             Err(error) => {
                 server.state = RemoteState::Unavailable(format!("{error:#}"));
                 server.client = None;
+                server._events = None;
             }
         }
         cx.notify();
+    }
+
+    /// A server's workspaces without a connection, for tests and previews.
+    pub fn set_workspaces(
+        &mut self,
+        name: &str,
+        workspaces: Vec<WorkspaceSummary>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(server) = self.servers.iter_mut().find(|server| server.name == name) {
+            server.workspaces = workspaces;
+            cx.notify();
+        }
+    }
+
+    /// Moves one of a server's workspaces to `status` on that server, then refreshes its listing.
+    pub fn set_status(
+        &mut self,
+        name: &str,
+        workspace_id: String,
+        status: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(server) = self.servers.iter_mut().find(|server| server.name == name) else {
+            return;
+        };
+        if let Some(workspace) = server
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        {
+            workspace.status = status.clone();
+        }
+        cx.notify();
+        let Some(client) = server.client.clone() else {
+            return;
+        };
+        let name = name.to_owned();
+        let set = Tokio::spawn_result(cx, async move {
+            client
+                .request(
+                    "workspace.set",
+                    json!({ "id": workspace_id, "status": status }),
+                )
+                .await?;
+            fetch(client).await
+        });
+        cx.spawn(async move |this, cx| {
+            let listing = set.await;
+            this.update(cx, |this, cx| match listing {
+                Ok((workspaces, statuses)) => {
+                    if let Some(server) = this.servers.iter_mut().find(|s| s.name == name) {
+                        server.workspaces = workspaces;
+                        server.statuses = statuses;
+                        cx.notify();
+                    }
+                }
+                Err(error) => log::error!("moving a workspace on {name} failed: {error:#}"),
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
@@ -139,18 +280,48 @@ impl RemoteServers {
                         .flatten();
                     let name = entry.name.clone();
                     let listing = Tokio::spawn_result(cx, async move {
-                        let client = match client {
-                            Some(client) => client,
-                            None => Client::connect_saved(&entry, "icarus-panel").await?.0,
+                        let (client, events) = match client {
+                            Some(client) => (client, None),
+                            None => {
+                                let (client, events) =
+                                    Client::connect_saved(&entry, "icarus-panel").await?;
+                                (client, Some(events))
+                            }
                         };
                         let (workspaces, statuses) = fetch(client.clone()).await?;
-                        anyhow::Ok((client, workspaces, statuses))
+                        anyhow::Ok(((client, workspaces, statuses), events))
                     })
                     .await;
-                    if this
-                        .update(cx, |this, cx| this.set_listing(&name, listing, cx))
-                        .is_err()
-                    {
+                    let (listing, events) = match listing {
+                        Ok((listing, events)) => (Ok(listing), events),
+                        Err(error) => (Err(error), None),
+                    };
+                    let updated = this.update(cx, |this, cx| {
+                        this.set_listing(&name, listing, cx);
+                        let Some(mut events) = events else {
+                            return;
+                        };
+                        let forward = cx.spawn(async move |_, cx| {
+                            loop {
+                                let next = Tokio::spawn(cx, async move {
+                                    let event = events.recv().await;
+                                    (events, event)
+                                })
+                                .await;
+                                let Ok((returned, Some(event))) = next else {
+                                    return;
+                                };
+                                events = returned;
+                                cx.update(|cx| {
+                                    crate::handle_view_event(&event.topic, event.payload, cx)
+                                });
+                            }
+                        });
+                        if let Some(server) = this.servers.iter_mut().find(|s| s.name == name) {
+                            server._events = Some(Rc::new(forward));
+                        }
+                    });
+                    if updated.is_err() {
                         return;
                     }
                 }
@@ -176,6 +347,33 @@ struct GlobalRemoteServers(Entity<RemoteServers>);
 
 impl Global for GlobalRemoteServers {}
 
+const CACHED_PATHS_KEY: &str = "icarus_saved_server_folders";
+
+fn load_cached_paths(cx: &App) -> HashMap<String, Vec<PathBuf>> {
+    db::kvp::KeyValueStore::global(cx)
+        .read_kvp(CACHED_PATHS_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).log_err())
+        .unwrap_or_default()
+}
+
+fn save_cached_paths(paths: &HashMap<String, Vec<PathBuf>>, cx: &App) {
+    let Some(json) = serde_json::to_string(paths).log_err() else {
+        return;
+    };
+    let store = db::kvp::KeyValueStore::global(cx);
+    db::write_and_log(cx, move || async move {
+        store.write_kvp(CACHED_PATHS_KEY.to_string(), json).await
+    });
+}
+
+/// The store if the app created it; routing never starts watching on its own.
+pub fn existing_store(cx: &App) -> Option<Entity<RemoteServers>> {
+    cx.try_global::<GlobalRemoteServers>()
+        .map(|store| store.0.clone())
+}
+
 /// The app-wide store; it starts watching saved servers the first time a real panel asks for it.
 pub fn store(cx: &mut App, watch: bool) -> Entity<RemoteServers> {
     let store = match cx.try_global::<GlobalRemoteServers>() {
@@ -183,6 +381,16 @@ pub fn store(cx: &mut App, watch: bool) -> Entity<RemoteServers> {
         None => {
             let store = cx.new(|_| RemoteServers::default());
             cx.set_global(GlobalRemoteServers(store.clone()));
+            if crate::enabled(cx) {
+                // Routing needs the saved servers' folders before the first listing arrives, or the
+                // first agent tab of a saved server's workspace would go to this machine's server.
+                let cached = load_cached_paths(cx);
+                let saved = SavedServers::load().log_err().unwrap_or_default().servers;
+                store.update(cx, |store, cx| {
+                    store.cached_paths = cached;
+                    store.set_saved(&saved, cx);
+                });
+            }
             store
         }
     };
@@ -197,11 +405,11 @@ pub fn store(cx: &mut App, watch: bool) -> Entity<RemoteServers> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tests::{panel_window, summary};
 
-    fn saved(name: &str, address: &str) -> SavedServer {
+    pub(crate) fn saved(name: &str, address: &str) -> SavedServer {
         SavedServer {
             name: name.into(),
             address: address.into(),
@@ -209,6 +417,7 @@ mod tests {
             fingerprint: None,
             client_id: None,
             command: None,
+            ssh: None,
         }
     }
 
@@ -256,6 +465,27 @@ mod tests {
                 store.servers()[0].state,
                 RemoteState::Unavailable(_)
             ));
+        });
+    }
+
+    #[gpui::test]
+    fn folders_from_the_last_launch_route_before_the_first_listing(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(|_| RemoteServers::default());
+        store.update(cx, |store, cx| {
+            store
+                .cached_paths
+                .insert("desk".into(), vec![PathBuf::from("/srv/ws/remote")]);
+            store.set_saved(&[saved("desk", "100.64.0.2:4000")], cx);
+            assert_eq!(
+                store.servers()[0].workspace_paths(),
+                [Path::new("/srv/ws/remote")],
+                "a fresh launch knows the folders before the server answers"
+            );
+            store.set_workspaces("desk", vec![summary("other", "/srv/ws/other", None)], cx);
+            assert_eq!(
+                store.servers()[0].workspace_paths(),
+                [Path::new("/srv/ws/other")]
+            );
         });
     }
 

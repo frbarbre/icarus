@@ -8516,6 +8516,8 @@ dependencies = [
 name = "icarus_ui"
 version = "0.1.0"
 dependencies = [
+ "acp_thread",
+ "agent_servers",
  "anyhow",
  "block2 0.6.2",
  "buffer_diff",
@@ -8546,6 +8548,8 @@ dependencies = [
  "paths",
  "picker",
  "project",
+ "recent_projects",
+ "remote",
  "remote_connection",
  "schemars 1.0.4",
  "serde",

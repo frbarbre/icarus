@@ -61,10 +61,19 @@ fn trust_known(workspace: &Workspace, cx: &mut App) -> bool {
     if restricted.is_empty() {
         return false;
     }
-    let icarus_paths = cx
+    let mut icarus_paths = cx
         .try_global::<AppConnection>()
         .map(|connection| connection.workspace_paths.clone())
         .unwrap_or_default();
+    if let Some(store) = crate::servers::existing_store(cx) {
+        icarus_paths.extend(store.read(cx).servers().iter().flat_map(|server| {
+            server
+                .workspace_paths()
+                .into_iter()
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        }));
+    }
     let restricted: Vec<_> = restricted
         .iter()
         .map(|(id, path)| (*id, path.as_ref()))
@@ -124,6 +133,11 @@ fn trust_icarus_worktrees(
 /// Re-checks every open window after the list of Icarus workspaces changed.
 pub(crate) fn set_icarus_workspace_paths(paths: Vec<PathBuf>, cx: &mut App) {
     cx.default_global::<AppConnection>().workspace_paths = paths;
+    recheck_open_windows(cx);
+}
+
+/// Trusts newly known Icarus folders in every open window, closing a trust prompt they no longer need.
+pub(crate) fn recheck_open_windows(cx: &mut App) {
     for window in cx.windows() {
         let Some(window) = window.downcast::<MultiWorkspace>() else {
             continue;

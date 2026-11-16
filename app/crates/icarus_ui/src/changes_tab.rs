@@ -587,16 +587,20 @@ impl SourceControlPanel {
         self.set_scope(next, cx);
     }
 
-    fn client(cx: &App) -> Option<Arc<Client>> {
-        cx.try_global::<AppConnection>()
-            .and_then(|connection| connection.client.clone())
+    /// The server that owns this window's workspace (a saved one, or the app's own connection).
+    fn client(&self, cx: &App) -> Option<Arc<Client>> {
+        // Through the project, not the workspace: this runs inside workspace updates.
+        crate::routing::client_for_weak_project(&self.project, cx).or_else(|| {
+            cx.try_global::<AppConnection>()
+                .and_then(|connection| connection.client.clone())
+        })
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.refreshing.is_some() {
             return;
         }
-        let Some(client) = Self::client(cx) else {
+        let Some(client) = self.client(cx) else {
             self.error = Some("Not connected to the Icarus server".into());
             cx.notify();
             return;
@@ -704,7 +708,7 @@ impl SourceControlPanel {
                 .any(|value| value.present && value.hidden);
         }
         cx.notify();
-        let Some(client) = Self::client(cx) else {
+        let Some(client) = self.client(cx) else {
             return;
         };
         let mut change = serde_json::Map::new();
@@ -840,7 +844,7 @@ impl SourceControlPanel {
         if self.git_busy.is_some() {
             return;
         }
-        let Some(task) = crate::review::request(Self::client(cx), method, params, cx) else {
+        let Some(task) = crate::review::request(self.client(cx), method, params, cx) else {
             self.git_error = Some("Not connected to the Icarus server".into());
             cx.notify();
             return;

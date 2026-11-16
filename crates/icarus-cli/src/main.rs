@@ -770,6 +770,10 @@ enum RemoteCommand {
         /// For SSH servers: the remote command instead of `icarus-server proxy`.
         #[arg(long)]
         command: Option<String>,
+        /// For a paired address: an SSH destination for the same machine, so the app can open
+        /// its worktrees (e.g. `--ssh devbox`).
+        #[arg(long)]
+        ssh: Option<String>,
     },
     /// List saved servers.
     List,
@@ -897,6 +901,7 @@ async fn remote_command(cli: &Cli, command: &RemoteCommand) -> Result<()> {
             fingerprint,
             label,
             command,
+            ssh,
         } => {
             let mut saved = SavedServers::load()?;
             let server = match parse_address(address)? {
@@ -907,6 +912,7 @@ async fn remote_command(cli: &Cli, command: &RemoteCommand) -> Result<()> {
                     fingerprint: None,
                     client_id: None,
                     command: command.clone(),
+                    ssh: None,
                 },
                 Target::Tcp(addr) => {
                     let code = code.as_deref().context(
@@ -932,6 +938,7 @@ async fn remote_command(cli: &Cli, command: &RemoteCommand) -> Result<()> {
                         fingerprint: client.server_fingerprint.clone(),
                         client_id: client.paired_client_id.clone(),
                         command: None,
+                        ssh: ssh.clone(),
                     }
                 }
             };
@@ -964,6 +971,7 @@ async fn remote_command(cli: &Cli, command: &RemoteCommand) -> Result<()> {
                         "paired": s.token.is_some(),
                         "client_id": s.client_id,
                         "fingerprint": s.fingerprint,
+                        "ssh": s.ssh_destination(),
                     }))
                     .collect::<Vec<_>>()
             );
@@ -971,7 +979,10 @@ async fn remote_command(cli: &Cli, command: &RemoteCommand) -> Result<()> {
                 saved
                     .servers
                     .iter()
-                    .map(|s| format!("{}\t{}", s.name, s.address))
+                    .map(|s| match &s.ssh {
+                        Some(ssh) => format!("{}\t{}\tssh {ssh}", s.name, s.address),
+                        None => format!("{}\t{}", s.name, s.address),
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             });

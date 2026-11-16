@@ -218,7 +218,8 @@ impl DiffTab {
             let editor = editor.downgrade();
             let buffer = buffer.clone();
             let root = root.to_string_lossy().into_owned();
-            cx.new(|cx| DiffReview::new(editor, buffer, root, relative, cx))
+            let client = crate::routing::client_for_project(project.read(cx), cx);
+            cx.new(|cx| DiffReview::new(editor, buffer, root, relative, client, cx))
         });
         let review_changes = review
             .as_ref()
@@ -263,7 +264,8 @@ impl DiffTab {
     pub fn enable_review(&mut self, workspace_key: String, path: String, cx: &mut Context<Self>) {
         let editor = self.editor.downgrade();
         let buffer = self.buffer.clone();
-        let review = cx.new(|cx| DiffReview::new(editor, buffer, workspace_key, path, cx));
+        let client = crate::review::app_client(cx);
+        let review = cx.new(|cx| DiffReview::new(editor, buffer, workspace_key, path, client, cx));
         self._review_changes = Some(vec![cx.observe(&review, |_, _, cx| cx.notify())]);
         self.review = Some(review);
     }

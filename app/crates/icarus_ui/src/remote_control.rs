@@ -18,7 +18,7 @@ use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{HideStatusItem, ItemHandle, StatusItemView, Workspace};
 
-use crate::{app_client, enabled};
+use crate::enabled;
 
 actions!(
     icarus,
@@ -66,7 +66,7 @@ impl RemoteControlSource {
     pub fn server() -> Self {
         Self {
             info: Rc::new(|id, cx| {
-                let Some(client) = app_client(cx) else {
+                let Some(client) = crate::routing::client_for_agent(&id, cx) else {
                     return Task::ready(Err(anyhow::anyhow!("not connected to the Icarus server")));
                 };
                 Tokio::spawn_result(cx, async move {
@@ -75,7 +75,7 @@ impl RemoteControlSource {
                 })
             }),
             set: Rc::new(|id, enabled, cx| {
-                let Some(client) = app_client(cx) else {
+                let Some(client) = crate::routing::client_for_agent(&id, cx) else {
                     return Task::ready(Err(anyhow::anyhow!("not connected to the Icarus server")));
                 };
                 Tokio::spawn_result(cx, async move {

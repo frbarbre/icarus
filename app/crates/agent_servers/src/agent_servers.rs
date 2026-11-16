@@ -25,7 +25,7 @@ pub use acp::test_support::{
 pub use acp::{
     AcpConnection, AcpDebugMessage, AcpDebugMessageContent, AcpDebugMessageDirection,
     AcpV2Connection, DecodedTerminalNotification, DecodedTerminalUpdate,
-    GEMINI_TERMINAL_AUTH_METHOD_ID, v2_terminal_client_builder,
+    GEMINI_TERMINAL_AUTH_METHOD_ID, connect as connect_acp, v2_terminal_client_builder,
 };
 
 pub struct AgentServerDelegate {

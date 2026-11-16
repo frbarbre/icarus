@@ -817,6 +817,9 @@ fn main() {
         icarus_ui::set_open_agent_handler(cx, |agent_id, pane, workspace, window, cx| {
             agent_ui::agent_tab::open_agent_tab(workspace, agent_id, pane, true, window, cx);
         });
+        cx.set_global(agent_ui::agent_tab::TabAgentServer(std::rc::Rc::new(
+            icarus_ui::remote_agent::agent_server_for_project,
+        )));
         icarus_ui::remote_control::set_agent_resolver(cx, |item, cx| {
             item.act_as::<agent_ui::agent_tab::AgentTab>(cx)?
                 .read(cx)

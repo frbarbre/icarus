@@ -19,7 +19,7 @@ use workspace::{OpenOptions, Workspace};
 
 use crate::links::{PreviewDeployment, ordered_previews};
 use crate::review::{ReviewSection, ReviewView};
-use crate::{server_home, status_style};
+use crate::status_style;
 
 actions!(
     icarus,
@@ -939,34 +939,22 @@ impl GitHubPanel {
         }
         panel._poll = cx.spawn(async move |this, cx| {
             loop {
-                let Ok(client) = this.read_with(cx, |panel, _| panel.client.clone()) else {
+                let Ok(workspace) = this.read_with(cx, |panel, _| panel.workspace.clone()) else {
                     return;
                 };
-                let client = match client {
-                    Some(client) => client,
-                    None => {
-                        let connect = Tokio::spawn_result(cx, async move {
-                            let home = server_home()
-                                .ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-                            let (client, _events) = Client::connect(&home, "icarus-github").await?;
-                            Ok(client)
-                        });
-                        match connect.await {
-                            Ok(client) => client,
-                            Err(error) => {
-                                if this
-                                    .update(cx, |panel, cx| panel.set_offline(error, cx))
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                cx.background_executor()
-                                    .timer(GITHUB_REFRESH_INTERVAL)
-                                    .await;
-                                continue;
-                            }
-                        }
+                let client = cx.update(|cx| crate::routing::client_for_workspace(&workspace, cx));
+                let Some(client) = client else {
+                    let offline = anyhow::anyhow!("not connected to the Icarus server");
+                    if this
+                        .update(cx, |panel, cx| panel.set_offline(offline, cx))
+                        .is_err()
+                    {
+                        return;
                     }
+                    cx.background_executor()
+                        .timer(GITHUB_REFRESH_INTERVAL)
+                        .await;
+                    continue;
                 };
                 let Ok(paths) = this.read_with(cx, |panel, cx| panel.project_paths(cx)) else {
                     return;

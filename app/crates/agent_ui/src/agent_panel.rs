@@ -4212,6 +4212,11 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ConversationView> {
+        let server_override = server_override.or_else(|| {
+            cx.try_global::<crate::agent_tab::TabAgentServer>()
+                .map(|hook| hook.0.clone())
+                .and_then(|hook| hook(&self.project, cx))
+        });
         let agent = match &server_override {
             Some(server) => Agent::Custom {
                 id: server.agent_id(),

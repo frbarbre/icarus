@@ -688,6 +688,16 @@ fn open_tab(
     Some(tab)
 }
 
+/// Picks the agent server for new and restored agent tabs in a project (Icarus: the server that owns
+/// the project's workspace); `None` keeps the panel's selected agent.
+pub struct TabAgentServer(
+    pub  std::rc::Rc<
+        dyn Fn(&Entity<Project>, &App) -> Option<std::rc::Rc<dyn agent_servers::AgentServer>>,
+    >,
+);
+
+impl gpui::Global for TabAgentServer {}
+
 /// Present once agent tabs are on; the agent panel then leaves sessions to the tabs.
 pub struct AgentTabsEnabled;
 

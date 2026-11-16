@@ -1180,9 +1180,9 @@ impl DiffReview {
         buffer: Entity<Buffer>,
         workspace_key: String,
         path: String,
+        client: Option<Arc<Client>>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let client = app_client(cx);
         let mut review = Self {
             editor,
             buffer,
