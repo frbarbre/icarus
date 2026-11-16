@@ -111,6 +111,20 @@ impl Default for SshConnectionHost {
     }
 }
 
+// Some login shells exit 0 even when the command is missing, so the exit code alone can't prove
+// the server binary exists; its `version` output must also be a bare version token.
+fn prints_a_version(output: &str) -> bool {
+    output
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .is_some_and(|line| {
+            line.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+                && !line.contains(char::is_whitespace)
+                && !line.contains(':')
+        })
+}
+
 fn bracket_ipv6(host: &str) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{}]", host)
@@ -1047,7 +1061,7 @@ impl SshRemoteConnection {
                 true,
             )
             .await
-            .is_ok();
+            .is_ok_and(|output| prints_a_version(&output));
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
         if let Some(remote_server_path) = super::build_remote_server_from_source(
@@ -2333,6 +2347,18 @@ fn build_command_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_version_line_proves_the_server_binary_exists() {
+        assert!(prints_a_version("0.1.1\n"));
+        assert!(prints_a_version("Last login: today\r\n1.30.0\r\n"));
+        assert!(prints_a_version("12345+dev\n"));
+        assert!(!prints_a_version(""));
+        assert!(!prints_a_version(
+            "zsh:1: no such file or directory: .icarus_server/zed-remote-server-stable-0.1.1\n"
+        ));
+        assert!(!prints_a_version("command not found\n"));
+    }
 
     #[cfg(not(windows))]
     #[test]
