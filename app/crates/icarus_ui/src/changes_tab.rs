@@ -91,7 +91,7 @@ pub(crate) fn next_file(
     }
 }
 
-/// Which rows the list shows (docs/source-control.md §2.1). One per tab, so the shortcuts flip it in place.
+/// Which rows the list shows (spec/source-control.md §2.1). One per tab, so the shortcuts flip it in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangesScope {
     Base,
