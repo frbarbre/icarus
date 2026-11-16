@@ -41,10 +41,10 @@ use git_ui::unstaged_diff::UnstagedDiffToolbar;
 use git_ui_core::file_diff_view::FileDiffStyleToolbar;
 use gpui::{
     Action, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, DismissEvent,
-    Element, Entity, FocusHandle, Focusable, Image, ImageFormat, KeyBinding, ParentElement,
-    PathPromptOptions, PromptLevel, ReadGlobal, SharedString, Size, Task, TaskExt, TitlebarOptions,
-    UpdateGlobal, WeakEntity, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions,
-    actions, image_cache, img, point, px, retain_all,
+    Element, Entity, FocusHandle, Focusable, KeyBinding, ParentElement, PathPromptOptions,
+    PromptLevel, ReadGlobal, SharedString, Size, Task, TaskExt, TitlebarOptions, UpdateGlobal,
+    WeakEntity, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions,
+    image_cache, img, point, px, retain_all,
 };
 use image_viewer::ImageInfo;
 use language::Capability;
@@ -746,7 +746,7 @@ fn show_software_emulation_warning_if_needed(
         };
         let message = format!(
             db::indoc! {r#"
-            Zed uses {} for rendering and requires a compatible GPU.
+            Icarus uses {} for rendering and requires a compatible GPU.
 
             Currently you are using a software emulated GPU ({}) which
             will result in awful performance.
@@ -1567,26 +1567,10 @@ fn initialize_pane(
 }
 
 fn open_about_window(cx: &mut App) {
-    fn about_window_icon(release_channel: ReleaseChannel) -> Arc<Image> {
-        let bytes = match release_channel {
-            ReleaseChannel::Dev => include_bytes!("../resources/app-icon-dev.png").as_slice(),
-            ReleaseChannel::Nightly => {
-                include_bytes!("../resources/app-icon-nightly.png").as_slice()
-            }
-            ReleaseChannel::Preview => {
-                include_bytes!("../resources/app-icon-preview.png").as_slice()
-            }
-            ReleaseChannel::Stable => include_bytes!("../resources/app-icon.png").as_slice(),
-        };
-
-        Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec()))
-    }
-
     struct AboutWindow {
         focus_handle: FocusHandle,
         ok_entry: NavigableEntry,
         copy_entry: NavigableEntry,
-        app_icon: Arc<Image>,
         message: SharedString,
         commit: Option<SharedString>,
         full_version: SharedString,
@@ -1614,7 +1598,6 @@ fn open_about_window(cx: &mut App) {
                 focus_handle: cx.focus_handle(),
                 ok_entry: NavigableEntry::focusable(cx),
                 copy_entry: NavigableEntry::focusable(cx),
-                app_icon: about_window_icon(release_channel),
                 message,
                 commit,
                 full_version,
@@ -1662,7 +1645,7 @@ fn open_about_window(cx: &mut App) {
                             .w_full()
                             .gap_2()
                             .items_center()
-                            .child(img(self.app_icon.clone()).size_16().flex_none())
+                            .child(img(ui::ICARUS_MARK).size_16().flex_none())
                             .child(Headline::new(self.message.clone()))
                             .when_some(self.commit.clone(), |this, commit| {
                                 this.child(

@@ -70,7 +70,7 @@ fn open_copilot_code_verification_window(copilot: &Entity<Copilot>, window: &Win
             is_resizable: false,
             is_movable: true,
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Use GitHub Copilot in Zed".into()),
+                title: Some("Use GitHub Copilot in Icarus".into()),
                 appears_transparent: true,
                 ..Default::default()
             }),
@@ -283,7 +283,7 @@ impl CopilotCodeVerification {
             .items_center()
             .text_center()
             .child(
-                Headline::new("Use GitHub Copilot Edit Predictions in Zed")
+                Headline::new("Use GitHub Copilot Edit Predictions in Icarus")
                     .size(HeadlineSize::Large),
             )
             .child(
@@ -606,7 +606,7 @@ impl CopilotChatCodeVerification {
             .gap_2p5()
             .items_center()
             .text_center()
-            .child(Headline::new("Use GitHub Copilot Chat in Zed").size(HeadlineSize::Large))
+            .child(Headline::new("Use GitHub Copilot Chat in Icarus").size(HeadlineSize::Large))
             .child(
                 Label::new("Using Copilot Chat requires an active subscription on GitHub.")
                     .color(Color::Muted),

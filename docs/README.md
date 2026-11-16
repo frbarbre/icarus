@@ -1,3 +1,5 @@
+<img src="images/icarus-mark-512.png" alt="" width="96" height="96">
+
 # Icarus documentation
 
 Icarus is a native workspace for running coding agents (Claude Code and Codex) in parallel git worktrees. A background server owns every agent, terminal and automation. The app is a soft fork of [Zed](https://zed.dev), and the `icarus` CLI can do everything the app does.

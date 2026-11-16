@@ -123,7 +123,7 @@ mod windows_impl {
             MessageBoxW(
                 None,
                 &HSTRING::from(content),
-                windows::core::w!("Error: Zed update failed."),
+                windows::core::w!("Error: Icarus update failed."),
                 MB_ICONERROR | MB_SYSTEMMODAL,
             )
         };

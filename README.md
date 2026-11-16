@@ -1,3 +1,5 @@
+<img src="docs/images/icarus-mark-512.png" alt="" width="96" height="96">
+
 # Icarus
 
 A fast, native workspace for running coding agents in parallel git worktrees.

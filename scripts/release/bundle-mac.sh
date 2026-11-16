@@ -71,7 +71,7 @@ trap 'mv "$root/app/$manifest.icarus-backup" "$root/app/$manifest"' EXIT
 cat >>"$manifest" <<'EOF'
 
 [package.metadata.bundle]
-icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
+icon = ["resources/icarus/app-icon@2x.png", "resources/icarus/app-icon.png"]
 identifier = "dev.icarus.app"
 name = "Icarus"
 category = "Developer Tool"
@@ -90,11 +90,26 @@ cp "$release_dir/zed" "$app_path/Contents/MacOS/zed"
 cp "$release_dir/cli" "$app_path/Contents/MacOS/cli"
 cp "$bin_dir/icarus" "$bin_dir/icarus-server" "$app_path/Contents/MacOS/"
 mkdir -p "$app_path/Contents/Resources"
-cp crates/zed/resources/Document.icns "$app_path/Contents/Resources/Document.icns"
+icon_dir=crates/zed/resources/icarus
+cp "$icon_dir/Document.icns" "$app_path/Contents/Resources/Document.icns"
+
+# macOS 26 draws the Liquid Glass icon from Assets.car; older macOS falls back to Icarus.icns.
+icon_build=$(mktemp -d)
+xcrun actool "$icon_dir/Icarus.icon" --compile "$icon_build" \
+  --output-format human-readable-text --notices --warnings \
+  --platform macosx --minimum-deployment-target "$MACOSX_DEPLOYMENT_TARGET" \
+  --app-icon Icarus --include-all-app-icons \
+  --output-partial-info-plist "$icon_build/partial.plist"
+cp "$icon_build/Assets.car" "$icon_build/Icarus.icns" "$app_path/Contents/Resources/"
+rm -rf "$icon_build"
 
 plist="$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$plist"
+for key in CFBundleIconFile CFBundleIconName; do
+  /usr/libexec/PlistBuddy -c "Set :$key Icarus" "$plist" 2>/dev/null ||
+    /usr/libexec/PlistBuddy -c "Add :$key string Icarus" "$plist"
+done
 "$root/scripts/release/brand-plist.sh" "$plist"
 
 entitlements=$(mktemp)

@@ -6,7 +6,7 @@ use fs::Fs;
 use gpui::{
     Action, AnyElement, App, AppContext, AsyncWindowContext, Context, Entity, EventEmitter,
     FocusHandle, Focusable, Global, IntoElement, KeyContext, Render, ScrollHandle, SharedString,
-    Subscription, Task, WeakEntity, Window, actions,
+    Subscription, Task, WeakEntity, Window, actions, img,
 };
 use notifications::status_toast::StatusToast;
 use project::agent_server_store::AllAgentServersSettings;
@@ -15,7 +15,7 @@ use serde::Deserialize;
 use settings::{SettingsStore, VsCodeSettingsSource};
 use std::sync::Arc;
 use ui::{
-    Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement, Vector, VectorName,
+    Divider, ICARUS_MARK, KeyBinding, ParentElement as _, StatefulInteractiveElement,
     WithScrollbar as _, prelude::*, rems_from_px,
 };
 
@@ -347,18 +347,20 @@ impl Render for Onboarding {
                                     .child(
                                         h_flex()
                                             .gap_4()
-                                            .child(Vector::square(VectorName::ZedLogo, rems(2.5)))
+                                            .child(img(ICARUS_MARK).size(rems(2.5)).flex_none())
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to Zed")
+                                                        Headline::new("Welcome to Icarus")
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(
-                                                        Label::new("The editor for what's next")
-                                                            .color(Color::Muted)
-                                                            .size(LabelSize::Small)
-                                                            .italic(),
+                                                        Label::new(
+                                                            "Coding agents in parallel worktrees",
+                                                        )
+                                                        .color(Color::Muted)
+                                                        .size(LabelSize::Small)
+                                                        .italic(),
                                                     ),
                                             ),
                                     )
@@ -616,7 +618,9 @@ impl workspace::SerializableItem for Onboarding {
         _cx: &mut App,
     ) -> gpui::Task<gpui::Result<Entity<Self>>> {
         // Icarus has no Zed onboarding; a tab saved by an earlier build must not come back.
-        gpui::Task::ready(Err(anyhow::anyhow!("Zed onboarding is not restored in Icarus")))
+        gpui::Task::ready(Err(anyhow::anyhow!(
+            "Zed onboarding is not restored in Icarus"
+        )))
     }
 
     fn serialize(

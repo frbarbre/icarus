@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <polygon id="upper-paper" points="280,390 870,182 282,490.5" fill="#FFE6A8"/>
+  <polygon id="upper-crease" points="282,490.5 870,182 489.1,447.85" fill="#E6A65A"/>
+  <polygon id="inner-paper" points="282,490.5 489.1,447.85 284,591" fill="#FBD38A"/>
+  <polygon id="left-return" points="280,390 154,716 284,591 282,490.5" fill="#F4BE6C"/>
+</svg>

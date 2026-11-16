@@ -15,6 +15,7 @@ use crate::traits::transformable::Transformable;
 #[strum(serialize_all = "snake_case")]
 pub enum VectorName {
     BusinessStamp,
+    IcarusLogo,
     VipStamp,
     Grid,
     ProTrialStamp,
@@ -31,6 +32,9 @@ impl VectorName {
         format!("images/{file_stem}.svg").into()
     }
 }
+
+/// The full-colour Icarus mark, shown with `gpui::img` wherever the app shows its logo in colour.
+pub const ICARUS_MARK: &str = "images/icarus_mark.png";
 
 /// A vector image, such as an SVG.
 ///
@@ -189,5 +193,9 @@ mod tests {
     #[test]
     fn vector_path() {
         assert_eq!(VectorName::ZedLogo.path().as_ref(), "images/zed_logo.svg");
+        assert_eq!(
+            VectorName::IcarusLogo.path().as_ref(),
+            "images/icarus_logo.svg"
+        );
     }
 }

@@ -218,23 +218,7 @@ fn main() {
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn icon_path() -> std::path::PathBuf {
-    use std::str::FromStr;
-
-    let release_channel = option_env!("RELEASE_CHANNEL").unwrap_or("dev");
-    let channel = match release_channel {
-        "stable" => "",
-        "preview" => "-preview",
-        "nightly" => "-nightly",
-        "dev" => "-dev",
-        _ => "-dev",
-    };
-
-    #[cfg(windows)]
-    let icon = format!("resources/windows/app-icon{}.ico", channel);
-    #[cfg(not(windows))]
-    let icon = format!("resources/app-icon{}.png", channel);
-
-    std::path::PathBuf::from_str(&icon).unwrap()
+    std::path::PathBuf::from("resources/icarus/app-icon.png")
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -255,6 +239,5 @@ fn prepare_app_icon_x11() {
     let icon_out_path = Path::new(&out_dir).join("app_icon.png");
     resized_image.save(&icon_out_path).expect("saving app icon");
 
-    println!("cargo:rerun-if-env-changed=RELEASE_CHANNEL");
     println!("cargo:rerun-if-changed={}", icon_path().to_string_lossy());
 }

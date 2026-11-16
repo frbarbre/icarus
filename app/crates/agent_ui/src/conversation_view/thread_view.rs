@@ -12936,7 +12936,7 @@ impl ThreadView {
             ThreadError::RateLimitExceeded { provider } => self.render_error_callout(
                 "Rate Limit Reached",
                 format!(
-                    "{provider}'s rate limit was reached. Zed will retry automatically. \
+                    "{provider}'s rate limit was reached. Icarus will retry automatically. \
                     You can also wait a moment and try again."
                 )
                 .into(),
@@ -12947,7 +12947,7 @@ impl ThreadView {
             ThreadError::ServerOverloaded { provider } => self.render_error_callout(
                 "Provider Unavailable",
                 format!(
-                    "{provider}'s servers are temporarily unavailable. Zed will retry \
+                    "{provider}'s servers are temporarily unavailable. Icarus will retry \
                     automatically. If the problem persists, check the provider's status page."
                 )
                 .into(),
@@ -12967,7 +12967,7 @@ impl ThreadView {
             ThreadError::StreamError { provider } => self.render_error_callout(
                 "Connection Interrupted",
                 format!(
-                    "The connection to {provider}'s API was interrupted. Zed will retry \
+                    "The connection to {provider}'s API was interrupted. Icarus will retry \
                     automatically. If the problem persists, check your network connection."
                 )
                 .into(),
@@ -13016,7 +13016,7 @@ impl ThreadView {
                 "API Error",
                 format!(
                     "{provider}'s API returned an unexpected error. \
-                    If the problem persists, try switching models or restarting Zed."
+                    If the problem persists, try switching models or restarting Icarus."
                 )
                 .into(),
                 true,

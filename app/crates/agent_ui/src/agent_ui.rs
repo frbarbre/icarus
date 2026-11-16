@@ -405,7 +405,7 @@ actions!(
         ScrollOutputToNextMessage,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
-        /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).
+        /// Import agent threads from other Icarus release channels (e.g. Preview, Nightly).
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
