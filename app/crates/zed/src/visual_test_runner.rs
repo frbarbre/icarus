@@ -1491,12 +1491,13 @@ fn run_visual_test(
     screenshot.save(&output_path)?;
     println!("  Screenshot saved to: {}", output_path.display());
 
-    // Icarus baselines are tracked in git: rewriting a matching one only churns its bytes.
+    // Icarus baselines are tracked in git: rewriting an identical one only churns its bytes. The bar
+    // is far stricter than MATCH_THRESHOLD, which would also keep a baseline missing a small new UI.
     let unchanged = update_baseline
         && test_name.starts_with("icarus_")
         && baseline_path.exists()
         && image::open(&baseline_path).is_ok_and(|baseline| {
-            compare_images(&screenshot, &baseline.to_rgba8()).match_percentage >= MATCH_THRESHOLD
+            compare_images(&screenshot, &baseline.to_rgba8()).match_percentage >= 0.9999
         });
     if unchanged {
         println!("  Baseline unchanged: {}", baseline_path.display());
@@ -3238,8 +3239,29 @@ fn open_icarus_tab_types_window(
 
     cx.update(icarus_ui::sidebar::install_switcher);
     let open = window.update(cx, |workspace, window, cx| {
-        let panel = cx
-            .new(|cx| SourceControlPanel::preview(listing, ChangesScope::Uncommitted, Some(0), cx));
+        let panel = cx.new(|cx| {
+            let mut panel =
+                SourceControlPanel::preview(listing, ChangesScope::Uncommitted, Some(0), cx);
+            // Ages relative to now, so the "3m ago" text is the same on every run.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or_default();
+            let turns = serde_json::from_value(serde_json::json!([
+                { "name": "t2", "files": 2, "added": 18, "removed": 4,
+                  "meta": { "prompt": "Make the session cookie expire with the token", "agentId": "a", "provider": "claude", "completedAt": now_ms.saturating_sub(185_000) } },
+                { "name": "t1", "files": 1, "added": 42, "removed": 0,
+                  "meta": { "prompt": "Add a session store", "agentId": "a", "provider": "claude", "completedAt": now_ms.saturating_sub(3_700_000) } },
+            ]))
+            .unwrap_or_default();
+            let sync = serde_json::from_value(serde_json::json!({
+                "branch": "fix-login", "upstream": "origin/fix-login", "published": true,
+                "ahead": 2, "behind": 1, "has_uncommitted_changes": true
+            }))
+            .unwrap_or_default();
+            panel.set_git_preview(turns, sync, cx);
+            panel
+        });
         workspace.add_panel(panel, window, cx);
         workspace.open_panel::<SourceControlPanel>(window, cx);
         open_diff_tab(

@@ -506,7 +506,7 @@ pub(crate) struct RpcStub(pub Arc<dyn Fn(&str, &Value) -> Result<Value> + Send +
 #[cfg(test)]
 impl gpui::Global for RpcStub {}
 
-fn request(
+pub(crate) fn request(
     client: Option<Arc<Client>>,
     method: &'static str,
     params: Value,

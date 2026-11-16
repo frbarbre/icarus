@@ -1,5 +1,6 @@
 pub mod browser;
 pub mod changes_tab;
+pub mod commit_modal;
 pub mod diff_tab;
 pub mod github_panel;
 pub mod layout;
@@ -607,6 +608,9 @@ fn start_app_connection(cx: &mut App) {
                     }
                     // Notes render in the same diff-tab layer, so one reload covers both.
                     "review.changed" | "note.changed" => cx.update(review::review_changed),
+                    "git.changed" => {
+                        cx.update(|cx| changes_tab::git_changed(event.payload, cx));
+                    }
                     "ports.changed" => {
                         cx.update(|cx| links::ports_changed(event.payload, cx));
                     }

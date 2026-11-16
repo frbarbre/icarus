@@ -692,6 +692,12 @@
     },
   },
   {
+    "context": "IcarusCommit > Editor",
+    "bindings": {
+      "cmd-enter": "icarus::ConfirmCommit",
+    },
+  },
+  {
     "context": "IcarusChanges",
     "bindings": {
       "up": "menu::SelectPrevious",

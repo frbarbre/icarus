@@ -1172,6 +1172,7 @@ impl Server {
             }
             other if other.starts_with("rules.") => self.rules_dispatch(other, params_value).await,
             other if other.starts_with("note.") => self.notes_dispatch(other, params_value).await,
+            other if other.starts_with("git.") => self.git_dispatch(other, params_value).await,
             "workspace.changes"
             | "workspace.changes.explain"
             | "workspace.changes.filter"

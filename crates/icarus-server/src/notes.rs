@@ -540,9 +540,9 @@ fn internal(error: impl std::fmt::Display) -> RpcError {
 }
 
 #[derive(Deserialize, Default)]
-struct Target {
-    workspace: Option<String>,
-    cwd: Option<PathBuf>,
+pub(crate) struct Target {
+    pub(crate) workspace: Option<String>,
+    pub(crate) cwd: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -557,7 +557,7 @@ struct Outcome {
 }
 
 impl Server {
-    fn note_workspace(&self, target: &Target) -> Result<Workspace, RpcError> {
+    pub(crate) fn note_workspace(&self, target: &Target) -> Result<Workspace, RpcError> {
         if let Some(key) = target.workspace.as_deref().filter(|k| !k.is_empty()) {
             return self.workspace_by_key(key);
         }

@@ -1,6 +1,7 @@
 mod acp;
 mod attach;
 mod extras;
+mod git_ops;
 mod issue;
 mod notes;
 mod ports;
@@ -160,6 +161,14 @@ enum Command {
         workspace: Option<String>,
         #[command(subcommand)]
         command: notes::NotesCommand,
+    },
+    /// Source Control actions in a workspace's worktree: discard, stage, commit, push, pull, sync.
+    Git {
+        /// Workspace id, name or path; defaults to $ICARUS_WORKSPACE_ID, then the current directory's.
+        #[arg(long, global = true)]
+        workspace: Option<String>,
+        #[command(subcommand)]
+        command: git_ops::GitCommand,
     },
     /// Notifications from the server (agents, CI, reviews, merges, rules); newest first.
     Notifications {
@@ -2115,6 +2124,10 @@ async fn main() -> Result<()> {
         Command::Notes { workspace, command } => {
             let client = connect(&cli).await?;
             notes::run(&cli, &client, workspace.as_deref(), command).await?;
+        }
+        Command::Git { workspace, command } => {
+            let client = connect(&cli).await?;
+            git_ops::run(&cli, &client, workspace.as_deref(), command).await?;
         }
         Command::Issue { command } => {
             let client = connect(&cli).await?;

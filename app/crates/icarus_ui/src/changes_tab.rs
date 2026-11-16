@@ -8,7 +8,7 @@ use file_icons::FileIcons;
 use git_ui::commit_view::{CommitView, CommitViewOptions};
 use gpui::{
     Action, App, AsyncWindowContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, Pixels, Render, ScrollStrategy, SharedString, Task,
+    Focusable, FontWeight, Pixels, PromptLevel, Render, ScrollStrategy, SharedString, Task,
     UniformListScrollHandle, WeakEntity, Window, actions, px, uniform_list,
 };
 use gpui_tokio::Tokio;
@@ -37,6 +37,18 @@ actions!(
         NextChangedFile,
         /// Opens the previous file in the Changes list (⌥⇧F7).
         PreviousChangedFile,
+        /// Throws away the selected file's uncommitted change, after asking.
+        DiscardSelectedChange,
+        /// Opens the commit dialog (⌘Enter commits).
+        CommitChanges,
+        /// Pushes the workspace's branch, publishing it if needed.
+        PushBranch,
+        /// Pushes with --force-with-lease, which refuses if the remote moved since the last fetch.
+        ForcePushWithLease,
+        /// Pulls the branch's own upstream.
+        PullBranch,
+        /// Pulls, then pushes.
+        SyncBranch,
     ]
 );
 
@@ -146,6 +158,156 @@ pub struct Row {
     pub removed: Option<u64>,
     #[serde(default)]
     pub binary: bool,
+    #[serde(default)]
+    pub unstaged: bool,
+    #[serde(default)]
+    pub untracked: bool,
+    #[serde(default)]
+    pub conflicted: bool,
+}
+
+/// The row's Discard button label, when it has one: only for an unstaged or untracked change that
+/// isn't conflicted, and never while a turn or commit is shown (source-control.md §1.6).
+pub(crate) fn discard_label(row: &Row, scope: &ChangesScope) -> Option<&'static str> {
+    if !matches!(scope, ChangesScope::Base | ChangesScope::Uncommitted)
+        || row.conflicted
+        || !(row.unstaged || row.untracked)
+    {
+        return None;
+    }
+    Some(if row.untracked {
+        "Delete untracked file"
+    } else if row.status == "deleted" {
+        "Restore file"
+    } else {
+        "Discard changes"
+    })
+}
+
+/// One agent turn snapshot (`workspace.turns`), newest first.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct TurnRow {
+    pub name: String,
+    #[serde(default)]
+    pub meta: Option<TurnRowMeta>,
+    #[serde(default)]
+    pub files: usize,
+    #[serde(default)]
+    pub added: u64,
+    #[serde(default)]
+    pub removed: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnRowMeta {
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub completed_at: u64,
+}
+
+impl TurnRow {
+    /// The prompt's first line, as the row's title.
+    fn title(&self) -> String {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.prompt.lines().find(|line| !line.trim().is_empty()))
+            .map(|line| line.trim().to_string())
+            .unwrap_or_else(|| "Agent turn".to_string())
+    }
+
+    /// `agent · 3m ago · 2 files +4 −1`.
+    fn detail(&self, now_ms: u64) -> String {
+        let agent = self
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.provider.clone())
+            .unwrap_or_else(|| "agent".to_string());
+        let age = self
+            .meta
+            .as_ref()
+            .map(|meta| relative_age(now_ms.saturating_sub(meta.completed_at)))
+            .unwrap_or_default();
+        let files = if self.files == 1 {
+            "1 file".to_string()
+        } else {
+            format!("{} files", self.files)
+        };
+        format!(
+            "{agent} · {age} · {files} +{} −{}",
+            self.added, self.removed
+        )
+    }
+}
+
+/// Open Source Control panels, so a `git.changed` event refreshes them at once instead of on the next poll.
+#[derive(Default)]
+struct SourceControlPanels(Vec<WeakEntity<SourceControlPanel>>);
+
+impl gpui::Global for SourceControlPanels {}
+
+/// A git action ran on the server (from any client or agent): reload the panels and open diffs.
+pub(crate) fn git_changed(payload: serde_json::Value, cx: &mut App) {
+    let workspace = payload["workspace"].as_str().map(str::to_owned);
+    let panels = cx
+        .try_global::<SourceControlPanels>()
+        .map(|panels| panels.0.clone())
+        .unwrap_or_default();
+    for panel in panels {
+        panel
+            .update(cx, |panel, cx| {
+                if workspace.is_none() || panel.icarus_workspace == workspace {
+                    panel.refresh(cx);
+                }
+            })
+            .ok();
+    }
+    if cx.has_global::<SourceControlPanels>() {
+        cx.update_global::<SourceControlPanels, _>(|panels, _| {
+            panels.0.retain(|panel| panel.upgrade().is_some())
+        });
+    }
+    crate::review::review_changed(cx);
+}
+
+/// The server's message without its error code, so git's words reach the user unchanged.
+pub(crate) fn git_error_text(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<icarus_client::ClientError>() {
+        Some(icarus_client::ClientError::Rpc(rpc)) => rpc.message.clone(),
+        None => format!("{error:#}"),
+    }
+}
+
+fn relative_age(elapsed_ms: u64) -> String {
+    let minutes = elapsed_ms / 60_000;
+    match minutes {
+        0 => "just now".to_string(),
+        1..=59 => format!("{minutes}m ago"),
+        60..=1439 => format!("{}h ago", minutes / 60),
+        _ => format!("{}d ago", minutes / 1440),
+    }
+}
+
+/// Where the branch pushes and how far it is from there (`git.status`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct SyncInfo {
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub upstream: Option<String>,
+    #[serde(default)]
+    pub published: bool,
+    #[serde(default)]
+    pub ahead: u32,
+    #[serde(default)]
+    pub behind: u32,
+    #[serde(default)]
+    pub has_uncommitted_changes: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
@@ -241,6 +403,7 @@ fn status_color(status: &str) -> Color {
 fn scope_badge(
     scope: &ChangesScope,
     listing: Option<&Listing>,
+    newest_turn: Option<&str>,
 ) -> Option<(String, Option<String>)> {
     let prompt = listing
         .and_then(|listing| listing.turn.as_ref())
@@ -250,6 +413,10 @@ fn scope_badge(
         ChangesScope::Base => None,
         ChangesScope::Uncommitted => Some(("Uncommitted".into(), None)),
         ChangesScope::LatestTurn => Some(("Latest turn".into(), prompt)),
+        // A previewed turn reads as latest only while no newer turn has landed (§2.1).
+        ChangesScope::Turn(name) if newest_turn == Some(name.as_str()) => {
+            Some(("Latest turn".into(), prompt))
+        }
         ChangesScope::Turn(_) => Some(("Historical changes".into(), prompt)),
         ChangesScope::Commit(sha) => Some((
             format!("Commit {}", &sha[..sha.len().min(7)]),
@@ -275,6 +442,14 @@ pub struct SourceControlPanel {
     last_step: Option<(bool, Instant)>,
     /// Open notes per changed file, shown as a badge on its row.
     note_counts: HashMap<String, usize>,
+    /// The workspace's agent turns, newest first.
+    turns: Vec<TurnRow>,
+    turns_collapsed: bool,
+    sync: Option<SyncInfo>,
+    /// The running git action's label, e.g. "Pushing…".
+    git_busy: Option<SharedString>,
+    /// The last git action's failure, in git's own words.
+    git_error: Option<SharedString>,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     refreshing: Option<Task<()>>,
@@ -299,6 +474,10 @@ impl SourceControlPanel {
         let project = workspace.project().downgrade();
         let root = worktree_root(&project, cx).unwrap_or_default();
         let workspace = workspace.weak_handle();
+        if crate::enabled(cx) {
+            let this = cx.entity().downgrade();
+            cx.default_global::<SourceControlPanels>().0.push(this);
+        }
         // Polls only while the panel shows; the shortcuts reveal it first.
         let poll = if !crate::enabled(cx) {
             Task::ready(())
@@ -328,6 +507,11 @@ impl SourceControlPanel {
             selected: None,
             last_step: None,
             note_counts: HashMap::default(),
+            turns: Vec::new(),
+            turns_collapsed: false,
+            sync: None,
+            git_busy: None,
+            git_error: None,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             refreshing: None,
@@ -355,6 +539,11 @@ impl SourceControlPanel {
             selected,
             last_step: None,
             note_counts: HashMap::default(),
+            turns: Vec::new(),
+            turns_collapsed: false,
+            sync: None,
+            git_busy: None,
+            git_error: None,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             refreshing: None,
@@ -362,6 +551,13 @@ impl SourceControlPanel {
             active: true,
             _poll: Task::ready(()),
         }
+    }
+
+    /// Fills the turns and branch state a server would, for previews.
+    pub fn set_git_preview(&mut self, turns: Vec<TurnRow>, sync: SyncInfo, cx: &mut Context<Self>) {
+        self.turns = turns;
+        self.sync = Some(sync);
+        cx.notify();
     }
 
     pub fn scope(&self) -> &ChangesScope {
@@ -440,15 +636,29 @@ impl SourceControlPanel {
                 .ok()
                 .map(|value| note_counts(&value))
                 .unwrap_or_default();
-            anyhow::Ok((id, listing, note_counts))
+            // Turns and the branch state are extras: a failure leaves those sections empty.
+            let turns = client
+                .request("workspace.turns", serde_json::json!({ "id": id }))
+                .await
+                .ok()
+                .and_then(|value| serde_json::from_value::<Vec<TurnRow>>(value).ok())
+                .unwrap_or_default();
+            let sync = client
+                .request("git.status", serde_json::json!({ "workspace": id }))
+                .await
+                .ok()
+                .and_then(|value| serde_json::from_value::<SyncInfo>(value).ok());
+            anyhow::Ok((id, listing, note_counts, turns, sync))
         });
         self.refreshing = Some(cx.spawn(async move |this, cx| {
             let result = fetch.await;
             this.update(cx, |this, cx| {
                 this.refreshing = None;
                 match result {
-                    Ok((id, listing, note_counts)) => {
+                    Ok((id, listing, note_counts, turns, sync)) => {
                         this.note_counts = note_counts;
+                        this.turns = turns;
+                        this.sync = sync;
                         this.icarus_workspace = Some(id);
                         this.error = None;
                         if let Some(selected) = this.selected
@@ -581,6 +791,156 @@ impl SourceControlPanel {
         });
     }
 
+    /// Asks, then throws away the row's uncommitted change (committed branch changes stay).
+    pub fn discard_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.rows().get(index).cloned() else {
+            return;
+        };
+        let Some(label) = discard_label(&row, &self.scope) else {
+            return;
+        };
+        let Some(workspace) = self.icarus_workspace.clone() else {
+            return;
+        };
+        let detail = format!(
+            "{}\n\nOnly the uncommitted change is thrown away; what's committed on the branch stays. This can't be undone.",
+            row.path
+        );
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("{label}?"),
+            Some(&detail),
+            &[label, "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await? != 0 {
+                return anyhow::Ok(());
+            }
+            this.update(cx, |this, cx| {
+                this.run_git(
+                    "git.discard",
+                    serde_json::json!({ "workspace": workspace, "paths": [row.path] }),
+                    "Discarding…",
+                    cx,
+                );
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Runs a `git.*` RPC for this workspace, showing its progress and git's own error text.
+    pub fn run_git(
+        &mut self,
+        method: &'static str,
+        params: serde_json::Value,
+        busy: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.git_busy.is_some() {
+            return;
+        }
+        let Some(task) = crate::review::request(Self::client(cx), method, params, cx) else {
+            self.git_error = Some("Not connected to the Icarus server".into());
+            cx.notify();
+            return;
+        };
+        self.git_busy = Some(busy.to_string().into());
+        self.git_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.git_busy = None;
+                match result {
+                    Ok(value) => {
+                        if let Ok(sync) = serde_json::from_value::<SyncInfo>(value)
+                            && sync.branch.is_some()
+                        {
+                            this.sync = Some(sync);
+                        }
+                        this.refresh(cx);
+                    }
+                    Err(error) => this.git_error = Some(git_error_text(&error).into()),
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn workspace_params(&self) -> Option<serde_json::Value> {
+        self.icarus_workspace
+            .as_ref()
+            .map(|id| serde_json::json!({ "workspace": id }))
+    }
+
+    pub fn push(&mut self, force_with_lease: bool, cx: &mut Context<Self>) {
+        let Some(mut params) = self.workspace_params() else {
+            return;
+        };
+        params["force_with_lease"] = serde_json::json!(force_with_lease);
+        let busy = if force_with_lease {
+            "Force pushing…"
+        } else {
+            "Pushing…"
+        };
+        self.run_git("git.push", params, busy, cx);
+    }
+
+    pub fn pull(&mut self, cx: &mut Context<Self>) {
+        if let Some(params) = self.workspace_params() {
+            self.run_git("git.pull", params, "Pulling…", cx);
+        }
+    }
+
+    pub fn sync_branch(&mut self, cx: &mut Context<Self>) {
+        if let Some(params) = self.workspace_params() {
+            self.run_git("git.sync", params, "Syncing…", cx);
+        }
+    }
+
+    pub fn commit(&mut self, message: String, amend: bool, cx: &mut Context<Self>) {
+        let Some(mut params) = self.workspace_params() else {
+            return;
+        };
+        params["message"] = serde_json::json!(message);
+        params["amend"] = serde_json::json!(amend);
+        self.run_git("git.commit", params, "Committing…", cx);
+    }
+
+    /// Shows what the turn changed: the turn scope plus its first file (source-control.md §2.1).
+    pub fn open_turn(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(turn) = self.turns.get(index) else {
+            return;
+        };
+        self.set_scope(ChangesScope::Turn(turn.name.clone()), cx);
+        // The rows arrive with the refresh; open the first one once they're in.
+        cx.spawn_in(window, async move |this, cx| {
+            for _ in 0..50 {
+                let opened = this.update_in(cx, |this, window, cx| {
+                    if this.refreshing.is_some() {
+                        return false;
+                    }
+                    if !this.rows().is_empty() {
+                        this.select(0, cx);
+                        this.open_selected(window, cx);
+                    }
+                    true
+                })?;
+                if opened {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let listing = self.listing.as_ref();
         let totals = listing.map(|listing| listing.totals).unwrap_or_default();
@@ -597,7 +957,11 @@ impl SourceControlPanel {
                 base.clone().unwrap_or_else(|| "the base".into())
             )
         });
-        let badge = scope_badge(&self.scope, listing);
+        let badge = scope_badge(
+            &self.scope,
+            listing,
+            self.turns.first().map(|turn| turn.name.as_str()),
+        );
         let facets = listing
             .map(|listing| listing.facets.clone())
             .unwrap_or_default();
@@ -735,8 +1099,10 @@ impl SourceControlPanel {
         let icon = FileIcons::get_icon(path, cx);
         let selected = self.selected == Some(index);
         let color = status_color(&row.status);
+        let discard = discard_label(row, &self.scope);
         h_flex()
             .id(("changes-row", index))
+            .group("changes-row")
             .h(px(26.))
             .px_2()
             .gap_1p5()
@@ -822,12 +1188,270 @@ impl SourceControlPanel {
                     )
                 },
             )
+            .when_some(discard, |this, label| {
+                this.child(
+                    IconButton::new(("changes-row-discard", index), IconName::Undo)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .visible_on_hover("changes-row")
+                        .tooltip(Tooltip::text(label))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.discard_row(index, window, cx);
+                        })),
+                )
+            })
             .child(
                 Label::new(status_letter(&row.status))
                     .size(LabelSize::XSmall)
                     .color(color),
             )
             .into_any_element()
+    }
+
+    fn render_turns(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+        let collapsed = self.turns_collapsed;
+        let showing = match &self.scope {
+            ChangesScope::Turn(name) => Some(name.clone()),
+            ChangesScope::LatestTurn => self.turns.first().map(|turn| turn.name.clone()),
+            _ => None,
+        };
+        v_flex()
+            .w_full()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                h_flex()
+                    .id("changes-turns-header")
+                    .h(px(28.))
+                    .px_2()
+                    .gap_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.turns_collapsed = !this.turns_collapsed;
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("AGENT TURNS")
+                            .size(LabelSize::XSmall)
+                            .weight(FontWeight::SEMIBOLD)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(self.turns.len().to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .when(!collapsed, |this| {
+                this.child(
+                    v_flex()
+                        .id("changes-turns")
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .pb_1()
+                        .children(self.turns.iter().enumerate().map(|(index, turn)| {
+                            let current = showing.as_deref() == Some(turn.name.as_str());
+                            let prompt = turn
+                                .meta
+                                .as_ref()
+                                .map(|meta| meta.prompt.clone())
+                                .unwrap_or_default();
+                            h_flex()
+                                .id(("changes-turn", index))
+                                .px_2()
+                                .py_0p5()
+                                .gap_1p5()
+                                .w_full()
+                                .cursor_pointer()
+                                .when(current, |this| {
+                                    this.bg(cx.theme().colors().element_selected)
+                                })
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .when(!prompt.is_empty(), |this| {
+                                    this.tooltip(Tooltip::text(prompt))
+                                })
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.open_turn(index, window, cx);
+                                }))
+                                .child(
+                                    Icon::new(IconName::ZedAssistant)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            Label::new(turn.title())
+                                                .size(LabelSize::Small)
+                                                .single_line()
+                                                .truncate(),
+                                        )
+                                        .child(
+                                            Label::new(turn.detail(now_ms))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .single_line()
+                                                .truncate(),
+                                        ),
+                                )
+                        })),
+                )
+            })
+    }
+
+    fn render_git_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sync = self.sync.clone().unwrap_or_default();
+        let busy = self.git_busy.clone();
+        let idle = busy.is_none();
+        let branch: SharedString = sync
+            .branch
+            .clone()
+            .unwrap_or_else(|| "detached HEAD".to_string())
+            .into();
+        let position = if !sync.published {
+            "not published".to_string()
+        } else if sync.ahead == 0 && sync.behind == 0 {
+            "up to date".to_string()
+        } else {
+            format!("↑{} ↓{}", sync.ahead, sync.behind)
+        };
+        let weak = cx.entity().downgrade();
+        v_flex()
+            .w_full()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .when_some(self.git_error.clone(), |this, error| {
+                this.child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .items_start()
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::XSmall)
+                                .color(Color::Error),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(error)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Error),
+                            ),
+                        )
+                        .child(
+                            IconButton::new("changes-git-error-dismiss", IconName::Close)
+                                .icon_size(IconSize::XSmall)
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.git_error = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                h_flex()
+                    .h(px(30.))
+                    .px_2()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(match &busy {
+                                Some(busy) => busy.clone(),
+                                None => format!("{branch} · {position}").into(),
+                            })
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line()
+                            .truncate(),
+                        ),
+                    )
+                    .child(
+                        Button::new("changes-commit", "Commit…")
+                            .label_size(LabelSize::XSmall)
+                            .disabled(!idle)
+                            .tooltip(Tooltip::for_action_title("Commit", &CommitChanges))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(CommitChanges), cx);
+                            }),
+                    )
+                    .child(
+                        IconButton::new("changes-pull", IconName::ArrowDown)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!idle || !sync.published)
+                            .tooltip(Tooltip::text(if sync.behind > 0 {
+                                format!("Pull {} commit(s)", sync.behind)
+                            } else {
+                                "Pull".to_string()
+                            }))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pull(cx))),
+                    )
+                    .child(
+                        IconButton::new("changes-push", IconName::ArrowUp)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!idle)
+                            .tooltip(Tooltip::text(if !sync.published {
+                                "Publish branch".to_string()
+                            } else if sync.ahead > 0 {
+                                format!("Push {} commit(s)", sync.ahead)
+                            } else {
+                                "Push".to_string()
+                            }))
+                            .on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.push(false, cx)),
+                            ),
+                    )
+                    .child(
+                        PopoverMenu::new("changes-git-more")
+                            .trigger(
+                                IconButton::new("changes-git-more-trigger", IconName::Ellipsis)
+                                    .icon_size(IconSize::XSmall)
+                                    .disabled(!idle),
+                            )
+                            .menu(move |window, cx| {
+                                let weak = weak.clone();
+                                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                    let sync_target = weak.clone();
+                                    let force_target = weak;
+                                    menu.entry("Sync (pull, then push)", None, move |_, cx| {
+                                        sync_target
+                                            .update(cx, |this, cx| this.sync_branch(cx))
+                                            .log_err();
+                                    })
+                                    .entry(
+                                        "Force push (with lease)",
+                                        None,
+                                        move |_, cx| {
+                                            force_target
+                                                .update(cx, |this, cx| this.push(true, cx))
+                                                .log_err();
+                                        },
+                                    )
+                                }))
+                            }),
+                    ),
+            )
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1143,6 +1767,45 @@ pub fn register(cx: &mut App) {
         workspace.register_action(|workspace, _: &PreviousChangedFile, window, cx| {
             step_changed_file(false, workspace, window, cx);
         });
+        workspace.register_action(|workspace, _: &DiscardSelectedChange, window, cx| {
+            let Some(panel) = workspace.panel::<SourceControlPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                if let Some(selected) = panel.selected {
+                    panel.discard_row(selected, window, cx);
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &CommitChanges, window, cx| {
+            let Some(panel) = reveal_source_control(workspace, window, cx) else {
+                return;
+            };
+            let panel = panel.downgrade();
+            workspace.toggle_modal(window, cx, |window, cx| {
+                crate::commit_modal::CommitModal::new(panel, window, cx)
+            });
+        });
+        workspace.register_action(|workspace, _: &PushBranch, window, cx| {
+            if let Some(panel) = reveal_source_control(workspace, window, cx) {
+                panel.update(cx, |panel, cx| panel.push(false, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &ForcePushWithLease, window, cx| {
+            if let Some(panel) = reveal_source_control(workspace, window, cx) {
+                panel.update(cx, |panel, cx| panel.push(true, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &PullBranch, window, cx| {
+            if let Some(panel) = reveal_source_control(workspace, window, cx) {
+                panel.update(cx, |panel, cx| panel.pull(cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &SyncBranch, window, cx| {
+            if let Some(panel) = reveal_source_control(workspace, window, cx) {
+                panel.update(cx, |panel, cx| panel.sync_branch(cx));
+            }
+        });
     })
     .detach();
 }
@@ -1271,6 +1934,12 @@ impl Render for SourceControlPanel {
                     )
                 }
             })
+            .when(!self.turns.is_empty(), |this| {
+                this.child(self.render_turns(cx))
+            })
+            .when(self.icarus_workspace.is_some(), |this| {
+                this.child(self.render_git_bar(cx))
+            })
     }
 }
 
@@ -1347,15 +2016,105 @@ mod tests {
     fn scopes_go_on_the_wire_and_badge_as_orca_does() {
         assert_eq!(ChangesScope::LatestTurn.wire(), "turn:latest");
         assert_eq!(ChangesScope::Commit("abc".into()).wire(), "commit:abc");
-        assert_eq!(scope_badge(&ChangesScope::Base, None), None);
+        assert_eq!(scope_badge(&ChangesScope::Base, None, None), None);
         assert_eq!(
-            scope_badge(&ChangesScope::Commit("0123456789".into()), None).map(|(text, _)| text),
+            scope_badge(&ChangesScope::Commit("0123456789".into()), None, None)
+                .map(|(text, _)| text),
             Some("Commit 0123456".into())
         );
         assert_eq!(
-            scope_badge(&ChangesScope::Turn("t1".into()), None).map(|(text, _)| text),
+            scope_badge(&ChangesScope::Turn("t1".into()), None, Some("t2")).map(|(text, _)| text),
             Some("Historical changes".into())
         );
+        assert_eq!(
+            scope_badge(&ChangesScope::Turn("t2".into()), None, Some("t2")).map(|(text, _)| text),
+            Some("Latest turn".into()),
+            "a previewed turn is latest until a newer one lands"
+        );
+    }
+
+    #[test]
+    fn discard_is_offered_only_for_local_changes_outside_turns_and_commits() {
+        let row = |status: &str, unstaged: bool, untracked: bool, conflicted: bool| Row {
+            path: "a.txt".into(),
+            status: status.into(),
+            old_path: None,
+            added: None,
+            removed: None,
+            binary: false,
+            unstaged,
+            untracked,
+            conflicted,
+        };
+        let base = ChangesScope::Base;
+        assert_eq!(
+            discard_label(&row("modified", true, false, false), &base),
+            Some("Discard changes")
+        );
+        assert_eq!(
+            discard_label(&row("added", false, true, false), &base),
+            Some("Delete untracked file")
+        );
+        assert_eq!(
+            discard_label(&row("deleted", true, false, false), &base),
+            Some("Restore file")
+        );
+        assert_eq!(
+            discard_label(&row("modified", false, false, false), &base),
+            None,
+            "committed only"
+        );
+        assert_eq!(
+            discard_label(&row("modified", true, false, true), &base),
+            None,
+            "conflicted"
+        );
+        assert_eq!(
+            discard_label(
+                &row("modified", true, false, false),
+                &ChangesScope::Turn("t".into())
+            ),
+            None
+        );
+        assert_eq!(
+            discard_label(
+                &row("modified", true, false, false),
+                &ChangesScope::Uncommitted
+            ),
+            Some("Discard changes")
+        );
+    }
+
+    #[test]
+    fn turn_rows_read_like_orca() {
+        let turn = TurnRow {
+            name: "t".into(),
+            meta: Some(TurnRowMeta {
+                prompt: "\nFix the login\nand more".into(),
+                agent_id: "agent-1".into(),
+                provider: Some("claude".into()),
+                completed_at: 1_000_000,
+            }),
+            files: 2,
+            added: 4,
+            removed: 1,
+        };
+        assert_eq!(turn.title(), "Fix the login");
+        assert_eq!(
+            turn.detail(1_000_000 + 3 * 60_000),
+            "claude · 3m ago · 2 files +4 −1"
+        );
+        // The server sends turn metadata in camelCase, as git stores it.
+        let parsed: TurnRow = serde_json::from_value(json!({
+            "name": "001794797580408-80175ea3", "oid": "80175ea3", "parent": "p",
+            "files": 2, "added": 4, "removed": 1,
+            "meta": { "agentId": "agent-1", "completedAt": 1_000_000, "prompt": "\nFix the login\nand more",
+                      "provider": "claude", "startedAt": 999_000 },
+        }))
+        .expect("server turn");
+        assert_eq!(parsed.meta, turn.meta);
+        assert_eq!(relative_age(30_000), "just now");
+        assert_eq!(relative_age(2 * 3_600_000), "2h ago");
     }
 
     #[test]
@@ -1376,6 +2135,234 @@ mod tests {
             Some(DiffBase::Uncommitted),
             "§5.1 step 4"
         );
+    }
+
+    /// A Source Control panel in a real workspace, already loaded, with RPCs answered by `answer`.
+    async fn git_panel(
+        cx: &mut gpui::TestAppContext,
+        answer: impl Fn(&str, &serde_json::Value) -> anyhow::Result<serde_json::Value>
+        + Send
+        + Sync
+        + 'static,
+    ) -> (
+        Entity<Workspace>,
+        Entity<SourceControlPanel>,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        gpui::VisualTestContext,
+    ) {
+        let (workspace, mut cx) = crate::diff_tab::tests::git_workspace(cx).await;
+        let calls = cx.update(|_, cx| crate::review::tests::stub_rpc(cx, answer));
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| SourceControlPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        panel.update(&mut cx, |panel, _| {
+            let mut listing = sample_listing();
+            listing.rows[0].unstaged = true;
+            panel.listing = Some(listing);
+            panel.icarus_workspace = Some("ws-1".into());
+            panel.refreshing = Some(Task::ready(()));
+            panel.sync = Some(SyncInfo {
+                branch: Some("feature".into()),
+                upstream: Some("origin/feature".into()),
+                published: true,
+                ahead: 2,
+                behind: 0,
+                has_uncommitted_changes: true,
+            });
+        });
+        (workspace, panel, calls, cx)
+    }
+
+    #[gpui::test]
+    async fn discarding_asks_first_and_sends_only_the_chosen_file(cx: &mut gpui::TestAppContext) {
+        let (_workspace, panel, calls, mut cx) =
+            git_panel(cx, |_, _| Ok(json!({ "discarded": [] }))).await;
+        let cx = &mut cx;
+        panel.update(cx, |panel, cx| panel.select(0, cx));
+
+        cx.dispatch_action(DiscardSelectedChange);
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "discarding asks first");
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(crate::review::tests::calls_to(&calls, "git.discard").is_empty());
+
+        cx.dispatch_action(DiscardSelectedChange);
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Discard changes");
+        cx.run_until_parked();
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "git.discard"),
+            [json!({ "workspace": "ws-1", "paths": ["src/app.rs"] })]
+        );
+
+        // A committed-only row has nothing to discard, so nothing is asked.
+        panel.update(cx, |panel, cx| panel.select(1, cx));
+        cx.dispatch_action(DiscardSelectedChange);
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+    }
+
+    #[gpui::test]
+    async fn the_commit_dialog_commits_on_cmd_enter(cx: &mut gpui::TestAppContext) {
+        let (workspace, _panel, calls, mut cx) = git_panel(cx, |method, _| match method {
+            "git.commit" => {
+                Ok(json!({ "oid": "abc", "summary": "Fix login", "committed_all": true }))
+            }
+            _ => Ok(json!({})),
+        })
+        .await;
+        let cx = &mut cx;
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "cmd-enter",
+                crate::commit_modal::ConfirmCommit,
+                Some("IcarusCommit > Editor"),
+            )])
+        });
+
+        cx.dispatch_action(CommitChanges);
+        cx.run_until_parked();
+        let modal = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<crate::commit_modal::CommitModal>(cx)
+            })
+            .expect("the commit dialog opens");
+        cx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        assert!(
+            crate::review::tests::calls_to(&calls, "git.commit").is_empty(),
+            "no message, no commit"
+        );
+
+        cx.simulate_input("Fix login");
+        modal.read_with(cx, |modal, cx| {
+            assert_eq!(modal.message_text(cx), "Fix login")
+        });
+        cx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "git.commit"),
+            [json!({ "workspace": "ws-1", "message": "Fix login", "amend": false })]
+        );
+        assert!(
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_modal::<crate::commit_modal::CommitModal>(cx)
+                    .is_none()
+            }),
+            "committing closes the dialog"
+        );
+    }
+
+    #[gpui::test]
+    async fn push_shows_progress_and_git_errors_verbatim(cx: &mut gpui::TestAppContext) {
+        let reject = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let rejecting = reject.clone();
+        let (_workspace, panel, calls, mut cx) = git_panel(cx, move |method, _| {
+            if method == "git.push" && rejecting.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow::anyhow!(icarus_client::ClientError::Rpc(
+                    icarus_protocol::RpcError::new(
+                        "git_failed",
+                        "! [rejected] feature -> feature (stale info)"
+                    )
+                )));
+            }
+            Ok(json!({
+                "branch": "feature", "upstream": "origin/feature", "published": true,
+                "ahead": 0, "behind": 0, "has_uncommitted_changes": false
+            }))
+        })
+        .await;
+        let cx = &mut cx;
+
+        cx.dispatch_action(ForcePushWithLease);
+        cx.run_until_parked();
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "git.push"),
+            [json!({ "workspace": "ws-1", "force_with_lease": true })]
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.git_error.as_deref(),
+                Some("! [rejected] feature -> feature (stale info)"),
+                "git's own words, without the error code"
+            );
+            assert!(panel.git_busy.is_none());
+            assert_eq!(
+                panel.sync.as_ref().map(|sync| sync.ahead),
+                Some(2),
+                "unchanged"
+            );
+        });
+
+        reject.store(false, std::sync::atomic::Ordering::SeqCst);
+        cx.dispatch_action(PushBranch);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.git_error.is_none(),
+                "a new attempt clears the old error"
+            );
+            assert_eq!(panel.sync.as_ref().map(|sync| sync.ahead), Some(0));
+        });
+
+        // While one runs, a second press is ignored rather than queued.
+        panel.update(cx, |panel, cx| {
+            panel.git_busy = Some("Pulling…".into());
+            panel.push(false, cx);
+        });
+        assert_eq!(crate::review::tests::calls_to(&calls, "git.push").len(), 2);
+    }
+
+    #[gpui::test]
+    async fn clicking_a_turn_filters_the_list_to_it(cx: &mut gpui::TestAppContext) {
+        let (_workspace, panel, _calls, mut cx) = git_panel(cx, |_, _| Ok(json!({}))).await;
+        let cx = &mut cx;
+        let turn = |name: &str, prompt: &str| TurnRow {
+            name: name.into(),
+            meta: Some(TurnRowMeta {
+                prompt: prompt.into(),
+                agent_id: "agent-1".into(),
+                provider: Some("claude".into()),
+                completed_at: 0,
+            }),
+            files: 1,
+            added: 1,
+            removed: 0,
+        };
+        panel.update(cx, |panel, _| {
+            panel.turns = vec![turn("t2", "Second"), turn("t1", "First")];
+        });
+
+        panel.update_in(cx, |panel, window, cx| panel.open_turn(1, window, cx));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.scope(), &ChangesScope::Turn("t1".into()));
+            assert_eq!(
+                scope_badge(
+                    panel.scope(),
+                    None,
+                    panel.turns.first().map(|t| t.name.as_str())
+                )
+                .map(|(text, _)| text),
+                Some("Historical changes".into())
+            );
+        });
+        panel.update_in(cx, |panel, window, cx| panel.open_turn(0, window, cx));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.scope(), &ChangesScope::Turn("t2".into()));
+            assert_eq!(
+                scope_badge(
+                    panel.scope(),
+                    None,
+                    panel.turns.first().map(|t| t.name.as_str())
+                )
+                .map(|(text, _)| text),
+                Some("Latest turn".into())
+            );
+        });
     }
 
     #[gpui::test]

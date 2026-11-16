@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub mod filters;
+pub mod ops;
 pub mod review_base;
 pub mod turns;
 
