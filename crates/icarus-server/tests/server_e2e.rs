@@ -481,7 +481,11 @@ async fn a_terminal_created_with_a_workspace_name_belongs_to_it_and_starts_in_it
         .request("workspace.info", json!({ "id": workspace["id"] }))
         .await
         .expect("workspace info");
-    let listed: Vec<&Value> = info["terminals"].as_array().expect("terminals").iter().collect();
+    let listed: Vec<&Value> = info["terminals"]
+        .as_array()
+        .expect("terminals")
+        .iter()
+        .collect();
     assert!(
         listed.iter().any(|t| t["id"] == terminal["id"]),
         "the workspace lists the terminal: {info}"
