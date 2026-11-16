@@ -222,4 +222,18 @@ async fn accounts_history_resume_and_workspace_sleep_from_the_cli() {
         env.ok(&["workspace", "wake", ws_id]).trim(),
         "woke 1 agent(s) and 0 terminal(s)"
     );
+
+    assert!(
+        env.ok(&["workspace", "set", ws_id, "--pin"])
+            .ends_with("pinned\n")
+    );
+    assert!(env.ok(&["workspace", "list"]).contains("  pinned"));
+    assert_eq!(env.json(&["workspace", "show", ws_id])["pinned"], true);
+    env.ok(&["workspace", "set", ws_id, "--unpin"]);
+    assert_eq!(env.json(&["workspace", "show", ws_id])["pinned"], false);
+    assert!(
+        !env.icarus(&["workspace", "set", ws_id, "--pin", "--unpin"])
+            .status
+            .success()
+    );
 }

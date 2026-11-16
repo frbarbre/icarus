@@ -605,7 +605,7 @@ enum WorkspaceCommand {
     Show {
         id: String,
     },
-    /// Change a workspace's status, title or base.
+    /// Change a workspace's status, title or base, or pin it to the top of its sidebar group.
     Set {
         id: String,
         #[arg(long)]
@@ -614,6 +614,10 @@ enum WorkspaceCommand {
         title: Option<String>,
         #[arg(long)]
         base: Option<String>,
+        #[arg(long, conflicts_with = "unpin")]
+        pin: bool,
+        #[arg(long)]
+        unpin: bool,
     },
     /// List changed files against the base (or only uncommitted ones).
     Changes {
@@ -1783,8 +1787,9 @@ async fn main() -> Result<()> {
                     (Some("running"), _) => "  setting up".to_owned(),
                     _ => String::new(),
                 };
+                let pinned = if w["pinned"] == true { "  pinned" } else { "" };
                 format!(
-                    "{}  {}  {}  {}{setup}",
+                    "{}  {}  {}  {}{setup}{pinned}",
                     w["id"].as_str().unwrap_or_default(),
                     w["name"].as_str().unwrap_or_default(),
                     w["status"].as_str().unwrap_or("-"),
@@ -1875,11 +1880,14 @@ async fn main() -> Result<()> {
                     status,
                     title,
                     base,
+                    pin,
+                    unpin,
                 } => {
+                    let pinned = (*pin || *unpin).then_some(*pin);
                     let value = client
                         .request(
                             "workspace.set",
-                            json!({ "id": id, "status": status, "title": title, "base": base }),
+                            json!({ "id": id, "status": status, "title": title, "base": base, "pinned": pinned }),
                         )
                         .await?;
                     print(&cli, &value, summary);

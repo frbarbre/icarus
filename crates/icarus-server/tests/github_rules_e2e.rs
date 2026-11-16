@@ -289,6 +289,10 @@ async fn pr_status_maps_the_branch_pull_request_in_one_batched_snapshot() {
         "cards get the PR summary from the cache"
     );
     assert_eq!(info["pr"]["state"], "draft");
+    assert_eq!(
+        info["pr"]["title"], "Pull request 5",
+        "the sidebar filter matches it"
+    );
     assert!(info["pr"]["additions"].is_u64());
     let summary_of = |id: &str| {
         listed

@@ -250,6 +250,7 @@ impl Server {
                     issue,
                     pull_request: None,
                     created_at_ms: now_ms(),
+                    pinned: false,
                 };
                 self.store.insert_workspace(&workspace).map_err(internal)?;
                 if let Err(error) = self.start_setup(&workspace, &project.root, setup_decision) {
@@ -356,9 +357,14 @@ impl Server {
                     base: Option<String>,
                     issue: Option<Value>,
                     pull_request: Option<Value>,
+                    pinned: Option<bool>,
                 }
                 let p: P = params(p)?;
                 let mut workspace = self.workspace_by_key(&p.id)?;
+                let pin_changed = p.pinned.is_some_and(|pinned| pinned != workspace.pinned);
+                if let Some(pinned) = p.pinned {
+                    workspace.pinned = pinned;
+                }
                 if let Some(status) = p.status {
                     workspace.status = if status.is_empty() {
                         None
@@ -379,6 +385,12 @@ impl Server {
                     workspace.pull_request = if pr.is_null() { None } else { Some(pr) };
                 }
                 self.store.update_workspace(&workspace).map_err(internal)?;
+                if pin_changed {
+                    self.broadcast(
+                        "workspace.changed",
+                        json!({ "workspaces": [workspace.id], "source": "pin" }),
+                    );
+                }
                 Ok(self.workspace_json(&workspace))
             }
             "workspace.remove" => {

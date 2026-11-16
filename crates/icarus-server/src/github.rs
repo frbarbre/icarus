@@ -469,6 +469,7 @@ impl GitHubService {
                 let pr = &details.pr;
                 json!({
                     "number": pr.number,
+                    "title": pr.title,
                     "url": pr.url,
                     "state": pr.lifecycle(),
                     "additions": details.additions,

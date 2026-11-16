@@ -209,6 +209,26 @@ async fn source_control_actions_run_in_the_worktree_and_announce_themselves() {
     assert_eq!(committed["committed_all"], true);
     assert_eq!(git(&path, &["status", "--porcelain"]), "");
 
+    let history = client
+        .request("git.commits", json!({ "workspace": id }))
+        .await
+        .expect("commits since the base");
+    assert_eq!(history["compare"]["status"], "ready");
+    let commits = history["commits"].as_array().expect("commits");
+    assert_eq!(commits.len(), 1, "the base's own commit isn't listed");
+    assert_eq!(commits[0]["subject"], "change a");
+    assert_eq!(commits[0]["oid"], git(&path, &["rev-parse", "HEAD"]));
+    assert_eq!(commits[0]["author"], "T");
+    let missing = client
+        .request(
+            "git.commits",
+            json!({ "workspace": id, "base": "origin/nope" }),
+        )
+        .await
+        .expect("an unknown base lists nothing rather than failing");
+    assert_eq!(missing["compare"]["status"], "invalid_base");
+    assert_eq!(missing["commits"], json!([]));
+
     let pushed = client
         .request("git.push", json!({ "workspace": id }))
         .await

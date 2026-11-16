@@ -269,3 +269,50 @@ fn remove_refuses_dirty_worktrees_unless_forced() {
     assert!(!wt_path.exists());
     assert_eq!(list_worktrees(&repo.root).expect("list").len(), 1);
 }
+
+#[test]
+fn branch_commits_list_only_what_the_branch_added_since_its_base() {
+    let repo = repo();
+    let empty = branch_commits(&repo.root, Some("origin/main".into()), 10).expect("commits");
+    assert!(empty.commits.is_empty() && !empty.truncated);
+    assert!(matches!(empty.compare, CompareStatus::Ready { .. }));
+
+    run(&repo.root, &["checkout", "-q", "-b", "feature"]);
+    for (index, subject) in ["First change", "Second | change"].iter().enumerate() {
+        write(&repo.root, "a.txt", &format!("edit {index}\n"));
+        run(&repo.root, &["commit", "-q", "-am", subject]);
+    }
+    let listed = branch_commits(&repo.root, Some("origin/main".into()), 10).expect("commits");
+    let subjects: Vec<&str> = listed.commits.iter().map(|c| c.subject.as_str()).collect();
+    assert_eq!(
+        subjects,
+        ["Second | change", "First change"],
+        "newest first"
+    );
+    let newest = &listed.commits[0];
+    assert_eq!(
+        newest.oid,
+        git(&repo.root, &["rev-parse", "HEAD"])
+            .expect("head")
+            .trim()
+    );
+    assert!(newest.oid.starts_with(&newest.short) && newest.short.len() >= 7);
+    assert_eq!(
+        (newest.author.as_str(), newest.author_email.as_str()),
+        ("T", "t@example.com")
+    );
+    assert!(newest.time > 1_600_000_000);
+
+    let capped = branch_commits(&repo.root, Some("origin/main".into()), 1).expect("commits");
+    assert_eq!(capped.commits.len(), 1);
+    assert!(capped.truncated);
+
+    let missing = branch_commits(&repo.root, Some("origin/nope".into()), 10).expect("commits");
+    assert!(missing.commits.is_empty());
+    assert_eq!(
+        missing.compare,
+        CompareStatus::InvalidBase {
+            base: "origin/nope".into()
+        }
+    );
+}

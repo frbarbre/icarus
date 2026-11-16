@@ -269,9 +269,11 @@ pub(crate) fn config_changed(cx: &mut App) {
             })
             .ok();
     }
-    cx.update_global::<OpenSettingsViews, _>(|views, _| {
-        views.0.retain(|(_, view)| view.upgrade().is_some());
-    });
+    if cx.has_global::<OpenSettingsViews>() {
+        cx.update_global::<OpenSettingsViews, _>(|views, _| {
+            views.0.retain(|(_, view)| view.upgrade().is_some());
+        });
+    }
 }
 
 impl EventEmitter<ItemEvent> for SettingsView {}
@@ -1501,6 +1503,11 @@ mod tests {
             "agents": { "default": "claude" },
             "notifications": { "enabled": true },
         })
+    }
+
+    #[gpui::test]
+    fn a_settings_change_before_any_settings_tab_opened_is_ignored(cx: &mut TestAppContext) {
+        cx.update(config_changed);
     }
 
     #[gpui::test]

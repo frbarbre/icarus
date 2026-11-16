@@ -742,44 +742,7 @@ pub fn changes(worktree: &Path, query: &ChangesQuery) -> Result<Changes> {
         worktree,
         &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
     );
-    let base_name = query.base.clone().or_else(|| default_base_ref(worktree));
-    let compare = match (&head, &base_name) {
-        (None, _) => CompareStatus::UnbornHead,
-        (_, None) => CompareStatus::NoBase,
-        (Some(head), Some(base)) => match qualify_ref(worktree, base) {
-            None => CompareStatus::InvalidBase { base: base.clone() },
-            Some(qualified) => match if review_base::is_review_base_ref(&qualified) {
-                git_ok(worktree, &["rev-parse", &qualified])
-            } else {
-                git_ok(worktree, &["merge-base", &qualified, head])
-            } {
-                None => CompareStatus::NoMergeBase { base: base.clone() },
-                Some(merge_base) => {
-                    let counts = git_ok(
-                        worktree,
-                        &[
-                            "rev-list",
-                            "--left-right",
-                            "--count",
-                            &format!("{qualified}...{head}"),
-                        ],
-                    )
-                    .unwrap_or_default();
-                    let mut parts = counts
-                        .split_whitespace()
-                        .map(|v| v.parse::<u64>().unwrap_or(0));
-                    let behind = parts.next().unwrap_or(0);
-                    let ahead = parts.next().unwrap_or(0);
-                    CompareStatus::Ready {
-                        base: base.clone(),
-                        merge_base,
-                        ahead,
-                        behind,
-                    }
-                }
-            },
-        },
-    };
+    let compare = compare_status(worktree, head.as_deref(), query.base.clone());
     let rows = match &compare {
         CompareStatus::Ready { merge_base, .. } if !query.uncommitted_only => {
             let head = head.clone().unwrap_or_default();
@@ -830,6 +793,127 @@ pub fn changes(worktree: &Path, query: &ChangesQuery) -> Result<Changes> {
         rows,
         added,
         removed,
+    })
+}
+
+/// How HEAD compares with `base` (the repo's default base when `None`), never guessing a base.
+fn compare_status(worktree: &Path, head: Option<&str>, base: Option<String>) -> CompareStatus {
+    let base_name = base.or_else(|| default_base_ref(worktree));
+    match (head, &base_name) {
+        (None, _) => CompareStatus::UnbornHead,
+        (_, None) => CompareStatus::NoBase,
+        (Some(head), Some(base)) => match qualify_ref(worktree, base) {
+            None => CompareStatus::InvalidBase { base: base.clone() },
+            Some(qualified) => match if review_base::is_review_base_ref(&qualified) {
+                git_ok(worktree, &["rev-parse", &qualified])
+            } else {
+                git_ok(worktree, &["merge-base", &qualified, head])
+            } {
+                None => CompareStatus::NoMergeBase { base: base.clone() },
+                Some(merge_base) => {
+                    let counts = git_ok(
+                        worktree,
+                        &[
+                            "rev-list",
+                            "--left-right",
+                            "--count",
+                            &format!("{qualified}...{head}"),
+                        ],
+                    )
+                    .unwrap_or_default();
+                    let mut parts = counts
+                        .split_whitespace()
+                        .map(|v| v.parse::<u64>().unwrap_or(0));
+                    let behind = parts.next().unwrap_or(0);
+                    let ahead = parts.next().unwrap_or(0);
+                    CompareStatus::Ready {
+                        base: base.clone(),
+                        merge_base,
+                        ahead,
+                        behind,
+                    }
+                }
+            },
+        },
+    }
+}
+
+/// One commit of a branch's history (`git.commits`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitInfo {
+    pub oid: String,
+    pub short: String,
+    pub subject: String,
+    pub author: String,
+    pub author_email: String,
+    /// Seconds since the epoch.
+    pub time: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BranchCommits {
+    pub compare: CompareStatus,
+    /// Newest first: the commits on HEAD since its merge base with the base.
+    pub commits: Vec<CommitInfo>,
+    /// More commits exist than `limit` allowed.
+    pub truncated: bool,
+}
+
+/// The commits on HEAD since its merge base with `base`; none while the compare isn't ready.
+pub fn branch_commits(
+    worktree: &Path,
+    base: Option<String>,
+    limit: usize,
+) -> Result<BranchCommits> {
+    let head = git_ok(
+        worktree,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    );
+    let compare = compare_status(worktree, head.as_deref(), base);
+    let CompareStatus::Ready { merge_base, .. } = &compare else {
+        return Ok(BranchCommits {
+            compare,
+            commits: Vec::new(),
+            truncated: false,
+        });
+    };
+    let count = (limit + 1).to_string();
+    let output = git(
+        worktree,
+        &[
+            "log",
+            "-z",
+            "--max-count",
+            &count,
+            "--format=%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%at",
+            &format!("{merge_base}..HEAD"),
+            "--",
+        ],
+    )?;
+    let mut commits: Vec<CommitInfo> = output
+        .split('\0')
+        .filter_map(|record| {
+            let mut fields = record.trim_start_matches('\n').split('\x1f');
+            let oid = fields.next().filter(|oid| !oid.is_empty())?.to_string();
+            Some(CommitInfo {
+                oid,
+                short: fields.next().unwrap_or_default().to_string(),
+                subject: fields.next().unwrap_or_default().to_string(),
+                author: fields.next().unwrap_or_default().to_string(),
+                author_email: fields.next().unwrap_or_default().to_string(),
+                time: fields
+                    .next()
+                    .and_then(|time| time.trim().parse().ok())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+    let truncated = commits.len() > limit;
+    commits.truncate(limit);
+    Ok(BranchCommits {
+        compare,
+        commits,
+        truncated,
     })
 }
 

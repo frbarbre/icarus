@@ -402,6 +402,7 @@ mod tests {
             issue: None,
             pull_request: None,
             created_at_ms: 0,
+            pinned: false,
         }
     }
 

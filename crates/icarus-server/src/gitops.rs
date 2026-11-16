@@ -13,6 +13,7 @@ use crate::notes::Target;
 use crate::server::{Server, params, rpc, to_value};
 
 pub const GIT_CHANGED_TOPIC: &str = "git.changed";
+const COMMITS_LIMIT: usize = 200;
 
 fn git_error(error: OpError) -> RpcError {
     rpc("git_failed", error.message)
@@ -54,6 +55,27 @@ impl Server {
                 let path = workspace.path.clone();
                 let state = blocking(move || ops::sync_state(&path)).await?;
                 return to_value(state);
+            }
+            "git.commits" => {
+                #[derive(Deserialize)]
+                struct P {
+                    #[serde(flatten)]
+                    target: Target,
+                    base: Option<String>,
+                    limit: Option<usize>,
+                }
+                let p: P = params(p)?;
+                let workspace = self.note_workspace(&p.target)?;
+                let path = workspace.path.clone();
+                let base = p.base.or(workspace.base_ref.clone());
+                let limit = p.limit.unwrap_or(COMMITS_LIMIT).clamp(1, 1000);
+                let commits = tokio::task::spawn_blocking(move || {
+                    icarus_git::branch_commits(&path, base, limit)
+                })
+                .await
+                .map_err(|error| rpc("internal", error))?
+                .map_err(|error| rpc("git_failed", format!("{error:#}")))?;
+                return to_value(commits);
             }
             "git.discard" => {
                 let p: Paths = params(p)?;

@@ -845,6 +845,8 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
             pr: None,
             setup: None,
             sleeping: false,
+            pinned: false,
+            created_at_ms: 0,
         }
     };
     let with_author = |mut workspace: icarus_ui::WorkspaceSummary, login: &str| {
@@ -1719,6 +1721,7 @@ fn run_icarus_workspaces_stack_tests(
     let pr = |number: u64, state: &str, stack: Option<(u64, u32, u32)>| {
         Some(icarus_ui::PrSummary {
             number,
+            title: format!("Pull request {number}"),
             url: format!("https://github.com/acme/app/pull/{number}"),
             state: state.into(),
             additions: number * 7 % 400 + 12,

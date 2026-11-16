@@ -34,6 +34,9 @@ pub struct Workspace {
     /// Linked pull request, e.g. `{ "number": 12, "url": "…" }`.
     pub pull_request: Option<Value>,
     pub created_at_ms: u64,
+    /// Pinned cards list first in their sidebar group.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Context queued for a workspace's composer; `sent_at` is set once it went out with a message.
@@ -66,6 +69,26 @@ fn json_column(value: &Option<Value>) -> Option<String> {
 
 fn parse_json(text: Option<String>) -> Option<Value> {
     text.and_then(|t| serde_json::from_str(&t).ok())
+}
+
+/// Adds a column that older `state.db` files were created without.
+fn add_missing_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        params![table, column],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
+    Ok(())
 }
 
 impl Store {
@@ -188,6 +211,12 @@ impl Store {
              CREATE INDEX IF NOT EXISTS note_replies_by_note ON note_replies(note_id, created_at);
              CREATE INDEX IF NOT EXISTS note_replies_by_agent ON note_replies(agent_id);",
         )?;
+        add_missing_column(
+            &connection,
+            "workspaces",
+            "pinned",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -282,8 +311,8 @@ impl Store {
 
     pub fn insert_workspace(&self, workspace: &Workspace) -> Result<()> {
         self.db().execute(
-            "INSERT INTO workspaces (id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO workspaces (id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 workspace.id,
                 workspace.project_id,
@@ -295,7 +324,8 @@ impl Store {
                 workspace.title,
                 json_column(&workspace.issue),
                 json_column(&workspace.pull_request),
-                workspace.created_at_ms as i64
+                workspace.created_at_ms as i64,
+                workspace.pinned
             ],
         )?;
         Ok(())
@@ -303,7 +333,7 @@ impl Store {
 
     pub fn update_workspace(&self, workspace: &Workspace) -> Result<()> {
         self.db().execute(
-            "UPDATE workspaces SET name = ?2, branch = ?3, base_ref = ?4, status = ?5, title = ?6, issue = ?7, pull_request = ?8
+            "UPDATE workspaces SET name = ?2, branch = ?3, base_ref = ?4, status = ?5, title = ?6, issue = ?7, pull_request = ?8, pinned = ?9
              WHERE id = ?1",
             params![
                 workspace.id,
@@ -313,7 +343,8 @@ impl Store {
                 workspace.status,
                 workspace.title,
                 json_column(&workspace.issue),
-                json_column(&workspace.pull_request)
+                json_column(&workspace.pull_request),
+                workspace.pinned
             ],
         )?;
         Ok(())
@@ -332,10 +363,11 @@ impl Store {
             issue: parse_json(row.get(8)?),
             pull_request: parse_json(row.get(9)?),
             created_at_ms: row.get::<_, i64>(10)? as u64,
+            pinned: row.get(11)?,
         })
     }
 
-    const WORKSPACE_COLUMNS: &str = "id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms";
+    const WORKSPACE_COLUMNS: &str = "id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms, pinned";
 
     /// Finds a workspace by id, name or path.
     pub fn workspace(&self, key: &str) -> Result<Option<Workspace>> {
@@ -878,9 +910,11 @@ mod tests {
             issue: Some(serde_json::json!({ "provider": "linear", "id": "ABC-12" })),
             pull_request: None,
             created_at_ms: 1,
+            pinned: false,
         };
         store.insert_workspace(&workspace).expect("insert");
         workspace.status = Some("in-review".into());
+        workspace.pinned = true;
         store.update_workspace(&workspace).expect("update");
         assert_eq!(
             store.workspace("abc-12").expect("q"),
@@ -909,6 +943,7 @@ mod tests {
             issue: None,
             pull_request: None,
             created_at_ms: 1,
+            pinned: false,
         };
         store.insert_workspace(&workspace).expect("insert");
         let first = store
@@ -940,6 +975,28 @@ mod tests {
         assert!(!store.remove_attachment(&second.id).expect("again"));
         store.remove_workspace("ws-1").expect("remove workspace");
         assert_eq!(store.attachment(&first.id).expect("get"), None, "cascade");
+    }
+
+    #[test]
+    fn databases_from_before_pinning_gain_the_column() {
+        let connection = Connection::open_in_memory().expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL UNIQUE,
+                     remote TEXT, base_ref TEXT, created_at_ms INTEGER NOT NULL);
+                 CREATE TABLE workspaces (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL,
+                     path TEXT NOT NULL UNIQUE, branch TEXT, base_ref TEXT, status TEXT, title TEXT,
+                     issue TEXT, pull_request TEXT, created_at_ms INTEGER NOT NULL);
+                 INSERT INTO projects VALUES ('p', 'widgets', '/src/widgets', NULL, NULL, 1);
+                 INSERT INTO workspaces VALUES ('ws-1', 'p', 'a', '/w/a', NULL, NULL, NULL, NULL, NULL, NULL, 1);",
+            )
+            .expect("old schema");
+        let store = Store::init(connection).expect("migrates");
+        let workspace = store.workspace("ws-1").expect("q").expect("kept");
+        assert!(!workspace.pinned);
+        let reopened = Store::init(store.connection.into_inner().expect("connection"))
+            .expect("a second open leaves the column alone");
+        assert_eq!(reopened.workspaces(None).expect("list").len(), 1);
     }
 
     #[test]

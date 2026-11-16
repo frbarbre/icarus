@@ -14,7 +14,7 @@ use gpui::{
 use gpui_tokio::Tokio;
 use icarus_client::Client;
 use serde::Deserialize;
-use ui::{ButtonLike, ContextMenu, PopoverMenu, Tooltip, prelude::*};
+use ui::{ButtonLike, ContextMenu, PopoverMenu, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
@@ -159,11 +159,111 @@ pub struct Row {
     #[serde(default)]
     pub binary: bool,
     #[serde(default)]
+    pub committed: bool,
+    #[serde(default)]
+    pub staged: bool,
+    #[serde(default)]
     pub unstaged: bool,
     #[serde(default)]
     pub untracked: bool,
     #[serde(default)]
     pub conflicted: bool,
+}
+
+fn local_scope(scope: &ChangesScope) -> bool {
+    matches!(scope, ChangesScope::Base | ChangesScope::Uncommitted)
+}
+
+/// Staging clears a conflict's unresolved state, so conflicted files are left to the merge tools.
+pub(crate) fn can_stage(row: &Row, scope: &ChangesScope) -> bool {
+    local_scope(scope) && !row.conflicted && (row.unstaged || row.untracked)
+}
+
+pub(crate) fn can_unstage(row: &Row, scope: &ChangesScope) -> bool {
+    local_scope(scope) && !row.conflicted && row.staged
+}
+
+/// The row's index state, as Orca's Staged / Changes sections would place it: `None` when nothing is staged.
+pub(crate) fn staged_label(row: &Row) -> Option<&'static str> {
+    if !row.staged {
+        None
+    } else if row.unstaged || row.untracked {
+        Some("Partly staged")
+    } else {
+        Some("Staged")
+    }
+}
+
+/// The paths a stage or unstage of `row` covers: a staged rename brings its old path back too.
+fn index_paths(row: &Row, unstage: bool) -> Vec<String> {
+    let mut paths = vec![row.path.clone()];
+    if unstage
+        && row.status == "renamed"
+        && !row.committed
+        && let Some(old_path) = &row.old_path
+    {
+        paths.push(old_path.clone());
+    }
+    paths
+}
+
+/// What a changed file's right-click menu offers, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    OpenDiff,
+    OpenFile,
+    Reveal,
+    CopyPath,
+    CopyRelativePath,
+    Stage,
+    Unstage,
+    Discard(&'static str),
+}
+
+impl RowAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenDiff => "Open Diff",
+            Self::OpenFile => "Open File",
+            Self::Reveal => "Reveal in Project Panel",
+            Self::CopyPath => "Copy Path",
+            Self::CopyRelativePath => "Copy Relative Path",
+            Self::Stage => "Stage",
+            Self::Unstage => "Unstage",
+            Self::Discard(label) => label,
+        }
+    }
+
+    /// The menu puts a separator between groups.
+    fn group(self) -> u8 {
+        match self {
+            Self::OpenDiff | Self::OpenFile | Self::Reveal => 0,
+            Self::CopyPath | Self::CopyRelativePath => 1,
+            Self::Stage | Self::Unstage => 2,
+            Self::Discard(_) => 3,
+        }
+    }
+}
+
+/// The row's menu: a deleted file has nothing on disk to open or reveal, and only local changes can be
+/// staged, unstaged or discarded.
+pub(crate) fn row_actions(row: &Row, scope: &ChangesScope) -> Vec<RowAction> {
+    let on_disk = row.status != "deleted";
+    let mut actions = vec![RowAction::OpenDiff];
+    if on_disk {
+        actions.extend([RowAction::OpenFile, RowAction::Reveal]);
+    }
+    actions.extend([RowAction::CopyPath, RowAction::CopyRelativePath]);
+    if can_stage(row, scope) {
+        actions.push(RowAction::Stage);
+    }
+    if can_unstage(row, scope) {
+        actions.push(RowAction::Unstage);
+    }
+    if let Some(label) = discard_label(row, scope) {
+        actions.push(RowAction::Discard(label));
+    }
+    actions
 }
 
 /// The row's Discard button label, when it has one: only for an unstaged or untracked change that
@@ -188,6 +288,8 @@ pub(crate) fn discard_label(row: &Row, scope: &ChangesScope) -> Option<&'static 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct TurnRow {
     pub name: String,
+    #[serde(default)]
+    pub oid: String,
     #[serde(default)]
     pub meta: Option<TurnRowMeta>,
     #[serde(default)]
@@ -243,6 +345,42 @@ impl TurnRow {
             self.added, self.removed
         )
     }
+}
+
+/// One commit on the workspace branch since its base (`git.commits`), newest first.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CommitRow {
+    pub oid: String,
+    #[serde(default)]
+    pub short: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub author: String,
+    /// Seconds since the epoch.
+    #[serde(default)]
+    pub time: i64,
+}
+
+impl CommitRow {
+    /// `abc1234 · Ada · 3h ago`.
+    fn detail(&self, now_ms: u64) -> String {
+        let at_ms = u64::try_from(self.time).unwrap_or_default() * 1000;
+        format!(
+            "{} · {} · {}",
+            self.short,
+            self.author,
+            relative_age(now_ms.saturating_sub(at_ms))
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+struct BranchCommits {
+    #[serde(default)]
+    commits: Vec<CommitRow>,
+    #[serde(default)]
+    truncated: bool,
 }
 
 /// Open Source Control panels, so a `git.changed` event refreshes them at once instead of on the next poll.
@@ -445,6 +583,11 @@ pub struct SourceControlPanel {
     /// The workspace's agent turns, newest first.
     turns: Vec<TurnRow>,
     turns_collapsed: bool,
+    /// The branch's commits since its base, newest first.
+    commits: Vec<CommitRow>,
+    commits_truncated: bool,
+    /// Collapsed by default, as Orca's Commits section is.
+    commits_collapsed: bool,
     sync: Option<SyncInfo>,
     /// The running git action's label, e.g. "Pushing…".
     git_busy: Option<SharedString>,
@@ -509,6 +652,9 @@ impl SourceControlPanel {
             note_counts: HashMap::default(),
             turns: Vec::new(),
             turns_collapsed: false,
+            commits: Vec::new(),
+            commits_truncated: false,
+            commits_collapsed: true,
             sync: None,
             git_busy: None,
             git_error: None,
@@ -541,6 +687,9 @@ impl SourceControlPanel {
             note_counts: HashMap::default(),
             turns: Vec::new(),
             turns_collapsed: false,
+            commits: Vec::new(),
+            commits_truncated: false,
+            commits_collapsed: true,
             sync: None,
             git_busy: None,
             git_error: None,
@@ -652,17 +801,25 @@ impl SourceControlPanel {
                 .await
                 .ok()
                 .and_then(|value| serde_json::from_value::<SyncInfo>(value).ok());
-            anyhow::Ok((id, listing, note_counts, turns, sync))
+            let commits = client
+                .request("git.commits", serde_json::json!({ "workspace": id }))
+                .await
+                .ok()
+                .and_then(|value| serde_json::from_value::<BranchCommits>(value).ok())
+                .unwrap_or_default();
+            anyhow::Ok((id, listing, note_counts, turns, sync, commits))
         });
         self.refreshing = Some(cx.spawn(async move |this, cx| {
             let result = fetch.await;
             this.update(cx, |this, cx| {
                 this.refreshing = None;
                 match result {
-                    Ok((id, listing, note_counts, turns, sync)) => {
+                    Ok((id, listing, note_counts, turns, sync, commits)) => {
                         this.note_counts = note_counts;
                         this.turns = turns;
                         this.sync = sync;
+                        this.commits = commits.commits;
+                        this.commits_truncated = commits.truncated;
                         this.icarus_workspace = Some(id);
                         this.error = None;
                         if let Some(selected) = this.selected
@@ -806,10 +963,17 @@ impl SourceControlPanel {
         let Some(workspace) = self.icarus_workspace.clone() else {
             return;
         };
-        let detail = format!(
-            "{}\n\nOnly the uncommitted change is thrown away; what's committed on the branch stays. This can't be undone.",
-            row.path
-        );
+        let detail = if row.untracked {
+            format!(
+                "{}\n\nThis file isn't tracked by git, so discarding deletes it from disk. This can't be undone.",
+                row.path
+            )
+        } else {
+            format!(
+                "{}\n\nOnly the uncommitted change is thrown away; what's committed on the branch stays. This can't be undone.",
+                row.path
+            )
+        };
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("{label}?"),
@@ -831,6 +995,116 @@ impl SourceControlPanel {
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Runs one of the row menu's actions on the row at `index`.
+    pub fn run_row_action(
+        &mut self,
+        index: usize,
+        action: RowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row) = self.rows().get(index).cloned() else {
+            return;
+        };
+        let absolute = self.root.join(&row.path);
+        match action {
+            RowAction::OpenDiff => {
+                self.select(index, cx);
+                self.open_selected(window, cx);
+            }
+            RowAction::OpenFile => {
+                let Some(workspace) = self.workspace.upgrade() else {
+                    return;
+                };
+                // A file's editor and diff are one tab's two views (features §2.9), so this is its edit view.
+                let base = self
+                    .listing
+                    .as_ref()
+                    .and_then(|listing| diff_base_for(&self.scope, listing))
+                    .unwrap_or(DiffBase::Uncommitted);
+                // Deferred: the menu that ran this may still be inside a Workspace update.
+                window.defer(cx, move |window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        open_diff_tab(
+                            absolute,
+                            base,
+                            DiffTabMode::Edit,
+                            None,
+                            workspace,
+                            window,
+                            cx,
+                        )
+                        .detach_and_log_err(cx);
+                    });
+                });
+            }
+            RowAction::Reveal => {
+                let Some(project) = self.project.upgrade() else {
+                    return;
+                };
+                window.defer(cx, move |_, cx| {
+                    project.update(cx, |project, cx| {
+                        let entry = project
+                            .find_project_path(&absolute, cx)
+                            .and_then(|path| project.entry_for_path(&path, cx))
+                            .map(|entry| entry.id);
+                        if let Some(entry) = entry {
+                            cx.emit(project::Event::RevealInProjectPanel(entry));
+                        }
+                    });
+                });
+            }
+            RowAction::CopyPath => cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                absolute.to_string_lossy().into_owned(),
+            )),
+            RowAction::CopyRelativePath => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(row.path))
+            }
+            RowAction::Stage => self.stage_rows(vec![index], true, cx),
+            RowAction::Unstage => self.stage_rows(vec![index], false, cx),
+            RowAction::Discard(_) => self.discard_row(index, window, cx),
+        }
+    }
+
+    /// Stages (or unstages) the rows at `indices` that can be, in one `git.stage` / `git.unstage` call.
+    pub fn stage_rows(&mut self, indices: Vec<usize>, stage: bool, cx: &mut Context<Self>) {
+        let Some(workspace) = self.icarus_workspace.clone() else {
+            return;
+        };
+        let paths: Vec<String> = indices
+            .into_iter()
+            .filter_map(|index| self.rows().get(index))
+            .filter(|row| {
+                if stage {
+                    can_stage(row, &self.scope)
+                } else {
+                    can_unstage(row, &self.scope)
+                }
+            })
+            .flat_map(|row| index_paths(row, !stage))
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let (method, busy) = if stage {
+            ("git.stage", "Staging…")
+        } else {
+            ("git.unstage", "Unstaging…")
+        };
+        self.run_git(
+            method,
+            serde_json::json!({ "workspace": workspace, "paths": paths }),
+            busy,
+            cx,
+        );
+    }
+
+    /// Stages every listed change that can be (Orca's Stage all, over the rows the filters leave).
+    pub fn stage_all(&mut self, stage: bool, cx: &mut Context<Self>) {
+        let indices = (0..self.rows().len()).collect();
+        self.stage_rows(indices, stage, cx);
     }
 
     /// Runs a `git.*` RPC for this workspace, showing its progress and git's own error text.
@@ -914,35 +1188,36 @@ impl SourceControlPanel {
         self.run_git("git.commit", params, "Committing…", cx);
     }
 
-    /// Shows what the turn changed: the turn scope plus its first file (source-control.md §2.1).
+    /// Shows what the turn changed: the turn scope plus the turn's snapshot in the commit view.
     pub fn open_turn(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(turn) = self.turns.get(index) else {
+        let Some(turn) = self.turns.get(index).cloned() else {
             return;
         };
         self.set_scope(ChangesScope::Turn(turn.name.clone()), cx);
-        // The rows arrive with the refresh; open the first one once they're in.
-        cx.spawn_in(window, async move |this, cx| {
-            for _ in 0..50 {
-                let opened = this.update_in(cx, |this, window, cx| {
-                    if this.refreshing.is_some() {
-                        return false;
-                    }
-                    if !this.rows().is_empty() {
-                        this.select(0, cx);
-                        this.open_selected(window, cx);
-                    }
-                    true
-                })?;
-                if opened {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(50))
-                    .await;
-            }
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        if !turn.oid.is_empty() {
+            self.open_commit_view(turn.oid, window, cx);
+        }
+    }
+
+    /// Shows a branch commit: the commit scope plus the whole commit in the commit view.
+    pub fn open_commit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(commit) = self.commits.get(index).cloned() else {
+            return;
+        };
+        self.set_scope(ChangesScope::Commit(commit.oid.clone()), cx);
+        self.open_commit_view(commit.oid, window, cx);
+    }
+
+    fn open_commit_view(&self, sha: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        // Deferred: a click lands inside this panel's update, and the commit view reads the workspace.
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                open_commit_view(sha, None, workspace, window, cx);
+            });
+        });
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -976,6 +1251,9 @@ impl SourceControlPanel {
             .count();
         let label = filter_label(&facets);
         let weak = cx.entity().downgrade();
+        let any_stageable = self.rows().iter().any(|row| can_stage(row, &self.scope));
+        let any_unstageable = self.rows().iter().any(|row| can_unstage(row, &self.scope));
+        let idle = self.git_busy.is_none();
 
         h_flex()
             .h(px(32.))
@@ -1023,6 +1301,30 @@ impl SourceControlPanel {
                 )
             })
             .child(div().flex_1())
+            .when(any_unstageable, |this| {
+                this.child(
+                    IconButton::new("changes-unstage-all", IconName::Dash)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .disabled(!idle)
+                        .tooltip(Tooltip::text("Unstage all"))
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.stage_all(false, cx)),
+                        ),
+                )
+            })
+            .when(any_stageable, |this| {
+                this.child(
+                    IconButton::new("changes-stage-all", IconName::Plus)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .disabled(!idle)
+                        .tooltip(Tooltip::text("Stage all"))
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.stage_all(true, cx)),
+                        ),
+                )
+            })
             .when_some(badge, |this, (text, tooltip)| {
                 this.child(
                     h_flex()
@@ -1104,9 +1406,15 @@ impl SourceControlPanel {
         let selected = self.selected == Some(index);
         let color = status_color(&row.status);
         let discard = discard_label(row, &self.scope);
-        h_flex()
+        let stage = can_stage(row, &self.scope);
+        let unstage = can_unstage(row, &self.scope);
+        let staged = staged_label(row).filter(|_| local_scope(&self.scope));
+        let actions = row_actions(row, &self.scope);
+        let weak = cx.entity().downgrade();
+        let element = h_flex()
             .id(("changes-row", index))
             .group("changes-row")
+            .relative()
             .h(px(26.))
             .px_2()
             .gap_1p5()
@@ -1192,24 +1500,86 @@ impl SourceControlPanel {
                     )
                 },
             )
-            .when_some(discard, |this, label| {
+            .when(discard.is_some() || stage || unstage, |this| {
+                // Overlaid like Orca's row actions, so rows keep their counts aligned while not hovered.
                 this.child(
-                    IconButton::new(("changes-row-discard", index), IconName::Undo)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .visible_on_hover("changes-row")
-                        .tooltip(Tooltip::text(label))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.discard_row(index, window, cx);
-                        })),
+                    h_flex()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right(px(40.))
+                        .pl_1()
+                        .gap_0p5()
+                        .bg(cx.theme().colors().element_hover)
+                        .invisible()
+                        .group_hover("changes-row", |style| style.visible())
+                        .when_some(discard, |this, label| {
+                            this.child(
+                                IconButton::new(("changes-row-discard", index), IconName::Undo)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(label))
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.discard_row(index, window, cx);
+                                        },
+                                    )),
+                            )
+                        })
+                        .when(unstage, |this| {
+                            this.child(
+                                IconButton::new(("changes-row-unstage", index), IconName::Dash)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Unstage"))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.stage_rows(vec![index], false, cx);
+                                    })),
+                            )
+                        })
+                        .when(stage, |this| {
+                            this.child(
+                                IconButton::new(("changes-row-stage", index), IconName::Plus)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Stage"))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.stage_rows(vec![index], true, cx);
+                                    })),
+                            )
+                        }),
+                )
+            })
+            .when(local_scope(&self.scope), |this| {
+                this.child(
+                    div()
+                        .id(("changes-row-staged", index))
+                        .w(px(12.))
+                        .flex_none()
+                        .when_some(staged, |this, label| {
+                            this.tooltip(Tooltip::text(label)).child(
+                                Icon::new(if label == "Staged" {
+                                    IconName::Check
+                                } else {
+                                    IconName::Dash
+                                })
+                                .size(IconSize::XSmall)
+                                .color(Color::Created),
+                            )
+                        }),
                 )
             })
             .child(
                 Label::new(status_letter(&row.status))
                     .size(LabelSize::XSmall)
                     .color(color),
-            )
+            );
+        right_click_menu(("changes-row-menu", index))
+            .trigger(move |_, _, _| element)
+            .menu(move |window, cx| row_menu(weak.clone(), index, actions.clone(), window, cx))
             .into_any_element()
     }
 
@@ -1308,6 +1678,118 @@ impl SourceControlPanel {
                                         )
                                         .child(
                                             Label::new(turn.detail(now_ms))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .single_line()
+                                                .truncate(),
+                                        ),
+                                )
+                        })),
+                )
+            })
+    }
+
+    fn render_commits(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+        let collapsed = self.commits_collapsed;
+        let showing = match &self.scope {
+            ChangesScope::Commit(sha) => Some(sha.clone()),
+            _ => None,
+        };
+        let count = if self.commits_truncated {
+            format!("{}+", self.commits.len())
+        } else {
+            self.commits.len().to_string()
+        };
+        v_flex()
+            .w_full()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                h_flex()
+                    .id("changes-commits-header")
+                    .h(px(28.))
+                    .px_2()
+                    .gap_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.commits_collapsed = !this.commits_collapsed;
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("COMMITS")
+                            .size(LabelSize::XSmall)
+                            .weight(FontWeight::SEMIBOLD)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(count)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .when(!collapsed && self.commits.is_empty(), |this| {
+                this.child(
+                    div().px_2().pb_1().child(
+                        Label::new("No commits on this branch yet")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .when(!collapsed && !self.commits.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .id("changes-commits")
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .pb_1()
+                        .children(self.commits.iter().enumerate().map(|(index, commit)| {
+                            let current = showing.as_deref() == Some(commit.oid.as_str());
+                            h_flex()
+                                .id(("changes-commit", index))
+                                .px_2()
+                                .py_0p5()
+                                .gap_1p5()
+                                .w_full()
+                                .cursor_pointer()
+                                .when(current, |this| {
+                                    this.bg(cx.theme().colors().element_selected)
+                                })
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .tooltip(Tooltip::text(commit.subject.clone()))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.open_commit(index, window, cx);
+                                }))
+                                .child(
+                                    Icon::new(IconName::GitCommit)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            Label::new(commit.subject.clone())
+                                                .size(LabelSize::Small)
+                                                .single_line()
+                                                .truncate(),
+                                        )
+                                        .child(
+                                            Label::new(commit.detail(now_ms))
                                                 .size(LabelSize::XSmall)
                                                 .color(Color::Muted)
                                                 .single_line()
@@ -1499,6 +1981,35 @@ impl SourceControlPanel {
     }
 }
 
+/// A changed file's right-click menu: open, reveal and copy, then its index and discard actions.
+fn row_menu(
+    panel: WeakEntity<SourceControlPanel>,
+    index: usize,
+    actions: Vec<RowAction>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    ContextMenu::build(window, cx, move |mut menu, _, _| {
+        let mut previous_group = None;
+        for action in actions {
+            let group = action.group();
+            if previous_group.is_some_and(|previous| previous != group) {
+                menu = menu.separator();
+            }
+            previous_group = Some(group);
+            let panel = panel.clone();
+            menu = menu.entry(action.label(), None, move |window, cx| {
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.run_row_action(index, action, window, cx)
+                    })
+                    .log_err();
+            });
+        }
+        menu
+    })
+}
+
 fn filter_menu(
     menu: ContextMenu,
     tab: &WeakEntity<SourceControlPanel>,
@@ -1596,7 +2107,20 @@ fn open_row(
         ChangesScope::Commit(sha) => Some(sha.clone()),
         _ => listing.turn.as_ref().map(|turn| turn.oid.clone()),
     };
-    let (Some(sha), Some(repo)) = (sha, workspace.project().read(cx).active_repository(cx)) else {
+    if let Some(sha) = sha {
+        open_commit_view(sha, Some(&row.path), workspace, window, cx);
+    }
+}
+
+/// Opens `sha` (a branch commit or a turn snapshot) in the commit view, scrolled to `reveal` when given.
+fn open_commit_view(
+    sha: String,
+    reveal: Option<&str>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
         return;
     };
     CommitView::open(
@@ -1604,7 +2128,7 @@ fn open_row(
         repo.downgrade(),
         workspace.weak_handle(),
         CommitViewOptions {
-            reveal_file: git::repository::RepoPath::new(&row.path).log_err(),
+            reveal_file: reveal.and_then(|path| git::repository::RepoPath::new(path).log_err()),
             ..Default::default()
         },
         window,
@@ -1942,7 +2466,8 @@ impl Render for SourceControlPanel {
                 this.child(self.render_turns(cx))
             })
             .when(self.icarus_workspace.is_some(), |this| {
-                this.child(self.render_git_bar(cx))
+                this.child(self.render_commits(cx))
+                    .child(self.render_git_bar(cx))
             })
     }
 }
@@ -2046,6 +2571,8 @@ mod tests {
             added: None,
             removed: None,
             binary: false,
+            committed: false,
+            staged: false,
             unstaged,
             untracked,
             conflicted,
@@ -2093,6 +2620,7 @@ mod tests {
     fn turn_rows_read_like_orca() {
         let turn = TurnRow {
             name: "t".into(),
+            oid: "80175ea3".into(),
             meta: Some(TurnRowMeta {
                 prompt: "\nFix the login\nand more".into(),
                 agent_id: "agent-1".into(),
@@ -2117,6 +2645,7 @@ mod tests {
         }))
         .expect("server turn");
         assert_eq!(parsed.meta, turn.meta);
+        assert_eq!(parsed.oid, turn.oid);
         assert_eq!(relative_age(30_000), "just now");
         assert_eq!(relative_age(2 * 3_600_000), "2h ago");
     }
@@ -2323,10 +2852,11 @@ mod tests {
 
     #[gpui::test]
     async fn clicking_a_turn_filters_the_list_to_it(cx: &mut gpui::TestAppContext) {
-        let (_workspace, panel, _calls, mut cx) = git_panel(cx, |_, _| Ok(json!({}))).await;
+        let (workspace, panel, _calls, mut cx) = git_panel(cx, |_, _| Ok(json!({}))).await;
         let cx = &mut cx;
         let turn = |name: &str, prompt: &str| TurnRow {
             name: name.into(),
+            oid: if name == "t1" { "1" } else { "2" }.repeat(40),
             meta: Some(TurnRowMeta {
                 prompt: prompt.into(),
                 agent_id: "agent-1".into(),
@@ -2367,6 +2897,313 @@ mod tests {
                 Some("Latest turn".into())
             );
         });
+        cx.run_until_parked();
+        let (commit_views, diff_tabs) = open_views(&workspace, cx);
+        assert_eq!(commit_views, 2, "each turn opens its own commit view");
+        assert_eq!(diff_tabs, 0, "a turn opens no single-file diff tab");
+    }
+
+    /// How many commit views and diff tabs the workspace has open.
+    fn open_views(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (usize, usize) {
+        workspace.read_with(cx, |workspace, cx| {
+            (
+                workspace.items_of_type::<CommitView>(cx).count(),
+                workspace.items_of_type::<crate::DiffTab>(cx).count(),
+            )
+        })
+    }
+
+    #[test]
+    fn row_menus_offer_what_the_file_allows() {
+        let row = |status: &str, staged: bool, unstaged: bool, untracked: bool| Row {
+            path: "src/a.rs".into(),
+            status: status.into(),
+            old_path: None,
+            added: None,
+            removed: None,
+            binary: false,
+            committed: !(staged || unstaged || untracked),
+            staged,
+            unstaged,
+            untracked,
+            conflicted: false,
+        };
+        let base = ChangesScope::Base;
+        assert_eq!(
+            row_actions(&row("modified", false, true, false), &base),
+            [
+                RowAction::OpenDiff,
+                RowAction::OpenFile,
+                RowAction::Reveal,
+                RowAction::CopyPath,
+                RowAction::CopyRelativePath,
+                RowAction::Stage,
+                RowAction::Discard("Discard changes"),
+            ]
+        );
+        assert_eq!(
+            row_actions(&row("modified", true, true, false), &base)[5..],
+            [
+                RowAction::Stage,
+                RowAction::Unstage,
+                RowAction::Discard("Discard changes")
+            ],
+            "partly staged: both ways"
+        );
+        assert_eq!(
+            row_actions(&row("modified", true, false, false), &base)[5..],
+            [RowAction::Unstage],
+            "fully staged: nothing left to stage or discard"
+        );
+        assert_eq!(
+            row_actions(&row("deleted", false, false, false), &base),
+            [
+                RowAction::OpenDiff,
+                RowAction::CopyPath,
+                RowAction::CopyRelativePath
+            ],
+            "a committed deletion has no file to open or reveal, and nothing local"
+        );
+        assert_eq!(
+            row_actions(
+                &row("added", false, false, true),
+                &ChangesScope::Commit("c".into())
+            )
+            .last(),
+            Some(&RowAction::CopyRelativePath),
+            "no index actions under a commit"
+        );
+        assert_eq!(
+            staged_label(&row("modified", true, false, false)),
+            Some("Staged")
+        );
+        assert_eq!(
+            staged_label(&row("modified", true, true, false)),
+            Some("Partly staged")
+        );
+        assert_eq!(staged_label(&row("modified", false, true, false)), None);
+
+        let mut renamed = row("renamed", true, false, false);
+        renamed.old_path = Some("src/old.rs".into());
+        assert_eq!(index_paths(&renamed, true), ["src/a.rs", "src/old.rs"]);
+        assert_eq!(index_paths(&renamed, false), ["src/a.rs"]);
+        renamed.committed = true;
+        assert_eq!(
+            index_paths(&renamed, true),
+            ["src/a.rs"],
+            "a committed rename's old path is not in the index to restore"
+        );
+    }
+
+    /// The row menu at `index`, as a right-click would build it.
+    fn open_row_menu(
+        panel: &Entity<SourceControlPanel>,
+        index: usize,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<ContextMenu> {
+        let weak = panel.downgrade();
+        let actions = panel.read_with(cx, |panel, _| {
+            row_actions(&panel.rows()[index], &panel.scope)
+        });
+        cx.update(|window, cx| row_menu(weak, index, actions, window, cx))
+    }
+
+    #[gpui::test]
+    async fn the_row_menu_opens_copies_reveals_and_stages(cx: &mut gpui::TestAppContext) {
+        let (workspace, panel, calls, mut cx) =
+            git_panel(cx, |_, _| Ok(json!({ "ok": true }))).await;
+        let cx = &mut cx;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let revealed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let revealed = revealed.clone();
+            cx.subscribe(&project, move |_, event, _| {
+                if let project::Event::RevealInProjectPanel(entry) = event {
+                    revealed.borrow_mut().push(*entry);
+                }
+            })
+        });
+
+        // The first entry, Open Diff, opens the row like a click.
+        let menu = open_row_menu(&panel, 0, cx);
+        menu.update_in(cx, |menu, window, cx| {
+            menu.select_first(&menu::SelectFirst, window, cx);
+            menu.confirm(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            open_views(&workspace, cx).1,
+            1,
+            "Open Diff opens a diff tab"
+        );
+
+        let run = |action: RowAction, cx: &mut gpui::VisualTestContext| {
+            panel.update_in(cx, |panel, window, cx| {
+                panel.run_row_action(0, action, window, cx)
+            });
+            cx.run_until_parked();
+        };
+        run(RowAction::CopyPath, cx);
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("/project/src/app.rs".into())
+        );
+        run(RowAction::CopyRelativePath, cx);
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("src/app.rs".into())
+        );
+        run(RowAction::Reveal, cx);
+        assert_eq!(revealed.borrow().len(), 1, "the file is revealed");
+        run(RowAction::OpenFile, cx);
+        let active = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<crate::DiffTab>())
+                .map(|tab| (tab.read(cx).path().to_path_buf(), tab.read(cx).mode()))
+        });
+        assert_eq!(
+            active,
+            Some((
+                PathBuf::from("/project/src/app.rs"),
+                crate::diff_tab::DiffTabMode::Edit
+            )),
+            "Open File shows the file's tab in its edit view"
+        );
+        assert_eq!(
+            open_views(&workspace, cx).1,
+            1,
+            "the same tab, not a second one"
+        );
+
+        run(RowAction::Stage, cx);
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "git.stage"),
+            [json!({ "workspace": "ws-1", "paths": ["src/app.rs"] })]
+        );
+        panel.update(cx, |panel, _| {
+            if let Some(listing) = &mut panel.listing {
+                listing.rows[0].staged = true;
+                listing.rows[0].unstaged = false;
+            }
+        });
+        let menu = open_row_menu(&panel, 0, cx);
+        menu.update_in(cx, |menu, window, cx| {
+            menu.select_last(window, cx);
+            menu.confirm(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "git.unstage"),
+            [json!({ "workspace": "ws-1", "paths": ["src/app.rs"] })],
+            "a fully staged row's last entry is Unstage"
+        );
+    }
+
+    #[gpui::test]
+    async fn discarding_an_untracked_file_says_it_deletes_it(cx: &mut gpui::TestAppContext) {
+        let (_workspace, panel, calls, mut cx) =
+            git_panel(cx, |_, _| Ok(json!({ "discarded": [] }))).await;
+        let cx = &mut cx;
+        panel.update(cx, |panel, _| {
+            if let Some(listing) = &mut panel.listing {
+                listing.rows[1].untracked = true;
+            }
+        });
+        let menu = open_row_menu(&panel, 1, cx);
+        menu.update_in(cx, |menu, window, cx| {
+            menu.select_last(window, cx);
+            menu.confirm(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+        let (message, detail) = cx.pending_prompt().expect("discarding asks first");
+        assert_eq!(message, "Delete untracked file?");
+        assert!(detail.contains("deletes it from disk"), "{detail}");
+        cx.simulate_prompt_answer("Delete untracked file");
+        cx.run_until_parked();
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "git.discard"),
+            [json!({ "workspace": "ws-1", "paths": ["src/new.rs"] })]
+        );
+    }
+
+    #[gpui::test]
+    async fn stage_all_and_unstage_all_send_every_eligible_listed_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_workspace, panel, calls, mut cx) =
+            git_panel(cx, |_, _| Ok(json!({ "ok": true }))).await;
+        let cx = &mut cx;
+        panel.update(cx, |panel, _| {
+            if let Some(listing) = &mut panel.listing {
+                // Row 0 is unstaged, row 1 untracked and row 2 a staged deletion.
+                listing.rows[1].untracked = true;
+                listing.rows[2].staged = true;
+            }
+        });
+        panel.update(cx, |panel, cx| panel.stage_all(true, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "git.stage"),
+            [json!({ "workspace": "ws-1", "paths": ["src/app.rs", "src/new.rs"] })]
+        );
+        panel.update(cx, |panel, cx| panel.stage_all(false, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "git.unstage"),
+            [json!({ "workspace": "ws-1", "paths": ["README.md"] })]
+        );
+
+        // Under a commit nothing is local, so nothing is sent.
+        panel.update(cx, |panel, cx| {
+            panel.scope = ChangesScope::Commit("c".into());
+            panel.stage_all(true, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(crate::review::tests::calls_to(&calls, "git.stage").len(), 1);
+    }
+
+    #[gpui::test]
+    async fn commits_list_the_branch_and_open_in_the_commit_view(cx: &mut gpui::TestAppContext) {
+        let (workspace, panel, _calls, mut cx) = git_panel(cx, |_, _| Ok(json!({}))).await;
+        let cx = &mut cx;
+        let commits: BranchCommits = serde_json::from_value(json!({
+            "compare": { "status": "ready", "base": "origin/main" },
+            "commits": [
+                { "oid": "a".repeat(40), "short": "aaaaaaa", "subject": "Fix login",
+                  "author": "Ada", "author_email": "ada@example.com", "time": 1_000 },
+                { "oid": "b".repeat(40), "short": "bbbbbbb", "subject": "Start", "author": "Bo", "time": 100 },
+            ],
+            "truncated": false,
+        }))
+        .expect("server commits");
+        assert_eq!(
+            commits.commits[0].detail(1_000_000 + 2 * 60_000),
+            "aaaaaaa · Ada · 2m ago"
+        );
+        panel.update(cx, |panel, cx| {
+            assert!(panel.commits_collapsed, "collapsed by default, as in Orca");
+            panel.commits = commits.commits;
+            cx.notify();
+        });
+
+        panel.update_in(cx, |panel, window, cx| panel.open_commit(1, window, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.scope(), &ChangesScope::Commit("b".repeat(40)));
+            assert_eq!(
+                scope_badge(panel.scope(), None, None).map(|(text, _)| text),
+                Some("Commit bbbbbbb".into())
+            );
+        });
+        assert_eq!(
+            open_views(&workspace, cx),
+            (1, 0),
+            "the whole commit opens in the commit view"
+        );
     }
 
     #[gpui::test]

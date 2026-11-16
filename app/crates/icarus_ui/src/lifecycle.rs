@@ -1187,6 +1187,8 @@ impl Render for NewWorkspaceModal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardAction {
+    Pin,
+    Unpin,
     Rename,
     Sleep,
     Wake,
@@ -1197,6 +1199,8 @@ pub enum CardAction {
 impl CardAction {
     pub fn label(self) -> &'static str {
         match self {
+            CardAction::Pin => "Pin",
+            CardAction::Unpin => "Unpin",
             CardAction::Rename => "Rename…",
             CardAction::Sleep => "Sleep",
             CardAction::Wake => "Wake",
@@ -1208,6 +1212,11 @@ impl CardAction {
 
 pub fn card_actions(summary: &WorkspaceSummary) -> Vec<CardAction> {
     vec![
+        if summary.pinned {
+            CardAction::Unpin
+        } else {
+            CardAction::Pin
+        },
         CardAction::Rename,
         if summary.sleeping {
             CardAction::Wake
@@ -1232,7 +1241,7 @@ pub fn card_menu(
         .is_some_and(|setup| setup.state == "running");
     ContextMenu::build(window, cx, move |mut menu, _, _| {
         for action in card_actions(&summary) {
-            if action == CardAction::Delete {
+            if matches!(action, CardAction::Rename | CardAction::Delete) {
                 menu = menu.separator();
             }
             let server = server.clone();
@@ -1259,7 +1268,14 @@ pub fn run_card_action(
     cx: &mut App,
 ) {
     let title = summary.display_title();
+    let mut params = json!({ "id": summary.id });
     let (method, failure) = match action {
+        CardAction::Pin | CardAction::Unpin => {
+            let pinned = action == CardAction::Pin;
+            params["pinned"] = json!(pinned);
+            let verb = if pinned { "pin" } else { "unpin" };
+            ("workspace.set", format!("Couldn't {verb} {title}"))
+        }
         CardAction::Rename => {
             let server = server.clone();
             let summary = summary.clone();
@@ -1287,7 +1303,7 @@ pub fn run_card_action(
             format!("Couldn't re-run setup for {title}"),
         ),
     };
-    let task = request(server, method, json!({ "id": summary.id }), cx);
+    let task = request(server, method, params, cx);
     let workspace = workspace.clone();
     window
         .spawn(cx, async move |cx| {
@@ -1914,13 +1930,14 @@ mod tests {
         assert_eq!(
             card_actions(&awake),
             [
+                CardAction::Pin,
                 CardAction::Rename,
                 CardAction::Sleep,
                 CardAction::RerunSetup,
                 CardAction::Delete
             ]
         );
-        assert_eq!(card_actions(&asleep)[1], CardAction::Wake);
+        assert_eq!(card_actions(&asleep)[2], CardAction::Wake);
 
         let (workspace, _, mut cx) = panel_window(vec![awake.clone(), asleep.clone()], cx).await;
         let cx = &mut cx;
@@ -2005,6 +2022,45 @@ mod tests {
             [json!({ "id": "ws-fix-login", "title": "Fix the login page" })]
         );
         assert!(active::<RenameWorkspaceModal>(&workspace, cx).is_none());
+    }
+
+    #[gpui::test]
+    async fn pin_and_unpin_set_the_flag_on_the_owning_server(cx: &mut gpui::TestAppContext) {
+        let card = summary("fix-login", "/w/fix-login", None);
+        let mut pinned = summary("docs", "/w/docs", None);
+        pinned.pinned = true;
+        assert_eq!(card_actions(&pinned)[0], CardAction::Unpin);
+        let (workspace, _, mut cx) = panel_window(vec![card.clone(), pinned.clone()], cx).await;
+        let cx = &mut cx;
+        let calls = cx.update(|_, cx| stub_rpc(cx, |_, _| Ok(json!({}))));
+        let weak = workspace.downgrade();
+        cx.update(|window, cx| {
+            run_card_action(
+                CardAction::Pin,
+                &ServerRef::Primary,
+                &card,
+                &weak,
+                window,
+                cx,
+            );
+            run_card_action(
+                CardAction::Unpin,
+                &ServerRef::Saved("desk".into()),
+                &pinned,
+                &weak,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "workspace.set"),
+            [
+                json!({ "id": "ws-fix-login", "pinned": true }),
+                json!({ "id": "ws-docs", "pinned": false })
+            ]
+        );
+        assert!(!has_failure_toast(&workspace, cx));
     }
 
     #[gpui::test]

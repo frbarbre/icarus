@@ -638,6 +638,12 @@
     },
   },
   {
+    "context": "IcarusWorkspacesPanel",
+    "bindings": {
+      "ctrl-f": "icarus::FocusWorkspaceFilter",
+    },
+  },
+  {
     "context": "IcarusChanges",
     "bindings": {
       "up": "menu::SelectPrevious",

@@ -46,6 +46,61 @@ pub enum GitCommand {
     Pull,
     /// Pull, then push.
     Sync,
+    /// The commits on the workspace branch since its base, newest first.
+    Commits {
+        /// Compare against this ref instead of the workspace's base.
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+}
+
+fn relative_age(seconds: i64) -> String {
+    let minutes = seconds.max(0) / 60;
+    match minutes {
+        0 => "just now".to_string(),
+        1..=59 => format!("{minutes}m ago"),
+        60..=1439 => format!("{}h ago", minutes / 60),
+        _ => format!("{}d ago", minutes / 1440),
+    }
+}
+
+/// `abc1234  Fix login  (Ada, 3h ago)` per commit, or why there are none.
+fn commits_text(value: &Value, now: i64) -> String {
+    let commits = value["commits"].as_array().cloned().unwrap_or_default();
+    if commits.is_empty() {
+        let compare = &value["compare"];
+        return match compare["status"].as_str() {
+            Some("ready") => format!(
+                "No commits since {}",
+                compare["base"].as_str().unwrap_or("the base")
+            ),
+            Some("no_base") => "No base branch to compare against".to_string(),
+            Some("invalid_base") => format!(
+                "The base {} doesn't exist",
+                compare["base"].as_str().unwrap_or_default()
+            ),
+            Some("no_merge_base") => "The branch shares no history with its base".to_string(),
+            _ => "No commits yet".to_string(),
+        };
+    }
+    let mut lines: Vec<String> = commits
+        .iter()
+        .map(|commit| {
+            format!(
+                "{}  {}  ({}, {})",
+                commit["short"].as_str().unwrap_or_default(),
+                commit["subject"].as_str().unwrap_or_default(),
+                commit["author"].as_str().unwrap_or_default(),
+                relative_age(now - commit["time"].as_i64().unwrap_or(now))
+            )
+        })
+        .collect();
+    if value["truncated"].as_bool() == Some(true) {
+        lines.push("… older commits not shown (raise --limit)".to_string());
+    }
+    lines.join("\n")
 }
 
 /// Paths given on the command line, made absolute so the server can place them in the worktree.
@@ -157,6 +212,56 @@ pub async fn run(
             let state = client.request("git.sync", target(workspace)).await?;
             super::print(cli, &state, sync_text);
         }
+        GitCommand::Commits { base, limit } => {
+            let mut request = target(workspace);
+            if let Some(base) = base {
+                request["base"] = json!(base);
+            }
+            if let Some(limit) = limit {
+                request["limit"] = json!(limit);
+            }
+            let commits = client.request("git.commits", request).await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs() as i64)
+                .unwrap_or_default();
+            super::print(cli, &commits, |value| commits_text(value, now));
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commits_read_newest_first_with_author_and_age() {
+        let value = json!({
+            "compare": { "status": "ready", "base": "origin/main" },
+            "commits": [
+                { "oid": "b".repeat(40), "short": "bbbbbbb", "subject": "Fix login", "author": "Ada", "time": 1_000 },
+                { "oid": "a".repeat(40), "short": "aaaaaaa", "subject": "Start", "author": "Bo", "time": 1_000 - 2 * 3600 },
+            ],
+            "truncated": true,
+        });
+        assert_eq!(
+            commits_text(&value, 1_000 + 180),
+            "bbbbbbb  Fix login  (Ada, 3m ago)\naaaaaaa  Start  (Bo, 2h ago)\n… older commits not shown (raise --limit)"
+        );
+        assert_eq!(
+            commits_text(
+                &json!({ "compare": { "status": "ready", "base": "origin/main" }, "commits": [] }),
+                0
+            ),
+            "No commits since origin/main"
+        );
+        assert_eq!(
+            commits_text(
+                &json!({ "compare": { "status": "invalid_base", "base": "origin/x" }, "commits": [] }),
+                0
+            ),
+            "The base origin/x doesn't exist"
+        );
+    }
 }

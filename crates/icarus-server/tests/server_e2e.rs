@@ -404,6 +404,21 @@ async fn workspace_lifecycle_creates_a_worktree_with_an_agent_and_lists_changes(
         .await
         .expect("set status");
     assert_eq!(updated["status"], "in-review");
+    assert_eq!(updated["pinned"], false);
+    let pinned = client
+        .request(
+            "workspace.set",
+            json!({ "id": workspace["id"], "pinned": true }),
+        )
+        .await
+        .expect("pin");
+    assert_eq!(pinned["pinned"], true);
+    assert_eq!(pinned["status"], "in-review", "other fields stay");
+    let listed = client
+        .request("workspace.list", json!({}))
+        .await
+        .expect("list");
+    assert_eq!(listed[0]["pinned"], true);
 
     let refused = client
         .request("workspace.remove", json!({ "id": workspace["id"] }))

@@ -1160,6 +1160,7 @@ mod tests {
                 issue: None,
                 pull_request: None,
                 created_at_ms: 1,
+                pinned: false,
             })
             .expect("workspace");
         store
@@ -1349,6 +1350,7 @@ mod tests {
             issue: None,
             pull_request: None,
             created_at_ms: 1,
+            pinned: false,
         };
         assert_eq!(
             relative_path(&workspace, "./src//a.rs").expect("rel"),

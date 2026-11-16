@@ -57,8 +57,9 @@ use workspace::{AppState, MultiWorkspace, OpenOptions, Workspace};
 use crate::github_panel::{AvatarKind, render_avatar};
 
 pub use model::{
-    AgentSummary, IssueLabel, PrAuthor, PrSummary, SetupBadge, SetupSummary, StackGroup, StackLane,
-    StackPlace, StatusColumn, StatusGroup, WorkspaceSummary, group_by_stack, group_by_status,
+    AgentSummary, IssueLabel, PrAuthor, PrGroup, PrSummary, SetupBadge, SetupSummary, StackGroup,
+    StackLane, StackPlace, StatusColumn, StatusGroup, WorkspaceSummary, group_by_pr,
+    group_by_stack, group_by_status, pinned_first,
 };
 
 actions!(
@@ -893,6 +894,21 @@ pub fn register_panel_actions(workspace: &mut Workspace) {
             panel.update(cx, |panel, cx| panel.set_group_by(group_by, cx));
         }
     });
+    workspace.register_action(|workspace, action: &cards::SetWorkspaceSort, _, cx| {
+        if let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) {
+            let sort_by = cards::SortBy::parse(&action.sort_by);
+            panel.update(cx, |panel, cx| panel.set_sort_by(sort_by, cx));
+        }
+    });
+    workspace.register_action(|workspace, _: &cards::FocusWorkspaceFilter, window, cx| {
+        if workspace.panel::<WorkspacesPanel>(cx).is_none() {
+            return;
+        }
+        workspace.open_panel::<WorkspacesPanel>(window, cx);
+        if let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) {
+            panel.update(cx, |panel, cx| panel.focus_filter(window, cx));
+        }
+    });
     workspace.register_action(|workspace, _: &cards::ToggleGroupByStack, _, cx| {
         if let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) {
             panel.update(cx, |panel, cx| {
@@ -1066,6 +1082,9 @@ pub struct WorkspacesPanel {
     view: cards::CardView,
     project_names: collections::HashMap<String, String>,
     ports_requested: HashSet<String>,
+    filter: Option<Entity<editor::Editor>>,
+    filter_query: String,
+    _filter_subscription: Option<Subscription>,
     _poll: Task<()>,
     _ports_observation: Subscription,
     remote: Entity<servers::RemoteServers>,
@@ -1140,6 +1159,9 @@ impl WorkspacesPanel {
             view: cards::CardView::showing_all(),
             project_names: collections::HashMap::default(),
             ports_requested: HashSet::default(),
+            filter: None,
+            filter_query: String::new(),
+            _filter_subscription: None,
             _poll: Task::ready(()),
             _ports_observation: cx.observe(&ports, |_, _, cx| cx.notify()),
             remote: remote.clone(),
@@ -1649,15 +1671,16 @@ impl WorkspacesPanel {
                 .cmp(&b.1.to_lowercase())
                 .then(a.0.cmp(&b.0))
         });
+        let arranged = self.arranged_workspaces();
         projects
             .into_iter()
             .map(|(id, name)| {
-                let workspaces = self
-                    .workspaces
+                let mut workspaces: Vec<WorkspaceSummary> = arranged
                     .iter()
                     .filter(|workspace| workspace.project_id == id)
                     .cloned()
                     .collect();
+                pinned_first(&mut workspaces);
                 (id, name, workspaces)
             })
             .collect()
@@ -1670,80 +1693,112 @@ impl WorkspacesPanel {
                 .size(IconSize::Small)
                 .color(Color::Muted)
         };
-        match self.view.group_by {
-            cards::GroupBy::Status => group_by_status(&self.workspaces, &self.status_order)
-                .into_iter()
-                .map(|group| match group.status.as_deref() {
-                    Some(id) => (
-                        self.status_icon(id, cx),
-                        self.status_label(id),
-                        self.status_color(id, cx),
-                        group.workspaces,
-                    ),
-                    None => (
-                        no_status_icon(),
-                        "No status".into(),
-                        Color::Default,
-                        group.workspaces,
-                    ),
-                })
-                .collect(),
-            cards::GroupBy::Stack => group_by_stack(
-                &self.workspaces,
-                &self.status_order,
-                self.view.reviewing_status.as_deref(),
-                self.view.stack_ascending,
-            )
-            .into_iter()
-            .map(|group| match group.lane {
-                StackLane::Reviewing => {
-                    let id = self.view.reviewing_status.clone().unwrap_or_default();
-                    (
-                        self.status_icon(&id, cx),
-                        self.status_label(&id),
-                        self.status_color(&id, cx),
-                        group.workspaces,
+        let workspaces = self.arranged_workspaces();
+        let mut sections: Vec<(Icon, String, Color, Vec<WorkspaceSummary>)> =
+            match self.view.group_by {
+                cards::GroupBy::Status => group_by_status(&workspaces, &self.status_order)
+                    .into_iter()
+                    .map(|group| match group.status.as_deref() {
+                        Some(id) => (
+                            self.status_icon(id, cx),
+                            self.status_label(id),
+                            self.status_color(id, cx),
+                            group.workspaces,
+                        ),
+                        None => (
+                            no_status_icon(),
+                            "No status".into(),
+                            Color::Default,
+                            group.workspaces,
+                        ),
+                    })
+                    .collect(),
+                cards::GroupBy::PrStatus => group_by_pr(&workspaces)
+                    .into_iter()
+                    .map(|(lane, workspaces)| {
+                        let (icon, color) = match lane {
+                            PrGroup::Done => (IconName::Check, Color::Success),
+                            PrGroup::InReview => (IconName::Eye, Color::Accent),
+                            PrGroup::InProgress => (IconName::PullRequest, Color::Muted),
+                            PrGroup::Closed => (IconName::XCircle, Color::Muted),
+                        };
+                        (
+                            Icon::new(icon).size(IconSize::Small).color(color),
+                            lane.label().into(),
+                            Color::Default,
+                            workspaces,
+                        )
+                    })
+                    .collect(),
+                cards::GroupBy::Stack => {
+                    // Why: a stack lane is ordered by stack position, so pins don't reorder it.
+                    return group_by_stack(
+                        &workspaces,
+                        &self.status_order,
+                        self.view.reviewing_status.as_deref(),
+                        self.view.stack_ascending,
                     )
+                    .into_iter()
+                    .map(|mut group| {
+                        if !matches!(group.lane, StackLane::Stack { .. }) {
+                            pinned_first(&mut group.workspaces);
+                        }
+                        group
+                    })
+                    .map(|group| match group.lane {
+                        StackLane::Reviewing => {
+                            let id = self.view.reviewing_status.clone().unwrap_or_default();
+                            (
+                                self.status_icon(&id, cx),
+                                self.status_label(&id),
+                                self.status_color(&id, cx),
+                                group.workspaces,
+                            )
+                        }
+                        StackLane::Stack { number, .. } => (
+                            Icon::new(IconName::ListTree)
+                                .size(IconSize::Small)
+                                .color(Color::Accent),
+                            format!("Stack #{number}"),
+                            Color::Default,
+                            group.workspaces,
+                        ),
+                        StackLane::None => (
+                            no_status_icon(),
+                            "Not in a stack".into(),
+                            Color::Default,
+                            group.workspaces,
+                        ),
+                    })
+                    .collect();
                 }
-                StackLane::Stack { number, .. } => (
-                    Icon::new(IconName::ListTree)
+                cards::GroupBy::Project => self
+                    .project_groups()
+                    .into_iter()
+                    .map(|(_, name, workspaces)| {
+                        (
+                            Icon::new(IconName::Folder)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                            name,
+                            Color::Default,
+                            workspaces,
+                        )
+                    })
+                    .collect(),
+                cards::GroupBy::None => vec![(
+                    Icon::new(IconName::GitBranch)
                         .size(IconSize::Small)
-                        .color(Color::Accent),
-                    format!("Stack #{number}"),
+                        .color(Color::Muted),
+                    "All workspaces".into(),
                     Color::Default,
-                    group.workspaces,
-                ),
-                StackLane::None => (
-                    no_status_icon(),
-                    "Not in a stack".into(),
-                    Color::Default,
-                    group.workspaces,
-                ),
-            })
-            .collect(),
-            cards::GroupBy::Project => self
-                .project_groups()
-                .into_iter()
-                .map(|(_, name, workspaces)| {
-                    (
-                        Icon::new(IconName::Folder)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                        name,
-                        Color::Default,
-                        workspaces,
-                    )
-                })
-                .collect(),
-            cards::GroupBy::None => vec![(
-                Icon::new(IconName::GitBranch)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-                "All workspaces".into(),
-                Color::Default,
-                self.workspaces.clone(),
-            )],
+                    workspaces,
+                )],
+            };
+        for (_, _, _, workspaces) in &mut sections {
+            pinned_first(workspaces);
         }
+        sections
     }
 
     /// Grouping, stack order and which card fields show (plan §3a).
@@ -1755,7 +1810,7 @@ impl WorkspacesPanel {
                 IconButton::new("icarus-workspaces-view-button", IconName::Settings)
                     .icon_size(IconSize::XSmall)
                     .icon_color(Color::Muted),
-                Tooltip::text("Group and card display"),
+                Tooltip::text("Group, sort and card display"),
             )
             .menu(move |window, cx| {
                 let view = view.clone();
@@ -1764,6 +1819,7 @@ impl WorkspacesPanel {
                     menu = menu.header("Group by");
                     for (group_by, label) in [
                         (cards::GroupBy::Status, "Status"),
+                        (cards::GroupBy::PrStatus, "PR"),
                         (cards::GroupBy::Stack, "Stack"),
                         (cards::GroupBy::Project, "Project"),
                         (cards::GroupBy::None, "None"),
@@ -1796,6 +1852,23 @@ impl WorkspacesPanel {
                                     .update(cx, |panel, cx| {
                                         panel.set_stack_ascending(!ascending, cx)
                                     })
+                                    .log_err();
+                            },
+                        );
+                    }
+                    menu = menu.separator().header("Sort by");
+                    for (sort_by, label) in cards::SortBy::CHOICES {
+                        let panel = panel.clone();
+                        menu = menu.toggleable_entry(
+                            label,
+                            view.sort_by == sort_by,
+                            ui::IconPosition::Start,
+                            Some(Box::new(cards::SetWorkspaceSort {
+                                sort_by: sort_by.setting().into(),
+                            })),
+                            move |_, cx| {
+                                panel
+                                    .update(cx, |panel, cx| panel.set_sort_by(sort_by, cx))
                                     .log_err();
                             },
                         );
@@ -1969,6 +2042,13 @@ impl WorkspacesPanel {
                             .color(Color::Muted),
                     )
                     .child(Label::new(workspace.display_title()).size(LabelSize::Default))
+                    .when(workspace.pinned, |row| {
+                        row.child(
+                            Icon::new(IconName::Pin)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
                     .child(div().flex_1())
                     .when_some(
                         workspace.setup.as_ref().and_then(SetupSummary::badge),
@@ -2511,7 +2591,8 @@ fn show_add_server_help(workspace: WeakEntity<Workspace>, cx: &mut App) {
 }
 
 impl Render for WorkspacesPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let filter = self.render_filter(window, cx);
         // Same height as the centre's tab bar, so the two bottom borders line up across the window.
         let header = h_flex()
             .flex_none()
@@ -2612,6 +2693,7 @@ impl Render for WorkspacesPanel {
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(header)
+            .child(filter)
             .child(body)
     }
 }
@@ -2713,6 +2795,8 @@ mod tests {
             pr: None,
             setup: None,
             sleeping: false,
+            pinned: false,
+            created_at_ms: 0,
         }
     }
 

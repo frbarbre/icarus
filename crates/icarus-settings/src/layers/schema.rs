@@ -274,8 +274,16 @@ pub fn document_schema() -> Schema {
             "sidebar",
             "Sidebar grouping and sorting.",
             closed(vec![
-                field("groupBy", "", Str),
-                field("sortBy", "", Str),
+                field(
+                    "groupBy",
+                    "How the workspaces list is grouped.",
+                    Schema::Enum(&["none", "workspace-status", "pr-status", "repo", "stack"]),
+                ),
+                field(
+                    "sortBy",
+                    "How workspaces are sorted inside a group; `smart` is agent activity.",
+                    Schema::Enum(&["name", "smart", "recent", "repo", "manual"]),
+                ),
                 field("projectOrderBy", "", Str),
                 field("stackOrder", "", Str),
             ]),
