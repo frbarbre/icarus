@@ -429,6 +429,17 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             }
         }
     }
+    println!("\n--- Icarus: icarus_notifications and icarus_agent_history ---");
+    for (name, result) in run_icarus_notifications_and_history_tests(&mut cx, update_baseline) {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
     println!("\n--- Icarus: icarus_workspaces_stack ---");
     for (name, result) in
         run_icarus_workspaces_stack_tests(workspace_window, &mut cx, update_baseline)
@@ -1194,6 +1205,174 @@ fn run_icarus_dark_and_light(
         result
     });
     vec![(dark_name, dark), (light_name, light)]
+}
+
+/// The status-bar notifications list and the session history palette, each in its own window.
+fn run_icarus_notifications_and_history_tests(
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    use icarus_ui::history::{HistoryEntry, HistoryPalette, HistorySource};
+    use icarus_ui::notifications::{Notice, NotificationsList};
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    let minutes_ago = |minutes: u64| now_ms.saturating_sub(minutes * 60_000);
+    let notice = |id: &str, kind: &str, title: &str, body: &str, minutes: u64, read: bool| Notice {
+        id: id.into(),
+        kind: kind.into(),
+        title: title.into(),
+        body: body.into(),
+        workspace_id: Some("ws-1".into()),
+        data: None,
+        created_at: minutes_ago(minutes),
+        read,
+    };
+    let notices = vec![
+        notice(
+            "n1",
+            "agent_turn_done",
+            "ABC-101 finished its turn",
+            "Lazy-load frames in batches",
+            3,
+            false,
+        ),
+        notice(
+            "n2",
+            "ci_failed",
+            "CI failed on #412",
+            "frontend / unit tests",
+            25,
+            false,
+        ),
+        notice(
+            "n3",
+            "review_requested",
+            "Review requested: #418",
+            "feat: playlist links data model",
+            95,
+            true,
+        ),
+        notice(
+            "n4",
+            "update_available",
+            "Update available — restart to update",
+            "Icarus 0.2.0 is out",
+            300,
+            true,
+        ),
+    ];
+    let mut results = Vec::new();
+    let options = |height: f32| WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(400.0), px(height)),
+        })),
+        focus: false,
+        show: false,
+        ..Default::default()
+    };
+    let store = cx.update(|cx| {
+        let store = icarus_ui::notifications::store(cx);
+        store.update(cx, |store, cx| store.replace(notices, cx));
+        store
+    });
+    match cx.update(|cx| {
+        cx.open_window(options(300.0), |window, cx| {
+            cx.new(|cx| NotificationsList::new(store, window, cx))
+        })
+    }) {
+        Ok(list) => {
+            cx.run_until_parked();
+            results.extend(run_icarus_dark_and_light(
+                "icarus_notifications",
+                "icarus_notifications_light",
+                list.into(),
+                cx,
+                update_baseline,
+            ));
+            cx.update_window(list.into(), |_, window, _cx| window.remove_window())
+                .log_err();
+        }
+        Err(error) => results.push(("icarus_notifications", Err(error))),
+    }
+
+    let entry = |id: &str, workspace: &str, prompt: &str, minutes: u64, turns: u64| HistoryEntry {
+        id: id.into(),
+        title: None,
+        provider: "claude".into(),
+        workspace: Some(workspace.into()),
+        first_prompt: Some(prompt.into()),
+        last_activity_ms: minutes_ago(minutes),
+        turns,
+        state: "sleeping".into(),
+        resumable: true,
+        snippet: None,
+    };
+    let mut entries = vec![
+        entry(
+            "agent-1",
+            "ws-1",
+            "Lazy-load frames in batches so the editor opens fast",
+            12,
+            6,
+        ),
+        entry(
+            "agent-2",
+            "ws-2",
+            "Review #418 against the spec and leave notes",
+            90,
+            3,
+        ),
+        entry(
+            "agent-3",
+            "ws-1",
+            "Why does the frame strip flicker on scroll?",
+            60 * 26,
+            1,
+        ),
+    ];
+    entries[1].title = Some("Review #418".into());
+    entries[1].snippet = Some("…the queue rounds look right; one note on slide.py:42…".into());
+    let source = HistorySource {
+        search: std::rc::Rc::new(move |_, _| gpui::Task::ready(Ok(entries.clone()))),
+        workspaces: std::rc::Rc::new(|_| {
+            let mut names = collections::HashMap::default();
+            names.insert(
+                "ws-1".into(),
+                ("ABC-101".into(), PathBuf::from("/w/abc-101")),
+            );
+            names.insert("ws-2".into(), ("pr-418".into(), PathBuf::from("/w/pr-418")));
+            gpui::Task::ready(Ok(names))
+        }),
+        resume: std::rc::Rc::new(|_, _, _| {}),
+    };
+    let mut history_options = options(260.0);
+    history_options.window_bounds = Some(WindowBounds::Windowed(Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(640.0), px(260.0)),
+    }));
+    match cx.update(|cx| {
+        cx.open_window(history_options, |window, cx| {
+            cx.new(|cx| HistoryPalette::new(source, window, cx))
+        })
+    }) {
+        Ok(palette) => {
+            cx.run_until_parked();
+            results.extend(run_icarus_dark_and_light(
+                "icarus_agent_history",
+                "icarus_agent_history_light",
+                palette.into(),
+                cx,
+                update_baseline,
+            ));
+            cx.update_window(palette.into(), |_, window, _cx| window.remove_window())
+                .log_err();
+        }
+        Err(error) => results.push(("icarus_agent_history", Err(error))),
+    }
+    results
 }
 
 fn run_icarus_workspace_ports_tests(

@@ -817,6 +817,11 @@ fn main() {
         icarus_ui::set_open_agent_handler(cx, |agent_id, pane, workspace, window, cx| {
             agent_ui::agent_tab::open_agent_tab(workspace, agent_id, pane, true, window, cx);
         });
+        icarus_ui::remote_control::set_agent_resolver(cx, |item, cx| {
+            item.act_as::<agent_ui::agent_tab::AgentTab>(cx)?
+                .read(cx)
+                .agent_id(cx)
+        });
         agent_ui::set_attachment_resolver(cx, icarus_ui::fetch_attachment_text);
         outline_panel::init(cx);
         tasks_ui::init(cx);

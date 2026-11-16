@@ -16,7 +16,7 @@ use util::shell::Shell;
 use crate::{AppConnection, server_home, worktree_trust};
 
 /// The `icarus` CLI shipped next to the app in a release bundle, else the one on `PATH`.
-fn icarus_program() -> String {
+pub(crate) fn icarus_program() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|exe| Some(exe.parent()?.join("icarus")))

@@ -49,11 +49,16 @@ workspace.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
+objc2.workspace = true
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "std",
+    "NSApplication",
     "NSBitmapImageRep",
+    "NSDockTile",
     "NSImage",
     "NSImageRep",
+    "NSResponder",
+    "NSSound",
 ] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "std",

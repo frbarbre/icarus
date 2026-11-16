@@ -1,16 +1,21 @@
+pub mod accounts;
 pub mod browser;
 pub mod cards;
 pub mod changes_tab;
 pub mod commit_modal;
 pub mod diff_tab;
 pub mod github_panel;
+pub mod history;
 pub mod layout;
 pub mod links;
 mod model;
 mod next_action;
+pub mod notifications;
 pub mod palettes;
 pub mod quick_commands;
+pub mod remote_control;
 pub mod review;
+pub mod servers;
 pub mod sidebar;
 pub mod status_style;
 mod terminals;
@@ -219,6 +224,18 @@ fn window_for_path(
     None
 }
 
+/// The workspace in the active window, else in the first Icarus window.
+pub(crate) fn front_workspace(
+    cx: &App,
+) -> Option<(WindowHandle<MultiWorkspace>, Entity<Workspace>)> {
+    let window = cx
+        .active_window()
+        .and_then(|window| window.downcast::<MultiWorkspace>())
+        .or_else(|| multi_workspace_windows(cx).first().copied())?;
+    let workspace = window.read(cx).ok()?.workspace().clone();
+    Some((window, workspace))
+}
+
 /// The window showing the workspace rooted at `path`, or the active window if none is.
 fn workspace_for_path(
     path: &Path,
@@ -298,6 +315,18 @@ pub fn open_agent_tab(
 /// Shows the workspace's window (opening it if needed) and arranges its tabs as `pending` says.
 fn open_layout(pending: layout::PendingLayout, cx: &mut App) {
     let path = pending.path.clone();
+    with_workspace_window(path, cx, move |workspace, window, cx| {
+        layout::apply_layout(&pending.layout, &pending.path, workspace, window, cx);
+        layout_applied(workspace, window, cx);
+    });
+}
+
+/// Brings the window showing `path` to the front (opening one if needed), then runs `then` in its workspace.
+pub(crate) fn with_workspace_window(
+    path: PathBuf,
+    cx: &mut App,
+    then: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+) {
     let window = match window_for_path(&path, cx) {
         Some(found) => Task::ready(Ok(found)),
         None => {
@@ -317,14 +346,17 @@ fn open_layout(pending: layout::PendingLayout, cx: &mut App) {
         window.update(cx, |multi_workspace, window, cx| {
             multi_workspace.activate(workspace.clone(), None, window, cx);
             window.activate_window();
-            workspace.update(cx, |workspace, cx| {
-                layout::apply_layout(&pending.layout, &pending.path, workspace, window, cx);
-                layout_applied(workspace, window, cx);
-            });
+            workspace.update(cx, |workspace, cx| then(workspace, window, cx));
         })?;
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
+}
+
+/// The app's connection to its server, if it is connected.
+pub(crate) fn app_client(cx: &App) -> Option<Arc<Client>> {
+    cx.try_global::<AppConnection>()
+        .and_then(|connection| connection.client.clone())
 }
 
 fn layout_applied(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -561,6 +593,7 @@ fn start_app_connection(cx: &mut App) {
                 });
             }
             apply_pending_for_open_windows(client.clone(), cx).await;
+            notifications::connected(client.clone(), cx).await;
             loop {
                 let next = Tokio::spawn(cx, async move {
                     let event = events.recv().await;
@@ -619,6 +652,11 @@ fn start_app_connection(cx: &mut App) {
                     }
                     "ports.changed" => {
                         cx.update(|cx| links::ports_changed(event.payload, cx));
+                    }
+                    "notification" | "notifications.changed" => {
+                        cx.update(|cx| {
+                            notifications::handle_event(&event.topic, event.payload, cx)
+                        });
                     }
                     "open_layout" => {
                         let Some(announced) =
@@ -685,6 +723,10 @@ pub fn init(cx: &mut App) {
     zed_import::register(cx);
     quick_commands::register(cx);
     terminals::register(cx);
+    notifications::register(cx);
+    history::register(cx);
+    accounts::register(cx);
+    remote_control::register(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_some() {
             // A workspace opened after its layout was stored (e.g. the app was closed) applies it now.
@@ -935,6 +977,8 @@ pub struct WorkspacesPanel {
     ports_requested: HashSet<String>,
     _poll: Task<()>,
     _ports_observation: Subscription,
+    remote: Entity<servers::RemoteServers>,
+    _remote_observation: Subscription,
 }
 
 impl WorkspacesPanel {
@@ -1004,6 +1048,8 @@ impl WorkspacesPanel {
     /// A panel that never contacts a server, for previews and visual tests.
     pub fn preview(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let ports = PortsStore::global(cx);
+        let watch = enabled(cx);
+        let remote = servers::store(cx, watch);
         Self {
             focus_handle: cx.focus_handle(),
             workspace,
@@ -1018,7 +1064,13 @@ impl WorkspacesPanel {
             ports_requested: HashSet::default(),
             _poll: Task::ready(()),
             _ports_observation: cx.observe(&ports, |_, _, cx| cx.notify()),
+            remote: remote.clone(),
+            _remote_observation: cx.observe(&remote, |_, _, cx| cx.notify()),
         }
+    }
+
+    pub fn remote_servers(&self) -> &Entity<servers::RemoteServers> {
+        &self.remote
     }
 
     fn set_unavailable(&mut self, error: anyhow::Error, cx: &mut Context<Self>) {
@@ -1869,6 +1921,212 @@ impl WorkspacesPanel {
     }
 }
 
+impl WorkspacesPanel {
+    /// One section per saved server: its name and state, then a compact row per workspace.
+    fn render_remote_server(
+        &self,
+        server: &servers::RemoteServer,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (state, state_color) = match &server.state {
+            servers::RemoteState::Connecting => ("connecting…".to_owned(), Color::Muted),
+            servers::RemoteState::Connected { .. } => {
+                (server.workspaces.len().to_string(), Color::Muted)
+            }
+            servers::RemoteState::Unavailable(_) => ("offline".to_owned(), Color::Warning),
+        };
+        let mut section = v_flex().gap_0p5().child(
+            h_flex()
+                .px_2()
+                .pt_1()
+                .gap_1p5()
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Icon::new(IconName::Server)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(server.name.clone())
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD),
+                )
+                .child(
+                    Label::new(server.address.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .child(div().flex_1())
+                .child(Label::new(state).size(LabelSize::XSmall).color(state_color)),
+        );
+        if let servers::RemoteState::Unavailable(reason) = &server.state {
+            section = section.child(
+                div().px_2().child(
+                    Label::new(reason.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            );
+        }
+        for (index, workspace) in server.workspaces.iter().enumerate() {
+            let status = server.status_label(workspace.status.as_deref());
+            let working = workspace.working_agents();
+            let path = workspace.path.clone();
+            let server_name = server.name.clone();
+            let weak = cx.entity().downgrade();
+            section = section.child(
+                v_flex()
+                    .id(SharedString::from(format!(
+                        "icarus-remote-{}-{index}",
+                        server.name
+                    )))
+                    .mx_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(Label::new(workspace.display_title()).truncate())
+                            .child(div().flex_1())
+                            .when(working > 0, |row| {
+                                row.child(
+                                    Label::new(format!("{working} working"))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                            }),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "{status}{}",
+                            workspace
+                                .branch
+                                .as_ref()
+                                .map(|branch| format!(" · {branch}"))
+                                .unwrap_or_default()
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .on_click(move |_, _, cx| {
+                        open_remote_workspace(&server_name, path.clone(), weak.clone(), cx);
+                    }),
+            );
+        }
+        section
+    }
+
+    /// The servers this window watches: the local one and every saved remote.
+    fn render_servers_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let local = match &self.connection {
+            Connection::Connected { server_version } => format!("This machine — {server_version}"),
+            Connection::Connecting => "This machine — connecting…".to_owned(),
+            Connection::Unavailable(_) => "This machine — offline".to_owned(),
+        };
+        let remote: Vec<(String, String)> = self
+            .remote
+            .read(cx)
+            .servers()
+            .iter()
+            .map(|server| {
+                let state = match &server.state {
+                    servers::RemoteState::Connecting => "connecting…".to_owned(),
+                    servers::RemoteState::Connected { server_version } => server_version.clone(),
+                    servers::RemoteState::Unavailable(_) => "offline".to_owned(),
+                };
+                (server.name.clone(), format!("{} — {state}", server.address))
+            })
+            .collect();
+        let workspace = self.workspace.clone();
+        ui::PopoverMenu::new("icarus-servers-menu")
+            .menu(move |window, cx| {
+                let local = local.clone();
+                let remote = remote.clone();
+                let workspace = workspace.clone();
+                Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.header("Servers").label(local);
+                    for (name, detail) in &remote {
+                        menu = menu.label(format!("{name}: {detail}"));
+                    }
+                    menu.separator().entry("Add a server…", None, move |_, cx| {
+                        show_add_server_help(workspace.clone(), cx);
+                    })
+                }))
+            })
+            .anchor(gpui::Anchor::TopRight)
+            .trigger_with_tooltip(
+                ui::IconButton::new("icarus-servers-button", IconName::Server)
+                    .icon_size(IconSize::Small),
+                ui::Tooltip::text("Servers"),
+            )
+    }
+}
+
+/// Opens a remote server's workspace when its folder is reachable from here (same machine or a
+/// shared disk); otherwise says so, since editing over the network isn't supported yet.
+fn open_remote_workspace(
+    server: &str,
+    path: PathBuf,
+    panel: WeakEntity<WorkspacesPanel>,
+    cx: &mut App,
+) {
+    if path.is_dir() {
+        with_workspace_window(path, cx, |_, _, _| {});
+        return;
+    }
+    let message = format!(
+        "{} is on {server}. Opening another machine's workspaces isn't supported yet; use `icarus --server {server} …` from a terminal.",
+        path.display()
+    );
+    panel
+        .update(cx, |panel, cx| {
+            panel
+                .workspace
+                .update(cx, |workspace, cx| {
+                    struct RemoteWorkspace;
+                    workspace.show_notification(
+                        workspace::notifications::NotificationId::unique::<RemoteWorkspace>(),
+                        cx,
+                        |cx| {
+                            cx.new(|cx| {
+                                workspace::notifications::simple_message_notification::MessageNotification::new(message, cx)
+                            })
+                        },
+                    );
+                })
+                .log_err();
+        })
+        .log_err();
+}
+
+fn show_add_server_help(workspace: WeakEntity<Workspace>, cx: &mut App) {
+    let command = "icarus remote add <name> <host:port> --code <code from `icarus server pair` on that machine>";
+    workspace
+        .update(cx, |workspace, cx| {
+            struct AddServer;
+            workspace.show_notification(
+                workspace::notifications::NotificationId::unique::<AddServer>(),
+                cx,
+                |cx| {
+                    cx.new(|cx| {
+                        workspace::notifications::simple_message_notification::MessageNotification::new(
+                            "Pair another machine: run `icarus server start --listen <tailscale-ip>:<port>` and `icarus server pair` there, then this here. It shows up in this list within a few seconds.",
+                            cx,
+                        )
+                        .with_title(command)
+                        .copy_text(command)
+                    })
+                },
+            );
+        })
+        .log_err();
+}
+
 impl Render for WorkspacesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Same height as the centre's tab bar, so the two bottom borders line up across the window.
@@ -1885,6 +2143,7 @@ impl Render for WorkspacesPanel {
                     .color(Color::Muted),
             )
             .child(div().flex_1())
+            .child(self.render_servers_menu(cx))
             .child(self.render_view_menu(cx))
             .child(match &self.connection {
                 Connection::Connecting => Label::new("connecting…")
@@ -1943,6 +2202,9 @@ impl Render for WorkspacesPanel {
                 section = section.child(self.render_card(workspace, cx));
             }
             body = body.child(section);
+        }
+        for server in self.remote.read(cx).servers().to_vec() {
+            body = body.child(self.render_remote_server(&server, cx));
         }
         v_flex()
             .key_context("IcarusWorkspacesPanel")
@@ -2025,7 +2287,7 @@ impl Panel for WorkspacesPanel {
 mod tests {
     use super::*;
 
-    fn summary(name: &str, path: &str, status: Option<&str>) -> WorkspaceSummary {
+    pub(crate) fn summary(name: &str, path: &str, status: Option<&str>) -> WorkspaceSummary {
         WorkspaceSummary {
             id: format!("ws-{name}"),
             project_id: "p".into(),
@@ -2057,7 +2319,7 @@ mod tests {
     }
 
     /// A window on `/project` with the workspaces panel (preview mode, no server) and its actions.
-    async fn panel_window(
+    pub(crate) async fn panel_window(
         workspaces: Vec<WorkspaceSummary>,
         cx: &mut gpui::TestAppContext,
     ) -> (
