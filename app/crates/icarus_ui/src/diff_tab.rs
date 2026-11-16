@@ -1,19 +1,21 @@
 //! A diff tab: one changed file against the workspace's base, shown as a diff or edited in place (source-control §5.2).
 
 use std::any::{Any, TypeId};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
-use editor::{Editor, EditorEvent, HiddenDiffHunkRenderer};
+use editor::scroll::Autoscroll;
+use editor::{Editor, EditorEvent, HiddenDiffHunkRenderer, SelectionEffects};
 use git::status::{DiffTreeType, TreeDiffStatus};
 use gpui::{
     AnyEntity, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString,
     Subscription, Task, WeakEntity, Window, actions,
 };
-use language::Buffer;
-use multi_buffer::{Anchor, MultiBuffer};
+use language::{Bias, Buffer, Point};
+use multi_buffer::{Anchor, MultiBuffer, MultiBufferRow};
 use project::{Project, ProjectPath};
 use serde::{Deserialize, Serialize};
 use ui::{ToggleButtonGroup, ToggleButtonSimple, prelude::*};
@@ -31,8 +33,78 @@ actions!(
         ShowEdit,
         /// Shows the active file's changes against the base (⌥⌘D).
         ShowDiff,
+        /// Goes to the next change in the diff (F7); stops at the last one.
+        NextChange,
+        /// Goes to the previous change in the diff (⇧F7); stops at the first one.
+        PreviousChange,
     ]
 );
+
+/// What one press of a change key does (source-control §5.3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ChangeStep {
+    /// Move the cursor to the start of the change at this index.
+    Jump(usize),
+    /// Page through a change taller than the viewport: the new top row.
+    Scroll(f64),
+    /// At the first or last change: Orca doesn't wrap.
+    Stay,
+}
+
+/// One change in display rows: everything it covers (deleted rows shown above the new ones
+/// included), and the row the cursor lands on, its first new line or, for a pure deletion, the line
+/// after the gap.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ChangeRows {
+    pub rows: Range<u32>,
+    pub target: u32,
+}
+
+/// Orca's change stepping over changes sorted by position; `top` and `visible` describe the
+/// viewport in display rows.
+pub(crate) fn step_change(
+    changes: &[ChangeRows],
+    cursor: u32,
+    top: f64,
+    visible: f64,
+    forward: bool,
+) -> ChangeStep {
+    let contains = |change: &ChangeRows| {
+        if change.rows.is_empty() {
+            change.target == cursor
+        } else {
+            change.rows.contains(&cursor)
+        }
+    };
+    let current = changes.iter().position(contains);
+    let page = (visible * 0.85).floor().max(1.0);
+    if forward {
+        if let Some(change) = current.map(|index| &changes[index]) {
+            let last_row = change.rows.end.saturating_sub(1).max(change.target);
+            if f64::from(last_row) > top + visible - 1.0 {
+                return ChangeStep::Scroll(top + page);
+            }
+        }
+        changes
+            .iter()
+            .position(|change| change.target > cursor)
+            .map_or(ChangeStep::Stay, ChangeStep::Jump)
+    } else {
+        if let Some(index) = current {
+            let change = &changes[index];
+            if f64::from(change.rows.start) < top {
+                return ChangeStep::Scroll((top - page).max(0.0));
+            }
+            if cursor > change.target {
+                return ChangeStep::Jump(index);
+            }
+        }
+        changes
+            .iter()
+            .rposition(|change| change.target < cursor)
+            .map_or(ChangeStep::Stay, ChangeStep::Jump)
+    }
+}
 
 /// What the file is compared against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +225,67 @@ impl DiffTab {
         let review = cx.new(|cx| DiffReview::new(editor, buffer, workspace_key, path, cx));
         self._review_changes = Some(cx.observe(&review, |_, _, cx| cx.notify()));
         self.review = Some(review);
+    }
+
+    /// One press of the next/previous change key (source-control §5.3).
+    pub fn step_change(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let buffer = snapshot.buffer_snapshot();
+            let display_row =
+                |point: Point, bias: Bias| snapshot.point_to_display_point(point, bias).row().0;
+            let mut destinations = Vec::new();
+            let mut changes = Vec::new();
+            for hunk in buffer.diff_hunks_in_range(Point::zero()..buffer.max_point()) {
+                let start_row = display_row(Point::new(hunk.row_range.start.0, 0), Bias::Left);
+                let end_row = if hunk.row_range.is_empty() {
+                    start_row
+                } else {
+                    let last = MultiBufferRow(hunk.row_range.end.0 - 1);
+                    display_row(Point::new(last.0, buffer.line_len(last)), Bias::Right) + 1
+                };
+                // The new text's start: the deleted rows shown above it aren't part of the file.
+                let first_new_row = buffer
+                    .row_infos(hunk.row_range.start)
+                    .zip(hunk.row_range.start.0..)
+                    .take_while(|(_, row)| {
+                        *row < hunk.row_range.end.0.max(hunk.row_range.start.0 + 1)
+                    })
+                    .find(|(info, _)| !info.diff_status.is_some_and(|status| status.is_deleted()))
+                    .map_or(hunk.row_range.end.0, |(_, row)| row);
+                let destination = Point::new(first_new_row, 0);
+                destinations.push(destination);
+                changes.push(ChangeRows {
+                    rows: start_row..end_row,
+                    target: display_row(destination, Bias::Left),
+                });
+            }
+            let head = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            let cursor = display_row(head, Bias::Left);
+            let top = editor.scroll_position(cx).y;
+            let visible = editor.visible_line_count().unwrap_or(1.0);
+            match step_change(&changes, cursor, top, visible, forward) {
+                ChangeStep::Jump(index) => {
+                    let Some(&destination) = destinations.get(index) else {
+                        return;
+                    };
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::center()),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([destination..destination]),
+                    );
+                }
+                ChangeStep::Scroll(new_top) => {
+                    let x = editor.scroll_position(cx).x;
+                    editor.set_scroll_position(gpui::point(x, new_top), window, cx);
+                }
+                ChangeStep::Stay => {}
+            }
+        });
     }
 
     fn add_review_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -336,8 +469,39 @@ pub fn register(cx: &mut App) {
                 });
             }
         });
+        workspace.register_action(|workspace, _: &NextChange, window, cx| {
+            step_change_outside_diff(true, workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &PreviousChange, window, cx| {
+            step_change_outside_diff(false, workspace, window, cx);
+        });
     })
     .detach();
+}
+
+/// A change key pressed outside the diff editor focuses the diff and steps there (Orca's
+/// diff-shortcuts-outside-editor): only while a diff is the active tab or Source Control is showing.
+fn step_change_outside_diff(
+    forward: bool,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let active = workspace
+        .active_item(cx)
+        .and_then(|item| item.downcast::<DiffTab>());
+    let tab = active.or_else(|| {
+        crate::changes_tab::source_control_showing(workspace, window, cx)
+            .then(|| workspace.items_of_type::<DiffTab>(cx).next())
+            .flatten()
+    });
+    let Some(tab) = tab else {
+        return;
+    };
+    workspace.activate_item(&tab, true, true, window, cx);
+    window.defer(cx, move |window, cx| {
+        tab.update(cx, |tab, cx| tab.step_change(forward, window, cx));
+    });
 }
 
 impl EventEmitter<EditorEvent> for DiffTab {}
@@ -479,8 +643,14 @@ impl Render for DiffTab {
                     .log_err();
             }
         };
+        let mut key_context = gpui::KeyContext::default();
+        key_context.add("IcarusDiffTab");
+        // Remapped bare keys (Orca's ↑/↓ for changes) apply only while the diff shows, not while editing.
+        if mode == DiffTabMode::Diff {
+            key_context.add("diff_mode");
+        }
         v_flex()
-            .key_context("IcarusDiffTab")
+            .key_context(key_context)
             .size_full()
             .on_action(
                 cx.listener(|this, _: &ShowEdit, _, cx| this.set_mode(DiffTabMode::Edit, cx)),
@@ -488,6 +658,12 @@ impl Render for DiffTab {
             .on_action(
                 cx.listener(|this, _: &ShowDiff, _, cx| this.set_mode(DiffTabMode::Diff, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &NextChange, window, cx| this.step_change(true, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &PreviousChange, window, cx| {
+                this.step_change(false, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &AddReviewComment, window, cx| {
                 this.add_review_comment(window, cx)
             }))
@@ -996,6 +1172,211 @@ pub(crate) mod tests {
                 .as_str()
                 .is_some_and(|text| text.ends_with("Check both lines")),
             "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn change_steps_stop_at_the_ends_and_page_through_tall_changes() {
+        // Rows 2..4, a deletion at 10, and a 50-row change at 20; the viewport shows 20 rows.
+        let changes = [2..4, 10..10, 20..70].map(|rows| ChangeRows {
+            target: rows.start,
+            rows,
+        });
+        let step = |cursor, top, forward| step_change(&changes, cursor, top, 20.0, forward);
+        assert_eq!(step(0, 0.0, true), ChangeStep::Jump(0));
+        assert_eq!(step(2, 0.0, true), ChangeStep::Jump(1));
+        assert_eq!(
+            step(10, 0.0, true),
+            ChangeStep::Jump(2),
+            "a deletion sits on the row after its gap"
+        );
+        assert_eq!(
+            step(20, 10.0, true),
+            ChangeStep::Scroll(27.0),
+            "a tall change pages by 85% of the viewport first"
+        );
+        assert_eq!(
+            step(20, 51.0, true),
+            ChangeStep::Stay,
+            "once its end shows there is no next change, and no wrap"
+        );
+        assert_eq!(step(0, 0.0, false), ChangeStep::Stay, "no wrap backwards");
+        assert_eq!(
+            step(20, 27.0, false),
+            ChangeStep::Scroll(10.0),
+            "paging back up a tall change"
+        );
+        assert_eq!(step(20, 15.0, false), ChangeStep::Jump(1));
+        assert_eq!(
+            step(3, 0.0, false),
+            ChangeStep::Jump(0),
+            "inside a change, back goes to its start first"
+        );
+        assert_eq!(
+            step_change(&[], 0, 0.0, 20.0, true),
+            ChangeStep::Stay,
+            "no changes, nothing to do"
+        );
+    }
+
+    #[test]
+    fn file_steps_wrap_on_a_press_but_not_while_held() {
+        use crate::changes_tab::next_file;
+        assert_eq!(next_file(None, 3, true, false), Some(0));
+        assert_eq!(next_file(None, 3, false, false), Some(2));
+        assert_eq!(next_file(Some(2), 3, true, false), Some(0));
+        assert_eq!(next_file(Some(2), 3, true, true), None);
+        assert_eq!(next_file(Some(0), 3, false, true), None);
+        assert_eq!(next_file(Some(1), 3, true, true), Some(2));
+        assert_eq!(next_file(Some(0), 0, true, false), None);
+    }
+
+    /// A workspace whose `src/app.rs` changed one line, lost another and gained a long block since the base.
+    async fn stepping_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Workspace>, gpui::VisualTestContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            cx.set_global(db::AppDatabase::test_new());
+            crate::changes_tab::register(cx);
+            crate::sidebar::register(cx);
+            register(cx);
+            cx.bind_keys([
+                gpui::KeyBinding::new("f7", NextChange, Some("IcarusDiffTab > Editor")),
+                gpui::KeyBinding::new("shift-f7", PreviousChange, Some("IcarusDiffTab > Editor")),
+            ]);
+        });
+        let base = "one\ntwo\nthree\nfour\nfive\nsix\ntail\n";
+        let added: String = (1..=60).map(|n| format!("added {n}\n")).collect();
+        let current = format!("one\nTWO\nthree\nfive\n{added}six\ntail\n");
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({ ".git": {}, "src": { "app.rs": current.clone() } }),
+        )
+        .await;
+        let dot_git = Path::new("/project/.git");
+        fs.set_head_and_index_for_repo(dot_git, &[("src/app.rs", current)]);
+        fs.set_merge_base_content_for_repo(dot_git, &[("src/app.rs", base.to_string())]);
+        let project = project::Project::test(fs, [Path::new("/project")], cx).await;
+        let multi_workspace = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let cx = gpui::VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.run_until_parked();
+        (workspace, cx)
+    }
+
+    fn cursor_line(tab: &Entity<DiffTab>, cx: &mut gpui::VisualTestContext) -> String {
+        tab.update(cx, |tab, cx| {
+            tab.editor.update(cx, |editor, cx| {
+                let head = editor
+                    .selections
+                    .newest::<Point>(&editor.display_snapshot(cx))
+                    .head();
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let row = MultiBufferRow(head.row);
+                snapshot
+                    .text_for_range(
+                        Point::new(head.row, 0)..Point::new(head.row, snapshot.line_len(row)),
+                    )
+                    .collect()
+            })
+        })
+    }
+
+    #[gpui::test]
+    async fn change_keys_step_through_a_diff_and_stop_at_the_last_change(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, mut cx) = stepping_workspace(cx).await;
+        let cx = &mut cx;
+        let tab = open(
+            &workspace,
+            "/project/src/app.rs",
+            DiffBase::MergeBase("origin/main".into()),
+            cx,
+        );
+        cx.run_until_parked();
+        let tab = tab.await.expect("diff tab");
+        cx.run_until_parked();
+        tab.update_in(cx, |tab, window, cx| {
+            window.focus(&tab.editor.focus_handle(cx), cx);
+        });
+
+        cx.simulate_keystrokes("f7");
+        assert_eq!(cursor_line(&tab, cx), "TWO", "first the modified line");
+        cx.simulate_keystrokes("f7");
+        assert_eq!(
+            cursor_line(&tab, cx),
+            "five",
+            "a deletion counts as the line after its gap"
+        );
+        cx.simulate_keystrokes("f7");
+        assert_eq!(cursor_line(&tab, cx), "added 1");
+        let scroll_top = |cx: &mut gpui::VisualTestContext| {
+            tab.update(cx, |tab, cx| {
+                tab.editor
+                    .update(cx, |editor, cx| editor.scroll_position(cx).y)
+            })
+        };
+        let before = scroll_top(cx);
+        for _ in 0..10 {
+            cx.simulate_keystrokes("f7");
+        }
+        assert!(
+            scroll_top(cx) > before,
+            "the 60-line change pages down instead of jumping past it"
+        );
+        let at_end = cursor_line(&tab, cx);
+        assert!(
+            at_end.starts_with("added"),
+            "no wrap back to the first change after the last: {at_end:?}"
+        );
+        cx.simulate_keystrokes("shift-f7");
+        cx.simulate_keystrokes("shift-f7");
+        cx.simulate_keystrokes("shift-f7");
+        cx.simulate_keystrokes("shift-f7");
+        for _ in 0..10 {
+            cx.simulate_keystrokes("shift-f7");
+        }
+        assert_eq!(
+            cursor_line(&tab, cx),
+            "TWO",
+            "backwards stops at the first change, no wrap"
+        );
+    }
+
+    #[gpui::test]
+    async fn change_keys_from_outside_the_diff_reach_the_active_diff_tab(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, mut cx) = stepping_workspace(cx).await;
+        let cx = &mut cx;
+        let tab = open(
+            &workspace,
+            "/project/src/app.rs",
+            DiffBase::MergeBase("origin/main".into()),
+            cx,
+        );
+        cx.run_until_parked();
+        let tab = tab.await.expect("diff tab");
+        cx.run_until_parked();
+        // Focus the workspace itself rather than the diff editor, as from the Source Control list.
+        workspace.update_in(cx, |workspace, window, cx| {
+            window.focus(&workspace.focus_handle(cx), cx);
+        });
+        cx.dispatch_action(NextChange);
+        cx.run_until_parked();
+        assert_eq!(cursor_line(&tab, cx), "TWO");
+        assert!(
+            cx.update(|window, cx| tab.read(cx).editor.focus_handle(cx).is_focused(window)),
+            "the diff takes focus, as Orca's outside-editor keys do"
         );
     }
 }

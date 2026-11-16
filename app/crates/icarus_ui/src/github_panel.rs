@@ -28,6 +28,8 @@ actions!(
         ToggleGitHubPanel,
         /// Reloads this workspace's pull request from the Icarus server.
         RefreshGitHubPanel,
+        /// Reveals the GitHub panel and puts the cursor in the review summary.
+        FocusReviewSummary,
     ]
 );
 
@@ -1990,6 +1992,15 @@ pub(crate) fn register(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleGitHubPanel, window, cx| {
             workspace.toggle_panel_focus::<GitHubPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &FocusReviewSummary, window, cx| {
+            workspace.open_panel::<GitHubPanel>(window, cx);
+            let section = workspace
+                .panel::<GitHubPanel>(cx)
+                .and_then(|panel| panel.read(cx).review_section().cloned());
+            if let Some(section) = section {
+                window.focus(&section.read(cx).summary_focus_handle(cx), cx);
+            }
         });
     })
     .detach();

@@ -155,14 +155,45 @@ impl Store {
                  label TEXT NOT NULL,
                  home TEXT NOT NULL,
                  created_at_ms INTEGER NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS notes (
+                 id TEXT PRIMARY KEY,
+                 workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                 path TEXT NOT NULL,
+                 line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL,
+                 side TEXT,
+                 base TEXT,
+                 author TEXT NOT NULL,
+                 agent_id TEXT,
+                 body TEXT NOT NULL,
+                 excerpt TEXT,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 resolved_at INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS notes_by_workspace ON notes(workspace_id, path, line);
+             CREATE TABLE IF NOT EXISTS note_replies (
+                 id TEXT PRIMARY KEY,
+                 note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                 author TEXT NOT NULL,
+                 agent_id TEXT,
+                 body TEXT NOT NULL,
+                 status TEXT,
+                 error TEXT,
+                 changed_files TEXT,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS note_replies_by_note ON note_replies(note_id, created_at);
+             CREATE INDEX IF NOT EXISTS note_replies_by_agent ON note_replies(agent_id);",
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
     }
 
-    fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.connection.lock().unwrap_or_else(|p| p.into_inner())
     }
 

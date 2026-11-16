@@ -126,6 +126,13 @@ impl Server {
             tracing::info!("restored {restored} sleeping agent session(s)");
         }
         let store = Store::open(&paths.state_db())?;
+        let orphaned = store.fail_unfinished_note_replies(
+            "the server restarted before the reply session answered",
+        )?;
+        for agent in orphaned.iter().flatten().filter_map(|id| agents.get(id)) {
+            let _ = agent.kill().await;
+            agents.remove(agent.id());
+        }
         let workspace_root = match std::env::var_os("ICARUS_WORKSPACE_ROOT") {
             Some(root) => PathBuf::from(root),
             None => dirs::home_dir()
@@ -1164,6 +1171,7 @@ impl Server {
                 self.attachments_dispatch(other, params_value).await
             }
             other if other.starts_with("rules.") => self.rules_dispatch(other, params_value).await,
+            other if other.starts_with("note.") => self.notes_dispatch(other, params_value).await,
             "workspace.changes"
             | "workspace.changes.explain"
             | "workspace.changes.filter"

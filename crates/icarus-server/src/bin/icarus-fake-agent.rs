@@ -4,7 +4,8 @@
 //! `sleep:<ms> <text>` waits first, `write:<path> <text>` emits a Write tool call and result,
 //! `fail <text>` ends the turn as an error, `ask <question>` calls AskUserQuestion first,
 //! `env:A,B` answers with those environment variables, `args` with its command-line arguments,
-//! `exit` terminates the process.
+//! `exit` terminates the process. In a long prompt, the last line starting with `@fake ` is the
+//! message instead (so tests can steer note reply sessions through the thread).
 
 use std::io::{BufRead, Write};
 use std::time::Duration;
@@ -47,6 +48,11 @@ fn main() {
             .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
             .unwrap_or_default()
             .to_string();
+        let text = text
+            .lines()
+            .rev()
+            .find_map(|line| line.trim().strip_prefix("@fake "))
+            .map_or(text.clone(), str::to_string);
         if text == "exit" {
             break;
         }

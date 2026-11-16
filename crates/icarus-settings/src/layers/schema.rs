@@ -581,6 +581,15 @@ pub fn document_schema() -> Schema {
             ]),
         ),
         field(
+            "notes",
+            "Notes on diffs and their reply sessions.",
+            closed(vec![field(
+                "reply_timeout_ms",
+                "How long a note reply session may run before it's stopped. Default 600000 (10 minutes).",
+                Integer,
+            )]),
+        ),
+        field(
             "orca",
             "Orca compatibility data kept so an export reproduces the original file.",
             Any,

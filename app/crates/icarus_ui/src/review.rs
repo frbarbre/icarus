@@ -465,6 +465,10 @@ pub struct ReviewSection {
 }
 
 impl ReviewSection {
+    pub fn summary_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.summary_editor.focus_handle(cx)
+    }
+
     /// Reloads on the next frame, which has the window a reload needs.
     pub fn reload_soon(&mut self, cx: &mut Context<Self>) {
         self.reload_requested = true;

@@ -643,6 +643,17 @@
     "context": "IcarusDiffTab > Editor",
     "bindings": {
       "ctrl-shift-a": "icarus::AddReviewComment",
+      // Orca's editor.nextChange / previousChange.
+      "f7": "icarus::NextChange",
+      "shift-f7": "icarus::PreviousChange",
+    },
+  },
+  {
+    // Change keys from outside any text field reach the open diff (Orca's diff-shortcuts-outside-editor).
+    "context": "Workspace && !Editor && !Terminal",
+    "bindings": {
+      "f7": "icarus::NextChange",
+      "shift-f7": "icarus::PreviousChange",
     },
   },
   {

@@ -2,6 +2,7 @@ mod acp;
 mod attach;
 mod extras;
 mod issue;
+mod notes;
 mod ports;
 mod review;
 mod rules;
@@ -149,6 +150,16 @@ enum Command {
     Issue {
         #[command(subcommand)]
         command: issue::IssueCommand,
+    },
+    /// Notes on lines of a workspace's files: how agents point the user at code in the diff, with
+    /// threads answered by throwaway agent sessions.
+    #[command(alias = "note")]
+    Notes {
+        /// Workspace id, name or path; defaults to $ICARUS_WORKSPACE_ID, then the current directory's.
+        #[arg(long, global = true)]
+        workspace: Option<String>,
+        #[command(subcommand)]
+        command: notes::NotesCommand,
     },
     /// Notifications from the server (agents, CI, reviews, merges, rules); newest first.
     Notifications {
@@ -448,6 +459,22 @@ enum SettingsCommand {
         /// Zed config directory to merge into (default: the app's, `~/.config/icarus`).
         #[arg(long)]
         zed_dir: Option<PathBuf>,
+    },
+    /// Translate Orca keybindings (`~/.orca/keybindings.json`, or an `orca settings export`) into
+    /// the app's keymap. Like Orca, a remap replaces that action's default key; actions the file
+    /// doesn't mention keep their defaults. Importing again replaces what the last import wrote.
+    /// Runs on this machine, where the app lives, even with `--server`.
+    ImportKeybindings {
+        file: PathBuf,
+        /// The platform whose bindings to use (default: this machine's).
+        #[arg(long, value_enum)]
+        platform: Option<KeymapPlatform>,
+        /// The app's Zed config directory to write (default: `~/.config/icarus`).
+        #[arg(long, value_name = "DIR")]
+        zed_dir: Option<PathBuf>,
+        /// Report what would change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Bring a normal Zed install's settings, keymap, snippets, themes and extensions into the app.
     /// Settings the app already has win; extensions are downloaded by the app on its next start.
@@ -971,6 +998,12 @@ fn server_binary() -> Result<PathBuf> {
 enum Switch {
     On,
     Off,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum KeymapPlatform {
+    Mac,
+    Linux,
 }
 
 impl Switch {
@@ -1507,6 +1540,50 @@ async fn main() -> Result<()> {
                 result.summary_lines().join("\n")
             });
         }
+        Command::Settings {
+            command:
+                SettingsCommand::ImportKeybindings {
+                    file,
+                    platform,
+                    zed_dir,
+                    dry_run,
+                },
+        } => {
+            use icarus_settings::keymap;
+            let text = std::fs::read_to_string(file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let mut orca: Value = serde_json::from_str(&text)
+                .with_context(|| format!("{} is not JSON", file.display()))?;
+            // An `orca settings export` carries the keybindings file as text.
+            if let Some(embedded) = orca.get("keybindings").and_then(Value::as_str) {
+                orca = serde_json::from_str(embedded)
+                    .context("the export's keybindings aren't JSON")?;
+            }
+            let platform = match platform {
+                Some(KeymapPlatform::Mac) => keymap::Platform::Mac,
+                Some(KeymapPlatform::Linux) => keymap::Platform::Linux,
+                None => keymap::Platform::current(),
+            };
+            let target = zed_dir
+                .clone()
+                .or_else(icarus_settings::zed::config_dir)
+                .context("no app config directory; pass --zed-dir")?;
+            let translation = keymap::translate(&orca, platform);
+            let applied = keymap::apply(&target, &translation, *dry_run)?;
+            let value =
+                json!({ "translation": translation, "applied": applied, "dry_run": dry_run });
+            print(&cli, &value, |_| {
+                let mut lines = translation.summary_lines();
+                let verb = if *dry_run { "would write" } else { "wrote" };
+                lines.push(format!(
+                    "{verb} {} section(s) to {} (replacing {} from the last import)",
+                    applied.added,
+                    applied.keymap.display(),
+                    applied.replaced
+                ));
+                lines.join("\n")
+            });
+        }
         Command::Settings { command } => {
             let client = connect(&cli).await?;
             match command {
@@ -1580,7 +1657,9 @@ async fn main() -> Result<()> {
                         None => print!("{text}"),
                     }
                 }
-                SettingsCommand::ImportZed { .. } => unreachable!("handled without a server"),
+                SettingsCommand::ImportZed { .. } | SettingsCommand::ImportKeybindings { .. } => {
+                    unreachable!("handled without a server")
+                }
             }
         }
         Command::Project { command } => {
@@ -2032,6 +2111,10 @@ async fn main() -> Result<()> {
         Command::Ports { command } => {
             let client = connect(&cli).await?;
             ports::run(&cli, &client, command).await?;
+        }
+        Command::Notes { workspace, command } => {
+            let client = connect(&cli).await?;
+            notes::run(&cli, &client, workspace.as_deref(), command).await?;
         }
         Command::Issue { command } => {
             let client = connect(&cli).await?;

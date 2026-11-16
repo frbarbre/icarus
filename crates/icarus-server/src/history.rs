@@ -156,7 +156,11 @@ impl HistoryIndex {
                         id: meta.id,
                         provider: meta.options.provider,
                         title: meta.options.title,
-                        workspace: meta.options.workspace,
+                        // Note reply sessions run outside the workspace's agents but belong to its history.
+                        workspace: meta
+                            .options
+                            .workspace
+                            .or_else(|| meta.options.env.get("ICARUS_WORKSPACE_ID").cloned()),
                         account: meta.options.account,
                         cwd: meta.options.cwd.to_string_lossy().into_owned(),
                         created_at_ms: meta.created_at_ms,

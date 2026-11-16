@@ -352,6 +352,15 @@ impl Server {
                 let (attachment, delivered) = self.attach_check(&workspace, &p.name).await?;
                 self.added(attachment, delivered)
             }
+            "attach.note" => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                }
+                let p: P = params(p)?;
+                let (attachment, delivered) = self.attach_note(&p.id)?;
+                self.added(attachment, delivered)
+            }
             "attach.pr_comments" => {
                 #[derive(Deserialize)]
                 struct P {

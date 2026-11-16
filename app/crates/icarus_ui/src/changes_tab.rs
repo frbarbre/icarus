@@ -1,7 +1,7 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use file_icons::FileIcons;
 use git_ui::commit_view::{CommitView, CommitViewOptions};
@@ -41,6 +41,28 @@ actions!(
 
 /// How often an open Changes tab re-reads the list; the server coalesces the git reads behind it.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+/// Key repeat arrives far faster than two deliberate presses, so steps closer than this are a held key.
+const HOLD_REPEAT: Duration = Duration::from_millis(150);
+
+/// The row a file step lands on: `None` at an end while the key is held, as Orca stops there.
+pub(crate) fn next_file(
+    current: Option<usize>,
+    count: usize,
+    forward: bool,
+    held: bool,
+) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    match (current, forward) {
+        (None, true) => Some(0),
+        (None, false) => Some(count - 1),
+        (Some(current), true) if current + 1 < count => Some(current + 1),
+        (Some(current), false) if current > 0 => Some(current - 1),
+        (Some(_), true) => (!held).then_some(0),
+        (Some(_), false) => (!held).then_some(count - 1),
+    }
+}
 
 /// Which rows the list shows (docs/source-control.md §2.1). One per tab, so the shortcuts flip it in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +256,8 @@ pub struct SourceControlPanel {
     listing: Option<Listing>,
     error: Option<SharedString>,
     selected: Option<usize>,
+    /// The last file step's direction and time, to tell a held key's repeats from single presses.
+    last_step: Option<(bool, Instant)>,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     refreshing: Option<Task<()>>,
@@ -285,6 +309,7 @@ impl SourceControlPanel {
             listing: None,
             error: None,
             selected: None,
+            last_step: None,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             refreshing: None,
@@ -310,6 +335,7 @@ impl SourceControlPanel {
             listing: Some(listing),
             error: None,
             selected,
+            last_step: None,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             refreshing: None,
@@ -472,15 +498,34 @@ impl SourceControlPanel {
 
     /// Steps through the rows and opens the file there; a single press wraps (§5.3).
     pub fn step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_from(forward, None, window, cx);
+    }
+
+    /// Steps from `current` (the open diff tab's file) when it's in the list, else from the selection.
+    /// A single press wraps; a held key's repeats stop at the ends (Orca's changed-file-hold-navigation).
+    pub fn step_from(
+        &mut self,
+        forward: bool,
+        current: Option<&Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = cx.background_executor().now();
+        let held = self.last_step.is_some_and(|(direction, at)| {
+            direction == forward && now.saturating_duration_since(at) < HOLD_REPEAT
+        });
+        self.last_step = Some((forward, now));
         let count = self.rows().len();
         if count == 0 {
             return;
         }
-        let next = match (self.selected, forward) {
-            (None, true) => 0,
-            (None, false) => count - 1,
-            (Some(current), true) => (current + 1) % count,
-            (Some(current), false) => (current + count - 1) % count,
+        let from_tab = current.and_then(|current| {
+            self.rows()
+                .iter()
+                .position(|row| self.root.join(&row.path) == current)
+        });
+        let Some(next) = next_file(from_tab.or(self.selected), count, forward, held) else {
+            return;
         };
         self.select(next, cx);
         self.open_selected(window, cx);
@@ -918,6 +963,36 @@ pub fn reveal_source_control(
     workspace.panel::<SourceControlPanel>(cx)
 }
 
+/// The file keys step from the open diff tab's file (Orca's published review order position).
+fn step_changed_file(
+    forward: bool,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let current = workspace
+        .active_item(cx)
+        .and_then(|item| item.downcast::<crate::diff_tab::DiffTab>())
+        .map(|tab| tab.read(cx).path().to_path_buf());
+    if let Some(changes) = changes_tab(workspace, window, cx) {
+        changes.update(cx, |changes, cx| {
+            changes.step_from(forward, current.as_deref(), window, cx)
+        });
+    }
+}
+
+/// Whether Source Control is the panel showing in any dock.
+pub(crate) fn source_control_showing(workspace: &Workspace, _window: &Window, cx: &App) -> bool {
+    let Some(panel) = workspace.panel::<SourceControlPanel>(cx) else {
+        return false;
+    };
+    workspace.all_docks().iter().any(|dock| {
+        dock.read(cx)
+            .visible_panel()
+            .is_some_and(|visible| visible.panel_id() == panel.entity_id())
+    })
+}
+
 fn changes_tab(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -1007,14 +1082,10 @@ pub fn register(cx: &mut App) {
             .detach_and_log_err(cx);
         });
         workspace.register_action(|workspace, _: &NextChangedFile, window, cx| {
-            if let Some(changes) = changes_tab(workspace, window, cx) {
-                changes.update(cx, |changes, cx| changes.step(true, window, cx));
-            }
+            step_changed_file(true, workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &PreviousChangedFile, window, cx| {
-            if let Some(changes) = changes_tab(workspace, window, cx) {
-                changes.update(cx, |changes, cx| changes.step(false, window, cx));
-            }
+            step_changed_file(false, workspace, window, cx);
         });
     })
     .detach();
@@ -1289,6 +1360,48 @@ mod tests {
                 .map(|tab| tab.read(cx).path().to_path_buf())
         });
         assert_eq!(active, Some(PathBuf::from("/project/src/app.rs")));
+    }
+
+    #[gpui::test]
+    async fn a_held_file_key_stops_at_the_last_file_but_a_press_wraps(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, mut cx) = crate::diff_tab::tests::git_workspace(cx).await;
+        let cx = &mut cx;
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| SourceControlPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        panel.update(cx, |panel, _| {
+            let mut listing = sample_listing();
+            listing.rows.truncate(2);
+            panel.listing = Some(listing);
+            panel.refreshing = Some(Task::ready(()));
+        });
+        let selected =
+            |cx: &mut gpui::VisualTestContext| panel.read_with(cx, |panel, _| panel.selected);
+        let press = |pause: Duration, cx: &mut gpui::VisualTestContext| {
+            cx.executor().advance_clock(pause);
+            cx.dispatch_action(NextChangedFile);
+            cx.run_until_parked();
+        };
+
+        press(Duration::from_secs(1), cx);
+        press(Duration::from_secs(1), cx);
+        assert_eq!(selected(cx), Some(1), "on the last file");
+        press(Duration::from_millis(40), cx);
+        assert_eq!(
+            selected(cx),
+            Some(1),
+            "a held key's repeat stops at the end"
+        );
+        press(Duration::from_secs(1), cx);
+        assert_eq!(
+            selected(cx),
+            Some(0),
+            "a fresh press wraps to the first file"
+        );
     }
 
     #[gpui::test]

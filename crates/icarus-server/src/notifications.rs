@@ -236,6 +236,10 @@ pub(crate) fn spawn(server: Arc<Server>) {
             let Some(agent) = server.agents.get(&id) else {
                 continue;
             };
+            // A note reply's answer shows up in its thread; it is not a turn the user waits on.
+            if server.store.is_note_reply_agent(&id).unwrap_or(false) {
+                continue;
+            }
             let info = agent.info();
             let label = info
                 .workspace

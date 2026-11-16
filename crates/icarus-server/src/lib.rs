@@ -11,6 +11,7 @@ pub mod history;
 pub mod layouts;
 pub mod linear;
 pub mod next_action;
+pub mod notes;
 pub mod notifications;
 pub mod paths;
 pub mod ports;

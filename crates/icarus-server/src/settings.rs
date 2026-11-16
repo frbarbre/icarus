@@ -254,6 +254,23 @@ impl Server {
                             .map_err(|e| rpc("zed_settings", e))?,
                     )
                 };
+                // The export carries Orca's keybindings file; it becomes the app's keymap.
+                let keybindings = import.user.get("keybindings").and_then(|value| {
+                    serde_json::from_str::<Json>(&value.to_compact_string()).ok()
+                });
+                let keymap = match (&keybindings, p.skip_zed) {
+                    (Some(orca), false) => {
+                        let translation = icarus_settings::keymap::translate(
+                            orca,
+                            icarus_settings::keymap::Platform::current(),
+                        );
+                        let applied =
+                            icarus_settings::keymap::apply(&zed_dir, &translation, p.dry_run)
+                                .map_err(|e| rpc("zed_keymap", e))?;
+                        json!({ "translation": translation, "applied": applied })
+                    }
+                    _ => Json::Null,
+                };
                 let zed_result = json!({
                     "settings": applied.as_ref().map(|a| &a.settings),
                     "theme": applied.as_ref().and_then(|a| a.theme.as_ref()),
@@ -261,6 +278,7 @@ impl Server {
                     "kept": applied.as_ref().map(|a| &a.kept),
                     "backup": applied.as_ref().and_then(|a| a.backup.as_ref()),
                     "fragment": to_json(&import.zed),
+                    "keymap": keymap,
                 });
                 if !p.dry_run {
                     if let Some(parent) = user_path.parent() {

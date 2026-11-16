@@ -59,8 +59,48 @@ actions!(
         OpenPullRequest,
         /// Copies the URL of this workspace's pull request.
         CopyPullRequestUrl,
+        /// Activates the next tab of the active tab's kind (agent, terminal, file, diff…).
+        ActivateNextItemOfSameType,
+        /// Activates the previous tab of the active tab's kind.
+        ActivatePreviousItemOfSameType,
     ]
 );
+
+/// Orca's tab.nextSameType / previousSameType: cycles the active pane's tabs of the active tab's kind.
+fn activate_item_of_same_type(
+    forward: bool,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let pane = workspace.active_pane().clone();
+    let target = {
+        let pane = pane.read(cx);
+        let items: Vec<_> = pane.items().collect();
+        let active = pane.active_item_index();
+        let Some(kind) = items
+            .get(active)
+            .map(|item| item.to_any_view().entity_type())
+        else {
+            return;
+        };
+        let count = items.len();
+        (1..count)
+            .map(|offset| {
+                if forward {
+                    (active + offset) % count
+                } else {
+                    (active + count - offset) % count
+                }
+            })
+            .find(|&index| items[index].to_any_view().entity_type() == kind)
+    };
+    if let Some(index) = target {
+        pane.update(cx, |pane, cx| {
+            pane.activate_item(index, true, true, window, cx)
+        });
+    }
+}
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -658,6 +698,14 @@ pub fn init(cx: &mut App) {
             })
             .detach();
         }
+        workspace.register_action(|workspace, _: &ActivateNextItemOfSameType, window, cx| {
+            activate_item_of_same_type(true, workspace, window, cx);
+        });
+        workspace.register_action(
+            |workspace, _: &ActivatePreviousItemOfSameType, window, cx| {
+                activate_item_of_same_type(false, workspace, window, cx);
+            },
+        );
         workspace.register_action(|workspace, _: &ToggleWorkspacesPanel, window, cx| {
             workspace.toggle_panel_focus::<WorkspacesPanel>(window, cx);
         });
