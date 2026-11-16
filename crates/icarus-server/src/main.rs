@@ -158,8 +158,18 @@ async fn listen_inherited(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if matches!(cli.command, Command::Serve { .. }) {
+        icarus_server::login_path::adopt();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("ICARUS_LOG")
@@ -167,7 +177,6 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    let cli = Cli::parse();
     let paths = ServerPaths::resolve(cli.home.as_deref())?;
     match cli.command {
         Command::Serve {

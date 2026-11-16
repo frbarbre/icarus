@@ -32,7 +32,7 @@ icarus server install   # a systemd user unit
 ### What you also need
 
 - `git`.
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) and/or [Codex](https://github.com/openai/codex) (`codex`), signed in. Icarus runs your own binaries with your own login and never reads their credentials.
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) and/or [Codex](https://github.com/openai/codex) (`codex`), signed in. Icarus runs your own binaries with your own login and never reads their credentials. The server finds them on your login shell's `PATH`, even when launchd, systemd or SSH starts it (set `ICARUS_KEEP_PATH=1` to keep the `PATH` it was started with).
 - The GitHub CLI `gh`, signed in (`gh auth login`), for pull requests, checks and reviews.
 - Optional: a Linear API key for Linear issues (see [GitHub and Linear](github-and-linear.md#linear)).
 

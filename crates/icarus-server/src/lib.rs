@@ -13,6 +13,7 @@ pub mod history;
 pub mod hooks;
 pub mod layouts;
 pub mod linear;
+pub mod login_path;
 pub mod next_action;
 pub mod notes;
 pub mod notifications;
