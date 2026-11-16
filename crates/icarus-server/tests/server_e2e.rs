@@ -445,6 +445,63 @@ async fn project_inspect_reports_what_add_would_store_without_adding() {
 }
 
 #[tokio::test]
+async fn a_terminal_created_with_a_workspace_name_belongs_to_it_and_starts_in_its_folder() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let repo = tempfile::tempdir().expect("repo");
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    git(repo.path(), &["config", "user.email", "t@example.com"]);
+    git(repo.path(), &["config", "user.name", "T"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.path().join("readme.md"), "hello\n").expect("write");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "init"]);
+    let _server = start_server(home.path());
+    let fake = env!("CARGO_BIN_EXE_icarus-fake-agent");
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let project = client
+        .request("project.add", json!({ "path": repo.path() }))
+        .await
+        .expect("add project");
+    let workspace = client
+        .request(
+            "workspace.create",
+            json!({ "project": project["id"], "name": "shells", "agent_command": [fake] }),
+        )
+        .await
+        .expect("create workspace");
+
+    let terminal = client
+        .request(
+            "terminal.create",
+            json!({ "workspace": "shells", "command": ["sh", "-c", "pwd; sleep 30"] }),
+        )
+        .await
+        .expect("create terminal");
+    let info = client
+        .request("workspace.info", json!({ "id": workspace["id"] }))
+        .await
+        .expect("workspace info");
+    let listed: Vec<&Value> = info["terminals"].as_array().expect("terminals").iter().collect();
+    assert!(
+        listed.iter().any(|t| t["id"] == terminal["id"]),
+        "the workspace lists the terminal: {info}"
+    );
+    let path = std::fs::canonicalize(workspace["path"].as_str().expect("path")).expect("path");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let read = client
+            .request("terminal.read", json!({ "id": terminal["id"] }))
+            .await
+            .expect("read");
+        if read.to_string().contains(path.to_str().expect("utf8")) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "pwd was {read}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
 async fn workspace_lifecycle_creates_a_worktree_with_an_agent_and_lists_changes() {
     let home = tempfile::tempdir().expect("tempdir");
     let repo = tempfile::tempdir().expect("repo");

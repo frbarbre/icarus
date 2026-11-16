@@ -1065,9 +1065,18 @@ impl Server {
                 {
                     return Err(rpc("invalid_params", "color must be #rgb or #rrggbb"));
                 }
-                let cwd = match p.cwd {
-                    Some(cwd) => cwd,
-                    None => dirs::home_dir().ok_or_else(|| rpc("invalid_params", "no cwd"))?,
+                // Listings match terminals by workspace id, so a name given here must become the id.
+                let workspace = p
+                    .workspace
+                    .as_deref()
+                    .map(|key| self.workspace_by_key(key).ok())
+                    .unwrap_or_default();
+                let cwd = match (p.cwd, &workspace) {
+                    (Some(cwd), _) => cwd,
+                    (None, Some(workspace)) => workspace.path.clone(),
+                    (None, None) => {
+                        dirs::home_dir().ok_or_else(|| rpc("invalid_params", "no cwd"))?
+                    }
                 };
                 if !cwd.is_dir() {
                     return Err(rpc(
@@ -1082,7 +1091,7 @@ impl Server {
                     columns: p.columns.unwrap_or(120),
                     rows: p.rows.unwrap_or(32),
                     label: p.label,
-                    workspace: p.workspace,
+                    workspace: workspace.map(|workspace| workspace.id).or(p.workspace),
                     color: p.color,
                 };
                 let session = if p.task {
