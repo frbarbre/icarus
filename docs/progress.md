@@ -243,6 +243,9 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 
 Parked until you're back; work continues on other items.
 - **macOS notification permission:** accept the prompt the first time the app shows a notification.
+- **Homebrew tap token:** the `TAP_TOKEN` secret can't push to frbarbre/homebrew-tap ("Permission denied", 403). Edit the token at github.com/settings/personal-access-tokens: Repository access → only frbarbre/homebrew-tap, Permissions → Contents: **Read and write**. Then rerun: `gh run rerun <release publish run id> --failed`, or `gh workflow run release-publish.yml -f version=0.1.0 -f run_id=43780249933`.
+
+**v0.1.0 is released** (github.com/frbarbre/icarus/releases/tag/v0.1.0): the macOS app (zip + dmg, Apple silicon, unsigned), the CLI and server for macOS (universal) and Linux (x86_64, arm64), and SHA256SUMS. The tag run built everything, but GitHub refused its release creation with a 403 that a probe couldn't reproduce from a dispatched run; `release-publish.yml` published the same built files.
 
 ## In progress
 
