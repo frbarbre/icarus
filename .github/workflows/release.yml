@@ -203,9 +203,14 @@ jobs:
           fi
           flags=(--latest)
           if [ "$PRERELEASE" = "true" ]; then flags=(--prerelease --latest=false); fi
+          # A pushed (annotated) tag plus --target made GitHub answer 403, so --target only creates a missing tag.
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            flags+=(--verify-tag)
+          else
+            flags+=(--target "$GITHUB_SHA")
+          fi
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
             --title "Icarus $VERSION" \
             --generate-notes \
             "${flags[@]}"
