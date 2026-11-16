@@ -97,6 +97,26 @@ pub fn batch_query(identifiers: &[String]) -> (String, Value) {
     (query, Value::Object(variables))
 }
 
+pub const SEARCH_MAX: usize = 50;
+
+pub fn search_query(term: &str, first: usize) -> (String, Value) {
+    (
+        format!(
+            "query SearchIssues($term: String!, $first: Int!) {{ searchIssues(term: $term, first: $first) {{ nodes {{ ...IssueFields }} }} }} {ISSUE_FIELDS}"
+        ),
+        serde_json::json!({ "term": term, "first": first.clamp(1, SEARCH_MAX) }),
+    )
+}
+
+pub fn my_issues_query(first: usize) -> (String, Value) {
+    (
+        format!(
+            "query MyIssues($first: Int!) {{ issues(first: $first, orderBy: updatedAt, filter: {{ assignee: {{ isMe: {{ eq: true }} }}, state: {{ type: {{ nin: [\"completed\", \"canceled\"] }} }} }}) {{ nodes {{ ...IssueFields }} }} }} {ISSUE_FIELDS}"
+        ),
+        serde_json::json!({ "first": first.clamp(1, SEARCH_MAX) }),
+    )
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawIssue {

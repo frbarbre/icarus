@@ -149,7 +149,10 @@ async fn a_workspace_from_a_linear_issue_is_named_from_it_and_its_card_stays_cur
         "abc-12",
         "--no-agent",
     ]);
-    assert_eq!(created["name"], "abc-12-fix-login-redirect");
+    assert_eq!(
+        created["name"], "abc-12",
+        "the lowercased identifier keeps dev URLs short"
+    );
     assert_eq!(created["branch"], "frederik/abc-12-fix-login-redirect");
     assert_eq!(created["issue"]["provider"], "linear");
     assert_eq!(created["issue"]["id"], "ABC-12");
@@ -222,6 +225,36 @@ async fn a_workspace_from_a_linear_issue_is_named_from_it_and_its_card_stays_cur
     let log = std::fs::read_to_string(env.fixtures.join("requests.jsonl")).expect("log");
     assert!(!log.contains("lin_test_fixture_key"));
     assert!(log.lines().all(|line| line.contains("\"authorized\":true")));
+}
+
+#[tokio::test]
+async fn issue_search_matches_text_and_identifiers_without_leaking_the_key() {
+    let env = start(Some("lin_test_fixture_key"));
+    write_issue(&env.fixtures, "ABC-14", "Login button copy", "Todo");
+    write_issue(&env.fixtures, "XYZ-3", "Billing export", "Backlog");
+
+    let found = env.json(&["issue", "search", "login"]);
+    let identifiers: Vec<&str> = found
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter_map(|issue| issue["identifier"].as_str())
+        .collect();
+    assert_eq!(identifiers, ["ABC-12", "ABC-14"]);
+    assert_eq!(
+        found[0]["branch_name"],
+        "frederik/abc-12-fix-login-redirect"
+    );
+
+    let by_id = env.json(&["issue", "search", "xyz-3"]);
+    assert_eq!(by_id[0]["title"], "Billing export");
+
+    let text = env.ok(&["issue", "search", "billing"]);
+    assert!(text.contains("XYZ-3  Billing export  Backlog"), "{text}");
+
+    let log = std::fs::read_to_string(env.fixtures.join("requests.jsonl")).expect("log");
+    assert!(log.contains("SearchIssues"));
+    assert!(!log.contains("lin_test_fixture_key"));
 }
 
 #[tokio::test]

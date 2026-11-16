@@ -94,18 +94,40 @@ impl Server {
                 let p: P = params(p)?;
                 let info = icarus_git::repo_info(&p.path)
                     .map_err(|e| rpc("not_a_repo", format!("{e:#}")))?;
-                let name = p.name.unwrap_or_else(|| {
-                    info.root
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "project".into())
-                });
-                let base = p.base_ref.or(info.default_base);
+                let name = p
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| default_project_name(&info.root));
+                let base = p
+                    .base_ref
+                    .filter(|base| !base.trim().is_empty())
+                    .or(info.default_base);
                 let project = self
                     .store
                     .add_project(&name, &info.root, info.remote.as_deref(), base.as_deref())
                     .map_err(internal)?;
                 to_value(project)
+            }
+            "project.inspect" => {
+                #[derive(Deserialize)]
+                struct P {
+                    path: PathBuf,
+                }
+                let p: P = params(p)?;
+                let info = icarus_git::repo_info(&p.path)
+                    .map_err(|e| rpc("not_a_repo", format!("{e:#}")))?;
+                let existing = self
+                    .store
+                    .project_by_root(&info.root)
+                    .map_err(internal)?
+                    .map(|project| project.id);
+                Ok(json!({
+                    "root": info.root,
+                    "name": default_project_name(&info.root),
+                    "remote": info.remote,
+                    "base_ref": info.default_base,
+                    "existing": existing,
+                }))
             }
             "project.list" => to_value(self.store.projects().map_err(internal)?),
             "project.remove" => {
@@ -184,12 +206,8 @@ impl Server {
                 let name = p
                     .name
                     .filter(|name| !name.trim().is_empty())
-                    .or_else(|| {
-                        from_linear
-                            .as_ref()
-                            .map(|found| format!("{} {}", found.identifier, found.title))
-                    })
-                    .or_else(|| linked.clone())
+                    // Why: the identifier alone keeps `<slug>.localhost` dev URLs under the 63-char DNS label limit.
+                    .or_else(|| linked.as_ref().map(|identifier| identifier.to_lowercase()))
                     .ok_or_else(|| rpc("invalid_params", "name is required"))?;
                 let slug = workspace_slug(&name, SLUG_MAX);
                 let repo_dir = workspace_slug(&project.name, SLUG_MAX);
@@ -592,6 +610,12 @@ impl Server {
 
 fn yes() -> bool {
     true
+}
+
+fn default_project_name(root: &std::path::Path) -> String {
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "project".into())
 }
 
 fn sleep_key(workspace_id: &str) -> String {

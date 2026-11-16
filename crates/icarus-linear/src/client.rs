@@ -5,7 +5,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::error::{LinearError, Result};
-use crate::issue::{BATCH_MAX, Issue, batch_query, normalize_identifier, parse_issue};
+use crate::issue::{
+    BATCH_MAX, Issue, batch_query, my_issues_query, normalize_identifier, parse_issue, search_query,
+};
 use crate::key::KeyResolver;
 use crate::transport::{LinearRequest, LinearResponse, Transport};
 
@@ -187,6 +189,29 @@ impl<T: Transport> Linear<T> {
             .ok_or(LinearError::NotFound(identifier))
     }
 
+    pub async fn search(&self, term: &str, limit: usize) -> Result<Vec<Issue>> {
+        let term = term.trim();
+        // Why: `searchIssues` is full-text; an identifier deserves an exact lookup.
+        if let Ok(identifier) = normalize_identifier(term) {
+            let found = self.issues(std::slice::from_ref(&identifier)).await?;
+            return Ok(found.into_values().flatten().collect());
+        }
+        let ((query, variables), field) = if term.is_empty() {
+            (my_issues_query(limit), "issues")
+        } else {
+            (search_query(term, limit), "searchIssues")
+        };
+        let data = self
+            .execute(&LinearRequest::new(query, variables), false)
+            .await?;
+        data[field]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|node| parse_issue(node.clone()))
+            .collect()
+    }
+
     /// Several issues in as few queries as possible; `None` marks an identifier Linear doesn't know.
     pub async fn issues(&self, identifiers: &[String]) -> Result<BTreeMap<String, Option<Issue>>> {
         let mut wanted: Vec<String> = identifiers
@@ -300,6 +325,60 @@ mod tests {
         assert_eq!(requests[0].key.expose(), "lin_test");
         assert_eq!(requests[0].request.operation().as_deref(), Some("Issues"));
         assert_eq!(requests[0].request.variables, json!({ "i0": "ABC-12" }));
+    }
+
+    #[tokio::test]
+    async fn search_uses_linear_search_for_text_a_lookup_for_identifiers_and_my_issues_when_empty()
+    {
+        let linear = client(
+            FakeLinear::new()
+                .on(
+                    "SearchIssues",
+                    LinearResponse::ok(json!({ "data": { "searchIssues": { "nodes": [
+                        node("ABC-12", "Fix login"), node("ABC-14", "Login copy"),
+                    ] } } })),
+                )
+                .on(
+                    "Issues",
+                    LinearResponse::ok(json!({ "data": { "i0": node("ABC-12", "Fix login") } })),
+                )
+                .on(
+                    "MyIssues",
+                    LinearResponse::ok(
+                        json!({ "data": { "issues": { "nodes": [node("ABC-7", "Mine")] } } }),
+                    ),
+                ),
+        );
+        let found = linear.search(" login ", 500).await.expect("search");
+        assert_eq!(
+            found
+                .iter()
+                .map(|i| i.identifier.as_str())
+                .collect::<Vec<_>>(),
+            ["ABC-12", "ABC-14"]
+        );
+        let requests = linear.transport().requests();
+        assert_eq!(
+            requests[0].request.variables,
+            json!({ "term": "login", "first": 50 }),
+            "trimmed, and the limit is capped"
+        );
+
+        let found = linear.search("abc-12", 10).await.expect("lookup");
+        assert_eq!(
+            found[0].branch_name.as_deref(),
+            Some("frederik/abc-12-fix-login")
+        );
+        assert_eq!(
+            linear.transport().requests()[1]
+                .request
+                .operation()
+                .as_deref(),
+            Some("Issues")
+        );
+
+        let found = linear.search("", 10).await.expect("mine");
+        assert_eq!(found[0].identifier, "ABC-7");
     }
 
     #[tokio::test]

@@ -90,7 +90,7 @@ impl Transport for FakeLinear {
 }
 
 /// Answers `Issues` queries from `<dir>/<IDENTIFIER>.json` issue nodes (Linear's GraphQL shape), re-read
-/// on every call. A `<dir>/_status.json` of `{"status": 401}` (or 429, …) answers every request with that
+/// on every call; `SearchIssues` matches their identifier and title, `MyIssues` returns them all. A `<dir>/_status.json` of `{"status": 401}` (or 429, …) answers every request with that
 /// status instead. Each request is appended to `<dir>/requests.jsonl` without the key.
 pub struct FixtureLinear {
     dir: PathBuf,
@@ -120,6 +120,18 @@ impl FixtureLinear {
         let text = std::fs::read_to_string(self.dir.join(name)).ok()?;
         serde_json::from_str(&text).ok()
     }
+
+    fn issue_nodes(&self) -> Vec<Value> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".json") && !name.starts_with('_'))
+            .collect();
+        names.sort();
+        names.iter().filter_map(|name| self.read(name)).collect()
+    }
 }
 
 impl Transport for FixtureLinear {
@@ -132,11 +144,39 @@ impl Transport for FixtureLinear {
                 json!({ "errors": [{ "message": format!("fixture status {code}") }] }),
             ));
         }
-        if request.operation().as_deref() != Some("Issues") {
-            return Ok(LinearResponse::json(
-                400,
-                json!({ "errors": [{ "message": "the fixture only answers Issues" }] }),
-            ));
+        match request.operation().as_deref() {
+            Some("Issues") => {}
+            Some("SearchIssues") => {
+                let term = request.variables["term"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_lowercase();
+                let nodes: Vec<Value> = self
+                    .issue_nodes()
+                    .into_iter()
+                    .filter(|node| {
+                        ["identifier", "title"].iter().any(|key| {
+                            node[key]
+                                .as_str()
+                                .is_some_and(|text| text.to_lowercase().contains(&term))
+                        })
+                    })
+                    .collect();
+                return Ok(LinearResponse::ok(
+                    json!({ "data": { "searchIssues": { "nodes": nodes } } }),
+                ));
+            }
+            Some("MyIssues") => {
+                return Ok(LinearResponse::ok(
+                    json!({ "data": { "issues": { "nodes": self.issue_nodes() } } }),
+                ));
+            }
+            _ => {
+                return Ok(LinearResponse::json(
+                    400,
+                    json!({ "errors": [{ "message": "the fixture answers Issues, SearchIssues and MyIssues" }] }),
+                ));
+            }
         }
         let mut data = serde_json::Map::new();
         let mut errors = Vec::new();

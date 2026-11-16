@@ -8,6 +8,7 @@ pub mod diff_tab;
 pub mod github_panel;
 pub mod history;
 pub mod layout;
+pub mod lifecycle;
 pub mod links;
 mod model;
 mod next_action;
@@ -47,6 +48,7 @@ use gpui_tokio::Tokio;
 use icarus_client::Client;
 use ui::{
     ButtonLike, CommonAnimationExt as _, ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*,
+    right_click_menu,
 };
 use util::ResultExt as _;
 use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
@@ -929,6 +931,13 @@ pub fn register_panel_actions(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &OpenWorkspaceSwitcher, window, cx| {
         open_workspace_switcher(workspace, window, cx);
     });
+    workspace.register_action(|workspace, _: &lifecycle::AddProject, window, cx| {
+        lifecycle::add_project(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &lifecycle::NewWorkspace, window, cx| {
+        let project = lifecycle::window_project(workspace, cx);
+        lifecycle::open_new_workspace(project, workspace, window, cx);
+    });
 }
 
 /// The switcher's rows, one per workspace in the panel's order; the filter also matches the
@@ -1623,6 +1632,37 @@ impl WorkspacesPanel {
         })
     }
 
+    fn project_groups(&self) -> Vec<(String, String, Vec<WorkspaceSummary>)> {
+        // Why: empty projects get a group too, so their header menu can remove them.
+        let mut projects: Vec<(String, String)> = self
+            .project_names
+            .iter()
+            .map(|(id, name)| (id.clone(), name.clone()))
+            .collect();
+        for workspace in &self.workspaces {
+            if !projects.iter().any(|(id, _)| id == &workspace.project_id) {
+                projects.push((workspace.project_id.clone(), workspace.project_id.clone()));
+            }
+        }
+        projects.sort_by(|a, b| {
+            a.1.to_lowercase()
+                .cmp(&b.1.to_lowercase())
+                .then(a.0.cmp(&b.0))
+        });
+        projects
+            .into_iter()
+            .map(|(id, name)| {
+                let workspaces = self
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| workspace.project_id == id)
+                    .cloned()
+                    .collect();
+                (id, name, workspaces)
+            })
+            .collect()
+    }
+
     /// The list's sections for the chosen grouping: header icon, title, colour and cards.
     fn sections(&self, cx: &App) -> Vec<(Icon, String, Color, Vec<WorkspaceSummary>)> {
         let no_status_icon = || {
@@ -1681,6 +1721,20 @@ impl WorkspacesPanel {
                 ),
             })
             .collect(),
+            cards::GroupBy::Project => self
+                .project_groups()
+                .into_iter()
+                .map(|(_, name, workspaces)| {
+                    (
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                        name,
+                        Color::Default,
+                        workspaces,
+                    )
+                })
+                .collect(),
             cards::GroupBy::None => vec![(
                 Icon::new(IconName::GitBranch)
                     .size(IconSize::Small)
@@ -1711,6 +1765,7 @@ impl WorkspacesPanel {
                     for (group_by, label) in [
                         (cards::GroupBy::Status, "Status"),
                         (cards::GroupBy::Stack, "Stack"),
+                        (cards::GroupBy::Project, "Project"),
                         (cards::GroupBy::None, "None"),
                     ] {
                         let panel = panel.clone();
@@ -1890,7 +1945,7 @@ impl WorkspacesPanel {
             .shows("project")
             .then(|| self.project_names.get(&workspace.project_id).cloned())
             .flatten();
-        v_flex()
+        let card = v_flex()
             .id(SharedString::from(format!(
                 "icarus-workspace-{}",
                 workspace.id
@@ -1919,6 +1974,13 @@ impl WorkspacesPanel {
                         workspace.setup.as_ref().and_then(SetupSummary::badge),
                         |row, badge| row.child(render_setup_badge(&workspace.id, badge)),
                     )
+                    .when(workspace.sleeping, |row| {
+                        row.child(
+                            Label::new("Asleep")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
                     .when(view.shows("inline-agents") && agent_count > 0, |row| {
                         row.child(
                             Label::new(if working > 0 {
@@ -1990,7 +2052,101 @@ impl WorkspacesPanel {
             .when(view.shows("ports"), |card| {
                 card.children(self.render_port_chips(workspace, cx))
             })
-            .children(self.render_issue(workspace))
+            .children(self.render_issue(workspace));
+        self.with_card_menu(routing::ServerRef::Primary, workspace, card)
+    }
+
+    fn render_add_menu(&self) -> impl IntoElement {
+        PopoverMenu::new("icarus-workspaces-add")
+            .trigger_with_tooltip(
+                IconButton::new("icarus-workspaces-add-button", IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted),
+                Tooltip::text("New workspace or project"),
+            )
+            .menu(move |window, cx| {
+                Some(ContextMenu::build(window, cx, |menu, _, _| {
+                    menu.action("New Workspace…", lifecycle::NewWorkspace.boxed_clone())
+                        .action("Add Project…", lifecycle::AddProject.boxed_clone())
+                }))
+            })
+    }
+
+    fn with_project_menu(
+        &self,
+        project_id: String,
+        project_name: String,
+        workspace_count: usize,
+        header: impl IntoElement + 'static,
+    ) -> impl IntoElement {
+        let weak_workspace = self.workspace.clone();
+        right_click_menu(SharedString::from(format!(
+            "icarus-project-menu-{project_id}"
+        )))
+        .trigger(move |_, _, _| header)
+        .menu(move |window, cx| {
+            let project_id = project_id.clone();
+            let project_name = project_name.clone();
+            let weak_workspace = weak_workspace.clone();
+            ContextMenu::build(window, cx, move |menu, _, _| {
+                let new_in = (project_id.clone(), weak_workspace.clone());
+                let remove = (project_id, project_name, weak_workspace);
+                menu.entry("New Workspace…", None, move |window, cx| {
+                    let (project_id, workspace) = new_in.clone();
+                    // The menu is still being updated; open the dialog once it is done.
+                    window.defer(cx, move |window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                lifecycle::open_new_workspace(
+                                    Some(project_id),
+                                    workspace,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .log_err();
+                    });
+                })
+                .separator()
+                .entry("Remove Project…", None, move |window, cx| {
+                    let (project_id, project_name, workspace) = remove.clone();
+                    lifecycle::remove_project(
+                        routing::ServerRef::Primary,
+                        project_id,
+                        project_name,
+                        workspace_count,
+                        workspace,
+                        window,
+                        cx,
+                    );
+                })
+            })
+        })
+    }
+
+    fn with_card_menu(
+        &self,
+        server: routing::ServerRef,
+        workspace: &WorkspaceSummary,
+        card: impl IntoElement + 'static,
+    ) -> impl IntoElement {
+        let summary = workspace.clone();
+        let weak_workspace = self.workspace.clone();
+        right_click_menu(SharedString::from(format!(
+            "icarus-card-menu-{}-{}",
+            server.saved_name().unwrap_or_default(),
+            workspace.id
+        )))
+        .trigger(move |_, _, _| card)
+        .menu(move |window, cx| {
+            lifecycle::card_menu(
+                server.clone(),
+                summary.clone(),
+                weak_workspace.clone(),
+                window,
+                cx,
+            )
+        })
     }
 }
 
@@ -2050,54 +2206,57 @@ impl WorkspacesPanel {
             let ssh = server.ssh_destination();
             let weak = cx.entity().downgrade();
             let status_menu = self.render_remote_status_menu(server, workspace, index);
-            section = section.child(
-                v_flex()
-                    .id(SharedString::from(format!(
-                        "icarus-remote-{}-{index}",
-                        server.name
-                    )))
-                    .mx_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(Label::new(workspace.display_title()).truncate())
-                            .child(div().flex_1())
-                            .when(working > 0, |row| {
-                                row.child(
-                                    Label::new(format!("{working} working"))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Accent),
-                                )
-                            }),
-                    )
-                    .child(
-                        h_flex().gap_1().child(status_menu).child(
-                            Label::new(
-                                workspace
-                                    .branch
-                                    .as_ref()
-                                    .map(|branch| format!("· {branch}"))
-                                    .unwrap_or_default(),
+            let row = v_flex()
+                .id(SharedString::from(format!(
+                    "icarus-remote-{}-{index}",
+                    server.name
+                )))
+                .mx_1()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(Label::new(workspace.display_title()).truncate())
+                        .child(div().flex_1())
+                        .when(working > 0, |row| {
+                            row.child(
+                                Label::new(format!("{working} working"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Accent),
                             )
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                        ),
-                    )
-                    .on_click(move |_, _, cx| {
-                        open_remote_workspace(
-                            &server_name,
-                            ssh.clone(),
-                            path.clone(),
-                            weak.clone(),
-                            cx,
-                        );
-                    }),
-            );
+                        }),
+                )
+                .child(
+                    h_flex().gap_1().child(status_menu).child(
+                        Label::new(
+                            workspace
+                                .branch
+                                .as_ref()
+                                .map(|branch| format!("· {branch}"))
+                                .unwrap_or_default(),
+                        )
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    ),
+                )
+                .on_click(move |_, _, cx| {
+                    open_remote_workspace(
+                        &server_name,
+                        ssh.clone(),
+                        path.clone(),
+                        weak.clone(),
+                        cx,
+                    );
+                });
+            section = section.child(self.with_card_menu(
+                routing::ServerRef::Saved(server.name.clone()),
+                workspace,
+                row,
+            ));
         }
         section
     }
@@ -2367,6 +2526,7 @@ impl Render for WorkspacesPanel {
                     .color(Color::Muted),
             )
             .child(div().flex_1())
+            .child(self.render_add_menu())
             .child(self.render_servers_menu(cx))
             .child(self.render_view_menu(cx))
             .child(match &self.connection {
@@ -2404,24 +2564,40 @@ impl Render for WorkspacesPanel {
                     ),
             );
         }
-        for (header_icon, title, header_color, workspaces) in self.sections(cx) {
-            let mut section = v_flex().gap_0p5().child(
-                h_flex()
-                    .px_2()
-                    .gap_1p5()
-                    .child(header_icon)
-                    .child(
-                        Label::new(title)
-                            .size(LabelSize::Small)
-                            .color(header_color)
-                            .weight(gpui::FontWeight::SEMIBOLD),
-                    )
-                    .child(
-                        Label::new(workspaces.len().to_string())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            );
+        let project_ids: Vec<String> = if self.view.group_by == cards::GroupBy::Project {
+            self.project_groups()
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (index, (header_icon, title, header_color, workspaces)) in
+            self.sections(cx).into_iter().enumerate()
+        {
+            let header = h_flex()
+                .id(SharedString::from(format!("icarus-section-{index}")))
+                .px_2()
+                .gap_1p5()
+                .child(header_icon)
+                .child(
+                    Label::new(title.clone())
+                        .size(LabelSize::Small)
+                        .color(header_color)
+                        .weight(gpui::FontWeight::SEMIBOLD),
+                )
+                .child(
+                    Label::new(workspaces.len().to_string())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                );
+            let header = match project_ids.get(index).cloned() {
+                Some(project_id) => self
+                    .with_project_menu(project_id, title, workspaces.len(), header)
+                    .into_any_element(),
+                None => header.into_any_element(),
+            };
+            let mut section = v_flex().gap_0p5().child(header);
             for workspace in &workspaces {
                 section = section.child(self.render_card(workspace, cx));
             }
@@ -2536,6 +2712,7 @@ mod tests {
             pr_author: None,
             pr: None,
             setup: None,
+            sleeping: false,
         }
     }
 

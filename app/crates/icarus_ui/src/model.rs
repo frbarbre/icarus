@@ -31,6 +31,8 @@ pub struct WorkspaceSummary {
     /// The project's setup script run for this workspace, if it has one.
     #[serde(default)]
     pub setup: Option<SetupSummary>,
+    #[serde(default)]
+    pub sleeping: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -309,6 +311,7 @@ mod tests {
             pr_author: None,
             pr: None,
             setup: None,
+            sleeping: false,
         }
     }
 

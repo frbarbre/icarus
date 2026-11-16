@@ -22,6 +22,12 @@ pub enum IssueCommand {
         #[arg(long)]
         no_browser: bool,
     },
+    /// Search Linear issues by identifier or text; with no query, your open issues.
+    Search {
+        query: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Refresh linked issues now (all, or one), re-running `linear.api_key_command` if it failed.
     Refresh { id: Option<String> },
     /// Whether Linear is configured on the server.
@@ -53,6 +59,16 @@ pub async fn run(cli: &super::Cli, client: &Client, command: &IssueCommand) -> R
             }
             super::print(cli, &json!({ "url": url }), |_| url.to_owned());
         }
+        IssueCommand::Search { query, limit } => {
+            let value = client
+                .request_timeout(
+                    "issue.search",
+                    json!({ "query": query.as_deref().unwrap_or_default(), "limit": limit }),
+                    timeout,
+                )
+                .await?;
+            super::print(cli, &value, search_text);
+        }
         IssueCommand::Refresh { id } => {
             let value = client
                 .request_timeout("issue.refresh", json!({ "id": id }), timeout)
@@ -81,6 +97,30 @@ pub async fn run(cli: &super::Cli, client: &Client, command: &IssueCommand) -> R
         }
     }
     Ok(())
+}
+
+fn search_text(found: &Value) -> String {
+    let lines: Vec<String> = found
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|issue| {
+            let mut line = format!(
+                "{}  {}",
+                issue["identifier"].as_str().unwrap_or_default(),
+                issue["title"].as_str().unwrap_or_default()
+            );
+            if let Some(state) = issue["state"]["name"].as_str() {
+                line.push_str(&format!("  {state}"));
+            }
+            line
+        })
+        .collect();
+    if lines.is_empty() {
+        "no issues found".to_owned()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn show_text(issue: &Value) -> String {

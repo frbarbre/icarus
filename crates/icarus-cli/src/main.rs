@@ -550,7 +550,7 @@ enum WorkspaceCommand {
     Create {
         #[arg(long)]
         project: String,
-        /// Defaults to the Linear issue's identifier and title with --from-linear.
+        /// Defaults to the Linear issue's identifier, lowercased (e.g. abc-12), with --from-linear.
         #[arg(required_unless_present = "from_linear")]
         name: Option<String>,
         #[arg(long)]
@@ -563,7 +563,7 @@ enum WorkspaceCommand {
         status: Option<String>,
         #[arg(long)]
         prompt: Option<String>,
-        /// Link a Linear issue by identifier, e.g. ABC-12; its title and branch name fill in the rest.
+        /// Link a Linear issue by identifier, e.g. ABC-12; it names the workspace, and Linear's branch name is the branch.
         #[arg(long)]
         from_linear: Option<String>,
         #[arg(long)]

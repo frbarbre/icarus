@@ -74,14 +74,16 @@ pub enum GroupBy {
     #[default]
     Status,
     Stack,
+    Project,
     None,
 }
 
 impl GroupBy {
-    /// Orca's `groupBy` values; repo and pr-status grouping fall back to status for now.
+    /// Orca's `groupBy` values; pr-status grouping falls back to status for now.
     pub fn parse(value: &str) -> Self {
         match value {
             "stack" => Self::Stack,
+            "repo" => Self::Project,
             "none" => Self::None,
             _ => Self::Status,
         }
@@ -91,6 +93,7 @@ impl GroupBy {
         match self {
             Self::Status => "workspace-status",
             Self::Stack => "stack",
+            Self::Project => "repo",
             Self::None => "none",
         }
     }
@@ -269,11 +272,11 @@ mod tests {
 
     #[test]
     fn grouping_round_trips_orcas_values() {
-        for value in ["workspace-status", "stack", "none"] {
+        for value in ["workspace-status", "stack", "repo", "none"] {
             assert_eq!(GroupBy::parse(value).setting(), value);
         }
         assert_eq!(
-            GroupBy::parse("repo"),
+            GroupBy::parse("pr-status"),
             GroupBy::Status,
             "not built yet, so status"
         );

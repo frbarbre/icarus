@@ -790,7 +790,8 @@
       "cmd-k s": "workspace::SaveWithoutFormat",
       "alt-shift-enter": "toast::RunAction",
       "cmd-shift-s": "workspace::SaveAs",
-      "cmd-shift-n": "workspace::NewWindow",
+      // Icarus: Orca's Mod+Shift+N creates a workspace; New Window stays in the File menu and palette.
+      "cmd-shift-n": "icarus::NewWorkspace",
       "ctrl-`": "terminal_panel::Toggle",
       "cmd-1": ["workspace::ActivatePane", 0],
       "cmd-2": ["workspace::ActivatePane", 1],

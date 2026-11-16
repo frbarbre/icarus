@@ -19,6 +19,7 @@ const ISSUE_TTL: Duration = Duration::from_secs(60);
 const CREATE_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_POLL_MS: u64 = 300_000;
 const MIN_POLL_MS: u64 = 1_000;
+const SEARCH_LIMIT: usize = 20;
 
 /// The transport the server uses: Linear's API, or a fixture directory when `ICARUS_LINEAR_FIXTURES` is set.
 pub enum ServerLinear {
@@ -220,6 +221,9 @@ impl Server {
     }
 
     pub(crate) async fn linear_dispatch(&self, method: &str, p: Value) -> Result<Value, RpcError> {
+        if method == "issue.search" {
+            return self.issue_search(p).await;
+        }
         #[derive(Deserialize)]
         struct P {
             id: Option<String>,
@@ -254,6 +258,36 @@ impl Server {
             }
             (other, _) => Err(rpc("unknown_method", other)),
         }
+    }
+
+    async fn issue_search(&self, p: Value) -> Result<Value, RpcError> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            query: String,
+            limit: Option<usize>,
+        }
+        let p: P = params(p)?;
+        self.linear_sync_settings().await;
+        let limit = p.limit.unwrap_or(SEARCH_LIMIT);
+        let found = self
+            .linear
+            .client
+            .search(&p.query, limit)
+            .await
+            .map_err(linear_rpc)?;
+        // Why: creating a workspace from a picked issue then needs no second Linear round trip.
+        let mut cache = lock(&self.linear.cache);
+        for issue in &found {
+            cache.insert(
+                issue.identifier.clone(),
+                Cached {
+                    fetched: Instant::now(),
+                    issue: Some(issue.clone()),
+                },
+            );
+        }
+        to_value(&found)
     }
 
     async fn issue_get(&self, identifier: &str, refresh: bool) -> Result<Value, RpcError> {

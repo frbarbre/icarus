@@ -844,6 +844,7 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
             pr_author: None,
             pr: None,
             setup: None,
+            sleeping: false,
         }
     };
     let with_author = |mut workspace: icarus_ui::WorkspaceSummary, login: &str| {

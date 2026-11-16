@@ -273,6 +273,73 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 #[tokio::test]
+async fn project_inspect_reports_what_add_would_store_without_adding() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let repo = tempfile::tempdir().expect("repo");
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    git(repo.path(), &["config", "user.email", "t@example.com"]);
+    git(repo.path(), &["config", "user.name", "T"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::create_dir(repo.path().join("src")).expect("mkdir");
+    std::fs::write(repo.path().join("src/lib.rs"), "\n").expect("write");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "init"]);
+    let _server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+
+    let inspected = client
+        .request(
+            "project.inspect",
+            json!({ "path": repo.path().join("src") }),
+        )
+        .await
+        .expect("inspect");
+    let root = std::fs::canonicalize(repo.path()).expect("canonical");
+    assert_eq!(
+        std::fs::canonicalize(inspected["root"].as_str().expect("root")).expect("canonical"),
+        root,
+        "a subfolder resolves to the repository root"
+    );
+    assert_eq!(inspected["base_ref"], "main");
+    assert_eq!(inspected["existing"], serde_json::Value::Null);
+    assert_eq!(
+        client
+            .request("project.list", json!({}))
+            .await
+            .expect("list"),
+        json!([]),
+        "inspecting adds nothing"
+    );
+
+    let added = client
+        .request(
+            "project.add",
+            json!({ "path": inspected["root"], "name": "", "base_ref": "" }),
+        )
+        .await
+        .expect("add");
+    assert_eq!(
+        added["name"], inspected["name"],
+        "a blank name means the default"
+    );
+    assert_eq!(
+        added["base_ref"], "main",
+        "a blank base means the detected one"
+    );
+    let again = client
+        .request("project.inspect", json!({ "path": repo.path() }))
+        .await
+        .expect("inspect again");
+    assert_eq!(again["existing"], added["id"]);
+
+    let error = client
+        .request("project.inspect", json!({ "path": home.path() }))
+        .await
+        .expect_err("not a repository");
+    assert!(format!("{error:#}").contains("not_a_repo"), "{error:#}");
+}
+
+#[tokio::test]
 async fn workspace_lifecycle_creates_a_worktree_with_an_agent_and_lists_changes() {
     let home = tempfile::tempdir().expect("tempdir");
     let repo = tempfile::tempdir().expect("repo");
