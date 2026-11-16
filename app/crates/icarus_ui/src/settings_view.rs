@@ -59,6 +59,8 @@ enum Control {
     Toggle,
     Choice(&'static [&'static str]),
     Text,
+    /// A prompt template: several lines, blank means the built-in one.
+    Prompt,
     Integer,
 }
 
@@ -122,6 +124,63 @@ const AUTOMATION: &[Field] = &[
         "Move cards by pull request state",
         "The status rules below.",
         Control::Toggle,
+    ),
+];
+
+const RULE_OPTIONS: &[Field] = &[
+    field(
+        "rules.orca_compat.onResolved",
+        "When your PR is merged or closed",
+        "Delete removes the workspace once its pull request is done.",
+        Control::Choice(&["none", "delete"]),
+    ),
+    field(
+        "rules.orca_compat.onReviewed",
+        "When you have reviewed",
+        "Delete removes a review workspace once your review is in.",
+        Control::Choice(&["none", "delete"]),
+    ),
+    field(
+        "rules.orca_compat.resolveConflictsWithAgent",
+        "Resolve conflicts with an agent",
+        "Start an agent when your PR enters the conflicts column.",
+        Control::Toggle,
+    ),
+    field(
+        "rules.orca_compat.conflictPromptTemplate",
+        "Conflict prompt",
+        "What that agent is asked; blank uses the built-in prompt.",
+        Control::Prompt,
+    ),
+    field(
+        "rules.orca_compat.reviewInbox.enabled",
+        "Review inbox",
+        "Create a review workspace for each review request.",
+        Control::Toggle,
+    ),
+    field(
+        "rules.orca_compat.reviewInbox.agent",
+        "Review agent",
+        "Runs reviews, conflict fixes and action prompts.",
+        Control::Choice(&["claude", "codex"]),
+    ),
+    field(
+        "rules.orca_compat.reviewInbox.view",
+        "Review agent view",
+        "How a review workspace shows its agent.",
+        Control::Choice(&["chat", "terminal", "default"]),
+    ),
+    field(
+        "rules.orca_compat.reviewInbox.promptTemplate",
+        "Review prompt",
+        "The first look at a pull request; blank uses the built-in prompt.",
+        Control::Prompt,
+    ),
+    field(
+        "rules.orca_compat.reviewInbox.rereviewPromptTemplate",
+        "Re-review prompt",
+        "After new commits; blank uses the built-in prompt.",
+        Control::Prompt,
     ),
 ];
 
@@ -293,14 +352,30 @@ impl SettingsView {
     ) -> Self {
         let mut editors = HashMap::new();
         let mut subscriptions = Vec::new();
-        for field in [AUTOMATION, INTEGRATIONS, PORTS]
+        for field in [AUTOMATION, RULE_OPTIONS, INTEGRATIONS, PORTS]
             .into_iter()
             .flatten()
-            .filter(|f| matches!(f.control, Control::Text | Control::Integer))
+            .filter(|f| {
+                matches!(
+                    f.control,
+                    Control::Text | Control::Prompt | Control::Integer
+                )
+            })
         {
+            let prompt = field.control == Control::Prompt;
             let editor = cx.new(|cx| {
-                let mut editor = Editor::single_line(window, cx);
-                editor.set_placeholder_text("Not set", window, cx);
+                let mut editor = if prompt {
+                    let mut editor = Editor::auto_height(1, 8, window, cx);
+                    editor.set_soft_wrap();
+                    editor
+                } else {
+                    Editor::single_line(window, cx)
+                };
+                editor.set_placeholder_text(
+                    if prompt { "Built-in prompt" } else { "Not set" },
+                    window,
+                    cx,
+                );
                 editor
             });
             let key = field.key;
@@ -369,6 +444,7 @@ impl SettingsView {
         let keys: Vec<&'static str> = [
             AGENTS,
             AUTOMATION,
+            RULE_OPTIONS,
             INTEGRATIONS,
             NOTIFICATIONS,
             PORTS,
@@ -828,6 +904,8 @@ impl SettingsView {
                 let current: SharedString = value
                     .as_ref()
                     .and_then(Value::as_str)
+                    // Each choice lists the built-in value first.
+                    .or_else(|| options.first().copied())
                     .unwrap_or("default")
                     .to_owned()
                     .into();
@@ -857,9 +935,13 @@ impl SettingsView {
                     })
                     .into_any_element()
             }
-            Control::Text | Control::Integer => match self.editors.get(key) {
+            Control::Text | Control::Prompt | Control::Integer => match self.editors.get(key) {
                 Some(editor) => div()
-                    .w(px(260.))
+                    .w(px(if field.control == Control::Prompt {
+                        320.
+                    } else {
+                        260.
+                    }))
                     .px_1p5()
                     .py_0p5()
                     .rounded_sm()
@@ -1293,6 +1375,7 @@ impl Render for SettingsView {
         };
         let agents = rows(AGENTS, self, cx);
         let automation = rows(AUTOMATION, self, cx);
+        let rule_options = rows(RULE_OPTIONS, self, cx);
         let integrations = rows(INTEGRATIONS, self, cx);
         let notifications = rows(NOTIFICATIONS, self, cx);
         let ports = rows(PORTS, self, cx);
@@ -1388,6 +1471,8 @@ impl Render for SettingsView {
                             .color(Color::Muted),
                     )
                     .child(self.render_conditions(cx))
+                    .child(Self::section("PULL REQUEST RULES", cx))
+                    .children(rule_options)
                     .child(Self::section("AGENTS", cx))
                     .children(agents)
                     .child(Self::section("INTEGRATIONS", cx))
@@ -1616,6 +1701,98 @@ mod tests {
             calls_to(&calls, "config.unset")[0],
             json!({ "key": "rules.orca_compat.statusByCondition.conflicts", "layer": "project", "project": "p-1" })
         );
+    }
+
+    #[gpui::test]
+    async fn the_pull_request_rule_options_load_and_save_from_the_tab(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let calls = cx.update(|cx| {
+            stub_rpc(cx, |method, _| match method {
+                "config.get" => {
+                    let mut value = resolved();
+                    value["rules"]["orca_compat"]["onResolved"] = json!("delete");
+                    value["rules"]["orca_compat"]["reviewInbox"] =
+                        json!({ "enabled": true, "agent": "claude", "promptTemplate": "Review {pr_url}\nCarefully." });
+                    Ok(value)
+                }
+                "config.explain" => Ok(json!({ "from": { "layer": "user" } })),
+                _ => Ok(json!({})),
+            })
+        });
+        let window = cx.add_empty_window();
+        let view = window.update(|window, cx| {
+            cx.new(|cx| SettingsView::new(WeakEntity::new_invalid(), None, window, cx))
+        });
+        window.run_until_parked();
+        let explained: Vec<Value> = calls_to(&calls, "config.explain")
+            .into_iter()
+            .map(|call| call["key"].clone())
+            .collect();
+        for field in RULE_OPTIONS {
+            assert!(
+                explained.contains(&json!(field.key)),
+                "{} shows where it comes from",
+                field.key
+            );
+        }
+        let prompt = view.read_with(window, |view, cx| {
+            assert!(view.set_here("rules.orca_compat.onResolved"));
+            let editor = view.editors["rules.orca_compat.reviewInbox.promptTemplate"].clone();
+            assert_eq!(editor.read(cx).text(cx), "Review {pr_url}\nCarefully.");
+            assert_eq!(
+                view.editors["rules.orca_compat.conflictPromptTemplate"]
+                    .read(cx)
+                    .text(cx),
+                "",
+                "blank shows the built-in placeholder"
+            );
+            editor
+        });
+
+        view.update_in(window, |view, window, cx| {
+            view.write(
+                "rules.orca_compat.onReviewed",
+                Some(json!("delete")),
+                window,
+                cx,
+            );
+            view.write(
+                "rules.orca_compat.resolveConflictsWithAgent",
+                Some(json!(true)),
+                window,
+                cx,
+            );
+            prompt.update(cx, |editor, cx| {
+                editor.set_text("Look closer.\nTwice.", window, cx)
+            });
+            view.commit_text(
+                "rules.orca_compat.reviewInbox.promptTemplate",
+                "Look closer.\nTwice.",
+                false,
+                window,
+                cx,
+            );
+        });
+        window.run_until_parked();
+        let sets = calls_to(&calls, "config.set");
+        for (key, value) in [
+            ("rules.orca_compat.onReviewed", json!("delete")),
+            ("rules.orca_compat.resolveConflictsWithAgent", json!(true)),
+            (
+                "rules.orca_compat.reviewInbox.promptTemplate",
+                json!("Look closer.\nTwice."),
+            ),
+        ] {
+            assert!(
+                sets.iter()
+                    .any(|call| call["key"] == key && call["value"] == value),
+                "{key} saved: {sets:?}"
+            );
+        }
     }
 
     #[gpui::test]

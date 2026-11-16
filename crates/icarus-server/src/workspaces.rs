@@ -39,6 +39,30 @@ struct Key {
 }
 
 impl Server {
+    /// Stamps the workspace's activity time (throttled) and tells clients, which re-sort Recent lists.
+    pub(crate) fn touch_activity(&self, workspace_key: &str) {
+        // Terminals keep the workspace key they were created with, which may be a name or path.
+        let workspace_id = match self.store.workspace(workspace_key) {
+            Ok(Some(workspace)) => workspace.id,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!("activity for {workspace_key}: {error:#}");
+                return;
+            }
+        };
+        let workspace_id = workspace_id.as_str();
+        match self.store.touch_activity(workspace_id, now_ms()) {
+            Ok(true) => {
+                self.broadcast(
+                    "workspace.changed",
+                    json!({ "workspaces": [workspace_id], "source": "activity" }),
+                );
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!("activity for {workspace_id}: {error:#}"),
+        }
+    }
+
     pub(crate) fn workspace_by_key(&self, key: &str) -> Result<Workspace, RpcError> {
         self.store
             .workspace(key)
@@ -277,6 +301,24 @@ impl Server {
                     );
                 }
                 Ok(self.workspace_json(&workspace))
+            }
+            "workspace.reorder" => {
+                #[derive(Deserialize)]
+                struct P {
+                    ids: Vec<String>,
+                }
+                let p: P = params(p)?;
+                let ids: Vec<String> = p
+                    .ids
+                    .iter()
+                    .map(|key| self.workspace_by_key(key).map(|workspace| workspace.id))
+                    .collect::<Result<_, _>>()?;
+                self.store.set_manual_order(&ids).map_err(internal)?;
+                self.broadcast(
+                    "workspace.changed",
+                    json!({ "workspaces": ids, "source": "order" }),
+                );
+                Ok(json!({ "ordered": ids.len() }))
             }
             "workspace.remove" => {
                 #[derive(Deserialize)]
@@ -746,6 +788,9 @@ impl Server {
                 .map(|pr| json!({ "number": pr.head.number, "url": pr.url })),
             created_at_ms: now_ms(),
             pinned: false,
+            // Orca stamps a new workspace at the top of the Manual order.
+            manual_order: Some(now_ms() as i64),
+            activity_at_ms: None,
         };
         self.store.insert_workspace(&workspace).map_err(internal)?;
         if let Err(error) = self.start_setup(&workspace, &project.root, setup_decision) {

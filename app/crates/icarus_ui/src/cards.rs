@@ -3,13 +3,15 @@
 //! so an Orca import, `icarus config set` and the panel's View menu all change the same values.
 
 use editor::{Editor, EditorEvent};
-use gpui::{Action, Context, Entity, Focusable as _, Window};
+use gpui::{Action, Context, Entity, Focusable as _, Modifiers, Render, Window};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use ui::prelude::*;
+use util::ResultExt as _;
 
 use crate::WorkspacesPanel;
 use crate::model::{WorkspaceSummary, matches_filter, sort_workspaces};
+use crate::routing::ServerRef;
 
 /// A card field the panel can draw, under Orca's `worktreeCardProperties` id.
 pub struct CardField {
@@ -115,17 +117,18 @@ pub enum SortBy {
     #[default]
     Recent,
     Repo,
-    /// Orca's drag order; without dragging the list keeps the server's (creation) order.
+    /// Orca's drag order, stored on the server; new workspaces go on top.
     Manual,
 }
 
 impl SortBy {
-    /// The choices the View menu offers, with Orca's labels; Manual needs dragging, so it isn't one.
-    pub const CHOICES: [(SortBy, &'static str); 4] = [
+    /// The choices the View menu offers, with Orca's labels.
+    pub const CHOICES: [(SortBy, &'static str); 5] = [
         (SortBy::Name, "Name"),
         (SortBy::Smart, "Agent Activity"),
         (SortBy::Recent, "Recent"),
         (SortBy::Repo, "Project"),
+        (SortBy::Manual, "Manual"),
     ];
 
     pub fn parse(value: &str) -> Self {
@@ -288,11 +291,96 @@ gpui::actions!(
     ]
 );
 
+/// A card in the panel: its server and workspace id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardKey {
+    pub server: ServerRef,
+    pub id: String,
+}
+
+/// The cards picked with ⌘-click (Ctrl elsewhere) and ⇧-click; the anchor is where a ⇧-range starts.
+#[derive(Default, Debug)]
+pub struct CardSelection {
+    pub keys: Vec<CardKey>,
+    pub anchor: Option<CardKey>,
+}
+
+/// Cards being dragged to a new place in the Manual order: every selected card when the dragged one
+/// is selected, else just it.
+#[derive(Clone, Debug)]
+pub struct DraggedCards {
+    pub server: ServerRef,
+    pub ids: Vec<String>,
+    pub title: String,
+}
+
+impl Render for DraggedCards {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = if self.ids.len() > 1 {
+            format!("{} workspaces", self.ids.len())
+        } else {
+            self.title.clone()
+        };
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(Label::new(label).size(LabelSize::Small))
+    }
+}
+
+/// The order after dropping `moving` on `target`: the moved cards keep their relative order and take the
+/// target's place, after it when they came from above (so a drag can reach the end) and before it otherwise.
+pub fn order_after_drop(order: &[String], moving: &[String], target: &str) -> Option<Vec<String>> {
+    if moving.iter().any(|id| id == target) {
+        return None;
+    }
+    let from = order.iter().position(|id| moving.contains(id))?;
+    let to = order.iter().position(|id| id == target)?;
+    let moved: Vec<String> = order
+        .iter()
+        .filter(|id| moving.contains(id))
+        .cloned()
+        .collect();
+    let mut rest: Vec<String> = order
+        .iter()
+        .filter(|id| !moving.contains(id))
+        .cloned()
+        .collect();
+    let at = rest.iter().position(|id| id == target)? + usize::from(from < to);
+    rest.splice(at..at, moved);
+    Some(rest)
+}
+
+/// `Sleep 1 Workspace`, `Sleep 3 Workspaces` (Orca's batch labels).
+pub fn count_label(verb: &str, count: usize) -> String {
+    if count == 1 {
+        format!("{verb} 1 Workspace")
+    } else {
+        format!("{verb} {count} Workspaces")
+    }
+}
+
+struct SortChangedToast;
+
 impl WorkspacesPanel {
     /// The workspaces the text filter keeps, in the chosen sort order (before grouping and pins).
     pub(crate) fn arranged_workspaces(&self) -> Vec<WorkspaceSummary> {
-        let mut workspaces: Vec<WorkspaceSummary> = self
-            .workspaces
+        self.arranged(&self.workspaces)
+    }
+
+    /// `workspaces` filtered and sorted as the panel shows them, pinned ones first; for a saved server's section.
+    pub(crate) fn arranged_remote(&self, workspaces: &[WorkspaceSummary]) -> Vec<WorkspaceSummary> {
+        let mut arranged = self.arranged(workspaces);
+        crate::model::pinned_first(&mut arranged);
+        arranged
+    }
+
+    fn arranged(&self, workspaces: &[WorkspaceSummary]) -> Vec<WorkspaceSummary> {
+        let mut workspaces: Vec<WorkspaceSummary> = workspaces
             .iter()
             .filter(|workspace| matches_filter(workspace, &self.filter_query))
             .cloned()
@@ -301,6 +389,240 @@ impl WorkspacesPanel {
             self.project_names.get(id).cloned().unwrap_or_default()
         });
         workspaces
+    }
+
+    /// Every card in the order the panel draws them: this server's sections, then each saved server's.
+    pub(crate) fn card_order(&self, cx: &App) -> Vec<(CardKey, WorkspaceSummary)> {
+        let mut cards: Vec<(CardKey, WorkspaceSummary)> = self
+            .sections(cx)
+            .into_iter()
+            .flat_map(|(_, _, _, workspaces)| workspaces)
+            .map(|workspace| {
+                (
+                    CardKey {
+                        server: ServerRef::Primary,
+                        id: workspace.id.clone(),
+                    },
+                    workspace,
+                )
+            })
+            .collect();
+        for server in self.remote.read(cx).servers() {
+            for workspace in self.arranged_remote(&server.workspaces) {
+                cards.push((
+                    CardKey {
+                        server: ServerRef::Saved(server.name.clone()),
+                        id: workspace.id.clone(),
+                    },
+                    workspace,
+                ));
+            }
+        }
+        cards
+    }
+
+    /// What every card does: a click opens it (or changes the selection with ⌘/⇧), a selected card is
+    /// highlighted, and cards drag onto each other to reorder.
+    pub(crate) fn with_card_behavior(
+        &self,
+        key: CardKey,
+        title: String,
+        card: gpui::Stateful<gpui::Div>,
+        open: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let selected = self.is_selected(&key);
+        let dragged = self.dragged_cards(&key, title);
+        let click_key = key.clone();
+        card.when(selected, |card| {
+            card.bg(cx.theme().colors().element_selected)
+        })
+        .on_click(
+            cx.listener(move |panel, event: &gpui::ClickEvent, window, cx| {
+                if !panel.select_on_click(&click_key, event.modifiers(), cx) {
+                    open(panel, window, cx);
+                }
+            }),
+        )
+        .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+        .drag_over::<DraggedCards>(|style, _, _, cx| {
+            style.bg(cx.theme().colors().drop_target_background)
+        })
+        .on_drop(cx.listener(move |panel, dragged: &DraggedCards, _, cx| {
+            panel.drop_cards(dragged, &key, cx)
+        }))
+    }
+
+    fn move_to_status(&mut self, id: String, status: Option<String>, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspaces.iter_mut().find(|w| w.id == id) {
+            workspace.status = status.clone();
+        }
+        if let Some(request) = crate::review::request(
+            crate::routing::client_for(&ServerRef::Primary, cx),
+            "workspace.set",
+            serde_json::json!({ "id": id, "status": status.unwrap_or_default() }),
+            cx,
+        ) {
+            request.detach_and_log_err(cx);
+        }
+    }
+
+    pub fn selection(&self) -> &[CardKey] {
+        &self.selection.keys
+    }
+
+    pub fn is_selected(&self, key: &CardKey) -> bool {
+        self.selection.keys.contains(key)
+    }
+
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.selection.keys.is_empty() {
+            self.selection.keys.clear();
+            cx.notify();
+        }
+        self.selection.anchor = None;
+    }
+
+    /// Orca's selection intent: ⌘ (Ctrl elsewhere) toggles the card, ⇧ selects from the anchor to it in
+    /// drawn order, and a plain click clears the selection. True when the click only changed the selection.
+    pub fn select_on_click(
+        &mut self,
+        key: &CardKey,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if modifiers.shift {
+            let order: Vec<CardKey> = self
+                .card_order(cx)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            let anchor = self
+                .selection
+                .anchor
+                .clone()
+                .filter(|anchor| order.contains(anchor))
+                .unwrap_or_else(|| key.clone());
+            let (Some(from), Some(to)) = (
+                order.iter().position(|item| *item == anchor),
+                order.iter().position(|item| item == key),
+            ) else {
+                return true;
+            };
+            let (start, end) = if from <= to { (from, to) } else { (to, from) };
+            self.selection.keys = order[start..=end].to_vec();
+            self.selection.anchor = Some(anchor);
+            cx.notify();
+            return true;
+        }
+        if modifiers.secondary(cx) {
+            if let Some(index) = self.selection.keys.iter().position(|item| item == key) {
+                self.selection.keys.remove(index);
+            } else {
+                self.selection.keys.push(key.clone());
+            }
+            self.selection.anchor = Some(key.clone());
+            cx.notify();
+            return true;
+        }
+        self.clear_selection(cx);
+        false
+    }
+
+    /// The cards a right-click on `key` acts on together: the selection when it holds `key` and another.
+    pub fn bulk_targets(&self, key: &CardKey, cx: &App) -> Vec<(ServerRef, WorkspaceSummary)> {
+        if self.selection.keys.len() < 2 || !self.is_selected(key) {
+            return Vec::new();
+        }
+        self.card_order(cx)
+            .into_iter()
+            .filter(|(key, _)| self.is_selected(key))
+            .map(|(key, workspace)| (key.server, workspace))
+            .collect()
+    }
+
+    /// What dragging the card `key` carries: the selected cards of its server when it is selected.
+    pub fn dragged_cards(&self, key: &CardKey, title: String) -> DraggedCards {
+        let ids = if self.is_selected(key) {
+            self.selection
+                .keys
+                .iter()
+                .filter(|item| item.server == key.server)
+                .map(|item| item.id.clone())
+                .collect()
+        } else {
+            vec![key.id.clone()]
+        };
+        DraggedCards {
+            server: key.server.clone(),
+            ids,
+            title,
+        }
+    }
+
+    /// Orca's manual sort: the dropped cards take the target's place, the new order is stored on their
+    /// server, and the list switches to Manual. Grouped by status, a drop into another status moves them there.
+    pub fn drop_cards(&mut self, dragged: &DraggedCards, target: &CardKey, cx: &mut Context<Self>) {
+        if dragged.server != target.server {
+            return;
+        }
+        let cards: Vec<(CardKey, WorkspaceSummary)> = self
+            .card_order(cx)
+            .into_iter()
+            .filter(|(key, _)| key.server == target.server)
+            .collect();
+        let order: Vec<String> = cards.iter().map(|(key, _)| key.id.clone()).collect();
+        let Some(new_order) = order_after_drop(&order, &dragged.ids, &target.id) else {
+            return;
+        };
+        if target.server == ServerRef::Primary
+            && self.view.group_by == GroupBy::Status
+            && let Some((_, target_workspace)) = cards.iter().find(|(key, _)| key.id == target.id)
+        {
+            let status = target_workspace.status.clone();
+            for (key, workspace) in &cards {
+                if dragged.ids.contains(&key.id) && workspace.status != status {
+                    self.move_to_status(key.id.clone(), status.clone(), cx);
+                }
+            }
+        }
+        if target.server == ServerRef::Primary {
+            let top = new_order.len() as i64;
+            for workspace in &mut self.workspaces {
+                if let Some(index) = new_order.iter().position(|id| id == &workspace.id) {
+                    workspace.manual_order = Some((top - index as i64) * 1000);
+                }
+            }
+        }
+        if self.view.sort_by != SortBy::Manual {
+            self.set_sort_by(SortBy::Manual, cx);
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            workspace::notifications::NotificationId::unique::<SortChangedToast>(),
+                            "Sort changed to Manual: workspaces stay where you drop them.",
+                        ),
+                        cx,
+                    )
+                })
+                .log_err();
+        }
+        cx.notify();
+        let client = crate::routing::client_for(&target.server, cx);
+        let Some(request) = crate::review::request(
+            client,
+            "workspace.reorder",
+            serde_json::json!({ "ids": new_order }),
+            cx,
+        ) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            request.await?;
+            this.update(cx, |panel, cx| panel.refresh(cx))
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn set_sort_by(&mut self, sort_by: SortBy, cx: &mut Context<Self>) {
@@ -548,6 +870,210 @@ mod tests {
             ""
         );
         assert_eq!(sections(&panel, cx), ["todo: beta,alpha,gamma,delta"]);
+    }
+
+    #[test]
+    fn drops_take_the_targets_place() {
+        let order: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+        let drop = |moving: &[&str], target: &str| {
+            let moving: Vec<String> = moving.iter().map(|id| id.to_string()).collect();
+            order_after_drop(&order, &moving, target).map(|order| order.join(","))
+        };
+        assert_eq!(
+            drop(&["a"], "c").as_deref(),
+            Some("b,c,a,d"),
+            "from above, after it"
+        );
+        assert_eq!(
+            drop(&["d"], "b").as_deref(),
+            Some("a,d,b,c"),
+            "from below, before it"
+        );
+        assert_eq!(
+            drop(&["a"], "d").as_deref(),
+            Some("b,c,d,a"),
+            "so the end is reachable"
+        );
+        assert_eq!(
+            drop(&["c", "a"], "d").as_deref(),
+            Some("b,d,a,c"),
+            "several keep their order"
+        );
+        assert_eq!(drop(&["b"], "b"), None);
+        assert_eq!(count_label("Sleep", 1), "Sleep 1 Workspace");
+        assert_eq!(count_label("Delete", 3), "Delete 3 Workspaces");
+    }
+
+    fn key(id: &str) -> CardKey {
+        CardKey {
+            server: ServerRef::Primary,
+            id: format!("ws-{id}"),
+        }
+    }
+
+    fn names(keys: &[CardKey]) -> Vec<&str> {
+        keys.iter()
+            .map(|key| key.id.trim_start_matches("ws-"))
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn modifier_clicks_select_and_dragging_reorders_on_the_server(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_, panel, mut cx) = crate::tests::panel_window(listed(), cx).await;
+        let cx = &mut cx;
+        let calls = cx.update(|_, cx| crate::review::tests::stub_rpc(cx, |_, _| Ok(json!({}))));
+        let secondary = cx.update(|_, cx| Modifiers::secondary_key(cx));
+        panel.update(cx, |panel, cx| {
+            assert!(panel.select_on_click(&key("beta"), secondary, cx));
+            assert!(panel.select_on_click(&key("gamma"), Modifiers::shift(), cx));
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| names(panel.selection()).join(",")),
+            "beta,alpha,gamma",
+            "⇧ selects the drawn range from the anchor"
+        );
+        let bulk = panel.read_with(cx, |panel, cx| {
+            panel
+                .bulk_targets(&key("alpha"), cx)
+                .into_iter()
+                .map(|(_, workspace)| workspace.name)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(bulk, ["beta", "alpha", "gamma"]);
+        assert!(
+            panel.read_with(cx, |panel, cx| panel
+                .bulk_targets(&key("delta"), cx)
+                .is_empty()),
+            "a right-click outside the selection is for that card alone"
+        );
+        panel.update(cx, |panel, cx| {
+            assert!(panel.select_on_click(&key("alpha"), secondary, cx));
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| names(panel.selection()).join(",")),
+            "beta,gamma",
+            "⌘ toggles one card"
+        );
+
+        cx.dispatch_action(SetWorkspaceSort {
+            sort_by: "name".into(),
+        });
+        assert_eq!(sections(&panel, cx), ["todo: delta,alpha,beta,gamma"]);
+        panel.update(cx, |panel, cx| {
+            let dragged = panel.dragged_cards(&key("beta"), "beta".into());
+            assert_eq!(
+                names(
+                    &dragged
+                        .ids
+                        .iter()
+                        .map(|id| CardKey {
+                            server: ServerRef::Primary,
+                            id: id.clone()
+                        })
+                        .collect::<Vec<_>>()
+                ),
+                ["beta", "gamma"]
+            );
+            panel.drop_cards(&dragged, &key("delta"), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "workspace.reorder"),
+            [json!({ "ids": ["ws-beta", "ws-gamma", "ws-delta", "ws-alpha"] })],
+            "dragged up onto delta, the selected cards go before it"
+        );
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.view().sort_by),
+            SortBy::Manual,
+            "a drag switches to Manual, as in Orca"
+        );
+        assert_eq!(sections(&panel, cx), ["todo: beta,gamma,delta,alpha"]);
+
+        panel.update(cx, |panel, cx| {
+            assert!(!panel.select_on_click(&key("alpha"), Modifiers::default(), cx));
+            assert!(panel.selection().is_empty(), "a plain click clears it");
+        });
+    }
+
+    #[gpui::test]
+    async fn dropping_into_another_status_moves_the_card_there(cx: &mut gpui::TestAppContext) {
+        let mut workspaces = listed();
+        workspaces[1].status = Some("done".into());
+        let (_, panel, mut cx) = crate::tests::panel_window(workspaces, cx).await;
+        let cx = &mut cx;
+        let calls = cx.update(|_, cx| crate::review::tests::stub_rpc(cx, |_, _| Ok(json!({}))));
+        panel.update(cx, |panel, cx| {
+            panel.set_status_order(vec!["todo".into(), "done".into()], cx);
+            let dragged = panel.dragged_cards(&key("gamma"), "gamma".into());
+            panel.drop_cards(&dragged, &key("alpha"), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| {
+                panel
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.name == "gamma")
+                    .and_then(|workspace| workspace.status.clone())
+            }),
+            Some("done".into())
+        );
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "workspace.set"),
+            [json!({ "id": "ws-gamma", "status": "done" })]
+        );
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "workspace.reorder").len(),
+            1
+        );
+    }
+
+    #[gpui::test]
+    async fn saved_server_sections_sort_and_lead_with_pins(cx: &mut gpui::TestAppContext) {
+        let (_, panel, mut cx) = crate::tests::panel_window(Vec::new(), cx).await;
+        let cx = &mut cx;
+        let store = panel.read_with(cx, |panel, _| panel.remote_servers().clone());
+        let mut remote = listed();
+        remote[3].pinned = true;
+        store.update(cx, |store, cx| {
+            store.set_saved(
+                &[crate::servers::tests::saved("desk", "100.64.0.2:4000")],
+                cx,
+            );
+            store.set_workspaces("desk", remote, cx);
+        });
+        cx.dispatch_action(SetWorkspaceSort {
+            sort_by: "name".into(),
+        });
+        let order = panel.read_with(cx, |panel, cx| {
+            panel
+                .card_order(cx)
+                .into_iter()
+                .map(|(key, workspace)| {
+                    format!(
+                        "{}:{}",
+                        key.server.saved_name().unwrap_or("-"),
+                        workspace.name
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            order,
+            ["desk:delta", "desk:alpha", "desk:beta", "desk:gamma"],
+            "the pinned card leads, the rest follow the sort"
+        );
+        panel.update(cx, |panel, cx| {
+            let saved_key = |id: &str| CardKey {
+                server: ServerRef::Saved("desk".into()),
+                id: format!("ws-{id}"),
+            };
+            assert!(panel.select_on_click(&saved_key("alpha"), Modifiers::shift(), cx));
+            assert!(panel.select_on_click(&saved_key("gamma"), Modifiers::shift(), cx));
+            assert_eq!(panel.selection().len(), 3);
+        });
     }
 
     #[test]

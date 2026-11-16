@@ -459,12 +459,16 @@ enum ConfigCommand {
 #[derive(Subcommand)]
 enum SettingsCommand {
     /// Bring Orca's per-workspace state over: statuses, pinned names, linked Linear issues, diff
-    /// notes and agent notes, matched to Icarus workspaces by path or by repository and name.
-    /// Reads Orca's `profile-state.db` read-only; workspace values you already set win.
+    /// notes and agent notes, and unsent PR review comments (queued as drafts on the workspace's
+    /// pull request), matched to Icarus workspaces by path or by repository and name.
+    /// Reads Orca's files read-only; workspace values you already set win.
     ImportOrcaState {
         /// Orca's `profile-state.db` (default: the one in Orca's profile folder on this machine).
         #[arg(long, value_name = "FILE")]
         from: Option<PathBuf>,
+        /// Orca's `pending-review-drafts.json` (default: the one in Orca's data folder, if any).
+        #[arg(long, value_name = "FILE")]
+        drafts: Option<PathBuf>,
         /// Report what would change; write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -646,6 +650,11 @@ enum WorkspaceCommand {
         pin: bool,
         #[arg(long)]
         unpin: bool,
+    },
+    /// Put workspaces at the top of the sidebar's Manual sort, in the order given.
+    Reorder {
+        #[arg(required = true)]
+        ids: Vec<String>,
     },
     /// List changed files against the base (or only uncommitted ones).
     Changes {
@@ -1800,9 +1809,13 @@ async fn main() -> Result<()> {
                         None => print!("{text}"),
                     }
                 }
-                SettingsCommand::ImportOrcaState { from, dry_run } => {
-                    let documents = orca_state::read(from.as_deref())?;
-                    let mut request = documents;
+                SettingsCommand::ImportOrcaState {
+                    from,
+                    drafts,
+                    dry_run,
+                } => {
+                    let mut request = orca_state::read(from.as_deref())?;
+                    request["pending_review_drafts"] = orca_state::read_drafts(drafts.as_deref())?;
                     request["dry_run"] = json!(dry_run);
                     let value = client
                         .request_timeout(
@@ -2018,6 +2031,17 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     print(&cli, &value, summary);
+                }
+                WorkspaceCommand::Reorder { ids } => {
+                    let value = client
+                        .request("workspace.reorder", json!({ "ids": ids }))
+                        .await?;
+                    print(&cli, &value, |v| {
+                        format!(
+                            "ordered {} workspace(s)",
+                            v["ordered"].as_u64().unwrap_or(0)
+                        )
+                    });
                 }
                 WorkspaceCommand::Changes { id, uncommitted } => {
                     let value = client

@@ -39,6 +39,21 @@ pub struct WorkspaceSummary {
     pub pinned: bool,
     #[serde(default)]
     pub created_at_ms: u64,
+    /// The rank in the Manual sort (higher first), stored on the server.
+    #[serde(default)]
+    pub manual_order: Option<i64>,
+    /// The server's last agent turn, terminal output or git change.
+    #[serde(default)]
+    pub activity_at_ms: Option<u64>,
+}
+
+impl WorkspaceSummary {
+    /// What Recent sorts by: the last activity, or the creation when nothing happened since.
+    pub fn recent_at_ms(&self) -> u64 {
+        self.activity_at_ms
+            .unwrap_or_default()
+            .max(self.created_at_ms)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -312,8 +327,8 @@ pub fn matches_filter(workspace: &WorkspaceSummary, query: &str) -> bool {
         .all(|word| haystack.contains(&word.to_lowercase()))
 }
 
-/// Orca's sort comparators, each falling back to the card title and then the id. Recent has no
-/// activity clock on the server yet, so it ranks by creation time.
+/// Orca's sort comparators, each falling back to the card title and then the id. Recent ranks by
+/// the server's activity time (or the creation time before any activity).
 pub fn sort_workspaces(
     workspaces: &mut [WorkspaceSummary],
     sort_by: SortBy,
@@ -324,9 +339,17 @@ pub fn sort_workspaces(
         label(a).cmp(&label(b)).then_with(|| a.id.cmp(&b.id))
     };
     let newest_first =
-        |a: &WorkspaceSummary, b: &WorkspaceSummary| b.created_at_ms.cmp(&a.created_at_ms);
+        |a: &WorkspaceSummary, b: &WorkspaceSummary| b.recent_at_ms().cmp(&a.recent_at_ms());
     match sort_by {
-        SortBy::Manual => {}
+        // Unranked cards (from before ranks existed, or previews) keep the order given, after ranked ones.
+        SortBy::Manual => workspaces.sort_by_key(|workspace| {
+            std::cmp::Reverse(
+                workspace
+                    .manual_order
+                    .map(|rank| (1, rank))
+                    .unwrap_or((0, 0)),
+            )
+        }),
         SortBy::Name => workspaces.sort_by(by_label),
         SortBy::Recent => {
             workspaces.sort_by(|a, b| newest_first(a, b).then_with(|| by_label(a, b)))
@@ -423,6 +446,8 @@ mod tests {
             sleeping: false,
             pinned: false,
             created_at_ms: 0,
+            manual_order: None,
+            activity_at_ms: None,
         }
     }
 
@@ -531,6 +556,31 @@ mod tests {
         items[1].pinned = true;
         pinned_first(&mut items);
         assert_eq!(order(&items), ["Alpha", "gamma", "beta"]);
+
+        let mut active = listed.clone();
+        active[1].activity_at_ms = Some(10);
+        active[0].manual_order = Some(5);
+        active[2].manual_order = Some(9);
+        let sorted = |items: &[WorkspaceSummary], sort_by| {
+            let mut items = items.to_vec();
+            sort_workspaces(&mut items, sort_by, projects);
+            order(&items).join(",")
+        };
+        assert_eq!(
+            sorted(&active, SortBy::Recent),
+            "Alpha,beta,gamma",
+            "the server's activity time outranks creation"
+        );
+        assert_eq!(
+            sorted(&active, SortBy::Smart),
+            "gamma,Alpha,beta",
+            "working first, then activity"
+        );
+        assert_eq!(
+            sorted(&active, SortBy::Manual),
+            "gamma,beta,Alpha",
+            "higher ranks first, unranked last"
+        );
     }
 
     #[test]

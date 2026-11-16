@@ -271,6 +271,37 @@ fn remove_refuses_dirty_worktrees_unless_forced() {
 }
 
 #[test]
+fn commit_files_list_one_commit_against_its_first_parent() {
+    let repo = repo();
+    let base = commit_files(&repo.root, "HEAD").expect("root commit");
+    assert_eq!(base.parent, None, "a root commit has no parent");
+    let paths: Vec<&str> = base.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["a.txt", "b.txt"]);
+    assert!(base.files.iter().all(|f| f.status == ChangeStatus::Added));
+
+    write(&repo.root, "a.txt", "one\n2\nthree\nfour\n");
+    run(&repo.root, &["mv", "b.txt", "c.txt"]);
+    write(&repo.root, "d.txt", "new\n");
+    run(&repo.root, &["add", "-A"]);
+    run(&repo.root, &["commit", "-q", "-m", "Edit, move, add"]);
+    let head = commit_files(&repo.root, "HEAD").expect("commit");
+    assert_eq!(head.subject, "Edit, move, add");
+    assert_eq!(head.parent.as_deref(), Some(base.oid.as_str()));
+    let a = head.files.iter().find(|f| f.path == "a.txt").expect("a");
+    assert_eq!(
+        (a.status, a.added, a.removed),
+        (ChangeStatus::Modified, Some(2), Some(1))
+    );
+    let moved = head.files.iter().find(|f| f.path == "c.txt").expect("c");
+    assert_eq!(moved.status, ChangeStatus::Renamed);
+    assert_eq!(moved.old_path.as_deref(), Some("b.txt"));
+    assert!(head.files.iter().any(|f| f.path == "d.txt"));
+    assert_eq!(head.files.len(), 3);
+
+    assert!(commit_files(&repo.root, "nope").is_err());
+}
+
+#[test]
 fn branch_commits_list_only_what_the_branch_added_since_its_base() {
     let repo = repo();
     let empty = branch_commits(&repo.root, Some("origin/main".into()), 10).expect("commits");

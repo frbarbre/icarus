@@ -37,6 +37,9 @@
     }
   },
   "quickCommands": [],
+  "sourceControl": {
+    "openIn": [{ "id": "vscode", "label": "VS Code", "command": "code" }]
+  },
   "theme": {
     "mode": "system"
   }

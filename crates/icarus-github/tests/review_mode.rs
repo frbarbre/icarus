@@ -270,3 +270,29 @@ fn attachments_become_image_links_or_bare_video_urls() {
         "\nhttps://github.com/user-attachments/assets/2\n"
     );
 }
+
+#[tokio::test]
+async fn reviewer_suggestions_put_githubs_own_first_then_frequent_reviewers() {
+    let reviewer = |kind: &str, login: &str| json!({ "author": { "__typename": kind, "login": login, "avatarUrl": "https://a" } });
+    let data = json!({ "data": { "repository": {
+        "pullRequest": {
+            "author": { "login": "alice" },
+            "suggestedReviewers": [ { "reviewer": { "login": "carol", "name": "Carol" } } ],
+        },
+        "pullRequests": { "nodes": [
+            { "reviews": { "nodes": [ reviewer("User", "dave"), reviewer("User", "erin"), reviewer("Bot", "copilot") ] } },
+            { "reviews": { "nodes": [ reviewer("User", "erin"), reviewer("User", "Alice"), reviewer("User", "carol") ] } },
+        ] },
+    } } });
+    let github = GitHub::new(FakeGh::new().on(
+        "graphql ReviewerSuggestions",
+        FakeResponse::ok(data.to_string()),
+    ));
+    let users = github
+        .reviewer_suggestions(&repo(), 5)
+        .await
+        .expect("suggestions");
+    let logins: Vec<&str> = users.iter().map(|u| u.login.as_str()).collect();
+    assert_eq!(logins, ["carol", "erin", "dave"]);
+    assert_eq!(users[0].name.as_deref(), Some("Carol"));
+}

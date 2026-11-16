@@ -956,6 +956,51 @@ pub fn commit_rows(worktree: &Path, from: Option<&str>, to: &str) -> Result<Vec<
         .collect())
 }
 
+/// The files one commit changed against its first parent (`git.commit_files`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitFiles {
+    pub oid: String,
+    /// `None` for a root commit, which is compared with the empty tree.
+    pub parent: Option<String>,
+    pub subject: String,
+    pub files: Vec<CommitFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitFile {
+    pub path: String,
+    pub status: ChangeStatus,
+    pub old_path: Option<String>,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+    pub binary: bool,
+}
+
+pub fn commit_files(worktree: &Path, sha: &str) -> Result<CommitFiles> {
+    let oid = resolve_commit(worktree, sha).ok_or_else(|| anyhow::anyhow!("no commit {sha}"))?;
+    let parent = first_parent(worktree, &oid);
+    let files = commit_rows(worktree, parent.as_deref(), &oid)?
+        .into_iter()
+        .map(|row| CommitFile {
+            path: row.path,
+            status: row.status,
+            old_path: row.old_path,
+            added: row.added,
+            removed: row.removed,
+            binary: row.binary,
+        })
+        .collect();
+    let subject = git(worktree, &["show", "-s", "--format=%s", &oid])?
+        .trim()
+        .to_string();
+    Ok(CommitFiles {
+        oid,
+        parent,
+        subject,
+        files,
+    })
+}
+
 pub(crate) fn resolve_commit(worktree: &Path, name: &str) -> Option<String> {
     git_ok(
         worktree,

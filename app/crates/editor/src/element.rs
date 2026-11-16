@@ -5645,6 +5645,10 @@ impl EditorElement {
             test_indicator.paint(window, cx);
         }
 
+        for marker in layout.gutter_comment_markers.iter_mut() {
+            marker.paint(window, cx);
+        }
+
         if let Some(diff_review_button) = layout.diff_review_button.as_mut() {
             diff_review_button.paint(window, cx);
         }
@@ -9781,35 +9785,71 @@ impl Element for EditorElement {
                         .ilog10()
                         + 1;
 
-                    let diff_review_button = self
-                        .should_render_diff_review_button(
-                            start_row..end_row,
-                            &row_infos,
-                            &snapshot,
-                            cx,
-                        )
-                        .map(|(display_row, buffer_row)| {
-                            let is_wide = max_line_number_length
-                                >= EditorSettings::get_global(cx).gutter.min_line_number_digits
-                                    as u32
-                                && buffer_row.is_some_and(|row| {
-                                    (row + 1).ilog10() + 1 == max_line_number_length
-                                })
-                                || gutter_dimensions.right_padding == px(0.);
-
-                            let button_width = if is_wide {
+                    let diff_review_target = self.should_render_diff_review_button(
+                        start_row..end_row,
+                        &row_infos,
+                        &snapshot,
+                        cx,
+                    );
+                    let marker_rows = self.editor.read(cx).gutter_comment_markers(
+                        &snapshot.display_snapshot,
+                        start_row..end_row,
+                        diff_review_target.map(|(row, _)| row),
+                        cx,
+                    );
+                    let gutter_comment_markers = marker_rows
+                        .into_iter()
+                        .filter(|(display_row, _, _)| {
+                            row_infos
+                                .get(display_row.0.saturating_sub(start_row.0) as usize)
+                                .is_none_or(|info| info.expand_info.is_none())
+                        })
+                        .filter_map(|(display_row, row, marker)| {
+                            let hook = self.editor.read(cx).gutter_comment_hook.clone()?;
+                            let width = if gutter_dimensions.right_padding == px(0.) {
                                 available_width - px(6.)
                             } else {
                                 available_width + em_width - px(6.)
                             };
-
-                            let button = self.editor.update(cx, |editor, cx| {
-                                editor
-                                    .render_diff_review_button(display_row, button_width, cx)
-                                    .into_any_element()
+                            let element = self.editor.update(cx, |_, cx| {
+                                Editor::render_gutter_comment_marker(
+                                    ElementId::NamedInteger(
+                                        "gutter_comment_marker".into(),
+                                        row.0 as u64,
+                                    ),
+                                    hook,
+                                    row,
+                                    marker,
+                                    width,
+                                    cx,
+                                )
+                                .into_any_element()
                             });
-                            gutter.prepaint_button(button, display_row, window, cx)
+                            Some(gutter.prepaint_button(element, display_row, window, cx))
+                        })
+                        .collect::<Vec<_>>();
+
+                    let diff_review_button = diff_review_target.map(|(display_row, buffer_row)| {
+                        let is_wide = max_line_number_length
+                            >= EditorSettings::get_global(cx).gutter.min_line_number_digits as u32
+                            && buffer_row.is_some_and(|row| {
+                                (row + 1).ilog10() + 1 == max_line_number_length
+                            })
+                            || gutter_dimensions.right_padding == px(0.);
+
+                        let button_width = if is_wide {
+                            available_width - px(6.)
+                        } else {
+                            available_width + em_width - px(6.)
+                        };
+
+                        let button = self.editor.update(cx, |editor, cx| {
+                            editor
+                                .render_diff_review_button(display_row, button_width, cx)
+                                .into_any_element()
                         });
+                        gutter.prepaint_button(button, display_row, window, cx)
+                    });
 
                     self.layout_signature_help(
                         &hitbox,
@@ -10063,6 +10103,7 @@ impl Element for EditorElement {
                         bookmarks,
                         breakpoints,
                         diff_review_button,
+                        gutter_comment_markers,
                         crease_toggles,
                         crease_trailers,
                         tab_invisible,
@@ -10272,6 +10313,7 @@ pub struct EditorLayout {
     bookmarks: Vec<AnyElement>,
     breakpoints: Vec<AnyElement>,
     diff_review_button: Option<AnyElement>,
+    gutter_comment_markers: Vec<AnyElement>,
     crease_toggles: Vec<Option<AnyElement>>,
     expand_toggles: Vec<Option<(AnyElement, gpui::Point<Pixels>)>>,
     diff_hunk_controls: Vec<AnyElement>,

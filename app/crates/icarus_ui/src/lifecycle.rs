@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use editor::Editor;
@@ -186,8 +186,9 @@ pub fn open_add_project(
     cx: &mut Context<Workspace>,
 ) {
     let weak = workspace.weak_handle();
+    let server = routing::server_for_project(workspace.project().read(cx), cx);
     workspace.toggle_modal(window, cx, move |window, cx| {
-        AddProjectModal::new(path, weak, window, cx)
+        AddProjectModal::new(path, server, weak, window, cx)
     });
 }
 
@@ -205,7 +206,11 @@ pub struct DetectedProject {
 
 pub struct AddProjectModal {
     workspace: WeakEntity<Workspace>,
+    /// The server the project is added to; it reads the folder on its own machine.
+    server: ServerRef,
     picked: PathBuf,
+    /// The folder, editable so a saved server's own paths can be typed.
+    folder: Entity<Editor>,
     detected: Option<DetectedProject>,
     name: Entity<Editor>,
     base: Entity<Editor>,
@@ -217,16 +222,23 @@ pub struct AddProjectModal {
 impl AddProjectModal {
     pub fn new(
         picked: PathBuf,
+        server: ServerRef,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let name = single_line("Project name", window, cx);
         let base = single_line("Base ref, e.g. origin/main", window, cx);
+        let folder = single_line("Folder on the server", window, cx);
+        folder.update(cx, |editor, cx| {
+            editor.set_text(picked.to_string_lossy(), window, cx)
+        });
         window.focus(&name.focus_handle(cx), cx);
         let mut modal = Self {
             workspace,
+            server,
             picked,
+            folder,
             detected: None,
             name,
             base,
@@ -246,11 +258,29 @@ impl AddProjectModal {
         self.error.as_deref()
     }
 
+    pub fn server(&self) -> &ServerRef {
+        &self.server
+    }
+
+    /// Reads the folder again on another server.
+    pub fn set_server(&mut self, server: ServerRef, window: &mut Window, cx: &mut Context<Self>) {
+        if self.server == server {
+            return;
+        }
+        self.server = server;
+        self.detected = None;
+        self.inspect(window, cx);
+    }
+
     fn inspect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = editor_text(&self.folder, cx);
+        if !typed.is_empty() {
+            self.picked = PathBuf::from(typed);
+        }
         self.busy = Some("Reading the repository…");
         self.error = None;
         let inspect = request(
-            &ServerRef::Primary,
+            &self.server.clone(),
             "project.inspect",
             json!({ "path": self.picked }),
             cx,
@@ -284,7 +314,13 @@ impl AddProjectModal {
         if self.busy.is_some() {
             return;
         }
-        let Some(detected) = self.detected.clone() else {
+        let typed = editor_text(&self.folder, cx);
+        let Some(detected) = self
+            .detected
+            .clone()
+            .filter(|_| typed.is_empty() || Path::new(&typed) == self.picked)
+        else {
+            self.detected = None;
             self.inspect(window, cx);
             return;
         };
@@ -295,7 +331,7 @@ impl AddProjectModal {
         self.error = None;
         cx.notify();
         let add = request(
-            &ServerRef::Primary,
+            &self.server.clone(),
             "project.add",
             json!({
                 "path": detected.root,
@@ -347,10 +383,30 @@ impl Render for AddProjectModal {
             (None, Some(_)) => "Try Again",
             _ => "Add Project",
         };
+        let several_servers = server_choices(cx).len() > 1;
+        let modal = cx.entity().downgrade();
+        let server_picker = render_server_picker(
+            "icarus-add-project-server",
+            &self.server,
+            move |server, window, cx| {
+                modal
+                    .update(cx, |modal, cx| modal.set_server(server, window, cx))
+                    .log_err();
+            },
+            cx,
+        );
         modal_frame("IcarusAddProject", "Add project", cx)
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
-            .child(render_fact("Folder", self.picked.display().to_string()))
+            .map(|modal| {
+                if several_servers {
+                    modal
+                        .child(row("Server", server_picker))
+                        .child(render_field("Folder", &self.folder, cx))
+                } else {
+                    modal.child(render_fact("Folder", self.picked.display().to_string()))
+                }
+            })
             .when_some(self.detected.as_ref(), |modal, detected| {
                 modal
                     .child(render_fact(
@@ -545,9 +601,76 @@ pub fn open_new_workspace(
     cx: &mut Context<Workspace>,
 ) {
     let weak = workspace.weak_handle();
+    let server = routing::server_for_project(workspace.project().read(cx), cx);
     workspace.toggle_modal(window, cx, move |window, cx| {
-        NewWorkspaceModal::new(weak, project, window, cx)
+        NewWorkspaceModal::new(weak, server, project, window, cx)
     });
+}
+
+/// The servers a dialog can create on: the app's own, then each saved server it doesn't already reach.
+pub fn server_choices(cx: &App) -> Vec<(ServerRef, String)> {
+    let primary = routing::primary(cx);
+    let mut choices = vec![(
+        ServerRef::Primary,
+        primary.clone().unwrap_or_else(|| "This machine".to_owned()),
+    )];
+    if let Some(store) = crate::servers::existing_store(cx) {
+        for server in store.read(cx).servers() {
+            if Some(&server.name) != primary.as_ref() {
+                choices.push((ServerRef::Saved(server.name.clone()), server.name.clone()));
+            }
+        }
+    }
+    choices
+}
+
+fn server_label(server: &ServerRef, cx: &App) -> String {
+    server_choices(cx)
+        .into_iter()
+        .find(|(choice, _)| choice == server)
+        .map(|(_, label)| label)
+        .unwrap_or_else(|| server.saved_name().unwrap_or("This machine").to_owned())
+}
+
+/// A server picker button for the dialogs; `pick` runs with the chosen server.
+fn render_server_picker(
+    id: &'static str,
+    server: &ServerRef,
+    pick: impl Fn(ServerRef, &mut Window, &mut App) + Clone + 'static,
+    cx: &App,
+) -> gpui::AnyElement {
+    let choices = server_choices(cx);
+    let current = server.clone();
+    PopoverMenu::new(id)
+        .trigger(
+            Button::new(
+                SharedString::from(format!("{id}-button")),
+                server_label(server, cx),
+            )
+            .start_icon(Icon::new(IconName::Server).size(IconSize::XSmall))
+            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+            .disabled(choices.len() < 2),
+        )
+        .menu(move |window, cx| {
+            let choices = choices.clone();
+            let current = current.clone();
+            let pick = pick.clone();
+            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for (choice, label) in &choices {
+                    let pick = pick.clone();
+                    let choice = choice.clone();
+                    menu = menu.toggleable_entry(
+                        label.clone(),
+                        choice == current,
+                        IconPosition::Start,
+                        None,
+                        move |window, cx| pick(choice.clone(), window, cx),
+                    );
+                }
+                menu
+            }))
+        })
+        .into_any_element()
 }
 
 pub fn window_project(workspace: &Workspace, cx: &App) -> Option<String> {
@@ -565,6 +688,8 @@ pub fn window_project(workspace: &Workspace, cx: &App) -> Option<String> {
 
 pub struct NewWorkspaceModal {
     workspace: WeakEntity<Workspace>,
+    /// The server the workspace is created on; its projects fill the picker.
+    server: ServerRef,
     projects: Vec<ProjectChoice>,
     project: Option<String>,
     name: Entity<Editor>,
@@ -631,6 +756,7 @@ fn looks_like_identifier(text: &str) -> bool {
 impl NewWorkspaceModal {
     pub fn new(
         workspace: WeakEntity<Workspace>,
+        server: ServerRef,
         project: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -647,6 +773,7 @@ impl NewWorkspaceModal {
         window.focus(&name.focus_handle(cx), cx);
         let mut modal = Self {
             workspace,
+            server,
             projects: Vec::new(),
             project,
             name,
@@ -696,9 +823,9 @@ impl NewWorkspaceModal {
         cx.notify();
         self.search_task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(ISSUE_SEARCH_DELAY).await;
-            let Ok(search) = this.update(cx, |_, cx| {
+            let Ok(search) = this.update(cx, |this, cx| {
                 request(
-                    &ServerRef::Primary,
+                    &this.server.clone(),
                     "issue.search",
                     json!({ "query": query, "limit": ISSUE_SEARCH_LIMIT }),
                     cx,
@@ -755,9 +882,10 @@ impl NewWorkspaceModal {
     }
 
     fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let projects = request(&ServerRef::Primary, "project.list", json!({}), cx);
+        let server = self.server.clone();
+        let projects = request(&server, "project.list", json!({}), cx);
         let provider = request(
-            &ServerRef::Primary,
+            &server,
             "config.get",
             json!({ "key": "agents.default" }),
             cx,
@@ -802,7 +930,7 @@ impl NewWorkspaceModal {
             return;
         };
         let layouts = request(
-            &ServerRef::Primary,
+            &self.server.clone(),
             "layout.list",
             json!({ "project": project }),
             cx,
@@ -851,6 +979,30 @@ impl NewWorkspaceModal {
         &self.layouts
     }
 
+    pub fn server(&self) -> &ServerRef {
+        &self.server
+    }
+
+    /// Switches to another server: its projects, layouts and scripts load, and the linked issue is dropped.
+    pub fn set_server(&mut self, server: ServerRef, window: &mut Window, cx: &mut Context<Self>) {
+        if self.creating || self.server == server {
+            return;
+        }
+        self.server = server;
+        self.projects.clear();
+        self.project = None;
+        self.layouts.clear();
+        self.layout = None;
+        self.scripts = None;
+        self.trust_prompt = false;
+        self.linked_issue = None;
+        self.issue_results.clear();
+        self.error = None;
+        self.loading = true;
+        self.load(window, cx);
+        cx.notify();
+    }
+
     pub fn set_project(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.project = Some(id);
         self.trust_prompt = false;
@@ -865,7 +1017,7 @@ impl NewWorkspaceModal {
             return;
         };
         let scripts = request(
-            &ServerRef::Primary,
+            &self.server.clone(),
             "project.scripts",
             json!({ "id": project }),
             cx,
@@ -1077,7 +1229,8 @@ impl NewWorkspaceModal {
         self.error = None;
         self.notice = None;
         cx.notify();
-        let create = request(&ServerRef::Primary, "workspace.create", params, cx);
+        let server = self.server.clone();
+        let create = request(&server, "workspace.create", params, cx);
         let workspace = self.workspace.clone();
         self.create_task = cx.spawn_in(window, async move |this, cx| {
             let created = create.await;
@@ -1111,7 +1264,7 @@ impl NewWorkspaceModal {
             })
             .log_err();
             if let Some(path) = path {
-                open_workspace_path(&workspace, path, cx);
+                open_created_workspace(&server, &workspace, path, cx);
             }
         });
     }
@@ -1127,7 +1280,7 @@ impl NewWorkspaceModal {
         self.cancelling = true;
         cx.notify();
         let cancel = request(
-            &ServerRef::Primary,
+            &self.server.clone(),
             "workspace.create_cancel",
             json!({ "create_id": create_id }),
             cx,
@@ -1401,6 +1554,38 @@ impl NewWorkspaceModal {
     }
 }
 
+/// Opens a workspace the dialog created: a saved server's opens the way its cards do (over SSH, or the
+/// folder when it is on this machine too).
+fn open_created_workspace(
+    server: &ServerRef,
+    workspace: &WeakEntity<Workspace>,
+    path: PathBuf,
+    cx: &mut AsyncWindowContext,
+) {
+    let ServerRef::Saved(name) = server else {
+        open_workspace_path(workspace, path, cx);
+        return;
+    };
+    cx.update(|_, cx| {
+        let Some(panel) = workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<WorkspacesPanel>(cx))
+        else {
+            return;
+        };
+        let ssh = crate::servers::existing_store(cx).and_then(|store| {
+            store
+                .read(cx)
+                .servers()
+                .iter()
+                .find(|saved| &saved.name == name)
+                .and_then(|saved| saved.ssh_destination())
+        });
+        crate::open_remote_workspace(name, ssh, path, panel.downgrade(), cx);
+    })
+    .log_err();
+}
+
 fn open_workspace_path(
     workspace: &WeakEntity<Workspace>,
     path: PathBuf,
@@ -1456,12 +1641,27 @@ impl Render for NewWorkspaceModal {
             .scripts
             .as_ref()
             .is_some_and(ProjectScripts::asks_for_setup);
+        let several_servers = server_choices(cx).len() > 1;
+        let modal = cx.entity().downgrade();
+        let server_picker = render_server_picker(
+            "icarus-new-workspace-server",
+            &self.server,
+            move |server, window, cx| {
+                modal
+                    .update(cx, |modal, cx| modal.set_server(server, window, cx))
+                    .log_err();
+            },
+            cx,
+        );
         modal_frame("IcarusNewWorkspace", "New workspace", cx)
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             .child(self.render_issue_search(cx))
             .child(render_field("Name", &self.name, cx))
             .child(render_field("Branch", &self.branch, cx))
+            .when(several_servers, |modal| {
+                modal.child(row("Server", server_picker))
+            })
             .child(row("Project", self.render_project_picker(cx)))
             .child(row(
                 "Start from",
@@ -1707,6 +1907,238 @@ pub fn run_card_action(
             .log_err();
         })
         .detach();
+}
+
+/// What a right-click on a multi-selection offers: pin or unpin, sleep, wake and delete, each on every
+/// selected workspace's own server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkAction {
+    Pin,
+    Unpin,
+    Sleep,
+    Wake,
+    Delete,
+}
+
+/// The bulk actions with their labels and the workspaces each applies to.
+pub fn bulk_actions(
+    targets: &[(ServerRef, WorkspaceSummary)],
+) -> Vec<(BulkAction, String, Vec<(ServerRef, WorkspaceSummary)>)> {
+    let pick = |keep: &dyn Fn(&WorkspaceSummary) -> bool| -> Vec<(ServerRef, WorkspaceSummary)> {
+        targets
+            .iter()
+            .filter(|(_, workspace)| keep(workspace))
+            .cloned()
+            .collect()
+    };
+    let unpinned = pick(&|workspace| !workspace.pinned);
+    let mut actions = Vec::new();
+    if unpinned.is_empty() {
+        actions.push((
+            BulkAction::Unpin,
+            crate::cards::count_label("Unpin", targets.len()),
+            targets.to_vec(),
+        ));
+    } else {
+        actions.push((
+            BulkAction::Pin,
+            crate::cards::count_label("Pin", unpinned.len()),
+            unpinned,
+        ));
+    }
+    let awake = pick(&|workspace| !workspace.sleeping);
+    if !awake.is_empty() {
+        actions.push((
+            BulkAction::Sleep,
+            crate::cards::count_label("Sleep", awake.len()),
+            awake,
+        ));
+    }
+    let asleep = pick(&|workspace| workspace.sleeping);
+    if !asleep.is_empty() {
+        actions.push((
+            BulkAction::Wake,
+            crate::cards::count_label("Wake", asleep.len()),
+            asleep,
+        ));
+    }
+    actions.push((
+        BulkAction::Delete,
+        format!("{}…", crate::cards::count_label("Delete", targets.len())),
+        targets.to_vec(),
+    ));
+    actions
+}
+
+pub fn bulk_card_menu(
+    targets: Vec<(ServerRef, WorkspaceSummary)>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    ContextMenu::build(window, cx, move |mut menu, _, _| {
+        menu = menu.header(format!("{} workspaces selected", targets.len()));
+        for (action, label, applies_to) in bulk_actions(&targets) {
+            if action == BulkAction::Delete {
+                menu = menu.separator();
+            }
+            let workspace = workspace.clone();
+            menu = menu.entry(label, None, move |window, cx| {
+                run_bulk_action(action, applies_to.clone(), workspace.clone(), window, cx)
+            });
+        }
+        menu
+    })
+}
+
+pub fn run_bulk_action(
+    action: BulkAction,
+    targets: Vec<(ServerRef, WorkspaceSummary)>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (method, verb) = match action {
+        BulkAction::Pin => ("workspace.set", "pin"),
+        BulkAction::Unpin => ("workspace.set", "unpin"),
+        BulkAction::Sleep => ("workspace.sleep", "put to sleep"),
+        BulkAction::Wake => ("workspace.wake", "wake"),
+        BulkAction::Delete => {
+            delete_workspaces(targets, workspace, window, cx);
+            return;
+        }
+    };
+    let tasks: Vec<(String, Task<Result<Value>>)> = targets
+        .iter()
+        .map(|(server, summary)| {
+            let mut params = json!({ "id": summary.id });
+            if matches!(action, BulkAction::Pin | BulkAction::Unpin) {
+                params["pinned"] = json!(action == BulkAction::Pin);
+            }
+            (summary.display_title(), request(server, method, params, cx))
+        })
+        .collect();
+    window
+        .spawn(cx, async move |cx| {
+            let mut failures = Vec::new();
+            for (title, task) in tasks {
+                if let Err(error) = task.await {
+                    failures.push(format!("{title}: {}", error_text(&error)));
+                }
+            }
+            cx.update(|_, cx| {
+                refresh_panel(&workspace, cx);
+                if !failures.is_empty() {
+                    show_failure(
+                        &workspace,
+                        format!("Couldn't {verb} {}", failures.join("; ")),
+                        cx,
+                    );
+                }
+            })
+            .log_err();
+        })
+        .detach();
+}
+
+/// Deletes several workspaces after one confirmation (Orca always confirms a bulk delete). Those refused
+/// for local changes, unsent review comments or a failed archive script are offered one Force Delete.
+fn delete_workspaces(
+    targets: Vec<(ServerRef, WorkspaceSummary)>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let count = targets.len();
+    let answer = window.prompt(
+        PromptLevel::Warning,
+        &format!("Delete {count} workspaces?"),
+        Some(
+            "Each project's archive script runs, then the worktree folders and their branches are removed. Their agents and terminals end.",
+        ),
+        &[&crate::cards::count_label("Delete", count), "Cancel"],
+        cx,
+    );
+    window
+        .spawn(cx, async move |cx| {
+            if answer.await? != 0 {
+                return anyhow::Ok(());
+            }
+            let mut forceable = Vec::new();
+            let mut failures = Vec::new();
+            for (server, summary) in targets {
+                let removed = cx
+                    .update(|_, cx| {
+                        request(&server, "workspace.remove", json!({ "id": summary.id }), cx)
+                    })?
+                    .await;
+                let Err(error) = removed else {
+                    continue;
+                };
+                let line = format!("{}: {}", summary.display_title(), error_text(&error));
+                if error_code(&error)
+                    .as_deref()
+                    .is_some_and(|code| FORCEABLE.contains(&code))
+                {
+                    forceable.push((server, summary, line));
+                } else {
+                    failures.push(line);
+                }
+            }
+            cx.update(|_, cx| refresh_panel(&workspace, cx))?;
+            if !forceable.is_empty() {
+                let detail = forceable
+                    .iter()
+                    .map(|(_, _, line)| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Critical,
+                        &if forceable.len() == 1 {
+                            "1 workspace wasn't deleted".to_owned()
+                        } else {
+                            format!("{} workspaces weren't deleted", forceable.len())
+                        },
+                        Some(&detail),
+                        &["Force Delete", "Cancel"],
+                        cx,
+                    )
+                })?;
+                if answer.await? == 0 {
+                    for (server, summary, _) in forceable {
+                        let forced = cx
+                            .update(|_, cx| {
+                                request(
+                                    &server,
+                                    "workspace.remove",
+                                    json!({ "id": summary.id, "force": true }),
+                                    cx,
+                                )
+                            })?
+                            .await;
+                        if let Err(error) = forced {
+                            failures.push(format!(
+                                "{}: {}",
+                                summary.display_title(),
+                                error_text(&error)
+                            ));
+                        }
+                    }
+                }
+            }
+            cx.update(|_, cx| {
+                refresh_panel(&workspace, cx);
+                if !failures.is_empty() {
+                    show_failure(
+                        &workspace,
+                        format!("Couldn't delete {}", failures.join("; ")),
+                        cx,
+                    );
+                }
+            })
+        })
+        .detach_and_log_err(cx);
 }
 
 const FORCEABLE: [&str; 3] = ["dirty", "unsent_review", "archive_failed"];
@@ -2620,6 +3052,168 @@ mod tests {
             ]
         );
         assert!(!has_failure_toast(&workspace, cx));
+    }
+
+    #[gpui::test]
+    async fn bulk_actions_run_on_every_selected_workspace_with_one_delete_confirmation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut pinned = summary("pinned", "/w/pinned", None);
+        pinned.pinned = true;
+        let mut asleep = summary("asleep", "/w/asleep", None);
+        asleep.sleeping = true;
+        let dirty = summary("dirty", "/w/dirty", None);
+        let targets = vec![
+            (ServerRef::Primary, pinned.clone()),
+            (ServerRef::Saved("desk".into()), asleep.clone()),
+            (ServerRef::Primary, dirty.clone()),
+        ];
+        let labels: Vec<(BulkAction, String, usize)> = bulk_actions(&targets)
+            .into_iter()
+            .map(|(action, label, applies)| (action, label, applies.len()))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                (BulkAction::Pin, "Pin 2 Workspaces".to_owned(), 2),
+                (BulkAction::Sleep, "Sleep 2 Workspaces".to_owned(), 2),
+                (BulkAction::Wake, "Wake 1 Workspace".to_owned(), 1),
+                (BulkAction::Delete, "Delete 3 Workspaces…".to_owned(), 3),
+            ]
+        );
+        assert_eq!(
+            bulk_actions(&targets[..1])[0].1,
+            "Unpin 1 Workspace",
+            "all pinned: unpin"
+        );
+
+        let (workspace, _, mut cx) =
+            panel_window(vec![pinned.clone(), asleep.clone(), dirty.clone()], cx).await;
+        let cx = &mut cx;
+        let calls = cx.update(|_, cx| {
+            stub_rpc(cx, |method, params| match method {
+                "workspace.remove"
+                    if params["id"] == "ws-dirty" && params["force"] != json!(true) =>
+                {
+                    Err(rpc_error("dirty", "worktree has uncommitted changes"))
+                }
+                _ => Ok(json!({})),
+            })
+        });
+        let weak = workspace.downgrade();
+        cx.update(|window, cx| {
+            run_bulk_action(
+                BulkAction::Pin,
+                targets[1..].to_vec(),
+                weak.clone(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "workspace.set"),
+            [
+                json!({ "id": "ws-asleep", "pinned": true }),
+                json!({ "id": "ws-dirty", "pinned": true })
+            ]
+        );
+
+        cx.update(|window, cx| {
+            run_bulk_action(
+                BulkAction::Delete,
+                targets.clone(),
+                weak.clone(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Delete 3 Workspaces");
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "workspace.remove").len(),
+            3,
+            "one confirmation for all"
+        );
+        assert!(cx.has_pending_prompt(), "the dirty one is offered a force");
+        cx.simulate_prompt_answer("Force Delete");
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "workspace.remove").last(),
+            Some(&json!({ "id": "ws-dirty", "force": true }))
+        );
+        assert!(!cx.has_pending_prompt());
+        assert!(!has_failure_toast(&workspace, cx));
+    }
+
+    #[gpui::test]
+    async fn the_dialogs_create_on_the_picked_server(cx: &mut gpui::TestAppContext) {
+        let (workspace, panel, mut cx) = panel_window(Vec::new(), cx).await;
+        let cx = &mut cx;
+        let calls = new_workspace_stub(cx, false);
+        let store = panel.read_with(cx, |panel, _| panel.remote_servers().clone());
+        store.update(cx, |store, cx| {
+            store.set_saved(
+                &[crate::servers::tests::saved("desk", "100.64.0.2:4000")],
+                cx,
+            )
+        });
+        let choices: Vec<String> = cx.update(|_, cx| {
+            server_choices(cx)
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect()
+        });
+        assert_eq!(choices, ["This machine", "desk"]);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_new_workspace(None, workspace, window, cx)
+        });
+        cx.run_until_parked();
+        let modal = active::<NewWorkspaceModal>(&workspace, cx).expect("the dialog");
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.server().clone()),
+            ServerRef::Primary,
+            "the window's own server by default"
+        );
+        modal.update_in(cx, |modal, window, cx| {
+            modal.set_project("proj-w".into(), window, cx);
+            modal.set_server(ServerRef::Saved("desk".into()), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "project.list").len(),
+            2,
+            "the saved server's projects load"
+        );
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.server(), &ServerRef::Saved("desk".into()));
+            assert_eq!(
+                modal.selected_project(),
+                Some("proj-a"),
+                "the old pick isn't kept across servers"
+            );
+        });
+
+        cx.dispatch_action(menu::Cancel);
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_add_project(PathBuf::from("/srv/repo"), workspace, window, cx)
+        });
+        cx.run_until_parked();
+        let add = active::<AddProjectModal>(&workspace, cx).expect("the Add project dialog");
+        add.update_in(cx, |modal, window, cx| {
+            modal.set_server(ServerRef::Saved("desk".into()), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "project.inspect"),
+            [
+                json!({ "path": "/srv/repo" }),
+                json!({ "path": "/srv/repo" })
+            ],
+            "the folder is read again on the picked server"
+        );
     }
 
     #[gpui::test]

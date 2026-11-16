@@ -422,6 +422,29 @@ pub fn document_schema() -> Schema {
             ]),
         ),
         field(
+            "sourceControl",
+            "The Source Control panel.",
+            closed(vec![
+                field(
+                    "openIn",
+                    "Apps in a changed file's \"Open in\" menu (Orca's openInApplications). `command` runs with the file's path as its last argument; a command with spaces runs through the shell.",
+                    array(open(vec![
+                        field("id", "", Str),
+                        field("label", "", Str),
+                        field("command", "", Str),
+                    ])),
+                ),
+                field(
+                    "sections",
+                    "Section order and hidden sections (ids: agent-turns, changes, commits), as Orca's sourceControlSectionLayout.",
+                    open(vec![
+                        field("order", "", array(Str)),
+                        field("hidden", "", array(Str)),
+                    ]),
+                ),
+            ]),
+        ),
+        field(
             "changes",
             "Changes list filters. Facets extend the built-in `type` facet by id or add new ones (e.g. `area`); see source-control.md §7.",
             open(vec![

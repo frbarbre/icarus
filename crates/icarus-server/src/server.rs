@@ -1279,7 +1279,7 @@ impl Server {
             other if other.starts_with("project.") || other.starts_with("workspace.") => {
                 self.workspace_dispatch(other, params_value).await
             }
-            "settings.import_orca_state" => self.orca_state_dispatch(params_value),
+            "settings.import_orca_state" => self.orca_state_dispatch(params_value).await,
             other if other.starts_with("config.") || other.starts_with("settings.") => {
                 self.settings_dispatch(other, params_value).await
             }
@@ -1373,6 +1373,10 @@ impl Server {
                     }
                     crate::terminal::TerminalChange::Label { id, label } => {
                         ("terminal.label", json!({ "id": id, "label": label }))
+                    }
+                    crate::terminal::TerminalChange::Activity { workspace } => {
+                        server.touch_activity(&workspace);
+                        continue;
                     }
                 };
                 server.broadcast(topic, payload);

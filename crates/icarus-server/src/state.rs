@@ -37,7 +37,18 @@ pub struct Workspace {
     /// Pinned cards list first in their sidebar group.
     #[serde(default)]
     pub pinned: bool,
+    /// Rank in the sidebar's Manual sort; higher lists first. New workspaces get their creation time.
+    #[serde(default)]
+    pub manual_order: Option<i64>,
+    /// The last agent turn, terminal output or git change (ms), for Recent and Agent Activity sorting.
+    #[serde(default)]
+    pub activity_at_ms: Option<u64>,
 }
+
+/// Activity stamps closer together than this don't rewrite the row (Orca's recent-stamp throttle).
+pub const ACTIVITY_THROTTLE_MS: u64 = 10_000;
+/// The gap between neighbouring Manual ranks, so a drop can land between two without renumbering.
+pub const MANUAL_ORDER_STRIDE: i64 = 1000;
 
 /// Context queued for a workspace's composer; `sent_at` is set once it went out with a message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -217,6 +228,8 @@ impl Store {
             "pinned",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        add_missing_column(&connection, "workspaces", "manual_order", "INTEGER")?;
+        add_missing_column(&connection, "workspaces", "activity_at_ms", "INTEGER")?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -311,8 +324,8 @@ impl Store {
 
     pub fn insert_workspace(&self, workspace: &Workspace) -> Result<()> {
         self.db().execute(
-            "INSERT INTO workspaces (id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms, pinned)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO workspaces (id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms, pinned, manual_order, activity_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 workspace.id,
                 workspace.project_id,
@@ -325,10 +338,37 @@ impl Store {
                 json_column(&workspace.issue),
                 json_column(&workspace.pull_request),
                 workspace.created_at_ms as i64,
-                workspace.pinned
+                workspace.pinned,
+                workspace.manual_order,
+                workspace.activity_at_ms.map(|at| at as i64)
             ],
         )?;
         Ok(())
+    }
+
+    /// Ranks `ids` for the Manual sort, first highest, all above every earlier rank; others keep theirs.
+    pub fn set_manual_order(&self, ids: &[String]) -> Result<usize> {
+        let mut db = self.db();
+        let transaction = db.transaction()?;
+        let top = now_ms() as i64;
+        let mut changed = 0;
+        for (index, id) in ids.iter().enumerate() {
+            changed += transaction.execute(
+                "UPDATE workspaces SET manual_order = ?2 WHERE id = ?1",
+                params![id, top - index as i64 * MANUAL_ORDER_STRIDE],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// Stamps the workspace's activity time; false when an equal or newer stamp is within the throttle.
+    pub fn touch_activity(&self, id: &str, at_ms: u64) -> Result<bool> {
+        Ok(self.db().execute(
+            "UPDATE workspaces SET activity_at_ms = ?2
+             WHERE id = ?1 AND (activity_at_ms IS NULL OR activity_at_ms <= ?2 - ?3)",
+            params![id, at_ms as i64, ACTIVITY_THROTTLE_MS as i64],
+        )? > 0)
     }
 
     pub fn update_workspace(&self, workspace: &Workspace) -> Result<()> {
@@ -364,10 +404,12 @@ impl Store {
             pull_request: parse_json(row.get(9)?),
             created_at_ms: row.get::<_, i64>(10)? as u64,
             pinned: row.get(11)?,
+            manual_order: row.get(12)?,
+            activity_at_ms: row.get::<_, Option<i64>>(13)?.map(|at| at as u64),
         })
     }
 
-    const WORKSPACE_COLUMNS: &str = "id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms, pinned";
+    const WORKSPACE_COLUMNS: &str = "id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms, pinned, manual_order, activity_at_ms";
 
     /// Finds a workspace by id, name or path.
     pub fn workspace(&self, key: &str) -> Result<Option<Workspace>> {
@@ -911,6 +953,8 @@ mod tests {
             pull_request: None,
             created_at_ms: 1,
             pinned: false,
+            manual_order: Some(5),
+            activity_at_ms: None,
         };
         store.insert_workspace(&workspace).expect("insert");
         workspace.status = Some("in-review".into());
@@ -944,6 +988,8 @@ mod tests {
             pull_request: None,
             created_at_ms: 1,
             pinned: false,
+            manual_order: None,
+            activity_at_ms: None,
         };
         store.insert_workspace(&workspace).expect("insert");
         let first = store
@@ -978,6 +1024,74 @@ mod tests {
     }
 
     #[test]
+    fn manual_order_and_activity_are_stamped_apart_from_other_edits() {
+        let store = Store::in_memory().expect("store");
+        let project = store
+            .add_project("widgets", Path::new("/src/widgets"), None, None)
+            .expect("project");
+        for (index, id) in ["ws-a", "ws-b", "ws-c"].iter().enumerate() {
+            store
+                .insert_workspace(&Workspace {
+                    id: (*id).into(),
+                    project_id: project.id.clone(),
+                    name: (*id).into(),
+                    path: PathBuf::from(format!("/w/{id}")),
+                    branch: None,
+                    base_ref: None,
+                    status: None,
+                    title: None,
+                    issue: None,
+                    pull_request: None,
+                    created_at_ms: index as u64,
+                    pinned: false,
+                    manual_order: Some(index as i64),
+                    activity_at_ms: None,
+                })
+                .expect("insert");
+        }
+        assert_eq!(
+            store
+                .set_manual_order(&["ws-c".into(), "ws-a".into(), "gone".into()])
+                .expect("order"),
+            2
+        );
+        let rank = |id: &str| {
+            store
+                .workspace(id)
+                .expect("q")
+                .and_then(|w| w.manual_order)
+                .expect("ranked")
+        };
+        assert_eq!(rank("ws-c") - rank("ws-a"), MANUAL_ORDER_STRIDE);
+        assert!(rank("ws-a") > rank("ws-b"), "reordered ones rank above");
+
+        assert!(store.touch_activity("ws-b", 100_000).expect("touch"));
+        assert!(
+            !store
+                .touch_activity("ws-b", 100_000 + 5_000)
+                .expect("throttled"),
+            "inside the throttle"
+        );
+        assert!(!store.touch_activity("ws-b", 50_000).expect("older"));
+        let mut stale = store.workspace("ws-b").expect("q").expect("b");
+        assert_eq!(stale.activity_at_ms, Some(100_000));
+        assert!(
+            store
+                .touch_activity("ws-b", 100_000 + ACTIVITY_THROTTLE_MS)
+                .expect("later")
+        );
+        stale.title = Some("Renamed".into());
+        store.update_workspace(&stale).expect("update");
+        let read = store.workspace("ws-b").expect("q").expect("b");
+        assert_eq!(
+            read.activity_at_ms,
+            Some(100_000 + ACTIVITY_THROTTLE_MS),
+            "an edit from an older read keeps the newer stamp"
+        );
+        assert_eq!(read.manual_order, Some(1));
+    }
+
+    #[test]
     fn databases_from_before_pinning_gain_the_column() {
         let connection = Connection::open_in_memory().expect("db");
         connection
@@ -994,6 +1108,10 @@ mod tests {
         let store = Store::init(connection).expect("migrates");
         let workspace = store.workspace("ws-1").expect("q").expect("kept");
         assert!(!workspace.pinned);
+        assert_eq!(
+            (workspace.manual_order, workspace.activity_at_ms),
+            (None, None)
+        );
         let reopened = Store::init(store.connection.into_inner().expect("connection"))
             .expect("a second open leaves the column alone");
         assert_eq!(reopened.workspaces(None).expect("list").len(), 1);

@@ -219,6 +219,27 @@ async fn source_control_actions_run_in_the_worktree_and_announce_themselves() {
     assert_eq!(commits[0]["subject"], "change a");
     assert_eq!(commits[0]["oid"], git(&path, &["rev-parse", "HEAD"]));
     assert_eq!(commits[0]["author"], "T");
+    let files = client
+        .request(
+            "git.commit_files",
+            json!({ "workspace": id, "sha": commits[0]["oid"] }),
+        )
+        .await
+        .expect("a commit's files");
+    assert_eq!(files["subject"], "change a");
+    assert_eq!(files["parent"], git(&path, &["rev-parse", "HEAD^"]));
+    assert_eq!(
+        files["files"],
+        json!([{ "path": "a.txt", "status": "modified", "old_path": null, "added": 1, "removed": 1, "binary": false }])
+    );
+    let unknown = client
+        .request(
+            "git.commit_files",
+            json!({ "workspace": id, "sha": "nope" }),
+        )
+        .await
+        .expect_err("an unknown commit");
+    assert!(format!("{unknown:#}").contains("no commit nope"));
     let missing = client
         .request(
             "git.commits",

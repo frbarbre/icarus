@@ -77,6 +77,24 @@ impl Server {
                 .map_err(|error| rpc("git_failed", format!("{error:#}")))?;
                 return to_value(commits);
             }
+            "git.commit_files" => {
+                #[derive(Deserialize)]
+                struct P {
+                    #[serde(flatten)]
+                    target: Target,
+                    sha: String,
+                }
+                let p: P = params(p)?;
+                let workspace = self.note_workspace(&p.target)?;
+                let path = workspace.path.clone();
+                let files = tokio::task::spawn_blocking(move || {
+                    icarus_git::commit_files(&path, p.sha.trim())
+                })
+                .await
+                .map_err(|error| rpc("internal", error))?
+                .map_err(|error| rpc("git_failed", format!("{error:#}")))?;
+                return to_value(files);
+            }
             "git.discard" => {
                 let p: Paths = params(p)?;
                 let workspace = self.note_workspace(&p.target)?;
@@ -162,6 +180,7 @@ impl Server {
             GIT_CHANGED_TOPIC,
             json!({ "workspace": workspace.id, "op": method.trim_start_matches("git.") }),
         );
+        self.touch_activity(&workspace.id);
         Ok(value)
     }
 }

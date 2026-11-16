@@ -572,7 +572,7 @@ impl editor::Addon for ReviewAttached {
     }
 }
 
-/// Shows notes in plain file editors of Icarus workspaces too, not only in diff tabs.
+/// Shows PR threads, review drafts and notes in plain file editors of Icarus workspaces too.
 pub fn attach_notes_to_file_editors(cx: &mut App) {
     cx.observe_new(|editor: &mut Editor, window, cx| {
         let Some(window) = window else {
@@ -619,8 +619,35 @@ fn attach_notes(editor: &mut Editor, cx: &mut Context<Editor>) {
     let weak = cx.entity().downgrade();
     let workspace_key = root.to_string_lossy().into_owned();
     let review =
-        cx.new(|cx| DiffReview::notes_only(weak, buffer, workspace_key, relative, client, cx));
+        cx.new(|cx| DiffReview::file_editor(weak, buffer, workspace_key, relative, client, cx));
     editor.register_addon(ReviewAttached(Some(review)));
+}
+
+/// Someone the reviewer picker offers.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ReviewerCandidate {
+    pub login: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// GitHub's suggestion for this PR, or a frequent reviewer in the repository.
+    #[serde(skip)]
+    pub suggested: bool,
+}
+
+/// `review.reviewer_suggestions`' answer: the suggestions first, then everyone else who can review.
+pub fn reviewer_candidates_from(value: &Value) -> Vec<ReviewerCandidate> {
+    let list = |key: &str, suggested: bool| {
+        serde_json::from_value::<Vec<ReviewerCandidate>>(value[key].clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(move |candidate| ReviewerCandidate {
+                suggested,
+                ..candidate
+            })
+    };
+    list("suggested", true)
+        .chain(list("everyone", false))
+        .collect()
 }
 
 /// `review.mentionables`' answer as a list: the PR's author first, then the assignable users.
@@ -675,6 +702,8 @@ pub struct ReviewSection {
     busy: Option<String>,
     summary_editor: Entity<Editor>,
     reviewer_input: Entity<Editor>,
+    candidates: Vec<ReviewerCandidate>,
+    candidates_error: Option<String>,
     applying_summary: bool,
     reload_requested: bool,
     _save_summary: Task<()>,
@@ -746,6 +775,8 @@ impl ReviewSection {
             busy: None,
             summary_editor,
             reviewer_input,
+            candidates: Vec::new(),
+            candidates_error: None,
             applying_summary: false,
             reload_requested: false,
             _save_summary: Task::ready(()),
@@ -754,8 +785,79 @@ impl ReviewSection {
         };
         let this = cx.entity().downgrade();
         cx.default_global::<ReviewListeners>().sections.push(this);
+        section.load_candidates(cx);
         section.reload(window, cx);
         section
+    }
+
+    fn load_candidates(&mut self, cx: &mut Context<Self>) {
+        let Some(call) = request(
+            self.client.clone(),
+            "review.reviewer_suggestions",
+            json!({ "workspace": self.workspace }),
+            cx,
+        ) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(value) => {
+                        this.candidates = reviewer_candidates_from(&value);
+                        this.candidates_error = None;
+                    }
+                    Err(error) => this.candidates_error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    /// What the reviewer picker lists: suggestions first, without anyone already asked or who
+    /// reviewed (their row offers re-request), as in Orca.
+    pub fn picker_candidates(&self) -> Vec<ReviewerCandidate> {
+        self.candidates
+            .iter()
+            .filter(|candidate| {
+                !self
+                    .rows
+                    .iter()
+                    .any(|row| !row.team && row.name.eq_ignore_ascii_case(&candidate.login))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Shows fixed picker candidates without a server (previews, tests).
+    pub fn set_preview_candidates(&mut self, candidates: Vec<ReviewerCandidate>) {
+        self.candidates = candidates;
+    }
+
+    fn render_reviewer_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let candidates = self.picker_candidates();
+        let empty = candidates.is_empty();
+        let tooltip: SharedString = match (&self.candidates_error, empty) {
+            (Some(error), true) => format!("No suggestions: {error}").into(),
+            (_, true) => "No one to suggest".into(),
+            _ => "Pick a reviewer".into(),
+        };
+        PopoverMenu::new("icarus-reviewer-picker")
+            .trigger(
+                IconButton::new("icarus-reviewer-picker-button", IconName::UserGroup)
+                    .icon_size(IconSize::Small)
+                    .disabled(empty || self.busy.is_some())
+                    .tooltip(Tooltip::text(tooltip)),
+            )
+            .anchor(gpui::Anchor::TopRight)
+            .menu(move |window, cx| {
+                let this = this.clone();
+                let candidates = candidates.clone();
+                Some(cx.new(|cx| reviewer_palette(this, candidates, window, cx)))
+            })
     }
 
     /// A section that never talks to a server, for previews and visual tests.
@@ -1174,6 +1276,43 @@ impl ReviewSection {
     }
 }
 
+/// The reviewer picker: a fuzzy list of `candidates`; confirming one asks them for a review.
+pub fn reviewer_palette(
+    section: WeakEntity<ReviewSection>,
+    candidates: Vec<ReviewerCandidate>,
+    window: &mut Window,
+    cx: &mut Context<crate::palettes::Palette>,
+) -> crate::palettes::Palette {
+    let items = candidates
+        .iter()
+        .map(|candidate| crate::palettes::PaletteItem {
+            label: format!("@{}", candidate.login),
+            detail: if candidate.suggested {
+                Some("Suggested".to_owned())
+            } else {
+                candidate.name.clone()
+            },
+            keywords: candidate.name.clone().unwrap_or_default(),
+        })
+        .collect();
+    crate::palettes::Palette::new(
+        "Request a review from…",
+        items,
+        move |index, window, cx| {
+            let Some(login) = candidates.get(index).map(|c| c.login.clone()) else {
+                return;
+            };
+            section
+                .update(cx, |section, cx| {
+                    section.request_reviewers(vec![login], window, cx)
+                })
+                .log_err();
+        },
+        window,
+        cx,
+    )
+}
+
 impl Render for ReviewSection {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if std::mem::take(&mut self.reload_requested) {
@@ -1197,14 +1336,21 @@ impl Render for ReviewSection {
             section = section.child(self.render_reviewer(&row, cx));
         }
         section = section.child(
-            div()
-                .key_context("IcarusReviewerInput")
-                .px_1()
-                .py_0p5()
-                .border_1()
-                .rounded_sm()
-                .border_color(cx.theme().colors().border_variant)
-                .child(self.reviewer_input.clone()),
+            h_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .key_context("IcarusReviewerInput")
+                        .px_1()
+                        .py_0p5()
+                        .border_1()
+                        .rounded_sm()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(self.reviewer_input.clone()),
+                )
+                .child(self.render_reviewer_picker(cx)),
         );
         let Some(view) = self.view.clone() else {
             let problem = self.load_error.clone().or_else(|| self.error.clone());
@@ -1385,13 +1531,24 @@ impl MarkerKind {
         }
     }
 
-    fn tooltip(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
-            Self::Thread => "Show the PR thread",
-            Self::Draft => "Show your pending comment",
-            Self::Note => "Show the note",
+            Self::Thread => "a PR thread",
+            Self::Draft => "your pending comment",
+            Self::Note => "a note",
         }
     }
+}
+
+/// "Show a PR thread, your pending comment and a note".
+fn marker_tooltip(kinds: &[MarkerKind]) -> String {
+    let names: Vec<&str> = kinds.iter().map(|kind| kind.name()).collect();
+    let listed = match names.as_slice() {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    format!("Show {listed}")
 }
 
 struct ThreadGutter;
@@ -1420,12 +1577,12 @@ pub struct DiffReview {
     /// The last action's failure, kept across the reload that follows it.
     error: Option<String>,
     load_error: Option<String>,
-    /// A plain file editor: only notes, no PR threads or review drafts.
+    /// A plain file editor: its comment box leaves notes, not review drafts.
     notes_only: bool,
     people: MentionSource,
     people_requested: bool,
-    /// Multibuffer row → what its gutter marker opens, rebuilt with the blocks.
-    markers: Rc<RefCell<HashMap<u32, (MarkerKind, String)>>>,
+    /// Multibuffer row → each kind on it (threads, drafts, notes) with the first card of that kind.
+    markers: Rc<RefCell<HashMap<u32, Vec<(MarkerKind, String)>>>>,
     _poll: Task<()>,
 }
 
@@ -1441,8 +1598,8 @@ impl DiffReview {
         Self::build(editor, buffer, workspace_key, path, client, false, cx)
     }
 
-    /// Notes on a plain file editor of an Icarus workspace (no review threads or drafts there).
-    pub fn notes_only(
+    /// A plain file editor of an Icarus workspace: PR threads, drafts and notes on its lines.
+    pub fn file_editor(
         editor: WeakEntity<Editor>,
         buffer: Entity<Buffer>,
         workspace_key: String,
@@ -1547,22 +1704,6 @@ impl DiffReview {
             json!({ "cwd": self.workspace_key, "path": self.path, "include_resolved": true }),
             cx,
         );
-        if self.notes_only {
-            let Some(notes) = notes else {
-                return Task::ready(());
-            };
-            return cx.spawn(async move |this, cx| {
-                let notes = notes.await;
-                this.update(cx, |this, cx| {
-                    match notes {
-                        Ok(notes) => this.notes = serde_json::from_value(notes).unwrap_or_default(),
-                        Err(error) => log::warn!("loading notes failed: {error:#}"),
-                    }
-                    this.rebuild_blocks(cx);
-                })
-                .log_err();
-            });
-        }
         let (Some(threads), Some(drafts)) = (
             request(
                 self.client.clone(),
@@ -1697,8 +1838,11 @@ impl DiffReview {
                     AnyCard::Note(note, _) => (MarkerKind::Note, note.id.clone(), 2),
                 };
                 let row = multi_buffer::ToPoint::to_point(&anchor, &snapshot).row;
-                // A row with several kinds shows the first: threads, then drafts, then notes.
-                markers.entry(row).or_insert((kind, id));
+                let kinds: &mut Vec<(MarkerKind, String)> = markers.entry(row).or_default();
+                if !kinds.iter().any(|(known, _)| *known == kind) {
+                    kinds.push((kind, id));
+                    kinds.sort_by_key(|(kind, _)| *kind as u8);
+                }
                 highlights[slot].push(anchor..anchor);
             }
             let card = cx.new(|_| ReviewCard {
@@ -1731,9 +1875,18 @@ impl DiffReview {
         self.expanded.contains(id)
     }
 
-    /// The marker shown on a multibuffer row instead of "+".
+    /// What a click on a multibuffer row's marker opens: its first kind (threads, drafts, notes).
     pub fn marker_at(&self, row: u32) -> Option<(MarkerKind, String)> {
-        self.markers.borrow().get(&row).cloned()
+        self.markers.borrow().get(&row)?.first().cloned()
+    }
+
+    /// Every kind of card on a multibuffer row, each drawn as its own icon.
+    pub fn marker_kinds_at(&self, row: u32) -> Vec<MarkerKind> {
+        self.markers
+            .borrow()
+            .get(&row)
+            .map(|kinds| kinds.iter().map(|(kind, _)| *kind).collect())
+            .unwrap_or_default()
     }
 
     /// Gives the editor's gutter "+" (click or drag over rows) and the markers to this review.
@@ -1751,8 +1904,16 @@ impl DiffReview {
                     .log_err();
             }),
             marker: Rc::new(move |row, _cx| {
-                let (kind, _) = markers.borrow().get(&row.0).cloned()?;
-                Some((kind.icon(), kind.color(), kind.tooltip().into()))
+                let markers = markers.borrow();
+                let kinds: Vec<MarkerKind> =
+                    markers.get(&row.0)?.iter().map(|(kind, _)| *kind).collect();
+                Some(editor::GutterCommentMarker {
+                    icons: kinds
+                        .iter()
+                        .map(|kind| (kind.icon(), kind.color()))
+                        .collect(),
+                    tooltip: marker_tooltip(&kinds).into(),
+                })
             }),
             on_marker: Rc::new(move |row, window, cx| {
                 review
@@ -1797,7 +1958,7 @@ impl DiffReview {
 
     /// The people @-mentions offer; asked for once per tab, when a comment box first opens.
     fn mention_source(&mut self, cx: &mut Context<Self>) -> MentionSource {
-        if !self.people_requested && !self.notes_only {
+        if !self.people_requested {
             self.people_requested = true;
             let people = self.people.clone();
             if let Some(call) = self.call(
@@ -3457,6 +3618,77 @@ pub(crate) mod tests {
         );
         assert_eq!(
             calls_to(&calls, "review.remove_reviewers")[0]["reviewers"],
+            json!(["alice"])
+        );
+    }
+
+    #[gpui::test]
+    async fn the_reviewer_picker_lists_suggestions_first_and_requests_the_pick(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let calls = cx.update(|cx| {
+            stub_rpc(cx, |method, _| match method {
+                "review.get" => Ok(review_view(0)),
+                "review.reviewer_suggestions" => Ok(json!({
+                    "suggested": [{ "login": "carol", "name": "Carol" }, { "login": "bob" }],
+                    "everyone": [{ "login": "alice", "name": "Alice A" }, { "login": "dave" }],
+                })),
+                _ => Ok(json!({})),
+            })
+        });
+        let window = cx.add_empty_window();
+        let section = window
+            .update(|window, cx| cx.new(|cx| ReviewSection::new("ws-1".into(), None, window, cx)));
+        window.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "review.reviewer_suggestions"),
+            [json!({ "workspace": "ws-1" })]
+        );
+        section.update(window, |section, _| {
+            section.set_pull_request(&pull_request(json!({
+                "number": 7, "title": "t", "url": "u", "state": "OPEN", "head_ref_name": "h",
+                "base_ref_name": "main", "head_ref_oid": "abc", "author": "me",
+                "requested_reviewers": [{ "kind": "user", "login": "bob" }],
+            })));
+        });
+        let listed: Vec<(String, bool)> = section.read_with(window, |section, _| {
+            section
+                .picker_candidates()
+                .into_iter()
+                .map(|candidate| (candidate.login, candidate.suggested))
+                .collect()
+        });
+        assert_eq!(
+            listed,
+            [
+                ("carol".to_owned(), true),
+                ("alice".to_owned(), false),
+                ("dave".to_owned(), false)
+            ],
+            "suggestions first; someone already asked is left out"
+        );
+
+        let palette = window.update(|window, cx| {
+            let candidates = section.read(cx).picker_candidates();
+            let section = section.downgrade();
+            cx.new(|cx| reviewer_palette(section, candidates, window, cx))
+        });
+        let picker = palette.read_with(window, |palette, _| palette.picker().clone());
+        picker.update_in(window, |picker, window, cx| {
+            picker.set_query("ali", window, cx)
+        });
+        window.run_until_parked();
+        picker.update_in(window, |picker, window, cx| {
+            picker::PickerDelegate::confirm(&mut picker.delegate, false, window, cx)
+        });
+        window.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "review.request_reviewers")[0]["reviewers"],
             json!(["alice"])
         );
     }

@@ -3,7 +3,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use icarus_client::Client;
-use serde_json::json;
+use serde_json::{Value, json};
 
 struct ServerProcess {
     child: Child,
@@ -500,6 +500,43 @@ async fn workspace_lifecycle_creates_a_worktree_with_an_agent_and_lists_changes(
             .any(|r| r["path"] == note && r["status"] == "added"),
         "{rows:?}"
     );
+
+    let mut activity = Value::Null;
+    for _ in 0..50 {
+        let info = client
+            .request("workspace.info", json!({ "id": workspace["id"] }))
+            .await
+            .expect("info");
+        activity = info["activity_at_ms"].clone();
+        if !activity.is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        activity
+            .as_u64()
+            .is_some_and(|at| at >= workspace["created_at_ms"].as_u64().expect("created")),
+        "the agent's turn stamps the activity time: {activity}"
+    );
+    let first_rank = workspace["manual_order"]
+        .as_i64()
+        .expect("a new workspace is ranked");
+    let ordered = client
+        .request("workspace.reorder", json!({ "ids": [workspace["name"]] }))
+        .await
+        .expect("reorder by name");
+    assert_eq!(ordered["ordered"], 1);
+    let info = client
+        .request("workspace.info", json!({ "id": workspace["id"] }))
+        .await
+        .expect("info");
+    assert!(info["manual_order"].as_i64().expect("rank") >= first_rank);
+    let unknown = client
+        .request("workspace.reorder", json!({ "ids": ["nope"] }))
+        .await
+        .expect_err("an unknown workspace");
+    assert!(format!("{unknown:#}").contains("not_found"), "{unknown:#}");
 
     let updated = client
         .request(

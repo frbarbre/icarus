@@ -536,6 +536,95 @@ async fn comments_post_now_get_edited_and_deleted_and_mentionables_are_cached() 
         1,
         "the second lookup comes from the cache"
     );
+    gh["suggested_reviewers"] = json!([{ "login": "carol", "name": "Carol" }]);
+    gh["recent_reviewers"] = json!(["bob", "someone", "bob"]);
+    world.set_fixtures(&gh);
+    let suggestions = world
+        .request("review.reviewer_suggestions", json!({ "workspace": ws }))
+        .await;
+    let logins = |key: &str| -> Vec<String> {
+        suggestions[key]
+            .as_array()
+            .expect("list")
+            .iter()
+            .filter_map(|u| u["login"].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(
+        logins("suggested"),
+        ["carol", "bob"],
+        "GitHub's suggestion, then recent reviewers; never the author"
+    );
+    assert_eq!(
+        logins("everyone"),
+        ["alice"],
+        "the rest of the assignable users"
+    );
+    world
+        .request("workspace.remove", json!({ "id": ws, "force": true }))
+        .await;
+}
+
+#[tokio::test]
+async fn orcas_pending_review_drafts_import_once_onto_the_pull_request() {
+    let world = World::new(json!({ "viewer": "me" })).await;
+    let (ws, path, head) = world.workspace("rev").await;
+    world.set_fixtures(&fixtures(&head, "someone"));
+    let key = format!("r1::{}", path.display());
+    let request = json!({
+        "worktree_meta": {},
+        "repos": [],
+        "pending_review_drafts": { "version": 1,
+            "drafts": { key.clone(): [
+                { "id": "o1", "path": "src/a.rs", "line": 3, "startLine": 2, "body": "From Orca", "createdAt": 1700000000000u64 },
+            ] },
+            "summaries": { key: "Orca summary" },
+        },
+    });
+    let mut dry = request.clone();
+    dry["dry_run"] = json!(true);
+    let planned = world.request("settings.import_orca_state", dry).await;
+    assert_eq!(planned["matched"][0]["drafts"], 1);
+    let none = world
+        .request("review.comment.list", json!({ "workspace": ws }))
+        .await;
+    assert_eq!(none["drafts"].as_array().map(Vec::len), Some(0));
+
+    let applied = world
+        .request("settings.import_orca_state", request.clone())
+        .await;
+    assert_eq!(applied["matched"][0]["drafts_error"], Value::Null);
+    let view = world
+        .request("review.get", json!({ "workspace": ws }))
+        .await;
+    let drafts = view["drafts"].as_array().expect("drafts");
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(
+        (
+            &drafts[0]["path"],
+            &drafts[0]["line"],
+            &drafts[0]["start_line"]
+        ),
+        (&json!("src/a.rs"), &json!(3), &json!(2))
+    );
+    assert_eq!(drafts[0]["body"], "From Orca");
+    assert_eq!(view["summary"], "Orca summary");
+
+    let again = world.request("settings.import_orca_state", request).await;
+    assert_eq!(again["matched"][0]["drafts"], 0);
+    assert_eq!(
+        again["matched"][0]["review_summary"], false,
+        "the summary already there is kept"
+    );
+    assert_eq!(again["matched"][0]["drafts_already_imported"], 1);
+    let list = world
+        .request("review.comment.list", json!({ "workspace": ws }))
+        .await;
+    assert_eq!(
+        list["drafts"].as_array().map(Vec::len),
+        Some(1),
+        "nothing twice"
+    );
     world
         .request("workspace.remove", json!({ "id": ws, "force": true }))
         .await;

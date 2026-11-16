@@ -30,6 +30,23 @@ const ASSIGNABLE_USERS: &str =
 /// Bounds the pages fetched for very large organisations; the first few hundred cover any picker.
 const MAX_ASSIGNABLE_PAGES: usize = 5;
 
+const REVIEWER_SUGGESTIONS: &str =
+    "query ReviewerSuggestions($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      author { login }
+      suggestedReviewers { reviewer { login name avatarUrl(size: 64) } }
+    }
+    pullRequests(first: 30, states: [OPEN, MERGED], orderBy: { field: UPDATED_AT, direction: DESC }) {
+      nodes {
+        reviews(last: 20) {
+          nodes { author { __typename login avatarUrl(size: 64) ... on User { name } } }
+        }
+      }
+    }
+  }
+}";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Comment,
@@ -624,6 +641,29 @@ impl<G: Gh> GitHub<G> {
         Ok(users)
     }
 
+    /// People worth asking to review: GitHub's own suggestions for the PR, then whoever reviewed
+    /// the repository's recent pull requests most often. The PR's author and bots are left out.
+    pub async fn reviewer_suggestions(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Vec<GitHubUser>> {
+        let data: Value = self
+            .graphql_data(
+                REVIEWER_SUGGESTIONS,
+                json!({ "owner": repo.owner, "name": repo.name, "number": number }),
+            )
+            .await?;
+        let repository = &data["repository"];
+        if repository.is_null() {
+            return Err(GitHubError::NotFound(format!(
+                "Could not find {}/{}.",
+                repo.owner, repo.name
+            )));
+        }
+        Ok(rank_reviewer_suggestions(repository))
+    }
+
     pub async fn set_reaction(
         &self,
         subject_id: &str,
@@ -638,4 +678,58 @@ impl<G: Gh> GitHub<G> {
         .await
         .map(drop)
     }
+}
+
+fn rank_reviewer_suggestions(repository: &Value) -> Vec<GitHubUser> {
+    let pull = &repository["pullRequest"];
+    let author = pull["author"]["login"]
+        .as_str()
+        .map(str::to_ascii_lowercase);
+    let mut out: Vec<GitHubUser> = Vec::new();
+    let push = |user: GitHubUser, out: &mut Vec<GitHubUser>| {
+        let login = user.login.to_ascii_lowercase();
+        if login.is_empty()
+            || author.as_deref() == Some(login.as_str())
+            || out
+                .iter()
+                .any(|known| known.login.eq_ignore_ascii_case(&login))
+        {
+            return;
+        }
+        out.push(user);
+    };
+    for entry in pull["suggestedReviewers"].as_array().into_iter().flatten() {
+        if let Ok(user) = serde_json::from_value::<GitHubUser>(entry["reviewer"].clone()) {
+            push(user, &mut out);
+        }
+    }
+    let mut counts: Vec<(GitHubUser, usize)> = Vec::new();
+    for pr in repository["pullRequests"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        for review in pr["reviews"]["nodes"].as_array().into_iter().flatten() {
+            let reviewer = &review["author"];
+            if reviewer["__typename"] != "User" {
+                continue;
+            }
+            let Ok(user) = serde_json::from_value::<GitHubUser>(reviewer.clone()) else {
+                continue;
+            };
+            match counts
+                .iter_mut()
+                .find(|(known, _)| known.login.eq_ignore_ascii_case(&user.login))
+            {
+                Some((_, count)) => *count += 1,
+                None => counts.push((user, 1)),
+            }
+        }
+    }
+    // Stable sort: ties keep the order of the most recently updated pull request.
+    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    for (user, _) in counts {
+        push(user, &mut out);
+    }
+    out
 }

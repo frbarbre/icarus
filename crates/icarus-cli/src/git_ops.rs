@@ -54,6 +54,40 @@ pub enum GitCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// The files one commit changed, against its first parent.
+    CommitFiles {
+        sha: String,
+    },
+}
+
+/// `M  src/app.rs  +3 −1` per file, with `old → new` for renames.
+fn commit_files_text(value: &Value) -> String {
+    let files = value["files"].as_array().cloned().unwrap_or_default();
+    if files.is_empty() {
+        return "No file changes in this commit".to_string();
+    }
+    files
+        .iter()
+        .map(|file| {
+            let letter = match file["status"].as_str().unwrap_or_default() {
+                "added" => "A",
+                "deleted" => "D",
+                "renamed" => "R",
+                "copied" => "C",
+                _ => "M",
+            };
+            let path = file["path"].as_str().unwrap_or_default();
+            let path = match file["old_path"].as_str() {
+                Some(old) => format!("{old} → {path}"),
+                None => path.to_string(),
+            };
+            match (file["added"].as_u64(), file["removed"].as_u64()) {
+                (Some(added), Some(removed)) => format!("{letter}  {path}  +{added} −{removed}"),
+                _ => format!("{letter}  {path}  (binary)"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn relative_age(seconds: i64) -> String {
@@ -227,6 +261,12 @@ pub async fn run(
                 .unwrap_or_default();
             super::print(cli, &commits, |value| commits_text(value, now));
         }
+        GitCommand::CommitFiles { sha } => {
+            let mut request = target(workspace);
+            request["sha"] = json!(sha);
+            let files = client.request("git.commit_files", request).await?;
+            super::print(cli, &files, commit_files_text);
+        }
     }
     Ok(())
 }
@@ -234,6 +274,23 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_files_read_as_status_path_and_counts() {
+        let value = json!({ "files": [
+            { "path": "src/app.rs", "status": "modified", "old_path": null, "added": 3, "removed": 1 },
+            { "path": "new.rs", "status": "renamed", "old_path": "old.rs", "added": 0, "removed": 0 },
+            { "path": "logo.png", "status": "added", "old_path": null, "added": null, "removed": null },
+        ]});
+        assert_eq!(
+            commit_files_text(&value),
+            "M  src/app.rs  +3 −1\nR  old.rs → new.rs  +0 −0\nA  logo.png  (binary)"
+        );
+        assert_eq!(
+            commit_files_text(&json!({ "files": [] })),
+            "No file changes in this commit"
+        );
+    }
 
     #[test]
     fn commits_read_newest_first_with_author_and_age() {

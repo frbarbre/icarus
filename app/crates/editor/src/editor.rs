@@ -111,7 +111,6 @@ pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
     file_status_label_color, render_breadcrumb_text,
 };
-pub use git::GutterCommentHook;
 pub use git::blame::{BlameRenderer, GitBlame, MAX_RELATIVE_TIMESTAMP};
 pub use git::{
     DefaultDiffHunkRenderer, DiffHunkRenderer, HiddenDiffHunkRenderer,
@@ -120,6 +119,7 @@ pub use git::{
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
 use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
+pub use git::{GutterCommentHook, GutterCommentMarker};
 pub use hover_popover::hover_markdown_style;
 pub use inlays::Inlay;
 pub use inline_input::InlineInputState;

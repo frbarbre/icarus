@@ -247,4 +247,21 @@ fn an_untrusted_setup_names_the_trust_command_and_trust_runs_it() {
         "second",
         "--no-agent",
     ]);
+
+    let rank = |name: &str| {
+        let listed = env.json(&["workspace", "list"]);
+        listed
+            .as_array()
+            .expect("list")
+            .iter()
+            .find(|workspace| workspace["name"] == name)
+            .and_then(|workspace| workspace["manual_order"].as_i64())
+            .expect("ranked")
+    };
+    assert!(rank("second") > rank("first"), "new workspaces rank on top");
+    assert_eq!(
+        env.ok(&["workspace", "reorder", "first", "second"]).trim(),
+        "ordered 2 workspace(s)"
+    );
+    assert!(rank("first") > rank("second"), "reordered");
 }

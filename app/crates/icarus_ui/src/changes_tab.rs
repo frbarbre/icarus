@@ -13,14 +13,28 @@ use gpui::{
 };
 use gpui_tokio::Tokio;
 use icarus_client::Client;
+use schemars::JsonSchema;
 use serde::Deserialize;
-use ui::{ButtonLike, ContextMenu, PopoverMenu, Tooltip, prelude::*, right_click_menu};
+use ui::{
+    ButtonLike, ContextMenu, ContextMenuSubmenu, PopoverMenu, Tooltip, prelude::*, right_click_menu,
+};
 use util::ResultExt as _;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
 
 use crate::AppConnection;
 use crate::diff_tab::{DiffBase, DiffTabMode, open_diff_tab};
+use crate::source_control_settings::{
+    OpenInApp, Section, SectionLayout, SourceControlSettings, reveal_label,
+};
+
+/// Shows or hides a Source Control section (`changes`, `agent-turns` or `commits`).
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = icarus)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleSourceControlSection {
+    pub section: String,
+}
 
 actions!(
     icarus,
@@ -215,6 +229,8 @@ pub enum RowAction {
     Reveal,
     CopyPath,
     CopyRelativePath,
+    /// The OS file manager; the menu puts the "Open in" apps right before it.
+    RevealInFileManager,
     Stage,
     Unstage,
     Discard(&'static str),
@@ -228,6 +244,7 @@ impl RowAction {
             Self::Reveal => "Reveal in Project Panel",
             Self::CopyPath => "Copy Path",
             Self::CopyRelativePath => "Copy Relative Path",
+            Self::RevealInFileManager => reveal_label(),
             Self::Stage => "Stage",
             Self::Unstage => "Unstage",
             Self::Discard(label) => label,
@@ -239,8 +256,9 @@ impl RowAction {
         match self {
             Self::OpenDiff | Self::OpenFile | Self::Reveal => 0,
             Self::CopyPath | Self::CopyRelativePath => 1,
-            Self::Stage | Self::Unstage => 2,
-            Self::Discard(_) => 3,
+            Self::RevealInFileManager => 2,
+            Self::Stage | Self::Unstage => 3,
+            Self::Discard(_) => 4,
         }
     }
 }
@@ -254,6 +272,9 @@ pub(crate) fn row_actions(row: &Row, scope: &ChangesScope) -> Vec<RowAction> {
         actions.extend([RowAction::OpenFile, RowAction::Reveal]);
     }
     actions.extend([RowAction::CopyPath, RowAction::CopyRelativePath]);
+    if on_disk {
+        actions.push(RowAction::RevealInFileManager);
+    }
     if can_stage(row, scope) {
         actions.push(RowAction::Stage);
     }
@@ -373,6 +394,28 @@ impl CommitRow {
             relative_age(now_ms.saturating_sub(at_ms))
         )
     }
+}
+
+/// One file of an expanded commit (`git.commit_files`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CommitFile {
+    pub path: String,
+    pub status: String,
+    #[serde(default)]
+    pub old_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommitFilesReply {
+    files: Vec<CommitFile>,
+}
+
+/// An expanded commit's files, fetched on first expand.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommitFiles {
+    Loading,
+    Loaded(Vec<CommitFile>),
+    Failed(SharedString),
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -588,6 +631,11 @@ pub struct SourceControlPanel {
     commits_truncated: bool,
     /// Collapsed by default, as Orca's Commits section is.
     commits_collapsed: bool,
+    /// Commits expanded to list their files, by oid.
+    expanded_commits: HashMap<String, CommitFiles>,
+    changes_collapsed: bool,
+    /// The user's `sourceControl` settings, from the app's own server.
+    settings: SourceControlSettings,
     sync: Option<SyncInfo>,
     /// The running git action's label, e.g. "Pushing…".
     git_busy: Option<SharedString>,
@@ -655,6 +703,9 @@ impl SourceControlPanel {
             commits: Vec::new(),
             commits_truncated: false,
             commits_collapsed: true,
+            expanded_commits: HashMap::default(),
+            changes_collapsed: false,
+            settings: SourceControlSettings::default(),
             sync: None,
             git_busy: None,
             git_error: None,
@@ -690,6 +741,9 @@ impl SourceControlPanel {
             commits: Vec::new(),
             commits_truncated: false,
             commits_collapsed: true,
+            expanded_commits: HashMap::default(),
+            changes_collapsed: false,
+            settings: SourceControlSettings::default(),
             sync: None,
             git_busy: None,
             git_error: None,
@@ -706,6 +760,22 @@ impl SourceControlPanel {
     pub fn set_git_preview(&mut self, turns: Vec<TurnRow>, sync: SyncInfo, cx: &mut Context<Self>) {
         self.turns = turns;
         self.sync = Some(sync);
+        cx.notify();
+    }
+
+    /// Fills the Commits section, open, with the given commits expanded to their files, for previews.
+    pub fn set_commits_preview(
+        &mut self,
+        commits: Vec<CommitRow>,
+        expanded: Vec<(String, Vec<CommitFile>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.commits = commits;
+        self.commits_collapsed = false;
+        self.expanded_commits = expanded
+            .into_iter()
+            .map(|(oid, files)| (oid, CommitFiles::Loaded(files)))
+            .collect();
         cx.notify();
     }
 
@@ -745,10 +815,79 @@ impl SourceControlPanel {
         })
     }
 
+    /// Reads `sourceControl` from the app's own server, which holds the user's settings.
+    fn load_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(task) = crate::review::request(
+            crate::app_client(cx),
+            "config.get",
+            serde_json::json!({ "key": "sourceControl" }),
+            cx,
+        ) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let Some(value) = task.await.log_err() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                let settings = SourceControlSettings::from_settings(&value);
+                if this.settings != settings {
+                    this.settings = settings;
+                    cx.notify();
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    pub fn settings(&self) -> &SourceControlSettings {
+        &self.settings
+    }
+
+    /// Saves a new section layout to the user's settings; the panel shows it at once.
+    pub fn set_section_layout(&mut self, layout: SectionLayout, cx: &mut Context<Self>) {
+        if self.settings.sections == layout {
+            return;
+        }
+        self.settings.sections = layout.clone();
+        cx.notify();
+        if let Some(task) = crate::review::request(
+            crate::app_client(cx),
+            "config.set",
+            serde_json::json!({ "key": "sourceControl.sections", "value": layout.to_value() }),
+            cx,
+        ) {
+            task.detach_and_log_err(cx);
+        }
+    }
+
+    pub fn toggle_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        let layout = self.settings.sections.toggled_hidden(section);
+        self.set_section_layout(layout, cx);
+    }
+
+    pub fn move_section(
+        &mut self,
+        section: Section,
+        before: Option<Section>,
+        cx: &mut Context<Self>,
+    ) {
+        let layout = self.settings.sections.moved(section, before);
+        self.set_section_layout(layout, cx);
+    }
+
+    pub fn move_section_by_one(&mut self, section: Section, up: bool, cx: &mut Context<Self>) {
+        if let Some(layout) = self.settings.sections.moved_by_one(section, up) {
+            self.set_section_layout(layout, cx);
+        }
+    }
+
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.refreshing.is_some() {
             return;
         }
+        self.load_settings(cx);
         let Some(client) = self.client(cx) else {
             self.error = Some("Not connected to the Icarus server".into());
             cx.notify();
@@ -820,6 +959,9 @@ impl SourceControlPanel {
                         this.sync = sync;
                         this.commits = commits.commits;
                         this.commits_truncated = commits.truncated;
+                        let commits = &this.commits;
+                        this.expanded_commits
+                            .retain(|oid, _| commits.iter().any(|commit| &commit.oid == oid));
                         this.icarus_workspace = Some(id);
                         this.error = None;
                         if let Some(selected) = this.selected
@@ -1062,10 +1204,37 @@ impl SourceControlPanel {
             RowAction::CopyRelativePath => {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(row.path))
             }
+            RowAction::RevealInFileManager => cx.reveal_path(&absolute),
             RowAction::Stage => self.stage_rows(vec![index], true, cx),
             RowAction::Unstage => self.stage_rows(vec![index], false, cx),
             RowAction::Discard(_) => self.discard_row(index, window, cx),
         }
+    }
+
+    /// Opens the row's file in an external app from the "Open in" menu; a failure shows in the git bar.
+    pub fn open_row_in(&mut self, index: usize, app: OpenInApp, cx: &mut Context<Self>) {
+        let Some(row) = self.rows().get(index) else {
+            return;
+        };
+        let task = crate::source_control_settings::open_in(&app, &self.root.join(&row.path), cx);
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = task.await {
+                this.update(cx, |this, cx| {
+                    this.git_error =
+                        Some(format!("Couldn't open in {}: {error:#}", app.label).into());
+                    cx.notify();
+                })
+                .log_err();
+            }
+        })
+        .detach();
+    }
+
+    /// Whether this window's files are on this machine, so external apps and the file manager can open them.
+    fn files_are_local(&self, cx: &App) -> bool {
+        self.project
+            .upgrade()
+            .is_some_and(|project| project.read(cx).is_local())
     }
 
     /// Stages (or unstages) the rows at `indices` that can be, in one `git.stage` / `git.unstage` call.
@@ -1206,6 +1375,76 @@ impl SourceControlPanel {
         };
         self.set_scope(ChangesScope::Commit(commit.oid.clone()), cx);
         self.open_commit_view(commit.oid, window, cx);
+    }
+
+    /// Orca's commit row click: shows or hides the commit's files, loading them on first expand.
+    pub fn toggle_commit(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(oid) = self.commits.get(index).map(|commit| commit.oid.clone()) else {
+            return;
+        };
+        if self.expanded_commits.remove(&oid).is_some() {
+            cx.notify();
+            return;
+        }
+        let Some(workspace) = self.icarus_workspace.clone() else {
+            return;
+        };
+        let Some(task) = crate::review::request(
+            self.client(cx),
+            "git.commit_files",
+            serde_json::json!({ "workspace": workspace, "sha": oid }),
+            cx,
+        ) else {
+            self.expanded_commits.insert(
+                oid,
+                CommitFiles::Failed("Not connected to the Icarus server".into()),
+            );
+            cx.notify();
+            return;
+        };
+        self.expanded_commits
+            .insert(oid.clone(), CommitFiles::Loading);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let files = task
+                .await
+                .and_then(|value| Ok(serde_json::from_value::<CommitFilesReply>(value)?.files));
+            this.update(cx, |this, cx| {
+                // Collapsed again while loading: stay collapsed.
+                let Some(entry) = this.expanded_commits.get_mut(&oid) else {
+                    return;
+                };
+                *entry = match files {
+                    Ok(files) => CommitFiles::Loaded(files),
+                    Err(error) => CommitFiles::Failed(git_error_text(&error).into()),
+                };
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    pub fn commit_files(&self, oid: &str) -> Option<&CommitFiles> {
+        self.expanded_commits.get(oid)
+    }
+
+    /// One file's diff in the commit (against its first parent), in the commit view.
+    pub fn open_commit_file(
+        &mut self,
+        oid: String,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                open_commit_file_view(oid, &path, workspace, window, cx);
+            });
+        });
     }
 
     fn open_commit_view(&self, sha: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1409,7 +1648,11 @@ impl SourceControlPanel {
         let stage = can_stage(row, &self.scope);
         let unstage = can_unstage(row, &self.scope);
         let staged = staged_label(row).filter(|_| local_scope(&self.scope));
-        let actions = row_actions(row, &self.scope);
+        let mut actions = row_actions(row, &self.scope);
+        if !self.files_are_local(cx) {
+            actions.retain(|action| *action != RowAction::RevealInFileManager);
+        }
+        let open_in = self.settings.open_in.clone();
         let weak = cx.entity().downgrade();
         let element = h_flex()
             .id(("changes-row", index))
@@ -1579,7 +1822,16 @@ impl SourceControlPanel {
             );
         right_click_menu(("changes-row-menu", index))
             .trigger(move |_, _, _| element)
-            .menu(move |window, cx| row_menu(weak.clone(), index, actions.clone(), window, cx))
+            .menu(move |window, cx| {
+                row_menu(
+                    weak.clone(),
+                    index,
+                    actions.clone(),
+                    open_in.clone(),
+                    window,
+                    cx,
+                )
+            })
             .into_any_element()
     }
 
@@ -1598,38 +1850,12 @@ impl SourceControlPanel {
             .w_full()
             .border_t_1()
             .border_color(cx.theme().colors().border_variant)
-            .child(
-                h_flex()
-                    .id("changes-turns-header")
-                    .h(px(28.))
-                    .px_2()
-                    .gap_1()
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.turns_collapsed = !this.turns_collapsed;
-                        cx.notify();
-                    }))
-                    .child(
-                        Icon::new(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new("AGENT TURNS")
-                            .size(LabelSize::XSmall)
-                            .weight(FontWeight::SEMIBOLD)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new(self.turns.len().to_string())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
+            .child(self.render_section_header(
+                Section::AgentTurns,
+                self.turns.len().to_string(),
+                collapsed,
+                cx,
+            ))
             .when(!collapsed, |this| {
                 this.child(
                     v_flex()
@@ -1689,6 +1915,119 @@ impl SourceControlPanel {
             })
     }
 
+    fn collapsed(&self, section: Section) -> bool {
+        match section {
+            Section::Changes => self.changes_collapsed,
+            Section::AgentTurns => self.turns_collapsed,
+            Section::Commits => self.commits_collapsed,
+        }
+    }
+
+    pub fn toggle_collapsed(&mut self, section: Section, cx: &mut Context<Self>) {
+        let collapsed = match section {
+            Section::Changes => &mut self.changes_collapsed,
+            Section::AgentTurns => &mut self.turns_collapsed,
+            Section::Commits => &mut self.commits_collapsed,
+        };
+        *collapsed = !*collapsed;
+        cx.notify();
+    }
+
+    /// A section's header: click collapses it, dragging it onto another header moves it there, and its
+    /// right-click menu moves or hides it (Orca's section chrome).
+    fn render_section_header(
+        &self,
+        section: Section,
+        count: String,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let header = h_flex()
+            .id(SharedString::from(format!(
+                "changes-{}-header",
+                section.id()
+            )))
+            .h(px(28.))
+            .px_2()
+            .gap_1()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.toggle_collapsed(section, cx);
+            }))
+            .on_drag(DraggedSection(section), |dragged, _, _, cx| {
+                cx.new(|_| dragged.clone())
+            })
+            .drag_over::<DraggedSection>(|style, _, _, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedSection, _, cx| {
+                let layout = this.settings.sections.dropped(dragged.0, section);
+                this.set_section_layout(layout, cx);
+            }))
+            .child(
+                Icon::new(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                Label::new(section.label().to_uppercase())
+                    .size(LabelSize::XSmall)
+                    .weight(FontWeight::SEMIBOLD)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(count)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+        let weak = cx.entity().downgrade();
+        let layout = self.settings.sections.clone();
+        right_click_menu(SharedString::from(format!(
+            "changes-{}-section-menu",
+            section.id()
+        )))
+        .trigger(move |_, _, _| header)
+        .menu(move |window, cx| {
+            sections_menu(weak.clone(), Some(section), layout.clone(), window, cx)
+        })
+        .into_any_element()
+    }
+
+    /// The Changes section: its header, then the file list (or why it's empty).
+    fn render_changes_section(&mut self, first: bool, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.rows().len();
+        let collapsed = self.collapsed(Section::Changes);
+        v_flex()
+            .w_full()
+            .when(!collapsed, |this| this.flex_1().min_h_0())
+            .when(!first, |this| {
+                this.border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+            })
+            .child(self.render_section_header(Section::Changes, count.to_string(), collapsed, cx))
+            .when(!collapsed, |this| {
+                if count == 0 {
+                    this.child(self.render_empty(cx))
+                } else {
+                    this.child(
+                        uniform_list(
+                            "changes-rows",
+                            count,
+                            cx.processor(Self::render_rows_processor),
+                        )
+                        .track_scroll(&self.scroll)
+                        .flex_1()
+                        .py_1(),
+                    )
+                }
+            })
+            .into_any_element()
+    }
+
     fn render_commits(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1708,38 +2047,7 @@ impl SourceControlPanel {
             .w_full()
             .border_t_1()
             .border_color(cx.theme().colors().border_variant)
-            .child(
-                h_flex()
-                    .id("changes-commits-header")
-                    .h(px(28.))
-                    .px_2()
-                    .gap_1()
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.commits_collapsed = !this.commits_collapsed;
-                        cx.notify();
-                    }))
-                    .child(
-                        Icon::new(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new("COMMITS")
-                            .size(LabelSize::XSmall)
-                            .weight(FontWeight::SEMIBOLD)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new(count)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
+            .child(self.render_section_header(Section::Commits, count, collapsed, cx))
             .when(!collapsed && self.commits.is_empty(), |this| {
                 this.child(
                     div().px_2().pb_1().child(
@@ -1758,7 +2066,8 @@ impl SourceControlPanel {
                         .pb_1()
                         .children(self.commits.iter().enumerate().map(|(index, commit)| {
                             let current = showing.as_deref() == Some(commit.oid.as_str());
-                            h_flex()
+                            let files = self.expanded_commits.get(&commit.oid);
+                            let row = h_flex()
                                 .id(("changes-commit", index))
                                 .px_2()
                                 .py_0p5()
@@ -1769,10 +2078,29 @@ impl SourceControlPanel {
                                     this.bg(cx.theme().colors().element_selected)
                                 })
                                 .hover(|style| style.bg(cx.theme().colors().element_hover))
-                                .tooltip(Tooltip::text(commit.subject.clone()))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.open_commit(index, window, cx);
+                                .tooltip(Tooltip::text(if files.is_some() {
+                                    format!(
+                                        "Hide files in commit {}: {}",
+                                        commit.short, commit.subject
+                                    )
+                                } else {
+                                    format!(
+                                        "Show files in commit {}: {}",
+                                        commit.short, commit.subject
+                                    )
                                 }))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.toggle_commit(index, cx);
+                                }))
+                                .child(
+                                    Icon::new(if files.is_some() {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                                )
                                 .child(
                                     Icon::new(IconName::GitCommit)
                                         .size(IconSize::Small)
@@ -1795,10 +2123,122 @@ impl SourceControlPanel {
                                                 .single_line()
                                                 .truncate(),
                                         ),
-                                )
+                                );
+                            v_flex()
+                                .w_full()
+                                .child(row)
+                                .when_some(files, |this, files| {
+                                    this.child(self.render_commit_files(index, commit, files, cx))
+                                })
                         })),
                 )
             })
+    }
+
+    /// An expanded commit: its files (each opens that file's diff in the commit), then Orca's "Show in Changes".
+    fn render_commit_files(
+        &self,
+        index: usize,
+        commit: &CommitRow,
+        files: &CommitFiles,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let note = |text: SharedString, color: Color| {
+            div()
+                .pl(px(40.))
+                .py_0p5()
+                .child(Label::new(text).size(LabelSize::XSmall).color(color))
+                .into_any_element()
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        match files {
+            CommitFiles::Loading => rows.push(note("Loading files…".into(), Color::Muted)),
+            CommitFiles::Failed(error) => rows.push(note(error.clone(), Color::Error)),
+            CommitFiles::Loaded(files) if files.is_empty() => {
+                rows.push(note("No file changes in this commit".into(), Color::Muted))
+            }
+            CommitFiles::Loaded(files) => {
+                for (file_index, file) in files.iter().enumerate() {
+                    let path = Path::new(&file.path);
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| file.path.clone());
+                    let directory = path
+                        .parent()
+                        .map(|parent| parent.to_string_lossy().into_owned())
+                        .filter(|parent| !parent.is_empty());
+                    let color = status_color(&file.status);
+                    let oid = commit.oid.clone();
+                    let file_path = file.path.clone();
+                    rows.push(
+                        h_flex()
+                            .id(SharedString::from(format!(
+                                "changes-commit-file-{index}-{file_index}"
+                            )))
+                            .pl(px(40.))
+                            .pr_2()
+                            .py_0p5()
+                            .gap_1p5()
+                            .w_full()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().element_hover))
+                            .tooltip(Tooltip::text(match &file.old_path {
+                                Some(old_path) => format!("{old_path} → {}", file.path),
+                                None => file.path.clone(),
+                            }))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.open_commit_file(oid.clone(), file_path.clone(), window, cx);
+                            }))
+                            .children(FileIcons::get_icon(path, cx).map(|icon| {
+                                Icon::from_path(icon).size(IconSize::Small).color(color)
+                            }))
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .overflow_hidden()
+                                    .child(Label::new(name).size(LabelSize::Small).single_line())
+                                    .when_some(directory, |this, directory| {
+                                        this.child(
+                                            Label::new(directory)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .single_line()
+                                                .truncate(),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                Label::new(status_letter(&file.status))
+                                    .size(LabelSize::XSmall)
+                                    .color(color),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        rows.push(
+            h_flex()
+                .id(("changes-commit-show", index))
+                .pl(px(40.))
+                .py_0p5()
+                .gap_1()
+                .cursor_pointer()
+                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.open_commit(index, window, cx);
+                }))
+                .child(
+                    Label::new("Show in Changes")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Accent),
+                )
+                .into_any_element(),
+        );
+        v_flex().w_full().children(rows)
     }
 
     fn render_git_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1981,11 +2421,83 @@ impl SourceControlPanel {
     }
 }
 
+/// A section header being dragged to a new place.
+#[derive(Clone)]
+pub struct DraggedSection(pub Section);
+
+impl Render for DraggedSection {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_0p5()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(
+                Label::new(self.0.label().to_uppercase())
+                    .size(LabelSize::XSmall)
+                    .weight(FontWeight::SEMIBOLD),
+            )
+    }
+}
+
+/// A section header's menu (or the panel header's, with no section): move or hide the section, and show
+/// or hide any section, which is how a hidden one comes back.
+fn sections_menu(
+    panel: WeakEntity<SourceControlPanel>,
+    section: Option<Section>,
+    layout: SectionLayout,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    ContextMenu::build(window, cx, move |mut menu, _, _| {
+        if let Some(section) = section {
+            for (label, up) in [("Move Up", true), ("Move Down", false)] {
+                let panel = panel.clone();
+                menu = menu.item(
+                    ui::ContextMenuEntry::new(label)
+                        .disabled(layout.moved_by_one(section, up).is_none())
+                        .handler(move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| panel.move_section_by_one(section, up, cx))
+                                .log_err();
+                        }),
+                );
+            }
+            let hide = panel.clone();
+            menu = menu
+                .entry("Hide Section", None, move |_, cx| {
+                    hide.update(cx, |panel, cx| panel.toggle_section(section, cx))
+                        .log_err();
+                })
+                .separator();
+        }
+        menu = menu.header("Sections");
+        for item in layout.ordered() {
+            let panel = panel.clone();
+            menu = menu.toggleable_entry(
+                item.label(),
+                !layout.is_hidden(item),
+                IconPosition::Start,
+                None,
+                move |_, cx| {
+                    panel
+                        .update(cx, |panel, cx| panel.toggle_section(item, cx))
+                        .log_err();
+                },
+            );
+        }
+        menu
+    })
+}
+
 /// A changed file's right-click menu: open, reveal and copy, then its index and discard actions.
 fn row_menu(
     panel: WeakEntity<SourceControlPanel>,
     index: usize,
     actions: Vec<RowAction>,
+    open_in: Vec<OpenInApp>,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<ContextMenu> {
@@ -1997,6 +2509,27 @@ fn row_menu(
                 menu = menu.separator();
             }
             previous_group = Some(group);
+            if action == RowAction::RevealInFileManager && !open_in.is_empty() {
+                let apps = open_in.clone();
+                let panel = panel.clone();
+                menu = menu.item(
+                    ContextMenuSubmenu::new("Open in", move |mut submenu, _, _| {
+                        for app in &apps {
+                            let panel = panel.clone();
+                            let app = app.clone();
+                            submenu = submenu.entry(app.label.clone(), None, move |_, cx| {
+                                panel
+                                    .update(cx, |panel, cx| {
+                                        panel.open_row_in(index, app.clone(), cx)
+                                    })
+                                    .log_err();
+                            });
+                        }
+                        submenu
+                    })
+                    .id("changes-row-open-in"),
+                );
+            }
             let panel = panel.clone();
             menu = menu.entry(action.label(), None, move |window, cx| {
                 panel
@@ -2136,6 +2669,33 @@ fn open_commit_view(
     );
 }
 
+/// The commit view narrowed to one file: that file's diff in the commit.
+fn open_commit_file_view(
+    sha: String,
+    path: &str,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
+        return;
+    };
+    let Some(file) = git::repository::RepoPath::new(path).log_err() else {
+        return;
+    };
+    CommitView::open(
+        sha,
+        repo.downgrade(),
+        workspace.weak_handle(),
+        CommitViewOptions {
+            file_filter: Some(file),
+            ..Default::default()
+        },
+        window,
+        cx,
+    );
+}
+
 /// The project's first worktree; read through the project because panels activate inside Workspace updates.
 fn worktree_root(project: &WeakEntity<project::Project>, cx: &App) -> Option<PathBuf> {
     let project = project.upgrade()?;
@@ -2216,6 +2776,14 @@ pub fn register(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &ToggleSourceControlPanel, window, cx| {
             workspace.toggle_panel_focus::<SourceControlPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, action: &ToggleSourceControlSection, _, cx| {
+            let Some(section) = Section::parse(&action.section) else {
+                return;
+            };
+            if let Some(panel) = workspace.panel::<SourceControlPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.toggle_section(section, cx));
+            }
         });
         // Diff tabs handle ⌥⌘D themselves; from a plain editor it opens that file's diff (§5.2).
         workspace.register_action(|workspace, _: &crate::diff_tab::ShowDiff, window, cx| {
@@ -2422,7 +2990,6 @@ pub const SOURCE_CONTROL_PANEL: &str = "IcarusSourceControlPanel";
 
 impl Render for SourceControlPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self.rows().len();
         v_flex()
             .key_context("IcarusChanges")
             .track_focus(&self.focus_handle)
@@ -2445,29 +3012,40 @@ impl Render for SourceControlPanel {
             .on_action(
                 cx.listener(|this, _: &menu::Confirm, window, cx| this.open_selected(window, cx)),
             )
-            .child(self.render_header(cx))
-            .map(|this| {
-                if count == 0 {
-                    this.child(self.render_empty(cx))
-                } else {
-                    this.child(
-                        uniform_list(
-                            "changes-rows",
-                            count,
-                            cx.processor(Self::render_rows_processor),
-                        )
-                        .track_scroll(&self.scroll)
-                        .flex_1()
-                        .py_1(),
-                    )
-                }
+            .child({
+                let header = self.render_header(cx).into_any_element();
+                let weak = cx.entity().downgrade();
+                let layout = self.settings.sections.clone();
+                right_click_menu("changes-header-menu")
+                    .trigger(move |_, _, _| header)
+                    .menu(move |window, cx| {
+                        sections_menu(weak.clone(), None, layout.clone(), window, cx)
+                    })
             })
-            .when(!self.turns.is_empty(), |this| {
-                this.child(self.render_turns(cx))
+            .map(|mut this| {
+                let mut first = true;
+                let mut list_fills = false;
+                for section in self.settings.sections.visible() {
+                    match section {
+                        Section::Changes => {
+                            list_fills = !self.changes_collapsed;
+                            this = this.child(self.render_changes_section(first, cx));
+                        }
+                        Section::AgentTurns if !self.turns.is_empty() => {
+                            this = this.child(self.render_turns(cx));
+                        }
+                        Section::Commits if self.icarus_workspace.is_some() => {
+                            this = this.child(self.render_commits(cx));
+                        }
+                        _ => continue,
+                    }
+                    first = false;
+                }
+                // Keeps the git bar at the bottom when no file list takes the space.
+                this.when(!list_fills, |this| this.child(div().flex_1()))
             })
             .when(self.icarus_workspace.is_some(), |this| {
-                this.child(self.render_commits(cx))
-                    .child(self.render_git_bar(cx))
+                this.child(self.render_git_bar(cx))
             })
     }
 }
@@ -2940,12 +3518,13 @@ mod tests {
                 RowAction::Reveal,
                 RowAction::CopyPath,
                 RowAction::CopyRelativePath,
+                RowAction::RevealInFileManager,
                 RowAction::Stage,
                 RowAction::Discard("Discard changes"),
             ]
         );
         assert_eq!(
-            row_actions(&row("modified", true, true, false), &base)[5..],
+            row_actions(&row("modified", true, true, false), &base)[6..],
             [
                 RowAction::Stage,
                 RowAction::Unstage,
@@ -2954,7 +3533,7 @@ mod tests {
             "partly staged: both ways"
         );
         assert_eq!(
-            row_actions(&row("modified", true, false, false), &base)[5..],
+            row_actions(&row("modified", true, false, false), &base)[6..],
             [RowAction::Unstage],
             "fully staged: nothing left to stage or discard"
         );
@@ -2973,7 +3552,7 @@ mod tests {
                 &ChangesScope::Commit("c".into())
             )
             .last(),
-            Some(&RowAction::CopyRelativePath),
+            Some(&RowAction::RevealInFileManager),
             "no index actions under a commit"
         );
         assert_eq!(
@@ -3008,7 +3587,8 @@ mod tests {
         let actions = panel.read_with(cx, |panel, _| {
             row_actions(&panel.rows()[index], &panel.scope)
         });
-        cx.update(|window, cx| row_menu(weak, index, actions, window, cx))
+        let open_in = crate::source_control_settings::default_open_in();
+        cx.update(|window, cx| row_menu(weak, index, actions, open_in, window, cx))
     }
 
     #[gpui::test]
@@ -3164,6 +3744,125 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(crate::review::tests::calls_to(&calls, "git.stage").len(), 1);
+    }
+
+    #[gpui::test]
+    async fn expanding_a_commit_lists_its_files_and_opens_one_files_diff(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, panel, calls, mut cx) = git_panel(cx, |method, params| {
+            if method != "git.commit_files" {
+                return Ok(json!({}));
+            }
+            if params["sha"] == json!("b".repeat(40)) {
+                anyhow::bail!("no commit bbbb");
+            }
+            Ok(json!({ "oid": params["sha"], "parent": null, "subject": "Fix login", "files": [
+                { "path": "src/app.rs", "status": "modified", "old_path": null, "added": 1, "removed": 1, "binary": false },
+                { "path": "src/new.rs", "status": "renamed", "old_path": "src/old.rs", "added": 0, "removed": 0, "binary": false },
+            ]}))
+        })
+        .await;
+        let cx = &mut cx;
+        let (first, second) = ("a".repeat(40), "b".repeat(40));
+        panel.update(cx, |panel, cx| {
+            panel.commits = serde_json::from_value(json!([
+                { "oid": first, "short": "aaaaaaa", "subject": "Fix login", "author": "Ada", "time": 1 },
+                { "oid": second, "short": "bbbbbbb", "subject": "Start", "author": "Bo", "time": 1 },
+            ]))
+            .expect("commits");
+            panel.commits_collapsed = false;
+            cx.notify();
+        });
+
+        panel.update(cx, |panel, cx| panel.toggle_commit(0, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "git.commit_files"),
+            [json!({ "workspace": "ws-1", "sha": first })]
+        );
+        let paths = panel.read_with(cx, |panel, _| match panel.commit_files(&first) {
+            Some(CommitFiles::Loaded(files)) => files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("not loaded: {other:?}"),
+        });
+        assert_eq!(paths, ["src/app.rs", "src/new.rs"]);
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.scope().clone()),
+            ChangesScope::Base,
+            "expanding doesn't change what the Changes list shows"
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_commit_file(first.clone(), "src/app.rs".into(), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            open_views(&workspace, cx),
+            (1, 0),
+            "the file's diff in the commit opens in the commit view"
+        );
+
+        panel.update(cx, |panel, cx| panel.toggle_commit(1, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.commit_files(&second).cloned()),
+            Some(CommitFiles::Failed("no commit bbbb".into()))
+        );
+        panel.update(cx, |panel, cx| panel.toggle_commit(0, cx));
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.commit_files(&first).cloned()),
+            None,
+            "a second click collapses it"
+        );
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn sections_hide_move_and_save_to_the_user_settings(cx: &mut gpui::TestAppContext) {
+        let (_workspace, panel, calls, mut cx) = git_panel(cx, |_, _| Ok(json!({}))).await;
+        let cx = &mut cx;
+        let saved = |calls: &std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>| {
+            crate::review::tests::calls_to(calls, "config.set")
+                .last()
+                .cloned()
+                .expect("saved")
+        };
+        cx.dispatch_action(ToggleSourceControlSection {
+            section: "agent-turns".into(),
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            saved(&calls),
+            json!({ "key": "sourceControl.sections", "value": { "order": [], "hidden": ["agent-turns"] } })
+        );
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.settings().sections.visible()),
+            [Section::Changes, Section::Commits]
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.move_section_by_one(Section::Commits, true, cx);
+            panel.toggle_section(Section::AgentTurns, cx);
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.settings().sections.visible()),
+            [Section::Commits, Section::Changes, Section::AgentTurns],
+            "moving up skips the hidden section, and showing it again keeps its place"
+        );
+        assert_eq!(
+            saved(&calls)["value"],
+            json!({ "order": ["commits", "changes", "agent-turns"], "hidden": [] })
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.settings.sections = SectionLayout::default();
+            panel.toggle_collapsed(Section::Changes, cx);
+        });
+        assert!(panel.read_with(cx, |panel, _| panel.collapsed(Section::Changes)));
+        cx.run_until_parked();
     }
 
     #[gpui::test]

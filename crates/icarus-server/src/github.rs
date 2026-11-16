@@ -10,6 +10,7 @@ use icarus_github::merge::MergeResult;
 use icarus_github::previews::{PrPreviews, PreviewConfig};
 use icarus_github::repo::RepoMergeMetadata;
 use icarus_github::review::GitHubUser;
+use icarus_github::review_threads::PrThread;
 use icarus_github::snapshot::{PrDetails, PrTarget};
 use icarus_github::stack::{PollPolicy, StackMergeAction, StackMergeStatus, StackView};
 use icarus_github::{FakeGh, FakeResponse, Gh, GhCli, GhOutput, GhRequest, GitHub, GitHubError};
@@ -29,6 +30,7 @@ const PR_TTL: Duration = Duration::from_secs(15);
 const METADATA_TTL: Duration = Duration::from_secs(600);
 const PREVIEW_TTL: Duration = Duration::from_secs(30);
 const USERS_TTL: Duration = Duration::from_secs(600);
+const THREADS_TTL: Duration = Duration::from_secs(20);
 pub(crate) const STACK_INTENTS_KEY: &str = "rules.stack_auto_merge";
 
 /// The `gh` runner the server uses: the real CLI, or fixtures when `ICARUS_GH_FIXTURES` names a file.
@@ -279,6 +281,28 @@ fn fixture_response(fixtures: &Value, request: &GhRequest) -> (u16, Value) {
             data(json!({ "repository": { "assignableUsers": {
                 "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": nodes } } }))
         }
+        "graphql ReviewerSuggestions" => {
+            let reviews: Vec<Value> = fixtures["recent_reviewers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|login| json!({ "author": { "__typename": "User", "login": login } }))
+                .collect();
+            let author = fixture_pulls(fixtures)
+                .find(|p| p["number"] == variables["number"])
+                .map(|p| p["author"].clone())
+                .unwrap_or(Value::Null);
+            let suggested = match &fixtures["suggested_reviewers"] {
+                Value::Array(users) => users
+                    .iter()
+                    .map(|user| json!({ "reviewer": user }))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            data(json!({ "repository": {
+                "pullRequest": { "author": author, "suggestedReviewers": suggested },
+                "pullRequests": { "nodes": [ { "reviews": { "nodes": reviews } } ] } } }))
+        }
         "graphql UpdateReviewComment" => data(json!({ "updatePullRequestReviewComment": {
             "pullRequestReviewComment": { "body": variables["body"], "lastEditedAt": "2026-01-01T00:00:00Z" } } })),
         "graphql UpdateReview" => data(json!({ "updatePullRequestReview": {
@@ -399,6 +423,7 @@ pub struct GitHubService {
     stacks: Mutex<HashMap<String, (Instant, Option<StackView>)>>,
     previews: Mutex<HashMap<String, (Instant, PrPreviews)>>,
     users: Mutex<HashMap<String, (Instant, Vec<GitHubUser>)>>,
+    threads: Mutex<HashMap<String, (Instant, Vec<PrThread>)>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -416,7 +441,29 @@ impl GitHubService {
             stacks: Mutex::new(HashMap::new()),
             previews: Mutex::new(HashMap::new()),
             users: Mutex::new(HashMap::new()),
+            threads: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A PR's review threads, shared for a few seconds by every open diff tab and file editor.
+    pub(crate) async fn review_threads(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Vec<PrThread>, GitHubError> {
+        let key = repo.match_key(number);
+        if let Some((at, threads)) = lock(&self.threads).get(&key)
+            && at.elapsed() < THREADS_TTL
+        {
+            return Ok(threads.clone());
+        }
+        let threads = self.client.pr_review_threads(repo, number).await?;
+        lock(&self.threads).insert(key, (Instant::now(), threads.clone()));
+        Ok(threads)
+    }
+
+    pub(crate) fn forget_review_threads(&self) {
+        lock(&self.threads).clear();
     }
 
     /// The repository's assignable users, cached for ten minutes (mentions and the reviewer picker).

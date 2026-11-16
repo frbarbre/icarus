@@ -663,6 +663,41 @@ impl Server {
                     .and_then(|context| context.author_login);
                 Ok(json!({ "users": users, "author": author }))
             }
+            "review.reviewer_suggestions" => {
+                let at: At = params(p)?;
+                let (_workspace, target) = self.review_target(&at).await?;
+                let suggested = self
+                    .github
+                    .client
+                    .reviewer_suggestions(&target.repo, target.number)
+                    .await
+                    .map_err(github_error)?;
+                // Why fail open: the suggestions alone still make a usable picker.
+                let everyone = self
+                    .github
+                    .assignable_users(&target.repo, at.refresh)
+                    .await
+                    .unwrap_or_default();
+                let author = self
+                    .github
+                    .client
+                    .review_context(&target.repo, target.number)
+                    .await
+                    .ok()
+                    .and_then(|context| context.author_login);
+                let everyone: Vec<_> = everyone
+                    .into_iter()
+                    .filter(|user| {
+                        !suggested
+                            .iter()
+                            .any(|known| known.login.eq_ignore_ascii_case(&user.login))
+                            && author
+                                .as_deref()
+                                .is_none_or(|author| !author.eq_ignore_ascii_case(&user.login))
+                    })
+                    .collect();
+                Ok(json!({ "suggested": suggested, "everyone": everyone, "author": author }))
+            }
             "review.comment.edit" => {
                 let at: At = params(p.clone())?;
                 let edit: EditComment = params(p)?;
@@ -751,10 +786,12 @@ impl Server {
                 let at: At = params(p.clone())?;
                 let query: ThreadsQuery = params(p)?;
                 let (workspace, target) = self.review_target(&at).await?;
+                if at.refresh {
+                    self.github.forget_review_threads();
+                }
                 let threads = self
                     .github
-                    .client
-                    .pr_review_threads(&target.repo, target.number)
+                    .review_threads(&target.repo, target.number)
                     .await
                     .map_err(github_error)?;
                 let threads: Vec<Value> = threads
@@ -930,10 +967,45 @@ impl Server {
     }
 
     fn review_changed(&self, workspace: Option<&str>, thread: Option<&str>) {
+        self.github.forget_review_threads();
         self.broadcast(
             REVIEW_CHANGED_TOPIC,
             json!({ "workspace": workspace, "thread": thread }),
         );
+    }
+
+    /// Adds already-built drafts (an import) to the review of the workspace's pull request, and the
+    /// summary when the review has none yet.
+    pub(crate) async fn import_review_drafts(
+        &self,
+        workspace: &Workspace,
+        drafts: Vec<Draft>,
+        summary: Option<String>,
+    ) -> Result<bool, RpcError> {
+        let at = At {
+            workspace: workspace.id.clone(),
+            pr: workspace
+                .pull_request
+                .as_ref()
+                .and_then(|pr| pr["number"].as_u64()),
+            refresh: false,
+        };
+        let (workspace, target) = self.review_target(&at).await?;
+        self.update_session(&workspace, &target, |session| {
+            session.drafts.extend(drafts);
+            if session.drafts.len() > MAX_DRAFTS {
+                let excess = session.drafts.len() - MAX_DRAFTS;
+                session.drafts.drain(..excess);
+            }
+            let mut summary_set = false;
+            if let Some(summary) = summary
+                && session.summary.trim().is_empty()
+            {
+                session.summary = summary;
+                summary_set = true;
+            }
+            Ok(summary_set)
+        })
     }
 
     /// Unsent draft comments across the workspace's reviews; a workspace holding any is not removed silently.

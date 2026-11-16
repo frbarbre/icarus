@@ -1827,6 +1827,15 @@ pub(crate) mod tests {
                     "replies": [{ "id": "r1", "author": "reply-agent", "body": "For the test.",
                         "status": "done", "agent_id": "agent-7" }],
                 }])),
+                "review.threads" => {
+                    let mut thread = thread_json("T1", 1, false);
+                    thread["path"] = json!("src/new.rs");
+                    Ok(json!({ "threads": [thread] }))
+                }
+                "review.comment.list" => Ok(json!({ "drafts": [
+                    { "id": "d1", "path": "src/new.rs", "line": 1, "subject": "line", "body": "Queued" },
+                    { "id": "d2", "path": "src/other.rs", "line": 1, "subject": "line", "body": "Elsewhere" },
+                ] })),
                 _ => Ok(json!({})),
             })
         });
@@ -1854,12 +1863,43 @@ pub(crate) mod tests {
             "src/new.rs",
             "relative to the workspace root"
         );
-        assert!(
-            calls_to(&calls, "review.threads").is_empty(),
-            "file editors show notes only"
+        assert_eq!(
+            calls_to(&calls, "review.threads")[0]["path"],
+            "src/new.rs",
+            "file editors show the PR's threads on this file too"
         );
-        review.read_with(cx, |review, _| assert_eq!(review.notes().len(), 1));
-        assert!(editor.read_with(cx, |editor, _| editor.gutter_comment_hook().is_some()));
+        review.read_with(cx, |review, _| {
+            assert_eq!(review.notes().len(), 1);
+            assert_eq!(review.threads().len(), 1);
+            assert_eq!(
+                review
+                    .drafts()
+                    .iter()
+                    .map(|draft| draft.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["d1"],
+                "only this file's drafts"
+            );
+            assert_eq!(
+                review.marker_kinds_at(0),
+                [
+                    crate::review::MarkerKind::Thread,
+                    crate::review::MarkerKind::Draft,
+                    crate::review::MarkerKind::Note
+                ],
+                "a row with all three kinds shows each"
+            );
+        });
+        let hook = editor.read_with(cx, |editor, _| editor.gutter_comment_hook().cloned());
+        let hook = hook.expect("the review owns the gutter");
+        let marker = cx
+            .update(|_, cx| (hook.marker)(multi_buffer::MultiBufferRow(0), cx))
+            .expect("a marker on the first row");
+        assert_eq!(marker.icons.len(), 3);
+        assert_eq!(
+            marker.tooltip.as_ref(),
+            "Show a PR thread, your pending comment and a note"
+        );
 
         review.update(cx, |review, cx| review.open_transcript("agent-7", cx));
         cx.run_until_parked();

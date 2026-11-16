@@ -847,6 +847,8 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
             sleeping: false,
             pinned: false,
             created_at_ms: 0,
+            manual_order: None,
+            activity_at_ms: None,
         }
     };
     let with_author = |mut workspace: icarus_ui::WorkspaceSummary, login: &str| {
@@ -3751,6 +3753,20 @@ fn open_icarus_tab_types_window(
             }))
             .unwrap_or_default();
             panel.set_git_preview(turns, sync, cx);
+            let now_seconds = (now_ms / 1000) as i64;
+            let commits = serde_json::from_value(serde_json::json!([
+                { "oid": "a".repeat(40), "short": "aaaaaaa", "subject": "Expire the session with the token",
+                  "author": "Ada", "time": now_seconds - 2 * 3600 },
+                { "oid": "b".repeat(40), "short": "bbbbbbb", "subject": "Add a session store",
+                  "author": "Ada", "time": now_seconds - 26 * 3600 },
+            ]))
+            .unwrap_or_default();
+            let files = serde_json::from_value(serde_json::json!([
+                { "path": "src/session.rs", "status": "modified" },
+                { "path": "src/session/store.rs", "status": "added" },
+            ]))
+            .unwrap_or_default();
+            panel.set_commits_preview(commits, vec![("a".repeat(40), files)], cx);
             panel
         });
         workspace.add_panel(panel, window, cx);

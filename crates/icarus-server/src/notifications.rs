@@ -241,6 +241,11 @@ pub(crate) fn spawn(server: Arc<Server>) {
                 continue;
             }
             let info = agent.info();
+            if event.kind == "turn_end"
+                && let Some(workspace) = &info.workspace
+            {
+                server.touch_activity(workspace);
+            }
             let label = info
                 .workspace
                 .as_deref()

@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,7 +44,13 @@ pub enum TerminalChange {
         id: String,
         label: Option<String>,
     },
+    /// A workspace terminal printed something; at most once per `ACTIVITY_ANNOUNCE_MS` per terminal.
+    Activity {
+        workspace: String,
+    },
 }
+
+const ACTIVITY_ANNOUNCE_MS: u64 = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct SpawnOptions {
@@ -163,6 +169,7 @@ pub struct TerminalSession {
     io: Mutex<Option<Io>>,
     events: broadcast::Sender<TerminalEvent>,
     changes: OnceLock<broadcast::Sender<TerminalChange>>,
+    activity_announced_ms: AtomicU64,
 }
 
 type Child = Box<dyn portable_pty::Child + Send + Sync>;
@@ -256,7 +263,27 @@ impl TerminalSession {
             io: Mutex::new(None),
             events,
             changes: OnceLock::new(),
+            activity_announced_ms: AtomicU64::new(0),
         })
+    }
+
+    fn announce_activity(&self) {
+        let Some(workspace) = &self.workspace else {
+            return;
+        };
+        let now = now_ms();
+        let last = self.activity_announced_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < ACTIVITY_ANNOUNCE_MS
+            || self
+                .activity_announced_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        self.announce(TerminalChange::Activity {
+            workspace: workspace.clone(),
+        });
     }
 
     fn idle_state(emulator: Emulator) -> State {
@@ -467,6 +494,7 @@ impl TerminalSession {
         if effects.bell {
             let _ = self.events.send(TerminalEvent::Bell);
         }
+        self.announce_activity();
     }
 
     /// Stops reading and returns the terminal's state plus its PTY master (if the process runs).
@@ -1012,6 +1040,30 @@ mod tests {
             }
         );
         assert!(changes.try_recv().is_err(), "an unchanged label is quiet");
+        session.kill().expect("kill");
+    }
+
+    #[test]
+    fn a_workspace_terminal_announces_output_as_throttled_activity() {
+        let manager = TerminalManager::default();
+        let mut changes = manager.subscribe_changes();
+        let session = manager
+            .create(SpawnOptions {
+                workspace: Some("ws-1".into()),
+                ..options(&["/bin/cat"])
+            })
+            .expect("spawn");
+        session.write(b"one\n").expect("write");
+        wait_until(|| session.screen_text().matches("one").count() >= 2);
+        session.write(b"two\n").expect("write");
+        wait_until(|| session.screen_text().matches("two").count() >= 2);
+        assert_eq!(
+            changes.try_recv().expect("activity"),
+            TerminalChange::Activity {
+                workspace: "ws-1".into()
+            }
+        );
+        assert!(changes.try_recv().is_err(), "throttled");
         session.kill().expect("kill");
     }
 

@@ -185,10 +185,17 @@ pub(super) struct StoredReviewComment {
 pub struct GutterCommentHook {
     /// Runs after a click or drag on "+"; the chosen rows are the editor's newest selection.
     pub on_rows: Rc<dyn Fn(&mut Window, &mut App)>,
-    /// The marker for a multibuffer row that already has a comment, in place of "+".
-    pub marker: Rc<dyn Fn(MultiBufferRow, &App) -> Option<(IconName, Color, SharedString)>>,
+    /// The marker for a multibuffer row that already has comments; shown on that row at all times.
+    pub marker: Rc<dyn Fn(MultiBufferRow, &App) -> Option<GutterCommentMarker>>,
     /// Runs when a marker is clicked.
     pub on_marker: Rc<dyn Fn(MultiBufferRow, &mut Window, &mut App)>,
+}
+
+/// One icon per kind of comment on a row, drawn side by side.
+#[derive(Clone)]
+pub struct GutterCommentMarker {
+    pub icons: Vec<(IconName, Color)>,
+    pub tooltip: SharedString,
 }
 
 /// Represents an active diff review overlay that appears when clicking the "Add Review" button.
@@ -1050,26 +1057,16 @@ impl Editor {
             let row = MultiBufferRow(point.row);
             (hook.marker)(row, cx).map(|marker| (hook, row, marker))
         });
-        if let Some((hook, row, (icon, color, tooltip))) = marker {
-            return h_flex()
-                .id("diff_review_button")
-                .cursor_pointer()
-                .w(width - px(1.))
-                .h(relative(0.9))
-                .justify_center()
-                .rounded_sm()
-                .hover(|s| s.bg(icon_color.opacity(0.2)))
-                .child(Icon::new(icon).size(IconSize::Small).color(color))
-                .tooltip(Tooltip::text(tooltip))
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |_, _: &gpui::MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        let on_marker = hook.on_marker.clone();
-                        // Deferred: the handler updates blocks of this editor.
-                        window.defer(cx, move |window, cx| on_marker(row, window, cx));
-                    }),
-                );
+        if let Some((hook, row, marker)) = marker {
+            return Self::render_gutter_comment_marker(
+                "diff_review_button".into(),
+                hook,
+                row,
+                marker,
+                width,
+                cx,
+            )
+            .into_any_element();
         }
 
         h_flex()
@@ -1094,6 +1091,79 @@ impl Editor {
                     editor.start_diff_review_drag(display_row, window, cx);
                 }),
             )
+            .into_any_element()
+    }
+
+    pub(super) fn render_gutter_comment_marker(
+        id: ElementId,
+        hook: GutterCommentHook,
+        row: MultiBufferRow,
+        marker: GutterCommentMarker,
+        width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let icon_color = cx.theme().colors().icon_accent;
+        let size = if marker.icons.len() > 1 {
+            IconSize::XSmall
+        } else {
+            IconSize::Small
+        };
+        h_flex()
+            .id(id)
+            .cursor_pointer()
+            .w(width - px(1.))
+            .h(relative(0.9))
+            .justify_center()
+            .rounded_sm()
+            .hover(|s| s.bg(icon_color.opacity(0.2)))
+            .children(
+                marker
+                    .icons
+                    .into_iter()
+                    .map(move |(icon, color)| Icon::new(icon).size(size).color(color)),
+            )
+            .tooltip(Tooltip::text(marker.tooltip))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |_, _: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let on_marker = hook.on_marker.clone();
+                    // Deferred: the handler updates blocks of this editor.
+                    window.defer(cx, move |window, cx| on_marker(row, window, cx));
+                }),
+            )
+    }
+
+    /// Every visible row the hook marks, except `skip` (the hovered row draws its own button).
+    pub(super) fn gutter_comment_markers(
+        &self,
+        snapshot: &DisplaySnapshot,
+        rows: std::ops::Range<DisplayRow>,
+        skip: Option<DisplayRow>,
+        cx: &App,
+    ) -> Vec<(DisplayRow, MultiBufferRow, GutterCommentMarker)> {
+        let Some(hook) = self.gutter_comment_hook.as_ref() else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::default();
+        let mut out = Vec::new();
+        for display_row in rows.start.0..rows.end.0 {
+            let display_row = DisplayRow(display_row);
+            if Some(display_row) == skip {
+                continue;
+            }
+            let point =
+                snapshot.display_point_to_point(DisplayPoint::new(display_row, 0), Bias::Left);
+            let row = MultiBufferRow(point.row);
+            // Soft-wrapped lines span several display rows; mark only the first.
+            if !seen.insert(row) {
+                continue;
+            }
+            if let Some(marker) = (hook.marker)(row, cx) {
+                out.push((display_row, row, marker));
+            }
+        }
+        out
     }
 
     pub(super) fn start_diff_review_drag(

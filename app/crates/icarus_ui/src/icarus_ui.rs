@@ -23,6 +23,7 @@ pub mod routing;
 pub mod servers;
 pub mod settings_view;
 pub mod sidebar;
+pub mod source_control_settings;
 mod ssh_install;
 pub mod status_style;
 pub(crate) mod terminals;
@@ -1094,6 +1095,7 @@ pub struct WorkspacesPanel {
     ports_requested: HashSet<String>,
     filter: Option<Entity<editor::Editor>>,
     filter_query: String,
+    selection: cards::CardSelection,
     _filter_subscription: Option<Subscription>,
     _poll: Task<()>,
     _ports_observation: Subscription,
@@ -1171,6 +1173,7 @@ impl WorkspacesPanel {
             ports_requested: HashSet::default(),
             filter: None,
             filter_query: String::new(),
+            selection: cards::CardSelection::default(),
             _filter_subscription: None,
             _poll: Task::ready(()),
             _ports_observation: cx.observe(&ports, |_, _, cx| cx.notify()),
@@ -2039,10 +2042,19 @@ impl WorkspacesPanel {
             .gap_0p5()
             .rounded_md()
             .cursor_pointer()
-            .hover(|style| style.bg(cx.theme().colors().element_hover))
-            .on_click(cx.listener(move |panel, _, window, cx| {
-                panel.open_workspace(path.clone(), window, cx);
-            }))
+            .hover(|style| style.bg(cx.theme().colors().element_hover));
+        let key = cards::CardKey {
+            server: routing::ServerRef::Primary,
+            id: workspace.id.clone(),
+        };
+        let card = self
+            .with_card_behavior(
+                key,
+                workspace.display_title(),
+                card,
+                move |panel, window, cx| panel.open_workspace(path.clone(), window, cx),
+                cx,
+            )
             .child(
                 h_flex()
                     .gap_1p5()
@@ -2143,7 +2155,7 @@ impl WorkspacesPanel {
                 card.children(self.render_port_chips(workspace, cx))
             })
             .children(self.render_issue(workspace));
-        self.with_card_menu(routing::ServerRef::Primary, workspace, card)
+        self.with_card_menu(routing::ServerRef::Primary, workspace, card, cx)
     }
 
     fn render_add_menu(&self) -> impl IntoElement {
@@ -2219,9 +2231,17 @@ impl WorkspacesPanel {
         server: routing::ServerRef,
         workspace: &WorkspaceSummary,
         card: impl IntoElement + 'static,
+        cx: &App,
     ) -> impl IntoElement {
         let summary = workspace.clone();
         let weak_workspace = self.workspace.clone();
+        let bulk = self.bulk_targets(
+            &cards::CardKey {
+                server: server.clone(),
+                id: workspace.id.clone(),
+            },
+            cx,
+        );
         right_click_menu(SharedString::from(format!(
             "icarus-card-menu-{}-{}",
             server.saved_name().unwrap_or_default(),
@@ -2229,6 +2249,9 @@ impl WorkspacesPanel {
         )))
         .trigger(move |_, _, _| card)
         .menu(move |window, cx| {
+            if !bulk.is_empty() {
+                return lifecycle::bulk_card_menu(bulk.clone(), weak_workspace.clone(), window, cx);
+            }
             lifecycle::card_menu(
                 server.clone(),
                 summary.clone(),
@@ -2289,7 +2312,7 @@ impl WorkspacesPanel {
                 ),
             );
         }
-        for (index, workspace) in server.workspaces.iter().enumerate() {
+        for (index, workspace) in self.arranged_remote(&server.workspaces).iter().enumerate() {
             let working = workspace.working_agents();
             let path = workspace.path.clone();
             let server_name = server.name.clone();
@@ -2311,6 +2334,13 @@ impl WorkspacesPanel {
                     h_flex()
                         .gap_1()
                         .child(Label::new(workspace.display_title()).truncate())
+                        .when(workspace.pinned, |row| {
+                            row.child(
+                                Icon::new(IconName::Pin)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                        })
                         .child(div().flex_1())
                         .when(working > 0, |row| {
                             row.child(
@@ -2332,20 +2362,29 @@ impl WorkspacesPanel {
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                     ),
-                )
-                .on_click(move |_, _, cx| {
-                    open_remote_workspace(
-                        &server_name,
-                        ssh.clone(),
-                        path.clone(),
-                        weak.clone(),
-                        cx,
-                    );
-                });
+                );
+            let row = self.with_card_behavior(
+                cards::CardKey {
+                    server: routing::ServerRef::Saved(server.name.clone()),
+                    id: workspace.id.clone(),
+                },
+                workspace.display_title(),
+                row,
+                move |_, window, cx| {
+                    let (server_name, ssh, path, weak) =
+                        (server_name.clone(), ssh.clone(), path.clone(), weak.clone());
+                    // Deferred: opening may report back through this panel, which is being updated.
+                    window.defer(cx, move |_, cx| {
+                        open_remote_workspace(&server_name, ssh, path, weak, cx);
+                    });
+                },
+                cx,
+            );
             section = section.child(self.with_card_menu(
                 routing::ServerRef::Saved(server.name.clone()),
                 workspace,
                 row,
+                cx,
             ));
         }
         section
@@ -2511,7 +2550,7 @@ fn remote_open_plan(ssh: Option<&str>, folder_exists: bool) -> RemoteOpen {
     }
 }
 
-fn open_remote_workspace(
+pub(crate) fn open_remote_workspace(
     server: &str,
     ssh: Option<String>,
     path: PathBuf,
@@ -2807,6 +2846,8 @@ mod tests {
             sleeping: false,
             pinned: false,
             created_at_ms: 0,
+            manual_order: None,
+            activity_at_ms: None,
         }
     }
 

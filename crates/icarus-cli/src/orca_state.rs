@@ -21,6 +21,26 @@ fn default_databases() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Orca's unsent PR review comments (`pending-review-drafts.json` in its data folder); a missing
+/// file is no drafts, as Orca treats it.
+pub fn read_drafts(from: Option<&Path>) -> Result<Value> {
+    let path = match from {
+        Some(path) => path.to_owned(),
+        None => match dirs::data_dir() {
+            Some(dir) => dir.join("orca").join("pending-review-drafts.json"),
+            None => return Ok(Value::Null),
+        },
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && from.is_none() => {
+            return Ok(Value::Null);
+        }
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_str(&text).with_context(|| format!("{} isn't JSON", path.display()))
+}
+
 /// The `worktreeMeta` and `repos` documents, as the server's `settings.import_orca_state` takes them.
 pub fn read(from: Option<&Path>) -> Result<Value> {
     let path = match from {
@@ -96,6 +116,16 @@ pub fn summary(value: &Value) -> String {
         let replies = m["replies"].as_u64().unwrap_or(0);
         if notes + replies > 0 {
             changes.push(format!("{notes} notes, {replies} replies"));
+        }
+        let drafts = m["drafts"].as_u64().unwrap_or(0);
+        if drafts > 0 {
+            changes.push(format!("{drafts} pending review comments"));
+        }
+        if m["review_summary"] == true {
+            changes.push("review summary".to_owned());
+        }
+        if let Some(error) = m["drafts_error"].as_str() {
+            changes.push(format!("review comments not imported: {error}"));
         }
         if changes.is_empty() {
             changes.push("nothing new".to_owned());

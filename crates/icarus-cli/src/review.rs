@@ -114,6 +114,10 @@ pub enum ReviewCommand {
     People {
         #[arg(long)]
         refresh: bool,
+        /// Reviewer suggestions first (GitHub's own for the PR, then the repository's frequent
+        /// reviewers), then everyone else, as the app's reviewer picker lists them.
+        #[arg(long)]
+        suggested: bool,
     },
 }
 
@@ -325,7 +329,41 @@ pub async fn run(
                 super::print(cli, &value, |_| format!("deleted {node_id}"));
             }
         },
-        ReviewCommand::People { refresh } => {
+        ReviewCommand::People {
+            refresh,
+            suggested: true,
+        } => {
+            let value = call(
+                "review.reviewer_suggestions",
+                with(base, json!({ "refresh": refresh })),
+            )
+            .await?;
+            super::print(cli, &value, |v| {
+                let line = |user: &Value, tag: &str| {
+                    let login = user["login"].as_str().unwrap_or("");
+                    match (user["name"].as_str(), tag) {
+                        (Some(name), "") => format!("{login}  {name}"),
+                        (_, "") => login.to_owned(),
+                        (_, tag) => format!("{login}  ({tag})"),
+                    }
+                };
+                v["suggested"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|user| line(user, "suggested"))
+                    .chain(
+                        v["everyone"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|user| line(user, "")),
+                    )
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        }
+        ReviewCommand::People { refresh, .. } => {
             let value = call(
                 "review.mentionables",
                 with(base, json!({ "refresh": refresh })),
