@@ -605,7 +605,8 @@ fn start_app_connection(cx: &mut App) {
                         };
                         cx.update(|cx| dispatch_action(request, cx));
                     }
-                    "review.changed" => cx.update(review::review_changed),
+                    // Notes render in the same diff-tab layer, so one reload covers both.
+                    "review.changed" | "note.changed" => cx.update(review::review_changed),
                     "ports.changed" => {
                         cx.update(|cx| links::ports_changed(event.payload, cx));
                     }

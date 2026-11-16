@@ -1491,6 +1491,17 @@ fn run_visual_test(
     screenshot.save(&output_path)?;
     println!("  Screenshot saved to: {}", output_path.display());
 
+    // Icarus baselines are tracked in git: rewriting a matching one only churns its bytes.
+    let unchanged = update_baseline
+        && test_name.starts_with("icarus_")
+        && baseline_path.exists()
+        && image::open(&baseline_path).is_ok_and(|baseline| {
+            compare_images(&screenshot, &baseline.to_rgba8()).match_percentage >= MATCH_THRESHOLD
+        });
+    if unchanged {
+        println!("  Baseline unchanged: {}", baseline_path.display());
+        return Ok(TestResult::Passed);
+    }
     if update_baseline {
         // Update the baseline
         if let Some(parent) = baseline_path.parent() {
@@ -2984,6 +2995,16 @@ fn run_icarus_tab_types_tests(
                 )),
                 Err(error) => results.push(("icarus_review_diff", Err(error))),
             }
+            match show_icarus_notes_in_diff_tab(window, cx) {
+                Ok(()) => results.extend(run_icarus_dark_and_light(
+                    "icarus_notes_diff",
+                    "icarus_notes_diff_light",
+                    window.into(),
+                    cx,
+                    update_baseline,
+                )),
+                Err(error) => results.push(("icarus_notes_diff", Err(error))),
+            }
             window
                 .update(cx, |workspace, _window, cx| {
                     let project = workspace.project().clone();
@@ -3059,6 +3080,50 @@ fn show_icarus_review_in_diff_tab(
                     );
                 });
             }
+        }
+    })?;
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _cx| window.refresh())?;
+    cx.run_until_parked();
+    Ok(())
+}
+
+/// Notes in the diff tab: a user note answered by a reply session (with a changed file) and one still
+/// thinking, plus a note an agent left. Runs after the review scenario, on the same diff tab.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn show_icarus_notes_in_diff_tab(
+    window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+) -> Result<()> {
+    use icarus_ui::review::WorkspaceNote;
+
+    let notes: Vec<WorkspaceNote> = serde_json::from_value(serde_json::json!([
+        {
+            "id": "n1", "path": "src/login.rs", "line": 1, "end_line": 2, "author": "user",
+            "body": "Why does login take the password as plain text?",
+            "replies": [
+                { "id": "r1", "author": "user", "body": "Can you switch it to a typed secret?" },
+                { "id": "r2", "author": "reply-agent", "status": "done",
+                  "body": "Done: login now takes a Password newtype; the call sites are updated.",
+                  "changed_files": ["src/login.rs", "src/session.rs"] },
+                { "id": "r3", "author": "user", "body": "Does logout need the same?" },
+                { "id": "r4", "author": "reply-agent", "status": "running", "body": "" },
+            ],
+        },
+        {
+            "id": "n2", "path": "src/login.rs", "line": 5, "end_line": 5, "author": "agent",
+            "agent_id": "agent-1",
+            "body": "logout() is empty on purpose: the session store expires tokens itself.",
+        },
+    ]))?;
+    window.update(cx, |workspace, _window, cx| {
+        let tab = workspace.items_of_type::<icarus_ui::DiffTab>(cx).next();
+        if let Some(review) = tab.and_then(|tab| tab.read(cx).review().cloned()) {
+            review.update(cx, |review, cx| {
+                review.close_composer(cx);
+                review.set_preview(Vec::new(), Vec::new(), cx);
+                review.set_preview_notes(notes, cx);
+            });
         }
     })?;
     cx.run_until_parked();

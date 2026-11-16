@@ -153,6 +153,65 @@ pub struct ReactionSummary {
     pub viewer_has_reacted: bool,
 }
 
+/// A note on lines of a workspace file (`note.list`): written by the user or by an agent.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceNote {
+    pub id: String,
+    pub path: String,
+    pub line: u32,
+    pub end_line: u32,
+    /// `user` or `agent`.
+    pub author: String,
+    pub agent_id: Option<String>,
+    pub body: String,
+    pub resolved: bool,
+    pub replies: Vec<NoteReply>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct NoteReply {
+    pub id: String,
+    /// `user`, `agent`, or `reply-agent` (the throwaway session that answers a user reply).
+    pub author: String,
+    pub body: String,
+    /// For `reply-agent` entries: `pending`, `running`, `done` or `failed`.
+    pub status: Option<String>,
+    pub error: Option<String>,
+    pub changed_files: Vec<String>,
+}
+
+impl NoteReply {
+    pub fn is_thinking(&self) -> bool {
+        matches!(self.status.as_deref(), Some("pending" | "running"))
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.status.as_deref() == Some("failed")
+    }
+}
+
+impl WorkspaceNote {
+    pub fn by_agent(&self) -> bool {
+        self.author == "agent"
+    }
+
+    /// The user reply a failed answer was for, so Retry can send it again.
+    pub fn retry_target(&self, failed_reply: &str) -> Option<(&NoteReply, &NoteReply)> {
+        let index = self
+            .replies
+            .iter()
+            .position(|reply| reply.id == failed_reply)?;
+        let failed = &self.replies[index];
+        let asked = self.replies[..index]
+            .iter()
+            .rev()
+            .find(|reply| reply.author == "user")?;
+        Some((asked, failed))
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------------------------
@@ -365,6 +424,28 @@ pub fn thread_height(thread: &ReviewThread, expanded: bool) -> u32 {
 
 pub fn draft_height(draft: &ReviewDraft) -> u32 {
     3 + body_lines(&draft.body)
+}
+
+/// Editor lines a note card needs; a resolved note starts as one collapsed row.
+pub fn note_height(note: &WorkspaceNote, expanded: bool) -> u32 {
+    if note.resolved && !expanded {
+        return 2;
+    }
+    let replies: u32 = note
+        .replies
+        .iter()
+        .map(|reply| {
+            let body = if reply.is_thinking() {
+                1
+            } else if reply.is_failed() {
+                2
+            } else {
+                body_lines(&reply.body)
+            };
+            1 + body + u32::from(!reply.changed_files.is_empty())
+        })
+        .sum();
+    3 + body_lines(&note.body) + replies
 }
 
 fn reaction_emoji(content: &str) -> &'static str {
@@ -1049,15 +1130,28 @@ pub enum ComposerTarget {
     Reply {
         thread: String,
     },
+    /// A reply in a note thread; the server answers it with a throwaway agent session.
+    NoteReply {
+        note: String,
+    },
+    /// The note's own text, or one of its replies.
+    EditNote {
+        note: String,
+        reply: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Destination {
     /// A queued draft for the next review.
     Review,
-    /// A note for this workspace's agent: a chip in the composer.
+    /// A note on these lines (`note.add`), which the agent side of Icarus reads and answers.
     Agent,
 }
+
+/// Asks the diff tab to open another file's diff, e.g. one a note's answer changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenChangedFile(pub String);
 
 /// Draft comments, PR threads and the open composer for one diff tab's file, drawn as editor blocks.
 pub struct DiffReview {
@@ -1070,6 +1164,7 @@ pub struct DiffReview {
     client: Option<Arc<Client>>,
     threads: Vec<ReviewThread>,
     drafts: Vec<ReviewDraft>,
+    notes: Vec<WorkspaceNote>,
     expanded: HashSet<String>,
     composer: Option<(Entity<CommentComposer>, CustomBlockId)>,
     blocks: Vec<CustomBlockId>,
@@ -1096,6 +1191,7 @@ impl DiffReview {
             client,
             threads: Vec::new(),
             drafts: Vec::new(),
+            notes: Vec::new(),
             expanded: HashSet::default(),
             composer: None,
             blocks: Vec::new(),
@@ -1129,6 +1225,16 @@ impl DiffReview {
         &self.drafts
     }
 
+    pub fn notes(&self) -> &[WorkspaceNote] {
+        &self.notes
+    }
+
+    /// Shows fixed notes without a server (previews, visual tests).
+    pub fn set_preview_notes(&mut self, notes: Vec<WorkspaceNote>, cx: &mut Context<Self>) {
+        self.notes = notes;
+        self.rebuild_blocks(cx);
+    }
+
     pub fn composer(&self) -> Option<&Entity<CommentComposer>> {
         self.composer.as_ref().map(|(composer, _)| composer)
     }
@@ -1150,6 +1256,13 @@ impl DiffReview {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        // Notes don't need a pull request, so they load on their own and survive a review failure.
+        let notes = request(
+            self.client.clone(),
+            "note.list",
+            json!({ "cwd": self.workspace_key, "path": self.path, "include_resolved": true }),
+            cx,
+        );
         let (Some(threads), Some(drafts)) = (
             request(
                 self.client.clone(),
@@ -1169,7 +1282,18 @@ impl DiffReview {
         cx.spawn(async move |this, cx| {
             let threads = threads.await;
             let drafts = drafts.await;
+            let notes = match notes {
+                Some(notes) => Some(notes.await),
+                None => None,
+            };
             this.update(cx, |this, cx| {
+                match notes {
+                    Some(Ok(notes)) => {
+                        this.notes = serde_json::from_value(notes).unwrap_or_default();
+                    }
+                    Some(Err(error)) => log::warn!("loading notes failed: {error:#}"),
+                    None => {}
+                }
                 match (threads, drafts) {
                     (Ok(threads), Ok(drafts)) => {
                         this.load_error = None;
@@ -1182,10 +1306,11 @@ impl DiffReview {
                             .filter(|draft| draft.path == this.path)
                             .collect();
                     }
-                    // A branch without a PR is normal: show nothing rather than an error.
+                    // A branch without a PR, or a repo not on GitHub, is normal: notes still work.
                     (Err(error), _) | (_, Err(error)) => {
                         let text = format!("{error:#}");
-                        this.load_error = (!text.contains("no_pr")).then_some(text);
+                        this.load_error = (!text.contains("no_pr") && !text.contains("no_github"))
+                            .then_some(text);
                         this.threads.clear();
                         this.drafts.clear();
                     }
@@ -1245,6 +1370,15 @@ impl DiffReview {
                 order,
                 draft_height(draft),
                 AnyCard::Draft(draft.clone()),
+            ));
+        }
+        for note in &self.notes {
+            let expanded = self.expanded.contains(&note.id);
+            cards.push((
+                Some(note.end_line.max(note.line)),
+                2,
+                note_height(note, expanded),
+                AnyCard::Note(note.clone(), expanded),
             ));
         }
         cards.sort_by_key(|(line, order, _, _)| (line.is_none(), *line, *order));
@@ -1324,6 +1458,11 @@ impl DiffReview {
                 .iter()
                 .find(|candidate| &candidate.id == thread)
                 .and_then(|thread| thread.placement.line),
+            ComposerTarget::NoteReply { note } | ComposerTarget::EditNote { note, .. } => self
+                .notes
+                .iter()
+                .find(|candidate| &candidate.id == note)
+                .map(|note| note.end_line.max(note.line)),
         };
         let Some(anchor) = self.anchor_for_line(line, cx) else {
             return;
@@ -1410,12 +1549,17 @@ impl DiffReview {
         let workspace = self.workspace_key.clone();
         let (method, params) = match (&target, destination) {
             (ComposerTarget::Lines { start, end }, Destination::Agent) => (
-                "attach.text",
+                "note.add",
                 json!({
-                    "workspace": workspace,
-                    "title": format!("{}:{}", self.path, lines_label(*start, *end).to_lowercase()),
-                    "text": format!("{}:{}\n\n{body}", self.path, if start == end { start.to_string() } else { format!("{start}-{end}") }),
+                    "cwd": workspace, "path": self.path, "line": start, "end_line": end, "body": body,
                 }),
+            ),
+            (ComposerTarget::NoteReply { note }, _) => {
+                ("note.reply", json!({ "id": note, "body": body }))
+            }
+            (ComposerTarget::EditNote { note, reply }, _) => (
+                "note.edit",
+                json!({ "id": note, "reply_id": reply, "body": body }),
             ),
             (ComposerTarget::Lines { start, end }, Destination::Review) => (
                 "review.comment.add",
@@ -1505,6 +1649,71 @@ impl DiffReview {
         self.mutate("attach.pr_comments", params, cx);
     }
 
+    pub fn remove_note(&mut self, note: &str, reply: Option<&str>, cx: &mut Context<Self>) {
+        self.mutate("note.remove", json!({ "id": note, "reply_id": reply }), cx);
+    }
+
+    pub fn set_note_resolved(&mut self, note: &str, resolved: bool, cx: &mut Context<Self>) {
+        let method = if resolved {
+            "note.resolve"
+        } else {
+            "note.unresolve"
+        };
+        self.mutate(method, json!({ "id": note }), cx);
+    }
+
+    /// Drops the whole note conversation into this workspace's composer as one chip.
+    pub fn add_note_to_agent(&mut self, note: &str, cx: &mut Context<Self>) {
+        self.mutate("attach.note", json!({ "id": note }), cx);
+    }
+
+    /// Sends a failed reply again: drops the failed answer and its question, then asks anew.
+    pub fn retry_note_reply(&mut self, note: &str, failed_reply: &str, cx: &mut Context<Self>) {
+        let Some((asked, failed)) = self
+            .notes
+            .iter()
+            .find(|candidate| candidate.id == note)
+            .and_then(|note| note.retry_target(failed_reply))
+            .map(|(asked, failed)| (asked.clone(), failed.clone()))
+        else {
+            return;
+        };
+        let client = self.client.clone();
+        let note = note.to_owned();
+        let calls = [
+            request(
+                client.clone(),
+                "note.remove",
+                json!({ "id": note, "reply_id": failed.id }),
+                cx,
+            ),
+            request(
+                client,
+                "note.remove",
+                json!({ "id": note, "reply_id": asked.id }),
+                cx,
+            ),
+        ];
+        self.error = None;
+        cx.spawn(async move |this, cx| {
+            for call in calls.into_iter().flatten() {
+                if let Err(error) = call.await {
+                    this.update(cx, |this, cx| {
+                        this.error = Some(format!("{error:#}"));
+                        this.reload(cx);
+                    })
+                    .log_err();
+                    return;
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.mutate("note.reply", json!({ "id": note, "body": asked.body }), cx)
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
     fn toggle_expanded(&mut self, thread: &str, cx: &mut Context<Self>) {
         if !self.expanded.remove(thread) {
             self.expanded.insert(thread.to_owned());
@@ -1549,11 +1758,13 @@ impl DiffReview {
 }
 
 impl EventEmitter<()> for DiffReview {}
+impl EventEmitter<OpenChangedFile> for DiffReview {}
 
 #[derive(Debug, Clone)]
 enum AnyCard {
     Thread(ReviewThread, bool),
     Draft(ReviewDraft),
+    Note(WorkspaceNote, bool),
 }
 
 fn card_renderer(card: Entity<ReviewCard>) -> editor::display_map::RenderBlock {
@@ -1880,11 +2091,335 @@ impl ReviewCard {
     }
 }
 
+impl ReviewCard {
+    fn note_frame(cx: &App) -> Div {
+        // An accent edge tells notes apart from PR threads at a glance.
+        card_frame(cx)
+            .border_l_2()
+            .border_color(cx.theme().colors().text_accent)
+    }
+
+    fn note_badge(note: &WorkspaceNote, cx: &App) -> impl IntoElement {
+        let (label, icon) = if note.by_agent() {
+            ("AGENT NOTE", IconName::ZedAgent)
+        } else {
+            ("NOTE", IconName::Notepad)
+        };
+        h_flex()
+            .gap_0p5()
+            .px_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Accent))
+            .child(
+                Label::new(label)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent)
+                    .weight(gpui::FontWeight::SEMIBOLD),
+            )
+    }
+
+    fn render_note(
+        &self,
+        note: &WorkspaceNote,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = note.id.clone();
+        if note.resolved && !expanded {
+            let review = self.review.clone();
+            let summary = format!(
+                "Resolved note: {}",
+                note.body.lines().next().unwrap_or_default()
+            );
+            return Self::note_frame(cx)
+                .child(
+                    Button::new(SharedString::from(format!("note-expand-{id}")), summary)
+                        .style(ButtonStyle::Transparent)
+                        .label_size(LabelSize::Small)
+                        .start_icon(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::XSmall)
+                                .color(Color::Success),
+                        )
+                        .on_click(move |_, _, cx| {
+                            review
+                                .update(cx, |review, cx| review.toggle_expanded(&id, cx))
+                                .log_err();
+                        }),
+                )
+                .into_any_element();
+        }
+        let lines = lines_label(note.line, note.end_line.max(note.line));
+        let (edit_review, delete_review) = (self.review.clone(), self.review.clone());
+        let (edit_id, delete_id, body) = (id.clone(), id.clone(), note.body.clone());
+        let mut card = Self::note_frame(cx).child(
+            h_flex()
+                .gap_1p5()
+                .child(Self::note_badge(note, cx))
+                .child(
+                    Label::new(lines)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(div().flex_1())
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("note-edit-{id}")),
+                        IconName::Pencil,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Edit note"))
+                    .on_click(move |_, window, cx| {
+                        edit_review
+                            .update(cx, |review, cx| {
+                                review.open_composer(
+                                    ComposerTarget::EditNote {
+                                        note: edit_id.clone(),
+                                        reply: None,
+                                    },
+                                    body.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .log_err();
+                    }),
+                )
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("note-delete-{id}")),
+                        IconName::Trash,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Delete note"))
+                    .on_click(move |_, _, cx| {
+                        delete_review
+                            .update(cx, |review, cx| review.remove_note(&delete_id, None, cx))
+                            .log_err();
+                    }),
+                ),
+        );
+        card = card.child(render_body(&note.body));
+        for reply in &note.replies {
+            card = card.child(self.render_note_reply(&note.id, reply));
+        }
+        let (reply_review, agent_review, resolve_review, collapse_review) = (
+            self.review.clone(),
+            self.review.clone(),
+            self.review.clone(),
+            self.review.clone(),
+        );
+        let (reply_id, agent_id, resolve_id, collapse_id) =
+            (id.clone(), id.clone(), id.clone(), id.clone());
+        let resolved = note.resolved;
+        card.child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new(SharedString::from(format!("note-reply-{id}")), "Reply")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .tooltip(Tooltip::text(
+                            "A separate agent session reads the whole note and answers",
+                        ))
+                        .on_click(move |_, window, cx| {
+                            reply_review
+                                .update(cx, |review, cx| {
+                                    review.open_composer(
+                                        ComposerTarget::NoteReply {
+                                            note: reply_id.clone(),
+                                        },
+                                        String::new(),
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+                        }),
+                )
+                .child(
+                    Button::new(
+                        SharedString::from(format!("note-agent-{id}")),
+                        "Add to agent",
+                    )
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::ZedAgent).size(IconSize::XSmall))
+                    .on_click(move |_, _, cx| {
+                        agent_review
+                            .update(cx, |review, cx| review.add_note_to_agent(&agent_id, cx))
+                            .log_err();
+                    }),
+                )
+                .child(
+                    Button::new(
+                        SharedString::from(format!("note-resolve-{id}")),
+                        if resolved { "Unresolve" } else { "Resolve" },
+                    )
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .on_click(move |_, _, cx| {
+                        resolve_review
+                            .update(cx, |review, cx| {
+                                review.set_note_resolved(&resolve_id, !resolved, cx)
+                            })
+                            .log_err();
+                    }),
+                )
+                .when(resolved, |row| {
+                    row.child(
+                        Button::new(
+                            SharedString::from(format!("note-collapse-{id}")),
+                            "Collapse",
+                        )
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .on_click(move |_, _, cx| {
+                            collapse_review
+                                .update(cx, |review, cx| review.toggle_expanded(&collapse_id, cx))
+                                .log_err();
+                        }),
+                    )
+                }),
+        )
+        .into_any_element()
+    }
+
+    fn render_note_reply(&self, note: &str, reply: &NoteReply) -> AnyElement {
+        let author = match reply.author.as_str() {
+            "user" => "You",
+            "reply-agent" => "Answer",
+            _ => "Agent",
+        };
+        let mut column = v_flex().gap_0p5().pl_2().child(
+            h_flex()
+                .gap_1()
+                .when(reply.author != "user", |row| {
+                    row.child(
+                        Icon::new(IconName::ZedAgent)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
+                .child(
+                    Label::new(author)
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD),
+                )
+                .when(reply.author == "user", |row| {
+                    let review = self.review.clone();
+                    let (note, reply_id) = (note.to_owned(), reply.id.clone());
+                    row.child(div().flex_1()).child(
+                        IconButton::new(
+                            SharedString::from(format!("note-reply-delete-{}", reply.id)),
+                            IconName::Trash,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Delete reply"))
+                        .on_click(move |_, _, cx| {
+                            review
+                                .update(cx, |review, cx| {
+                                    review.remove_note(&note, Some(&reply_id), cx)
+                                })
+                                .log_err();
+                        }),
+                    )
+                }),
+        );
+        if reply.is_thinking() {
+            column = column.child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::ArrowCircle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Thinking…")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            );
+        } else if reply.is_failed() {
+            let review = self.review.clone();
+            let (note, reply_id) = (note.to_owned(), reply.id.clone());
+            column = column.child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Label::new(
+                            reply
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "The answer failed".into()),
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                    )
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("note-retry-{}", reply.id)),
+                            "Retry",
+                        )
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .on_click(move |_, _, cx| {
+                            review
+                                .update(cx, |review, cx| {
+                                    review.retry_note_reply(&note, &reply_id, cx)
+                                })
+                                .log_err();
+                        }),
+                    ),
+            );
+        } else {
+            column = column.child(render_body(&reply.body));
+        }
+        if !reply.changed_files.is_empty() {
+            let review = self.review.clone();
+            column = column.child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(
+                        Label::new("Changed")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .children(reply.changed_files.iter().map(|path| {
+                        let review = review.clone();
+                        let path_for_click = path.clone();
+                        Button::new(
+                            SharedString::from(format!("note-file-{}-{path}", reply.id)),
+                            path.clone(),
+                        )
+                        .style(ButtonStyle::Transparent)
+                        .label_size(LabelSize::XSmall)
+                        .color(Color::Accent)
+                        .tooltip(Tooltip::text("Open this file's diff"))
+                        .on_click(move |_, _, cx| {
+                            review
+                                .update(cx, |_, cx| {
+                                    cx.emit(OpenChangedFile(path_for_click.clone()))
+                                })
+                                .log_err();
+                        })
+                    })),
+            );
+        }
+        column.into_any_element()
+    }
+}
+
 impl Render for ReviewCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.card.clone() {
             AnyCard::Thread(thread, expanded) => self.render_thread(&thread, expanded, cx),
             AnyCard::Draft(draft) => self.render_draft(&draft, cx),
+            AnyCard::Note(note, expanded) => self.render_note(&note, expanded, cx),
         }
     }
 }
@@ -1912,6 +2447,8 @@ impl CommentComposer {
             ComposerTarget::Reply { .. } => "Reply…",
             ComposerTarget::EditDraft { .. } => "Edit comment",
             ComposerTarget::Lines { .. } => "Leave a review comment on this line",
+            ComposerTarget::NoteReply { .. } => "Ask about this note; a separate agent answers…",
+            ComposerTarget::EditNote { .. } => "Edit note",
         };
         let editor = cx.new(|cx| {
             let mut editor = Editor::auto_height(3, 14, window, cx);
@@ -2023,14 +2560,16 @@ impl Render for CommentComposer {
             ComposerTarget::Lines { start, end } => lines_label(*start, *end).to_uppercase(),
             ComposerTarget::EditDraft { .. } => "EDIT COMMENT".to_owned(),
             ComposerTarget::Reply { .. } => "REPLY".to_owned(),
+            ComposerTarget::NoteReply { .. } => "REPLY TO NOTE".to_owned(),
+            ComposerTarget::EditNote { .. } => "EDIT NOTE".to_owned(),
         };
         let new_comment = matches!(self.target, ComposerTarget::Lines { .. });
         let submit_label = match (&self.target, self.destination) {
             (_, _) if self.busy => "Posting…",
             (ComposerTarget::Lines { .. }, Destination::Review) => "Add to review",
             (ComposerTarget::Lines { .. }, Destination::Agent) => "Add note",
-            (ComposerTarget::EditDraft { .. }, _) => "Save",
-            (ComposerTarget::Reply { .. }, _) => "Reply",
+            (ComposerTarget::EditDraft { .. } | ComposerTarget::EditNote { .. }, _) => "Save",
+            (ComposerTarget::Reply { .. } | ComposerTarget::NoteReply { .. }, _) => "Reply",
         };
         let empty = self.editor.read(cx).text(cx).trim().is_empty();
         let images = markdown_images(&self.editor.read(cx).text(cx));

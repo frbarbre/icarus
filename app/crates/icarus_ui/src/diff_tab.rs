@@ -24,7 +24,7 @@ use workspace::item::{Item, ItemEvent, SaveOptions, SerializableItem};
 use workspace::searchable::SearchableItemHandle;
 use workspace::{ItemHandle as _, ItemId, ItemNavHistory, Pane, Workspace, WorkspaceId};
 
-use crate::review::{AddReviewComment, DiffReview};
+use crate::review::{AddReviewComment, DiffReview, OpenChangedFile};
 
 actions!(
     icarus,
@@ -133,11 +133,52 @@ pub struct DiffTab {
     editor: Entity<Editor>,
     /// Review drafts, PR threads and the comment box; only when Icarus runs.
     review: Option<Entity<DiffReview>>,
-    _review_changes: Option<Subscription>,
+    _review_changes: Option<Vec<Subscription>>,
     _editor_events: Subscription,
 }
 
 impl DiffTab {
+    /// Redraws on review changes, and opens the diff of a file a note's answer changed.
+    fn watch_review(
+        review: &Entity<DiffReview>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
+        vec![
+            cx.observe(review, |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                review,
+                window,
+                |this, _, event: &OpenChangedFile, window, cx| {
+                    this.open_changed_file(&event.0, window, cx)
+                },
+            ),
+        ]
+    }
+
+    fn open_changed_file(&mut self, relative: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self
+            .project
+            .read(cx)
+            .worktree_for_id(self.project_path.worktree_id, cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        else {
+            return;
+        };
+        let Some(workspace) = Workspace::for_window(window, cx) else {
+            return;
+        };
+        let path = root.join(relative);
+        let base = self.base.clone();
+        // Deferred: the click arrives while this tab is mid-update.
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                open_diff_tab(path, base, DiffTabMode::Diff, None, workspace, window, cx)
+                    .detach_and_log_err(cx);
+            });
+        });
+    }
+
     fn new(
         path: PathBuf,
         base: DiffBase,
@@ -181,7 +222,7 @@ impl DiffTab {
         });
         let review_changes = review
             .as_ref()
-            .map(|review| cx.observe(review, |_, _, cx| cx.notify()));
+            .map(|review| Self::watch_review(review, window, cx));
         let mut tab = Self {
             path,
             base,
@@ -223,7 +264,7 @@ impl DiffTab {
         let editor = self.editor.downgrade();
         let buffer = self.buffer.clone();
         let review = cx.new(|cx| DiffReview::new(editor, buffer, workspace_key, path, cx));
-        self._review_changes = Some(cx.observe(&review, |_, _, cx| cx.notify()));
+        self._review_changes = Some(vec![cx.observe(&review, |_, _, cx| cx.notify())]);
         self.review = Some(review);
     }
 
@@ -1154,7 +1195,7 @@ pub(crate) mod tests {
         );
         assert_eq!(calls_to(&calls, "review.comment.remove")[0]["id"], "d1");
 
-        // A note for the agent goes to the composer as a text attachment.
+        // The Agent side of the box writes a note on those lines.
         review.update_in(cx, |review, window, cx| {
             review.open_composer(
                 ComposerTarget::Lines { start: 1, end: 2 },
@@ -1165,14 +1206,151 @@ pub(crate) mod tests {
             review.submit_composer(Destination::Agent, window, cx);
         });
         cx.run_until_parked();
-        let notes = calls_to(&calls, "attach.text");
-        assert_eq!(notes[0]["title"], "src/app.rs:lines 1-2");
-        assert!(
-            notes[0]["text"]
-                .as_str()
-                .is_some_and(|text| text.ends_with("Check both lines")),
-            "{notes:?}"
+        assert_eq!(
+            calls_to(&calls, "note.add"),
+            [
+                json!({ "cwd": "/project", "path": "src/app.rs", "line": 1, "end_line": 2,
+                "body": "Check both lines" })
+            ]
         );
+    }
+
+    #[gpui::test]
+    async fn note_replies_think_then_answer_and_their_changed_files_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::review::tests::{calls_to, stub_rpc};
+        use crate::review::{ComposerTarget, Destination, OpenChangedFile, review_changed};
+
+        let (workspace, mut cx) = git_workspace(cx).await;
+        let cx = &mut cx;
+        cx.update(|_, cx| cx.set_global(crate::IcarusEnabled));
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(vec![json!({
+            "id": "n1", "path": "src/app.rs", "line": 1, "end_line": 1, "author": "user",
+            "body": "Why main?", "resolved": false, "replies": [],
+        })]));
+        let stored = notes.clone();
+        let calls = cx.update(|_, cx| {
+            stub_rpc(cx, move |method, params| {
+                let mut notes = stored.lock().unwrap_or_else(|p| p.into_inner());
+                match method {
+                    "note.list" => Ok(json!(*notes)),
+                    "note.reply" => {
+                        let replies = notes[0]["replies"].as_array_mut().expect("replies");
+                        replies
+                            .push(json!({ "id": "r1", "author": "user", "body": params["body"] }));
+                        replies.push(json!({ "id": "r2", "author": "reply-agent", "body": "",
+                            "status": "running" }));
+                        Ok(json!({}))
+                    }
+                    _ => Ok(json!({})),
+                }
+            })
+        });
+        let tab = open(&workspace, "/project/src/app.rs", DiffBase::Uncommitted, cx);
+        cx.run_until_parked();
+        let tab = tab.await.expect("diff tab");
+        let review = tab.read_with(cx, |tab, _| tab.review().cloned().expect("notes layer"));
+        review.update(cx, |review, cx| review.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "note.list")[0],
+            json!({ "cwd": "/project", "path": "src/app.rs", "include_resolved": true })
+        );
+        review.read_with(cx, |review, _| {
+            assert_eq!(review.notes().len(), 1);
+            assert!(!review.notes()[0].by_agent());
+        });
+
+        // A reply goes to note.reply; the throwaway session shows as thinking.
+        review.update_in(cx, |review, window, cx| {
+            review.open_composer(
+                ComposerTarget::NoteReply { note: "n1".into() },
+                "What does line 1 do?".into(),
+                window,
+                cx,
+            );
+            review.submit_composer(Destination::Review, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "note.reply"),
+            [json!({ "id": "n1", "body": "What does line 1 do?" })]
+        );
+        review.read_with(cx, |review, _| {
+            let replies = &review.notes()[0].replies;
+            assert_eq!(replies.len(), 2);
+            assert!(replies[1].is_thinking(), "{replies:?}");
+        });
+
+        // The server finishes the answer and announces it; the thread shows it with its files.
+        {
+            let mut notes = notes.lock().unwrap_or_else(|p| p.into_inner());
+            notes[0]["replies"][1] = json!({ "id": "r2", "author": "reply-agent", "status": "done",
+                "body": "It is the entry point.", "changed_files": ["src/new.rs"] });
+        }
+        cx.update(|_, cx| review_changed(cx));
+        cx.run_until_parked();
+        review.read_with(cx, |review, _| {
+            let answer = &review.notes()[0].replies[1];
+            assert!(!answer.is_thinking());
+            assert_eq!(answer.body, "It is the entry point.");
+            assert_eq!(answer.changed_files, ["src/new.rs"]);
+        });
+
+        // Clicking a changed file opens its diff tab.
+        review.update(cx, |_, cx| cx.emit(OpenChangedFile("src/new.rs".into())));
+        cx.run_until_parked();
+        let opened: Vec<PathBuf> = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<DiffTab>(cx)
+                .map(|tab| tab.read(cx).path().to_path_buf())
+                .collect()
+        });
+        assert!(
+            opened.contains(&PathBuf::from("/project/src/new.rs")),
+            "{opened:?}"
+        );
+
+        // A failed answer retries its question; edit, resolve, delete and add to agent.
+        {
+            let mut notes = notes.lock().unwrap_or_else(|p| p.into_inner());
+            notes[0]["replies"][1] = json!({ "id": "r2", "author": "reply-agent",
+                "status": "failed", "error": "timed out" });
+        }
+        cx.update(|_, cx| review_changed(cx));
+        cx.run_until_parked();
+        review.update_in(cx, |review, window, cx| {
+            review.retry_note_reply("n1", "r2", cx);
+            review.open_composer(
+                ComposerTarget::EditNote {
+                    note: "n1".into(),
+                    reply: None,
+                },
+                "Why is this main?".into(),
+                window,
+                cx,
+            );
+            review.submit_composer(Destination::Review, window, cx);
+            review.set_note_resolved("n1", true, cx);
+            review.add_note_to_agent("n1", cx);
+            review.remove_note("n1", Some("r1"), cx);
+        });
+        cx.run_until_parked();
+        let removed = calls_to(&calls, "note.remove");
+        assert_eq!(removed[0], json!({ "id": "n1", "reply_id": "r2" }));
+        assert_eq!(removed[1], json!({ "id": "n1", "reply_id": "r1" }));
+        assert_eq!(
+            calls_to(&calls, "note.reply").last().cloned(),
+            Some(json!({ "id": "n1", "body": "What does line 1 do?" })),
+            "retry asks the same question again"
+        );
+        assert_eq!(
+            calls_to(&calls, "note.edit"),
+            [json!({ "id": "n1", "reply_id": null, "body": "Why is this main?" })]
+        );
+        assert_eq!(calls_to(&calls, "note.resolve"), [json!({ "id": "n1" })]);
+        assert_eq!(calls_to(&calls, "attach.note"), [json!({ "id": "n1" })]);
     }
 
     #[test]

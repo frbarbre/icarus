@@ -1,3 +1,4 @@
+use collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -203,6 +204,20 @@ fn filter_label(facets: &[Facet]) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+/// Open notes per file from `note.list` (which leaves out resolved notes by default).
+fn note_counts(notes: &serde_json::Value) -> HashMap<String, usize> {
+    let mut counts = HashMap::default();
+    for note in notes.as_array().into_iter().flatten() {
+        if note["resolved"].as_bool() == Some(true) {
+            continue;
+        }
+        if let Some(path) = note["path"].as_str() {
+            *counts.entry(path.to_owned()).or_default() += 1;
+        }
+    }
+    counts
+}
+
 fn status_letter(status: &str) -> &'static str {
     match status {
         "added" => "A",
@@ -258,6 +273,8 @@ pub struct SourceControlPanel {
     selected: Option<usize>,
     /// The last file step's direction and time, to tell a held key's repeats from single presses.
     last_step: Option<(bool, Instant)>,
+    /// Open notes per changed file, shown as a badge on its row.
+    note_counts: HashMap<String, usize>,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     refreshing: Option<Task<()>>,
@@ -310,6 +327,7 @@ impl SourceControlPanel {
             error: None,
             selected: None,
             last_step: None,
+            note_counts: HashMap::default(),
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             refreshing: None,
@@ -336,6 +354,7 @@ impl SourceControlPanel {
             error: None,
             selected,
             last_step: None,
+            note_counts: HashMap::default(),
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             refreshing: None,
@@ -413,14 +432,23 @@ impl SourceControlPanel {
                     serde_json::json!({ "id": id, "scope": scope.wire() }),
                 )
                 .await?;
-            anyhow::Ok((id, serde_json::from_value::<Listing>(value)?))
+            let listing = serde_json::from_value::<Listing>(value)?;
+            // A server without notes, or a failed lookup, just shows no badges.
+            let note_counts = client
+                .request("note.list", serde_json::json!({ "workspace": id }))
+                .await
+                .ok()
+                .map(|value| note_counts(&value))
+                .unwrap_or_default();
+            anyhow::Ok((id, listing, note_counts))
         });
         self.refreshing = Some(cx.spawn(async move |this, cx| {
             let result = fetch.await;
             this.update(cx, |this, cx| {
                 this.refreshing = None;
                 match result {
-                    Ok((id, listing)) => {
+                    Ok((id, listing, note_counts)) => {
+                        this.note_counts = note_counts;
                         this.icarus_workspace = Some(id);
                         this.error = None;
                         if let Some(selected) = this.selected
@@ -763,6 +791,34 @@ impl SourceControlPanel {
                         Label::new(format!("−{removed}"))
                             .size(LabelSize::XSmall)
                             .color(Color::Deleted),
+                    )
+                },
+            )
+            .when_some(
+                self.note_counts
+                    .get(&row.path)
+                    .copied()
+                    .filter(|count| *count > 0),
+                |this, count| {
+                    this.child(
+                        h_flex()
+                            .id(("changes-row-notes", index))
+                            .gap_0p5()
+                            .tooltip(Tooltip::text(if count == 1 {
+                                "1 open note".to_owned()
+                            } else {
+                                format!("{count} open notes")
+                            }))
+                            .child(
+                                Icon::new(IconName::Notepad)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Accent),
+                            )
+                            .child(
+                                Label::new(count.to_string())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Accent),
+                            ),
                     )
                 },
             )
@@ -1233,6 +1289,19 @@ impl SourceControlPanel {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rows_count_only_open_notes() {
+        let counts = note_counts(&json!([
+            { "path": "src/app.rs", "resolved": false },
+            { "path": "src/app.rs", "resolved": false },
+            { "path": "src/app.rs", "resolved": true },
+            { "path": "README.md", "resolved": false },
+        ]));
+        assert_eq!(counts.get("src/app.rs"), Some(&2));
+        assert_eq!(counts.get("README.md"), Some(&1));
+        assert!(note_counts(&json!({ "error": "no notes" })).is_empty());
+    }
 
     pub(crate) fn sample_listing() -> Listing {
         serde_json::from_value(json!({
