@@ -768,6 +768,8 @@ dependencies = [
  "dirs",
  "icarus-client",
  "icarus-settings",
+ "portable-pty",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

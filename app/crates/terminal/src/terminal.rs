@@ -1036,6 +1036,7 @@ impl TerminalBuilder {
             output_events_tx: Some(events_tx),
             output_generation: 0,
             title_override: None,
+            external_id: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
                 terminal_bounds,
@@ -1326,6 +1327,7 @@ impl TerminalBuilder {
                 output_events_tx: None,
                 output_generation: 0,
                 title_override: terminal_title_override,
+                external_id: None,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
                 last_mouse: None,
@@ -1542,6 +1544,8 @@ pub struct Terminal {
 
     pub breadcrumb_text: String,
     title_override: Option<String>,
+    /// Where the shell really runs when an embedder routes it elsewhere (Icarus: a server terminal id).
+    external_id: Option<String>,
     scroll_px: Pixels,
     next_link_id: usize,
     selection_phase: SelectionPhase,
@@ -1637,6 +1641,14 @@ const FIND_HYPERLINK_THROTTLE: Duration = Duration::from_millis(100);
 const SELECTION_DRAG_THRESHOLD: f64 = 2.0;
 
 impl Terminal {
+    pub fn external_id(&self) -> Option<&str> {
+        self.external_id.as_deref()
+    }
+
+    pub fn set_external_id(&mut self, external_id: Option<String>) {
+        self.external_id = external_id;
+    }
+
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
             PtyEvent::Event(event, generation) => {

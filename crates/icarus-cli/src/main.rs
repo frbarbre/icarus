@@ -6,6 +6,7 @@ mod ports;
 mod review;
 mod rules;
 mod service;
+mod term_attach;
 mod update;
 
 use std::path::PathBuf;
@@ -770,6 +771,24 @@ enum TerminalCommand {
         #[arg(long)]
         remove: bool,
     },
+    /// Show a server terminal in this one and type into it; it keeps running when this exits.
+    Attach {
+        /// The terminal to show (omit with --create).
+        #[arg(required_unless_present = "create")]
+        id: Option<String>,
+        /// Start a new terminal and attach to it.
+        #[arg(long, conflicts_with = "id")]
+        create: bool,
+        #[arg(long, requires = "create")]
+        cwd: Option<PathBuf>,
+        #[arg(long, requires = "create")]
+        workspace: Option<String>,
+        #[arg(long, requires = "create")]
+        label: Option<String>,
+        /// Command and arguments to run, after `--` (with --create).
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
 }
 
 fn home(cli: &Cli) -> Result<PathBuf> {
@@ -1014,6 +1033,33 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = home(&cli)?;
     match &cli.command {
+        Command::Terminal {
+            command:
+                TerminalCommand::Attach {
+                    id,
+                    create,
+                    cwd,
+                    workspace,
+                    label,
+                    command,
+                },
+        } => {
+            let spec = create
+                .then(|| -> Result<term_attach::CreateSpec> {
+                    Ok(term_attach::CreateSpec {
+                        cwd: match cwd {
+                            Some(cwd) => cwd.clone(),
+                            None => std::env::current_dir()?,
+                        },
+                        workspace: workspace.clone(),
+                        label: label.clone(),
+                        command: command.clone(),
+                    })
+                })
+                .transpose()?;
+            let code = term_attach::run(&cli, id.clone(), spec).await?;
+            std::process::exit(code);
+        }
         Command::Server {
             command:
                 ServerCommand::Start { .. }
@@ -2293,6 +2339,9 @@ async fn main() -> Result<()> {
                         .request("terminal.kill", json!({ "id": id, "remove": remove }))
                         .await?;
                     print(&cli, &value, |_| String::new());
+                }
+                TerminalCommand::Attach { .. } => {
+                    anyhow::bail!("attach is handled before connecting");
                 }
             }
         }

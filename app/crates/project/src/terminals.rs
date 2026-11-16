@@ -20,7 +20,8 @@ use terminal::{
     terminal_settings::TerminalSettings,
 };
 use util::{
-    command::new_std_command, get_default_system_shell, get_system_shell, maybe, rel_path::RelPath,
+    ResultExt as _, command::new_std_command, get_default_system_shell, get_system_shell, maybe,
+    rel_path::RelPath,
 };
 
 use crate::{Project, ProjectPath};
@@ -28,6 +29,27 @@ use crate::{Project, ProjectPath};
 pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
 }
+
+/// A local interactive shell an embedder wants to run elsewhere.
+pub struct ShellRequest {
+    pub cwd: Option<PathBuf>,
+    /// The external terminal a restored tab was showing, to show again.
+    pub reattach: Option<String>,
+}
+
+/// The program that shows a routed shell, and the external id it runs under.
+pub struct RoutedShell {
+    pub shell: Shell,
+    pub external_id: String,
+}
+
+/// Lets an embedder run local interactive shells elsewhere; Icarus runs them on its server so they outlive the app.
+#[derive(Clone)]
+pub struct ShellRouter(
+    pub Arc<dyn Fn(ShellRequest, &mut App) -> Option<Task<Result<RoutedShell>>>>,
+);
+
+impl gpui::Global for ShellRouter {}
 
 impl Project {
     pub fn active_entry_directory(&self, cx: &App) -> Option<PathBuf> {
@@ -287,7 +309,17 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        self.create_terminal_shell_internal(cwd, false, cx)
+        self.create_terminal_shell_internal(cwd, false, None, cx)
+    }
+
+    /// Like [`Self::create_terminal_shell`], showing the routed shell a restored tab had, if it still runs.
+    pub fn create_terminal_shell_reattaching(
+        &mut self,
+        cwd: Option<PathBuf>,
+        reattach: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_shell_internal(cwd, false, reattach, cx)
     }
 
     /// Creates a local terminal even if the project is remote.
@@ -304,7 +336,7 @@ impl Project {
             // Local project: use project directory like normal terminals
             self.active_project_directory(cx).map(|p| p.to_path_buf())
         };
-        self.create_terminal_shell_internal(working_directory, true, cx)
+        self.create_terminal_shell_internal(working_directory, true, None, cx)
     }
 
     /// Internal method for creating terminal shells.
@@ -314,8 +346,22 @@ impl Project {
         &mut self,
         cwd: Option<PathBuf>,
         force_local: bool,
+        reattach: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
+        let routed_shell = if force_local || self.remote_client.is_some() {
+            None
+        } else {
+            cx.try_global::<ShellRouter>().cloned().and_then(|router| {
+                (router.0)(
+                    ShellRequest {
+                        cwd: cwd.clone(),
+                        reattach,
+                    },
+                    cx,
+                )
+            })
+        };
         let path = cwd.map(|p| Arc::from(&*p));
         let is_via_remote = !force_local && self.remote_client.is_some();
 
@@ -424,6 +470,12 @@ impl Project {
             .await
             .unwrap_or_default();
 
+            // An unreachable router (e.g. the Icarus server is down) falls back to a plain local shell.
+            let routed = match routed_shell {
+                Some(task) => task.await.log_err(),
+                None => None,
+            };
+            let external_id = routed.as_ref().map(|routed| routed.external_id.clone());
             let builder = project
                 .update(cx, move |_, cx| {
                     let (shell, env) = {
@@ -439,7 +491,10 @@ impl Project {
                                 };
                                 create_remote_shell(spawn_command, env, path, remote_client, cx)?
                             }
-                            None => (settings.shell, env),
+                            None => (
+                                routed.map(|routed| routed.shell).unwrap_or(settings.shell),
+                                env,
+                            ),
                         }
                     };
                     anyhow::Ok(TerminalBuilder::new(
@@ -461,7 +516,11 @@ impl Project {
                 })??
                 .await?;
             project.update(cx, move |this, cx| {
-                let terminal_handle = cx.new(|cx| builder.subscribe(cx));
+                let terminal_handle = cx.new(|cx| {
+                    let mut terminal = builder.subscribe(cx);
+                    terminal.set_external_id(external_id);
+                    terminal
+                });
 
                 this.terminals
                     .local_handles

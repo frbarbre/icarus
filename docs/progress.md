@@ -200,6 +200,11 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - `icarus server stop` still ends terminals. After a crash or `kill -9`, the PTYs close with the server and their shells get SIGHUP; anything detached (`nohup`, `setsid`) is orphaned. The next server lists these terminals as `lost` (from `terminals.json`), and they can be respawned.
 - Tested end to end (`crates/icarus-cli/tests/restart_e2e.rs`) on macOS and in a Linux container. The launchd and systemd restart paths have not been tested against a real service.
 
+**App terminals run on the server (§3c, features §2.5/§4):**
+- `icarus terminal attach <id>` (or `--create [--cwd] [--workspace] [--label] [-- cmd…]`) shows a server terminal in the current one, dtach-style: raw mode, the screen replayed, then output streamed by sequence; keys go to `terminal.write`, size changes to `terminal.resize`. It rides out a server restart (reconnects for up to 60 s and resumes by sequence, with no gaps or repeats) and exits with the shell's code (unknown, so 0, for a shell adopted across a restart). Closing the viewer leaves the shell running.
+- In the app, every new local shell in an Icarus workspace (terminal panel, centre terminals, layout terminal tabs) is created on the server for that workspace and shown by running `icarus terminal attach` (the `icarus` next to the app in a release bundle, else on `PATH`). The tab keeps the server id, so a restored tab reattaches to the same shell; if that shell is gone a new one starts. Closing a tab on purpose kills the server shell; quitting or crashing the app leaves it running. Tabs are titled like Zed's own ("folder — zsh"). Upstream hooks: `project::terminals::ShellRouter` (picks the program for local interactive shells), `Terminal::external_id`, and `terminal_view::ExternalTerminalCloser`; Icarus registers both only in the real app. Shells outside Icarus workspaces, remote projects, `NewLocalTerminal` and task terminals stay as Zed runs them.
+- Checked live: a counter started in an app terminal kept counting after the app was killed with `kill -9`, the relaunched app reattached the tab to the same shell with the output that continued meanwhile, and an `icarus server restart` with the app open kept the tab streaming without a gap.
+
 **Language tooling and themes on import (§3b, D10, D28):**
 - Language tooling is Zed's own (extensions plus Zed's `settings.json`); Icarus has no LSP settings or CLI. `icarus settings import` translates Orca's `languageServers`, `formatters` and `linters` (Orca's defaults when absent) into Zed keys: `languages.<Lang>.language_servers` (the chosen server first, its rivals turned off with `!name`, then `...`), `formatter` and `format_on_save`, `lsp.<server>.binary` for a custom command, and `auto_install_extensions` for tools that need one. Zed has pyrefly, pyright, basedpyright, ty, Ruff and typescript-language-server built in; tsgo comes from the `tsgo` extension (server `typescript-ls`) and oxlint/oxfmt from `oxc` (ids checked against zed-industries/extensions).
 - Appearance becomes Zed settings too: `theme` (`mode` as in Orca, `system` by default, with a light and a dark theme), UI, buffer and terminal fonts, terminal line height, and inactive pane opacity. Orca's VS Code editor theme and custom terminal palettes become one Zed theme family, `themes/icarus-imported.json` ("Icarus Imported Dark/Light"); Orca's built-in terminal themes carry no colours and fall back to the Zed theme's.
@@ -221,6 +226,10 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 - Branding: windows and the release-channel name read "Icarus" ("Icarus Dev" locally), the app menu says About/Hide/Quit Icarus, Help links to frbarbre/icarus (Zed's email, Twitter, jobs and release-notes items are gone), Install CLI is gone from the menu (it would replace Zed's `/usr/local/bin/zed`), and `scripts/release/brand-plist.sh` renames Zed in the bundle's permission prompts and document type.
 - Versions: the app keeps Zed's version (1.30.0) for the extension registry; About shows the Icarus version (`ICARUS_VERSION` from the workflow, else the root workspace version) with Zed's beside it, and `icarus --version` / `icarus-server --version` report the stamped version like `server.info` and `update.check` already did.
 
+## CI
+
+`.github/workflows/app.yml` tests the app on every push to main and every PR that touches `app/**`, the three crates it pulls from the root workspace (`icarus-client`, `icarus-protocol`, `icarus-settings`) or the root `Cargo.toml`, and on demand via workflow_dispatch. Four parallel jobs on free hosted runners: `cargo test` for icarus_ui, title_bar, agent_ui, git_ui, project_panel and `workspace --lib` on Linux; the whole `zed` crate under nextest with two retries for upstream's timing-sensitive session-restore tests, also on Linux; clippy with `-D warnings` on icarus_ui, agent_ui, workspace, title_bar and zed (all targets) on macOS so the `cfg(target_os = "macos")` code is linted; and the Icarus visual tests (`ICARUS_VISUAL_ONLY=1`) on macOS, which compare against the tracked `icarus_*.png` baselines and upload the screenshots and diffs when they fail. The macos-15 image's Xcode ships the Metal compiler, so no extra toolchain or `runtime_shaders` is needed. Builds use `CARGO_PROFILE_DEV_DEBUG=0` and no incremental, caches are per job and saved only from main, and no disk cleanup is done because a build peaks under 20 GB on runners with 45+ GB free. The dark baselines depend on the system appearance (the workspace reloads its theme from the window's appearance once One Light is registered), so the visual job forces dark mode; pinning the theme inside the runner would remove that dependency.
+
 ## Blocked on you
 
 Parked until you're back; work continues on other items.
@@ -232,8 +241,14 @@ Parked until you're back; work continues on other items.
 
 ## Next
 
-- App (in progress): Explorer, Source Control and GitHub as right-sidebar panels switched like Orca's, and the diff tab type (one file vs base, edit/diff toggle, full LSP).
-- App: the review mode UI on top of the `review.*` RPCs (queued comments in the diff, verdict, base picker, threads, media in comments).
-- App: notifications (sound, dock badge, the `notification` event), session history in the palette, account switching in the status bar.
-- App: a Remote Control toggle on agent tabs (the `agent.remote_control` RPC) that shows the claude.ai link.
-- Remaining plan items: `icarus theme import vscode|warp <file>` (D10), migration scripts for existing Orca CLI users, multi-server client.
+Gaps against the [MUST] list in features.md, in the order they're being built:
+1. **Terminal details:** splits inside a terminal tab (Mod+D / Mod+Shift+D), macOS line-editing keys translated to readline sequences, task terminals on the server.
+2. **Review mode UI** on the `review.*` RPCs: queued comments in the diff, verdict, base picker, inline PR threads, reviewers (request/re-request), media in comments, "add to agent" from the diff and the GitHub panel.
+3. **Notes:** diff notes, agent notes (`icarus notes` CLI, the agent → diff channel), replying under a note sends it to the agent.
+4. **Source Control actions:** discard, stage, commit (⌘Enter), amend, push, force-with-lease, pull; an agent turns list (not only the latest turn).
+5. **Sidebar and cards:** group by stack, card display options, Linear labels and ⌥⌘L, ⌘J workspace switcher.
+6. **App wiring for server features:** notifications (sound, dock badge), session history in the palette, account switching in the status bar, the Remote Control toggle, remote and multiple servers.
+7. **Settings and import:** an Icarus settings UI (statuses, rules, integrations), Orca keybindings into the keymap, the optional Orca workspace-state import, `icarus theme import vscode|warp` (D10).
+8. **Keyboard details:** ⌥⌘arrows between panes, splits inside a terminal tab, macOS line-editing keys in terminals.
+
+Dropped on purpose: the Claude web view (plan §5 open question; the composer replaces it).

@@ -1588,6 +1588,25 @@ impl Render for TerminalView {
 impl Item for TerminalView {
     type Event = ItemEvent;
 
+    fn on_removed(&self, cx: &mut Context<Self>) {
+        let Some(external_id) = self.terminal.read(cx).external_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(closer) = cx.try_global::<ExternalTerminalCloser>().cloned() else {
+            return;
+        };
+        // Moving a tab to another pane removes then re-adds it; only a tab that is gone was closed.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            if this.upgrade().is_none() {
+                cx.update(|cx| (closer.0)(external_id, cx));
+            }
+        })
+        .detach();
+    }
+
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
             let terminal = self.terminal().read(cx);
@@ -2030,10 +2049,12 @@ impl SerializableItem for TerminalView {
 
         let workspace_id = self.workspace_id?;
         let cwd = terminal.working_directory();
+        let external_id = terminal.external_id().map(str::to_owned);
         let custom_title = self.custom_title.clone();
         self.needs_serialize = false;
 
         let db = TerminalDb::global(cx);
+        let kvp = db::kvp::KeyValueStore::global(cx);
         Some(cx.background_spawn(async move {
             if let Some(cwd) = cwd {
                 db.save_working_directory(item_id, workspace_id, cwd)
@@ -2041,6 +2062,10 @@ impl SerializableItem for TerminalView {
             }
             db.save_custom_title(item_id, workspace_id, custom_title)
                 .await?;
+            if let Some(external_id) = external_id {
+                kvp.write_kvp(external_terminal_key(workspace_id, item_id), external_id)
+                    .await?;
+            }
             Ok(())
         }))
     }
@@ -2058,8 +2083,12 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title) = cx
+            let (cwd, custom_title, external_id) = cx
                 .update(|_window, cx| {
+                    let external_id = db::kvp::KeyValueStore::global(cx)
+                        .read_kvp(&external_terminal_key(workspace_id, item_id))
+                        .log_err()
+                        .flatten();
                     let db = TerminalDb::global(cx);
                     let from_db = db
                         .get_working_directory(item_id, workspace_id)
@@ -2080,13 +2109,15 @@ impl SerializableItem for TerminalView {
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    (cwd, custom_title)
+                    (cwd, custom_title, external_id)
                 })
                 .ok()
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, None));
 
             let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                .update(cx, |project, cx| {
+                    project.create_terminal_shell_reattaching(cwd, external_id, cx)
+                })
                 .await?;
             cx.update(|window, cx| {
                 cx.new(|cx| {
@@ -2264,6 +2295,16 @@ impl SearchableItem for TerminalView {
         // Replacement is not supported in terminal view, so this is a no-op.
     }
 }
+
+fn external_terminal_key(workspace_id: WorkspaceId, item_id: workspace::ItemId) -> String {
+    format!("terminal-external-id:{}:{item_id}", i64::from(workspace_id))
+}
+
+/// Closing a terminal tab on purpose ends a routed shell; quitting the app leaves it running.
+#[derive(Clone)]
+pub struct ExternalTerminalCloser(pub std::sync::Arc<dyn Fn(String, &mut App)>);
+
+impl gpui::Global for ExternalTerminalCloser {}
 
 /// Gets the working directory for the given workspace, respecting the user's settings.
 /// Falls back to home directory when no project directory is available.
@@ -3427,6 +3468,57 @@ mod tests {
         terminal_view.update(cx, |view, _cx| {
             assert!(view.custom_title().is_none());
         });
+    }
+
+    #[gpui::test]
+    async fn test_closing_a_routed_terminal_ends_it_but_moving_it_does_not(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, workspace, window_handle) = init_test_with_window(cx).await;
+        let closed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        cx.update(|cx| {
+            let closed = closed.clone();
+            cx.set_global(ExternalTerminalCloser(std::sync::Arc::new(move |id, _| {
+                closed.lock().expect("closed").push(id);
+            })));
+        });
+        let (pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, false, false, cx);
+        terminal.update(cx, |terminal, _| {
+            terminal.set_external_id(Some("term-1".into()))
+        });
+        let item_id = terminal_view.entity_id();
+        drop(terminal_view);
+        drop(terminal);
+
+        let other = window_handle
+            .update(cx, |_, window, cx| {
+                let other = workspace.update(cx, |workspace, cx| {
+                    workspace.split_pane(pane.clone(), workspace::SplitDirection::Right, window, cx)
+                });
+                workspace::move_item(&pane, &other, item_id, 0, true, window, cx);
+                other
+            })
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(
+            closed.lock().expect("closed").is_empty(),
+            "moving a tab keeps its shell"
+        );
+
+        window_handle
+            .update(cx, |_, window, cx| {
+                other.update(cx, |pane, cx| {
+                    pane.close_item_by_id(item_id, workspace::SaveIntent::Skip, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(*closed.lock().expect("closed"), vec!["term-1".to_string()]);
     }
 
     #[gpui::test]

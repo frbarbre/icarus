@@ -8,6 +8,7 @@ mod model;
 mod next_action;
 pub mod sidebar;
 pub mod status_style;
+mod terminals;
 mod worktree_trust;
 pub mod zed_import;
 
@@ -629,6 +630,7 @@ pub fn init(cx: &mut App) {
     diff_tab::register(cx);
     sidebar::register(cx);
     zed_import::register(cx);
+    terminals::register(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_some() {
             // A workspace opened after its layout was stored (e.g. the app was closed) applies it now.
