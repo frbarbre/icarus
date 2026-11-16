@@ -2,6 +2,8 @@
 extend-exclude = ["scratch/", "private/", "target/", "app/", "*.lock"]
 
 [default.extend-words]
+# Linear GraphQL's "not in" filter operator.
+nin = "nin"
 # Orca settings key names quoted in the compatibility spec.
 Udid = "Udid"
 udid = "udid"

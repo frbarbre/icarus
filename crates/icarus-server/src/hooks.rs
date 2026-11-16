@@ -1342,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_repositorys_own_scripts_need_trust() {
+    fn only_scripts_committed_to_the_repository_need_trust() {
         let stack = layers(
             hooks(json!({ "setup": "shared", "archive": "bye" })),
             hooks(json!({ "setup": "local" })),
