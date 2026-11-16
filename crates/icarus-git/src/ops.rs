@@ -371,7 +371,14 @@ pub fn pull(worktree: &Path) -> Result<SyncState, OpError> {
             "This branch has no upstream to pull from; push it first.",
         ));
     }
-    run(worktree, &["pull", "--no-edit"])?;
+    // Without pull.rebase configured, git refuses to reconcile diverged branches; merge then.
+    let configured = run(worktree, &["config", "--get", "pull.rebase"]).is_ok();
+    let args: &[&str] = if configured {
+        &["pull", "--no-edit"]
+    } else {
+        &["pull", "--no-edit", "--no-rebase"]
+    };
+    run(worktree, args)?;
     sync_state(worktree)
 }
 
