@@ -95,9 +95,9 @@ jobs:
           # A baseline mismatch fails the job after a complete build; keep that build.
           cache-on-failure: true
       # The dark baselines follow the system appearance once One Light is registered; runners default to light.
-      - run: osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to true' || true
+      - run: osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to true'
       - run: cargo build -p zed --bin zed-visual-test-runner --features visual-tests
-      - run: cargo run -p zed --bin zed-visual-test-runner --features visual-tests -- -AppleInterfaceStyle Dark
+      - run: cargo run -p zed --bin zed-visual-test-runner --features visual-tests
         env:
           ICARUS_VISUAL_ONLY: '1'
           VISUAL_TEST_OUTPUT_DIR: ${{ github.workspace }}/app/target/visual_tests
