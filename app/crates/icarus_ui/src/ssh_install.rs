@@ -232,9 +232,13 @@ fn launch_command(icarus: &str) -> AgentServerCommand {
     }
 }
 
-/// Asks in the active window whether to install; false when there's no window or the user declines.
+/// Asks whether to install; false when there's no window or the user declines.
 async fn ask_to_install(host: &str, cx: &mut AsyncApp) -> bool {
-    let Some(window) = cx.update(|cx| cx.active_window()) else {
+    // Tabs restored at launch, or opened while another app is in front, have no active window.
+    let Some(window) = cx.update(|cx| {
+        cx.active_window()
+            .or_else(|| cx.windows().into_iter().next())
+    }) else {
         return false;
     };
     let message = format!("Install Icarus on {host}?");
