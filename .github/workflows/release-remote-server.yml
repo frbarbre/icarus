@@ -79,7 +79,7 @@ jobs:
           bin="target/$TARGET/release/remote-server"
           strip -x "$bin" 2>/dev/null || strip "$bin"
           file "$bin"
-          if [[ "$TARGET" == *-musl ]] && ldd "$bin" >/dev/null 2>&1; then
+          if [[ "$TARGET" == *-musl ]] && ! file "$bin" | grep -qE 'static-pie linked|statically linked'; then
             echo "::error::$TARGET remote server is dynamically linked"
             exit 1
           fi
