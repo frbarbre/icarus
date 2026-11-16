@@ -283,6 +283,10 @@ impl Server {
                 self.creates.finish(&create_id);
                 result
             }
+            "workspace.adopt" => {
+                let p: AdoptParams = params(p)?;
+                self.adopt_workspace(p).await
+            }
             "workspace.create_cancel" => {
                 #[derive(Deserialize)]
                 struct P {
@@ -512,7 +516,11 @@ impl Server {
                 );
                 let result = tokio::task::spawn_blocking(move || {
                     if path.exists() {
-                        icarus_git::remove_worktree(&root, &path, force, delete_branch)
+                        // An adopted worktree can belong to another clone of the project's repository.
+                        let repo = icarus_git::repo_info(&path)
+                            .map(|info| info.root)
+                            .unwrap_or(root);
+                        icarus_git::remove_worktree(&repo, &path, force, delete_branch)
                     } else {
                         Ok(())
                     }
@@ -1056,6 +1064,179 @@ impl Server {
         }
         Ok(value)
     }
+
+    async fn adopt_workspace(&self, p: AdoptParams) -> Result<Value, RpcError> {
+        let found = tokio::task::spawn_blocking(move || inspect_worktree(&p.path))
+            .await
+            .map_err(internal)??;
+        let project = match &p.project {
+            Some(key) => self
+                .store
+                .project(key)
+                .map_err(internal)?
+                .ok_or_else(|| rpc("not_found", format!("project {key}")))?,
+            None => self.project_for_repo(&found.repo)?.ok_or_else(|| {
+                rpc(
+                    "no_project",
+                    format!(
+                        "no project matches the repository at {}; add it with `icarus project add {}`, or pass --project",
+                        found.repo.root.display(),
+                        found.repo.root.display()
+                    ),
+                )
+            })?,
+        };
+        let existing = self.store.workspaces(None).map_err(internal)?;
+        if let Some(workspace) = existing
+            .iter()
+            .find(|workspace| icarus_git::same_path(&workspace.path, &found.path))
+        {
+            return Err(rpc(
+                "exists",
+                format!(
+                    "{} is already the workspace {}",
+                    found.path.display(),
+                    workspace.name
+                ),
+            ));
+        }
+        let name = p
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                found
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        let slug = workspace_slug(&name, SLUG_MAX);
+        if existing
+            .iter()
+            .any(|workspace| workspace.project_id == project.id && workspace.name == slug)
+        {
+            return Err(rpc(
+                "exists",
+                format!(
+                    "{} already has a workspace named {slug}; pass --name",
+                    project.name
+                ),
+            ));
+        }
+        let workspace = Workspace {
+            id: format!("ws-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]),
+            project_id: project.id.clone(),
+            name: slug,
+            path: found.path,
+            branch: Some(found.branch),
+            base_ref: project.base_ref.clone(),
+            status: None,
+            title: None,
+            issue: None,
+            pull_request: None,
+            created_at_ms: now_ms(),
+            pinned: false,
+            manual_order: Some(now_ms() as i64),
+            activity_at_ms: None,
+        };
+        self.store.insert_workspace(&workspace).map_err(internal)?;
+        self.broadcast(
+            "workspace.changed",
+            json!({ "workspaces": [workspace.id], "source": "adopt" }),
+        );
+        Ok(self.workspace_json(&workspace))
+    }
+
+    /// The project registered for this repository's main checkout, else for its canonical remote.
+    fn project_for_repo(
+        &self,
+        repo: &icarus_git::RepoInfo,
+    ) -> Result<Option<crate::state::Project>, RpcError> {
+        if let Some(project) = self.store.project_by_root(&repo.root).map_err(internal)? {
+            return Ok(Some(project));
+        }
+        let Some(remote) = &repo.remote else {
+            return Ok(None);
+        };
+        Ok(self
+            .store
+            .projects()
+            .map_err(internal)?
+            .into_iter()
+            .find(|project| project.remote.as_ref() == Some(remote)))
+    }
+}
+
+#[derive(Deserialize)]
+struct AdoptParams {
+    path: PathBuf,
+    /// Overrides matching the worktree's repository to a project.
+    project: Option<String>,
+    /// Defaults to the worktree's folder name.
+    name: Option<String>,
+}
+
+/// A linked worktree that `workspace.adopt` can record as it is.
+struct FoundWorktree {
+    path: PathBuf,
+    branch: String,
+    repo: icarus_git::RepoInfo,
+}
+
+fn inspect_worktree(path: &std::path::Path) -> Result<FoundWorktree, RpcError> {
+    let shown = path.display();
+    let output = icarus_git::git(
+        path,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .map_err(|e| {
+        rpc(
+            "not_a_worktree",
+            format!("{shown} is not a git worktree: {e:#}"),
+        )
+    })?;
+    let mut lines = output.lines().map(PathBuf::from);
+    let (Some(top), Some(git_dir), Some(common)) = (lines.next(), lines.next(), lines.next())
+    else {
+        return Err(rpc(
+            "not_a_worktree",
+            format!("{shown} is not a git worktree"),
+        ));
+    };
+    if icarus_git::same_path(&git_dir, &common) {
+        return Err(rpc(
+            "main_checkout",
+            format!(
+                "{} is a repository's main checkout, not a linked worktree; register it with `icarus project add`",
+                top.display()
+            ),
+        ));
+    }
+    let branch = icarus_git::git(&top, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map(|branch| branch.trim().to_owned())
+        .ok()
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| {
+            rpc(
+                "detached_head",
+                format!(
+                    "{} has a detached HEAD; check out a branch in it first",
+                    top.display()
+                ),
+            )
+        })?;
+    let repo = icarus_git::repo_info(&top).map_err(|e| rpc("not_a_repo", format!("{e:#}")))?;
+    Ok(FoundWorktree {
+        path: top,
+        branch,
+        repo,
+    })
 }
 
 fn yes() -> bool {

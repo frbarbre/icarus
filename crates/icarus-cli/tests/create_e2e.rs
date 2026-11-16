@@ -298,6 +298,48 @@ fn workspaces_are_marked_read_and_unread() {
     assert!(!env.ok(&["workspace", "list"]).contains("unread"));
 }
 
+#[test]
+fn a_worktree_of_another_clone_is_adopted_by_its_remote_and_removed_from_that_clone() {
+    let env = Env::start(json!({}));
+    let (_, project) = env.project(&[]);
+    let clone = env.repos.path().join("other-clone");
+    git(
+        env.repos.path(),
+        &["clone", "-q", "origin.git", clone.to_str().expect("utf8")],
+    );
+    git(
+        &clone,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:acme/widgets.git",
+        ],
+    );
+    let worktree = env.repos.path().join("orca").join("feature-x");
+    git(
+        &clone,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature/x",
+            worktree.to_str().expect("utf8"),
+        ],
+    );
+
+    let adopted = env.json(&["workspace", "adopt", worktree.to_str().expect("utf8")]);
+    assert_eq!(adopted["project_id"], project.as_str());
+    assert_eq!(adopted["name"], "feature-x");
+    assert_eq!(adopted["branch"], "feature/x");
+    assert!(env.ok(&["workspace", "list"]).contains("feature-x"));
+
+    env.ok(&["workspace", "remove", "feature-x", "--force"]);
+    assert!(!worktree.exists());
+    assert_eq!(git(&clone, &["branch", "--list", "feature/x"]), "");
+}
+
 /// Stands in for the app: answers `client.config` by writing what it would hold.
 #[tokio::test]
 async fn app_config_reaches_the_app_and_prints_its_answer() {

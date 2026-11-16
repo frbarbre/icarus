@@ -40,6 +40,7 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `project scripts <id>` | Show the repository's committed scripts and whether they're trusted. |
 | `project trust <id> [--always]` / `untrust <id>` | Trust or untrust them. |
 | `workspace create --project <p> [name] …` | Create a workspace. See [Workspaces](workspaces.md#from-the-shell). |
+| `workspace adopt <path> [--project <p>] [--name <n>]` | Register an existing worktree as a workspace. See [Workspaces](workspaces.md#adopt-an-existing-worktree). |
 | `workspace list [--project]` / `show <ws>` | List or show workspaces. |
 | `workspace set <ws> [--status] [--title] [--base] [--pin\|--unpin]` | Change a workspace. |
 | `workspace reorder <ws>...` | Put workspaces at the top of the Manual sort. |

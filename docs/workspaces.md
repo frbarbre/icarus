@@ -55,6 +55,19 @@ icarus workspace create --project my-repo --from-issue https://github.com/acme/m
 
 Ctrl-C cancels a create in progress.
 
+### Adopt an existing worktree
+
+A worktree made outside Icarus (by Orca, or with `git worktree add`) can become a workspace where it is:
+
+```sh
+icarus workspace adopt ~/orca/workspaces/my-repo/fix-login
+icarus workspace adopt ../fix-login --project my-repo --name login
+```
+
+Icarus matches the worktree's repository to a project by its main checkout or, for another clone, by its remote; `--project` picks one yourself. The branch is whatever the worktree has checked out, and the name defaults to the folder's name (made DNS-safe, and unique in the project). Nothing runs: no setup script, no agent, no new branch, and the folder stays where it is. Removing an adopted workspace removes its worktree like any other.
+
+Adopt refuses a main checkout (add that with `icarus project add`), a detached HEAD (check out a branch first), and a folder that is already a workspace.
+
 ## Naming
 
 The folder is `<workspace root>/<project>/<slug>`, where the slug is the name made DNS-safe (lowercase letters, digits and dashes), so `<slug>.localhost` dev URLs work. The workspace root is `~/icarus/workspaces` unless you set `workspace.root` (read when the server starts).

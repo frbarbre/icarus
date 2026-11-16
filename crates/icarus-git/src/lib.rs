@@ -246,7 +246,7 @@ pub fn create_worktree(request: &CreateWorktree<'_>) -> Result<Worktree> {
         .context("created worktree not listed")
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+pub fn same_path(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canon(a) == canon(b)
 }

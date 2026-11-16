@@ -685,6 +685,16 @@ enum WorkspaceCommand {
         #[arg(long, value_name = "ID")]
         recipe: Option<String>,
     },
+    /// Register an existing linked worktree as a workspace, leaving it where it is.
+    Adopt {
+        path: PathBuf,
+        /// Defaults to the project registered for the worktree's repository or its remote.
+        #[arg(long)]
+        project: Option<String>,
+        /// Defaults to the worktree's folder name.
+        #[arg(long)]
+        name: Option<String>,
+    },
     List {
         #[arg(long)]
         project: Option<String>,
@@ -2150,6 +2160,20 @@ async fn main() -> Result<()> {
                             tabs
                         }
                     });
+                }
+                WorkspaceCommand::Adopt {
+                    path,
+                    project,
+                    name,
+                } => {
+                    let path = std::fs::canonicalize(path).unwrap_or(path.clone());
+                    let value = client
+                        .request(
+                            "workspace.adopt",
+                            json!({ "path": path, "project": project, "name": name }),
+                        )
+                        .await?;
+                    print(&cli, &value, summary);
                 }
                 WorkspaceCommand::List { project } => {
                     let value = client
