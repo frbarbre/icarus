@@ -505,7 +505,7 @@ async fn run_next_action_starts_an_agent_or_calls_github() {
 fn rules_settings(armed: Option<bool>) -> Value {
     let mut rules = json!({
         "projects": ["widgets"],
-        "orca_compat": {
+        "pr": {
             "enabled": true,
             "statusByCondition": { "draft": "in-progress", "reviewing": "in-review" },
             "reviewInbox": { "enabled": true, "agent": "claude" },
@@ -590,7 +590,7 @@ async fn deleting_a_merged_workspace_runs_the_archive_script_and_a_failure_keeps
     let markers = tempfile::tempdir().expect("markers");
     let marker = markers.path().join("archived.txt");
     let mut settings = rules_settings(Some(true));
-    settings["rules"]["orca_compat"]["onResolved"] = json!("delete");
+    settings["rules"]["pr"]["onResolved"] = json!("delete");
     settings["project"] = json!({ "hooks": { "scripts": { "archive": format!(
         "[ \"$ORCA_WORKSPACE_NAME\" = feat-keep ] && exit 1; echo \"$ORCA_WORKSPACE_NAME\" >> '{}'",
         marker.display()
@@ -661,7 +661,7 @@ async fn unarmed_ticks_are_dry_runs_that_execute_nothing() {
     assert_eq!(world.workspaces().await.len(), 1);
 
     let mut armed = rules_settings(Some(true));
-    armed["rules"]["orca_compat"]["enabled"] = json!(false);
+    armed["rules"]["pr"]["enabled"] = json!(false);
     world.set_settings(armed);
     let disabled = world.request("rules.tick", json!({})).await;
     assert_eq!(disabled["skipped"], "rules are disabled");

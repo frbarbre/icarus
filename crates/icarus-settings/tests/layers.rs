@@ -100,19 +100,19 @@ fn presets_sit_between_defaults_and_user() {
     let mut stack = LayerStack::with_defaults();
     stack.push(layer(
         Layer::User,
-        r#"{"rules":{"orca_compat":{"newWorkspaceStatus":"todo"}}}"#,
+        r#"{"rules":{"pr":{"newWorkspaceStatus":"todo"}}}"#,
     ));
     stack.add_preset("github-pr-flow").expect("preset");
     assert!(matches!(
         stack.add_preset("nope"),
         Err(LoadError::UnknownPreset(_))
     ));
-    let rules = stack.get("rules.orca_compat").expect("key").expect("value");
+    let rules = stack.get("rules.pr").expect("key").expect("value");
     assert_eq!(rules.get("enabled"), Some(&Value::Bool(true)));
     assert_eq!(rules.get("newWorkspaceStatus"), Some(&Value::from("todo")));
     assert_eq!(rules.get("holdStatus"), Some(&Value::Null));
     let explained = stack
-        .explain("rules.orca_compat.statusByCondition.review")
+        .explain("rules.pr.statusByCondition.review")
         .expect("key");
     assert_eq!(
         explained.winner().map(|s| s.label.as_str()),
@@ -191,7 +191,7 @@ fn cli_values_parse_as_json_or_fall_back_to_strings() {
 #[test]
 fn validation_errors_name_the_key() {
     let bad = doc(
-        r#"{"theme":{"mode":"neon","fonts":{"terminalSize":"big"}},"workspace":{"statuses":[{"id":"Todo","label":"x"},{"label":"y"}],"boardColumnWidth":1.5},"sidebar":{"groupby":"repo"},"rules":{"orca_compat":{"holdStatus":null,"enabled":"yes","futureKey":1}},"mystery":1}"#,
+        r#"{"theme":{"mode":"neon","fonts":{"terminalSize":"big"}},"workspace":{"statuses":[{"id":"Todo","label":"x"},{"label":"y"}],"boardColumnWidth":1.5},"sidebar":{"groupby":"repo"},"rules":{"pr":{"holdStatus":null,"enabled":"yes","futureKey":1}},"mystery":1}"#,
     );
     let errors: Vec<String> = layers::validate(&bad, Some(Layer::User))
         .iter()
@@ -205,7 +205,7 @@ fn validation_errors_name_the_key() {
             "user settings: `workspace.statuses.0.id`: `Todo` is not a valid id (lowercase letters, digits, `-`, `_`)",
             "user settings: `workspace.boardColumnWidth`: expected an integer, found 1.5",
             "user settings: `sidebar.groupby`: unknown setting",
-            "user settings: `rules.orca_compat.enabled`: expected a boolean, found string",
+            "user settings: `rules.pr.enabled`: expected a boolean, found string",
             "user settings: `mystery`: unknown setting",
         ]
     );
@@ -233,8 +233,7 @@ fn json_schema_describes_the_document() {
     }
     let hold = layers::get(
         &schema,
-        &KeyPath::parse("properties.rules.properties.orca_compat.properties.holdStatus")
-            .expect("key"),
+        &KeyPath::parse("properties.rules.properties.pr.properties.holdStatus").expect("key"),
     )
     .expect("holdStatus");
     assert_eq!(
@@ -290,6 +289,105 @@ fn layer_files_load_and_save() {
         LayerStack::load(&paths, &[]),
         Err(LoadError::NotObject { .. })
     ));
+}
+
+#[test]
+fn old_pr_rules_key_resolves_under_the_new_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = SettingsPaths {
+        user: Some(dir.path().join("icarus.json")),
+        project: None,
+        project_local: None,
+    };
+    let user = paths.user.as_deref().expect("user");
+    std::fs::write(
+        user,
+        r#"{"rules":{"enabled":true,"orca_compat":{"holdStatus":"todo"},"armed":true}}"#,
+    )
+    .expect("write");
+
+    let stack = LayerStack::load(&paths, &[]).expect("load");
+    assert_eq!(
+        stack.get("rules.pr.holdStatus").expect("key"),
+        Some(Value::from("todo"))
+    );
+    assert_eq!(
+        stack.get("rules.orca_compat.holdStatus").expect("key"),
+        Some(Value::from("todo"))
+    );
+    let explained = stack.explain("rules.orca_compat.holdStatus").expect("key");
+    assert_eq!(explained.key.to_string(), "rules.pr.holdStatus");
+    assert_eq!(
+        explained.winner().and_then(|s| s.origin.as_deref()),
+        Some(user)
+    );
+    assert!(stack.validate().is_empty());
+}
+
+#[test]
+fn writing_a_layer_migrates_the_old_pr_rules_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("icarus.json");
+    std::fs::write(
+        &path,
+        r#"{"rules":{"enabled":true,"orca_compat":{"holdStatus":"todo"},"armed":true}}"#,
+    )
+    .expect("write");
+
+    let mut user = layers::read_layer(Layer::User, &path)
+        .expect("read")
+        .expect("doc");
+    layers::set(
+        &mut user,
+        &KeyPath::parse("rules.orca_compat.onResolved").expect("key"),
+        Value::from("delete"),
+    )
+    .expect("set");
+    layers::write_document(&path, &user).expect("write");
+
+    assert_eq!(
+        layers::read_document(&path).expect("read").expect("doc"),
+        doc(
+            r#"{"rules":{"enabled":true,"pr":{"holdStatus":"todo","onResolved":"delete"},"armed":true}}"#
+        )
+    );
+    let written = std::fs::read_to_string(&path).expect("read");
+    assert!(!written.contains("orca_compat"), "{written}");
+}
+
+#[test]
+fn new_pr_rules_key_wins_over_the_old_one_in_the_same_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("icarus.json");
+    std::fs::write(
+        &path,
+        r#"{"rules":{"orca_compat":{"holdStatus":"old"},"pr":{"holdStatus":"new"}}}"#,
+    )
+    .expect("write");
+
+    let user = layers::read_layer(Layer::User, &path)
+        .expect("read")
+        .expect("doc");
+    assert_eq!(
+        layers::get(&user, &KeyPath::parse("rules.pr.holdStatus").expect("key")),
+        Some(&Value::from("new"))
+    );
+    let errors: Vec<String> = layers::validate(&user, Some(Layer::User))
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "user settings: `rules.orca_compat`: ignored: renamed to `rules.pr`, which this file also sets"
+        ]
+    );
+
+    layers::write_document(&path, &user).expect("write");
+    assert_eq!(
+        layers::read_document(&path).expect("read").expect("doc"),
+        doc(r#"{"rules":{"pr":{"holdStatus":"new"}}}"#)
+    );
 }
 
 #[test]

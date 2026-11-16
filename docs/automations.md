@@ -49,7 +49,7 @@ icarus rules tick     # run now
 
 ## Rules
 
-The rules live under the `rules.orca_compat` settings key. Settings → Automation and Pull request rules edit them.
+The rules live under the `rules.pr` settings key. Settings → Automation and Pull request rules edit them.
 
 ### Move cards by pull request state
 
@@ -73,7 +73,7 @@ Map conditions to status ids in Settings → Automation, or:
 ```json
 {
   "rules": {
-    "orca_compat": {
+    "pr": {
       "enabled": true,
       "statusByCondition": {
         "draft": "in-progress",
@@ -90,7 +90,7 @@ A condition you don't map never moves a card.
 
 ### Other options
 
-| Setting (under `rules.orca_compat`) | What it does |
+| Setting (under `rules.pr`) | What it does |
 |---|---|
 | `newWorkspaceStatus` | The column new workspaces start in. |
 | `holdStatus` | A column the rules never touch. Park a workspace there to keep it as it is. |

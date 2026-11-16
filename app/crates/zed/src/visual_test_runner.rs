@@ -1289,7 +1289,7 @@ fn run_icarus_settings_tests(
             "enabled": true,
             "armed": false,
             "interval_ms": 60000,
-            "orca_compat": {
+            "pr": {
                 "enabled": true,
                 "statusByCondition": { "merged": "done", "draft": "in-progress", "review": "review" },
             },

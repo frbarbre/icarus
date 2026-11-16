@@ -1,6 +1,7 @@
 mod path;
 mod schema;
 
+use std::borrow::Cow;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,9 @@ pub const PROJECT_LOCAL_FILE: &str = "icarus.local.json";
 pub const USER_FILE: &str = "icarus.json";
 // User settings lived here until the app took this directory for its Zed `settings.json`.
 const LEGACY_USER_FILE: &str = "settings.json";
+const PR_RULES: &str = "pr";
+// `rules.pr` was named `rules.orca_compat`; older files and keys still resolve to it.
+const LEGACY_PR_RULES: &str = "orca_compat";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Layer {
@@ -221,7 +225,7 @@ pub fn read_document(path: &Path) -> Result<Option<Value>, LoadError> {
             });
         }
     };
-    let doc = json::parse(&text).map_err(|source| LoadError::Parse {
+    let mut doc = json::parse(&text).map_err(|source| LoadError::Parse {
         path: path.to_owned(),
         source,
     })?;
@@ -230,12 +234,46 @@ pub fn read_document(path: &Path) -> Result<Option<Value>, LoadError> {
             path: path.to_owned(),
         });
     }
+    rename_legacy_keys(&mut doc, false);
     Ok(Some(doc))
+}
+
+fn has_legacy_keys(doc: &Value) -> bool {
+    doc.get("rules")
+        .and_then(|rules| rules.get(LEGACY_PR_RULES))
+        .is_some()
+}
+
+// With both names in one file the new one wins; reads keep the old one so validation can flag it, writes drop it.
+fn rename_legacy_keys(doc: &mut Value, drop_shadowed: bool) {
+    let Some(rules) = doc
+        .as_object_mut()
+        .and_then(|doc| doc.get_mut("rules"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(index) = rules.get_index_of(LEGACY_PR_RULES) else {
+        return;
+    };
+    if rules.contains_key(PR_RULES) {
+        if drop_shadowed {
+            rules.shift_remove_index(index);
+        }
+        return;
+    }
+    if let Some((_, value)) = rules.shift_remove_index(index) {
+        rules.shift_insert(index, PR_RULES.to_owned(), value);
+    }
 }
 
 pub fn write_document(path: &Path, doc: &Value) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+    }
+    let mut doc = Cow::Borrowed(doc);
+    if has_legacy_keys(&doc) {
+        rename_legacy_keys(doc.to_mut(), true);
     }
     let mut text = doc.to_pretty_string();
     text.push('\n');

@@ -203,7 +203,7 @@ impl CardView {
         self.group_by == GroupBy::Status || self.shows("workspace-status")
     }
 
-    /// Reads `workspace.cardFields`, the `sidebar` object and `rules.orca_compat`.
+    /// Reads `workspace.cardFields`, the `sidebar` object and `rules.pr`.
     pub fn from_settings(
         card_fields: &serde_json::Value,
         sidebar: &serde_json::Value,

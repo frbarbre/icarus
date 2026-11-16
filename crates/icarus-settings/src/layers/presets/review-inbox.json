@@ -1,6 +1,6 @@
 {
   "rules": {
-    "orca_compat": {
+    "pr": {
       "enabled": true,
       "statusByCondition": {
         "reviewing": "in-review"

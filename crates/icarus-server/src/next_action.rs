@@ -65,7 +65,7 @@ fn setting_str<'a>(settings: &'a Value, path: &[&str]) -> Option<&'a str> {
 }
 
 pub(crate) fn orca_config(settings: &Value) -> OrcaRuleConfig {
-    normalize(setting(settings, &["rules", "orca_compat"]).unwrap_or(&Value::Null))
+    normalize(setting(settings, &["rules", "pr"]).unwrap_or(&Value::Null))
 }
 
 /// How an agent session is launched: which provider, model and command line.

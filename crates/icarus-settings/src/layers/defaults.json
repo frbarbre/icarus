@@ -16,7 +16,7 @@
     "projectOrderBy": "manual"
   },
   "rules": {
-    "orca_compat": {
+    "pr": {
       "enabled": false,
       "statusByCondition": {},
       "mergingCheckName": "Reviews satisfied",

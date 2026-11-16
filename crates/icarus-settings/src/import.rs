@@ -32,7 +32,7 @@ const TRANSLATED_SETTINGS: [&str; 3] = ["languageServers", "formatters", "linter
 
 const UI_MAP: [(&str, &str); 13] = [
     ("workspaceStatuses", "workspace.statuses"),
-    ("workspaceStatusRules", "rules.orca_compat"),
+    ("workspaceStatusRules", "rules.pr"),
     ("worktreeCardProperties", "workspace.cardFields"),
     ("workspaceBoardOpacity", "workspace.boardOpacity"),
     ("workspaceBoardColumnWidth", "workspace.boardColumnWidth"),
@@ -390,7 +390,7 @@ impl Importer {
     }
 
     fn check_rules(&mut self) {
-        let Some(rules) = layers::get(&self.user, &path("rules.orca_compat")) else {
+        let Some(rules) = layers::get(&self.user, &path("rules.pr")) else {
             return;
         };
         let enabled = rules.get("enabled").and_then(Value::as_bool) == Some(true);
@@ -400,13 +400,13 @@ impl Importer {
             .is_some_and(|ids| !ids.is_empty());
         if enabled && !scoped {
             self.report.notes.push(
-                "rules.orca_compat: the export carries no project scope (repoIds); the rules do nothing until projects are chosen".into(),
+                "rules.pr: the export carries no project scope (repoIds); the rules do nothing until projects are chosen".into(),
             );
         }
         if rules.get("holdStatus").is_none() {
-            self.report.notes.push(
-                "rules.orca_compat: no holdStatus (older Orca build); absent means no hold".into(),
-            );
+            self.report
+                .notes
+                .push("rules.pr: no holdStatus (older Orca build); absent means no hold".into());
         }
     }
 

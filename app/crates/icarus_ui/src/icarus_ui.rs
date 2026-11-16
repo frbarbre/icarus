@@ -1076,7 +1076,7 @@ async fn fetch_snapshot(client: Arc<Client>) -> Result<Snapshot> {
     let statuses = get("workspace.statuses").await?;
     let card_fields = get("workspace.cardFields").await.unwrap_or_default();
     let sidebar = get("sidebar").await.unwrap_or_default();
-    let rules = get("rules.orca_compat").await.unwrap_or_default();
+    let rules = get("rules.pr").await.unwrap_or_default();
     let projects = client
         .request("project.list", serde_json::json!({}))
         .await

@@ -58,7 +58,7 @@ fn statuses_rules_and_prompts_map_verbatim() {
         .collect();
     assert_eq!(ids[4], "status-3-2");
 
-    let rules = get(user, "rules.orca_compat").expect("rules");
+    let rules = get(user, "rules.pr").expect("rules");
     assert_eq!(Some(rules), original.ui_value("workspaceStatusRules"));
     let typed = WorkspaceStatusRuleConfig::from_value(rules).expect("engine-readable");
     assert_eq!(typed.hold_status(), Some("status-9"));
@@ -140,7 +140,7 @@ fn statuses_rules_and_prompts_map_verbatim() {
 #[test]
 fn absent_hold_status_stays_absent() {
     let import = import_fixture("old-build-export.json");
-    let rules = get(&import.user, "rules.orca_compat").expect("rules");
+    let rules = get(&import.user, "rules.pr").expect("rules");
     assert!(rules.get("holdStatus").is_none());
     let typed = WorkspaceStatusRuleConfig::from_value(rules).expect("shape");
     assert_eq!(typed.hold_status, Presence::Absent);
@@ -159,7 +159,7 @@ fn absent_hold_status_stays_absent() {
         origin: None,
         doc: import.user.clone(),
     });
-    let explained = stack.explain("rules.orca_compat.holdStatus").expect("key");
+    let explained = stack.explain("rules.pr.holdStatus").expect("key");
     assert_eq!(explained.value, Some(Value::Null));
     assert_eq!(explained.winner().map(|s| s.layer), Some(Layer::Defaults));
 }
@@ -268,7 +268,7 @@ fn report_lists_what_was_not_mapped() {
         report
             .mapped
             .iter()
-            .any(|m| m.from == "ui.workspaceStatusRules" && m.to == "rules.orca_compat")
+            .any(|m| m.from == "ui.workspaceStatusRules" && m.to == "rules.pr")
     );
     assert!(report.notes.iter().any(|n| n.contains("3 bindings")));
     assert!(
@@ -298,7 +298,7 @@ fn edits_in_icarus_show_up_in_the_export() {
     .expect("append");
     layers::set(
         &mut import.user,
-        &KeyPath::parse("rules.orca_compat.holdStatus").expect("key"),
+        &KeyPath::parse("rules.pr.holdStatus").expect("key"),
         Value::Null,
     )
     .expect("set");

@@ -303,8 +303,8 @@ pub fn document_schema() -> Schema {
             "Automations.",
             closed(vec![
                 field(
-                    "orca_compat",
-                    "Orca's PR status rule config, consumed by the rules engine as is.",
+                    "pr",
+                    "Pull request rules: status moves, review inbox and agent prompts.",
                     status_rules_schema(),
                 ),
                 field("enabled", "Run the automation loop.", Bool),
@@ -716,6 +716,15 @@ pub fn validate(doc: &Value, layer: Option<Layer>) -> Vec<ValidationError> {
         layer,
         &mut errors,
     );
+    let legacy = format!("rules.{}", super::LEGACY_PR_RULES);
+    for error in &mut errors {
+        if error.key == legacy {
+            error.message = format!(
+                "ignored: renamed to `rules.{}`, which this file also sets",
+                super::PR_RULES
+            );
+        }
+    }
     errors
 }
 

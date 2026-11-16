@@ -113,7 +113,7 @@ impl Field {
     }
 }
 
-const NEW_WORKSPACE_STATUS: &str = "rules.orca_compat.newWorkspaceStatus";
+const NEW_WORKSPACE_STATUS: &str = "rules.pr.newWorkspaceStatus";
 
 const AGENTS: &[Field] = &[
     field(
@@ -150,7 +150,7 @@ const AUTOMATION: &[Field] = &[
         Control::Integer,
     ),
     field(
-        "rules.orca_compat.enabled",
+        "rules.pr.enabled",
         "Move cards by pull request state",
         "The status rules below.",
         Control::Toggle,
@@ -165,82 +165,82 @@ const RULE_OPTIONS: &[Field] = &[
         Control::Status,
     ),
     field(
-        "rules.orca_compat.holdStatus",
+        "rules.pr.holdStatus",
         "Hold workspaces in",
         "The rules never move, remove or update a workspace in this column.",
         Control::Status,
     ),
     field(
-        "rules.orca_compat.mergingCheckName",
+        "rules.pr.mergingCheckName",
         "Merge gate check name",
         "The check run or commit status that decides \"Merge gate passed\".",
         Control::Text,
     )
     .placeholder("Reviews satisfied"),
     field(
-        "rules.orca_compat.pmApprovalTeam",
+        "rules.pr.pmApprovalTeam",
         "PM approval team",
         "As org/team-slug; empty skips the PM approval column.",
         Control::Text,
     )
     .placeholder("org/team-slug"),
     field(
-        "rules.orca_compat.reviewEnteredCommand",
+        "rules.pr.reviewEnteredCommand",
         "Command when your PR enters Review",
         "Runs once in the workspace's folder each time it moves into the review column.",
         Control::Text,
     )
     .placeholder("Run nothing"),
     field(
-        "rules.orca_compat.onResolved",
+        "rules.pr.onResolved",
         "When your PR is merged or closed",
         "Delete removes the workspace once its pull request is done.",
         Control::Choice(&["none", "delete"]),
     ),
     field(
-        "rules.orca_compat.onReviewed",
+        "rules.pr.onReviewed",
         "When you have reviewed",
         "Delete removes a review workspace once your review is in.",
         Control::Choice(&["none", "delete"]),
     ),
     field(
-        "rules.orca_compat.resolveConflictsWithAgent",
+        "rules.pr.resolveConflictsWithAgent",
         "Resolve conflicts with an agent",
         "Start an agent when your PR enters the conflicts column.",
         Control::Toggle,
     ),
     field(
-        "rules.orca_compat.conflictPromptTemplate",
+        "rules.pr.conflictPromptTemplate",
         "Conflict prompt",
         "What that agent is asked; blank uses the built-in prompt.",
         Control::Prompt,
     ),
     field(
-        "rules.orca_compat.reviewInbox.enabled",
+        "rules.pr.reviewInbox.enabled",
         "Review inbox",
         "Create a review workspace for each review request.",
         Control::Toggle,
     ),
     field(
-        "rules.orca_compat.reviewInbox.agent",
+        "rules.pr.reviewInbox.agent",
         "Review agent",
         "Runs reviews, conflict fixes and action prompts.",
         Control::Choice(&["claude", "codex"]),
     ),
     field(
-        "rules.orca_compat.reviewInbox.view",
+        "rules.pr.reviewInbox.view",
         "Review agent view",
         "How a review workspace shows its agent.",
         Control::Choice(&["chat", "terminal", "default"]),
     ),
     field(
-        "rules.orca_compat.reviewInbox.promptTemplate",
+        "rules.pr.reviewInbox.promptTemplate",
         "Review prompt",
         "The first look at a pull request; blank uses the built-in prompt.",
         Control::Prompt,
     ),
     field(
-        "rules.orca_compat.reviewInbox.rereviewPromptTemplate",
+        "rules.pr.reviewInbox.rereviewPromptTemplate",
         "Re-review prompt",
         "After new commits; blank uses the built-in prompt.",
         Control::Prompt,
@@ -250,25 +250,25 @@ const RULE_OPTIONS: &[Field] = &[
 /// Orca's top bar action prompts (`actionPrompts`), used by the next-action button.
 const ACTION_PROMPTS: &[Field] = &[
     field(
-        "rules.orca_compat.actionPrompts.commitAndPush",
+        "rules.pr.actionPrompts.commitAndPush",
         "Commit & push",
         "Blank uses the built-in prompt.",
         Control::Prompt,
     ),
     field(
-        "rules.orca_compat.actionPrompts.createPullRequest",
+        "rules.pr.actionPrompts.createPullRequest",
         "Create PR",
         "Blank uses the built-in prompt.",
         Control::Prompt,
     ),
     field(
-        "rules.orca_compat.actionPrompts.readyForReview",
+        "rules.pr.actionPrompts.readyForReview",
         "Ready for review",
         "Blank uses the built-in prompt.",
         Control::Prompt,
     ),
     field(
-        "rules.orca_compat.actionPrompts.reviewPullRequest",
+        "rules.pr.actionPrompts.reviewPullRequest",
         "Review",
         "Blank uses the built-in prompt.",
         Control::Prompt,
@@ -347,7 +347,7 @@ pub const CONDITIONS: &[(&str, &str)] = &[
     ("review", "In review"),
 ];
 
-const STATUS_BY_CONDITION: &str = "rules.orca_compat.statusByCondition";
+const STATUS_BY_CONDITION: &str = "rules.pr.statusByCondition";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
@@ -2068,7 +2068,7 @@ mod tests {
                 "enabled": true,
                 "armed": false,
                 "interval_ms": 60000,
-                "orca_compat": { "enabled": true, "statusByCondition": { "conflicts": "review" } },
+                "pr": { "enabled": true, "statusByCondition": { "conflicts": "review" } },
             },
             "agents": { "default": "claude" },
             "notifications": { "enabled": true },
@@ -2178,13 +2178,13 @@ mod tests {
                 .any(|c| c["key"] == "workspace.cardFields" && c["value"] == json!([]))
         );
         assert!(sets.iter().any(|c| {
-            c["key"] == "rules.orca_compat.statusByCondition.draft"
+            c["key"] == "rules.pr.statusByCondition.draft"
                 && c["layer"] == "project"
                 && c["project"] == "p-1"
         }));
         assert_eq!(
             calls_to(&calls, "config.unset")[0],
-            json!({ "key": "rules.orca_compat.statusByCondition.conflicts", "layer": "project", "project": "p-1" })
+            json!({ "key": "rules.pr.statusByCondition.conflicts", "layer": "project", "project": "p-1" })
         );
     }
 
@@ -2199,8 +2199,8 @@ mod tests {
             stub_rpc(cx, |method, _| match method {
                 "config.get" => {
                     let mut value = resolved();
-                    value["rules"]["orca_compat"]["onResolved"] = json!("delete");
-                    value["rules"]["orca_compat"]["reviewInbox"] =
+                    value["rules"]["pr"]["onResolved"] = json!("delete");
+                    value["rules"]["pr"]["reviewInbox"] =
                         json!({ "enabled": true, "agent": "claude", "promptTemplate": "Review {pr_url}\nCarefully." });
                     Ok(value)
                 }
@@ -2225,11 +2225,11 @@ mod tests {
             );
         }
         let prompt = view.read_with(window, |view, cx| {
-            assert!(view.set_here("rules.orca_compat.onResolved"));
-            let editor = view.editors["rules.orca_compat.reviewInbox.promptTemplate"].clone();
+            assert!(view.set_here("rules.pr.onResolved"));
+            let editor = view.editors["rules.pr.reviewInbox.promptTemplate"].clone();
             assert_eq!(editor.read(cx).text(cx), "Review {pr_url}\nCarefully.");
             assert_eq!(
-                view.editors["rules.orca_compat.conflictPromptTemplate"]
+                view.editors["rules.pr.conflictPromptTemplate"]
                     .read(cx)
                     .text(cx),
                 "",
@@ -2239,14 +2239,9 @@ mod tests {
         });
 
         view.update_in(window, |view, window, cx| {
+            view.write("rules.pr.onReviewed", Some(json!("delete")), window, cx);
             view.write(
-                "rules.orca_compat.onReviewed",
-                Some(json!("delete")),
-                window,
-                cx,
-            );
-            view.write(
-                "rules.orca_compat.resolveConflictsWithAgent",
+                "rules.pr.resolveConflictsWithAgent",
                 Some(json!(true)),
                 window,
                 cx,
@@ -2255,7 +2250,7 @@ mod tests {
                 editor.set_text("Look closer.\nTwice.", window, cx)
             });
             view.commit_text(
-                "rules.orca_compat.reviewInbox.promptTemplate",
+                "rules.pr.reviewInbox.promptTemplate",
                 "Look closer.\nTwice.",
                 false,
                 window,
@@ -2265,10 +2260,10 @@ mod tests {
         window.run_until_parked();
         let sets = calls_to(&calls, "config.set");
         for (key, value) in [
-            ("rules.orca_compat.onReviewed", json!("delete")),
-            ("rules.orca_compat.resolveConflictsWithAgent", json!(true)),
+            ("rules.pr.onReviewed", json!("delete")),
+            ("rules.pr.resolveConflictsWithAgent", json!(true)),
             (
-                "rules.orca_compat.reviewInbox.promptTemplate",
+                "rules.pr.reviewInbox.promptTemplate",
                 json!("Look closer.\nTwice."),
             ),
         ] {
@@ -2356,8 +2351,8 @@ mod tests {
             stub_rpc(cx, |method, _| match method {
                 "config.get" => {
                     let mut value = resolved();
-                    value["rules"]["orca_compat"]["mergingCheckName"] = json!("Merge gate");
-                    value["rules"]["orca_compat"]["actionPrompts"] =
+                    value["rules"]["pr"]["mergingCheckName"] = json!("Merge gate");
+                    value["rules"]["pr"]["actionPrompts"] =
                         json!({ "readyForReview": "Polish #{{prNumber}}." });
                     Ok(value)
                 }
@@ -2372,9 +2367,9 @@ mod tests {
         window.run_until_parked();
         for key in [
             NEW_WORKSPACE_STATUS,
-            "rules.orca_compat.holdStatus",
-            "rules.orca_compat.pmApprovalTeam",
-            "rules.orca_compat.actionPrompts.commitAndPush",
+            "rules.pr.holdStatus",
+            "rules.pr.pmApprovalTeam",
+            "rules.pr.actionPrompts.commitAndPush",
         ] {
             assert!(
                 calls_to(&calls, "config.explain")
@@ -2385,13 +2380,13 @@ mod tests {
         }
         view.read_with(window, |view, cx| {
             let text = |key: &str| view.editors[key].read(cx).text(cx);
-            assert_eq!(text("rules.orca_compat.mergingCheckName"), "Merge gate");
+            assert_eq!(text("rules.pr.mergingCheckName"), "Merge gate");
             assert_eq!(
-                text("rules.orca_compat.actionPrompts.readyForReview"),
+                text("rules.pr.actionPrompts.readyForReview"),
                 "Polish #{{prNumber}}."
             );
             assert_eq!(
-                text("rules.orca_compat.actionPrompts.reviewPullRequest"),
+                text("rules.pr.actionPrompts.reviewPullRequest"),
                 "",
                 "blank is the built-in prompt"
             );
@@ -2399,28 +2394,17 @@ mod tests {
 
         view.update_in(window, |view, window, cx| {
             view.choose_status(NEW_WORKSPACE_STATUS, Some("todo".into()), window, cx);
-            view.choose_status(
-                "rules.orca_compat.holdStatus",
-                Some("review".into()),
-                window,
-                cx,
-            );
+            view.choose_status("rules.pr.holdStatus", Some("review".into()), window, cx);
+            view.commit_text("rules.pr.pmApprovalTeam", "acme/pm", false, window, cx);
             view.commit_text(
-                "rules.orca_compat.pmApprovalTeam",
-                "acme/pm",
-                false,
-                window,
-                cx,
-            );
-            view.commit_text(
-                "rules.orca_compat.reviewEnteredCommand",
+                "rules.pr.reviewEnteredCommand",
                 "mise run stop",
                 false,
                 window,
                 cx,
             );
             view.commit_text(
-                "rules.orca_compat.actionPrompts.commitAndPush",
+                "rules.pr.actionPrompts.commitAndPush",
                 "Commit it.\nPush it.",
                 false,
                 window,
@@ -2436,21 +2420,18 @@ mod tests {
         };
         assert_eq!(set(NEW_WORKSPACE_STATUS), Some(json!("todo")));
         assert!(
-            set("rules.orca_compat.newWorkspaceStatusSince")
+            set("rules.pr.newWorkspaceStatusSince")
                 .is_some_and(|since| since.as_u64().is_some_and(|since| since > 0)),
             "Orca stamps when the column took effect"
         );
-        assert_eq!(set("rules.orca_compat.holdStatus"), Some(json!("review")));
+        assert_eq!(set("rules.pr.holdStatus"), Some(json!("review")));
+        assert_eq!(set("rules.pr.pmApprovalTeam"), Some(json!("acme/pm")));
         assert_eq!(
-            set("rules.orca_compat.pmApprovalTeam"),
-            Some(json!("acme/pm"))
-        );
-        assert_eq!(
-            set("rules.orca_compat.reviewEnteredCommand"),
+            set("rules.pr.reviewEnteredCommand"),
             Some(json!("mise run stop"))
         );
         assert_eq!(
-            set("rules.orca_compat.actionPrompts.commitAndPush"),
+            set("rules.pr.actionPrompts.commitAndPush"),
             Some(json!("Commit it.\nPush it."))
         );
 
@@ -2463,7 +2444,7 @@ mod tests {
             .map(|call| call["key"].clone())
             .collect();
         assert!(unset.contains(&json!(NEW_WORKSPACE_STATUS)));
-        assert!(unset.contains(&json!("rules.orca_compat.newWorkspaceStatusSince")));
+        assert!(unset.contains(&json!("rules.pr.newWorkspaceStatusSince")));
     }
 
     #[gpui::test]

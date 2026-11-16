@@ -138,10 +138,7 @@ impl Server {
         let rules = setting(&settings, &["rules"])
             .cloned()
             .unwrap_or(Value::Null);
-        let orca = rules
-            .get("orca_compat")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let orca = rules.get("pr").cloned().unwrap_or_else(|| json!({}));
         let enabled = rules
             .get("enabled")
             .and_then(Value::as_bool)

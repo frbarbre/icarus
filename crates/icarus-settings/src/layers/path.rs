@@ -45,6 +45,9 @@ impl KeyPath {
         if segments.iter().any(String::is_empty) {
             return Err(KeyError::EmptySegment(key.to_owned()));
         }
+        if segments.len() > 1 && segments[0] == "rules" && segments[1] == super::LEGACY_PR_RULES {
+            segments[1] = super::PR_RULES.to_owned();
+        }
         Ok(Self(segments))
     }
 

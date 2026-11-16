@@ -302,7 +302,7 @@ async fn the_github_poll_notifies_ci_failures_merges_and_review_requests_once() 
     );
     let settings = json!({ "rules": {
         "projects": ["widgets"],
-        "orca_compat": { "enabled": true, "reviewInbox": { "enabled": true, "agent": "claude" } },
+        "pr": { "enabled": true, "reviewInbox": { "enabled": true, "agent": "claude" } },
     } });
     let world = World::new(settings, json!({ "viewer": "me" })).await;
     let project = world
