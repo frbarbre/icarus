@@ -27,6 +27,11 @@ priority = 99
 filter = 'test(test_rainbow_bracket_highlights) or test(test_wrapped_invisibles_drawing) or test(test_basic_following) or test(test_random_diagnostics_blocks)'
 slow-timeout = { period = "300s", terminate-after = 1 }
 
+# 30 iterations of a full window restore each; slower Linux runners need more than a minute.
+[[profile.default.overrides]]
+filter = 'package(zed) and test(/_still_restoring_/)'
+slow-timeout = { period = "300s", terminate-after = 1 }
+
 [[profile.default.overrides]]
 filter = 'package(extension_host) and test(test_extension_store_with_test_extension)'
 slow-timeout = { period = "300s", terminate-after = 1 }
