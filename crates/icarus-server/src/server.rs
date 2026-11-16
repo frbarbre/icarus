@@ -25,6 +25,58 @@ use crate::paths::ServerPaths;
 use crate::state::Store;
 use crate::terminal::{SpawnOptions, TerminalEvent, TerminalManager};
 
+/// `workspace.root` from the user's settings, so restarts keep the folder without an env var.
+fn configured_workspace_root(home: &std::path::Path) -> Option<PathBuf> {
+    use icarus_settings::layers::{self, Layer, SettingsPaths};
+    let path = SettingsPaths::discover(None).user?;
+    let doc = match layers::read_layer(Layer::User, &path) {
+        Ok(doc) => doc?,
+        Err(error) => {
+            tracing::warn!("workspace.root: reading {}: {error:?}", path.display());
+            return None;
+        }
+    };
+    let root = doc.get("workspace")?.get("root")?.as_str()?.trim().to_string();
+    expand_workspace_root(&root, home)
+}
+
+fn expand_workspace_root(root: &str, home: &std::path::Path) -> Option<PathBuf> {
+    match root {
+        "" => None,
+        "~" => Some(home.to_path_buf()),
+        _ => match root.strip_prefix("~/") {
+            Some(rest) => Some(home.join(rest)),
+            None if std::path::Path::new(root).is_absolute() => Some(PathBuf::from(root)),
+            None => {
+                tracing::warn!("workspace.root must be absolute or start with ~/: {root}");
+                None
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod workspace_root_tests {
+    use super::expand_workspace_root;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn expands_home_and_rejects_relative_roots() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            expand_workspace_root("~/code/ws", home),
+            Some(PathBuf::from("/home/me/code/ws"))
+        );
+        assert_eq!(expand_workspace_root("~", home), Some(home.to_path_buf()));
+        assert_eq!(
+            expand_workspace_root("/srv/ws", home),
+            Some(PathBuf::from("/srv/ws"))
+        );
+        assert_eq!(expand_workspace_root("ws", home), None);
+        assert_eq!(expand_workspace_root("", home), None);
+    }
+}
+
 pub struct Server {
     pub(crate) paths: ServerPaths,
     token: String,
@@ -133,12 +185,11 @@ impl Server {
             let _ = agent.kill().await;
             agents.remove(agent.id());
         }
+        let home = dirs::home_dir().context("no home directory")?;
         let workspace_root = match std::env::var_os("ICARUS_WORKSPACE_ROOT") {
             Some(root) => PathBuf::from(root),
-            None => dirs::home_dir()
-                .context("no home directory")?
-                .join("icarus")
-                .join("workspaces"),
+            None => configured_workspace_root(&home)
+                .unwrap_or_else(|| home.join("icarus").join("workspaces")),
         };
         let server = Arc::new(Self {
             agents,

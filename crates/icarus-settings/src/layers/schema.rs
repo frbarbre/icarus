@@ -263,6 +263,11 @@ pub fn document_schema() -> Schema {
                 ),
                 field("boardOpacity", "", Number),
                 field("boardColumnWidth", "", Integer),
+                field(
+                    "root",
+                    "Folder new workspaces are created in; `~` is the home folder. Read when the server starts.",
+                    Str,
+                ),
             ]),
         ),
         field(
