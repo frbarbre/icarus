@@ -42,7 +42,15 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
+          set -euo pipefail
           rm -f SHA256SUMS
+          # The app downloads these by name for SSH hosts; runs before 0.1.1 didn't build them.
+          for asset in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64; do
+            if [ ! -f "icarus-remote-server-$VERSION-$asset.gz" ]; then
+              echo "::error::missing icarus-remote-server-$VERSION-$asset.gz"
+              exit 1
+            fi
+          done
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
       - name: Create the release

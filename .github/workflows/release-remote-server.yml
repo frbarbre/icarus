@@ -1,0 +1,97 @@
+name: release remote server
+
+# Builds the Zed fork's remote server, which SSH remote projects run on the host. Icarus
+# releases download it from their own GitHub release (icarus_remote_server_asset in
+# app/crates/auto_update), not zed.dev's, which is built from upstream Zed. Linux builds are
+# static musl, as Zed's own, so they run on any distro. Called by release.yml.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Icarus version without the v, e.g. 0.2.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: remote server (${{ matrix.asset }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            asset: linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: linux-aarch64
+          - os: macos-26
+            target: aarch64-apple-darwin
+            asset: macos-aarch64
+          - os: macos-26
+            target: x86_64-apple-darwin
+            asset: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      ICARUS_VERSION: ${{ inputs.version }}
+      # The server cleans up older binaries per channel and names itself after it.
+      ZED_RELEASE_CHANNEL: stable
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install musl and lld
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools lld clang cmake
+      - name: Install the toolchain from app/rust-toolchain.toml
+        working-directory: app
+        run: |
+          rustup toolchain install
+          rustup target add "${{ matrix.target }}"
+      # The target dir would crowd the 10 GB cache, so only the cargo registry is cached.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: app
+          shared-key: release-remote-server-${{ matrix.target }}
+          cache-targets: false
+      - name: Build
+        working-directory: app
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET" == *-musl ]]; then
+            export "CC_${TARGET//-/_}=musl-gcc"
+          fi
+          # A separate invocation from the app, as Zed's bundle scripts do, so feature
+          # unification can't pull dynamic libraries into the server.
+          cargo --config .cargo/bundle-config.toml --config profile.release.debug=false \
+            build --release --locked --package remote_server --target "$TARGET"
+          bin="target/$TARGET/release/remote-server"
+          strip -x "$bin" 2>/dev/null || strip "$bin"
+          file "$bin"
+          if [[ "$TARGET" == *-musl ]] && ldd "$bin" >/dev/null 2>&1; then
+            echo "::error::$TARGET remote server is dynamically linked"
+            exit 1
+          fi
+          if [[ "$TARGET" != x86_64-apple-darwin ]]; then
+            "$bin" version
+          fi
+          mkdir -p ../dist
+          gzip --best --stdout "$bin" > "../dist/icarus-remote-server-$ICARUS_VERSION-$ASSET.gz"
+          ls -la ../dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: remote-server-${{ matrix.asset }}
+          path: dist/*.gz
+          retention-days: 7
+          if-no-files-found: error

@@ -172,9 +172,15 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  remote-server:
+    needs: meta
+    uses: ./.github/workflows/release-remote-server.yml
+    with:
+      version: ${{ needs.meta.outputs.version }}
+
   publish:
     name: publish
-    needs: [meta, binaries, app-macos]
+    needs: [meta, binaries, app-macos, remote-server]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -186,7 +192,17 @@ jobs:
           merge-multiple: true
       - name: Checksums
         working-directory: dist
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
+          set -euo pipefail
+          # The app downloads these by name for SSH hosts.
+          for asset in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64; do
+            if [ ! -f "icarus-remote-server-$VERSION-$asset.gz" ]; then
+              echo "::error::missing icarus-remote-server-$VERSION-$asset.gz"
+              exit 1
+            fi
+          done
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
       - name: Create the release
