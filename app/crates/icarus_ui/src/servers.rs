@@ -301,6 +301,7 @@ impl RemoteServers {
                         let Some(mut events) = events else {
                             return;
                         };
+                        let server_name = name.clone();
                         let forward = cx.spawn(async move |_, cx| {
                             loop {
                                 let next = Tokio::spawn(cx, async move {
@@ -313,7 +314,16 @@ impl RemoteServers {
                                 };
                                 events = returned;
                                 cx.update(|cx| {
-                                    crate::handle_view_event(&event.topic, event.payload, cx)
+                                    if event.topic.starts_with("terminal.") {
+                                        crate::terminals::terminal_changed(
+                                            Some(&server_name),
+                                            &event.topic,
+                                            &event.payload,
+                                            cx,
+                                        );
+                                    } else {
+                                        crate::handle_view_event(&event.topic, event.payload, cx)
+                                    }
                                 });
                             }
                         });

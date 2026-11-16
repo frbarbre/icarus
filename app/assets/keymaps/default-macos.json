@@ -1524,6 +1524,17 @@
     },
   },
   {
+    // Icarus: a program that turned on the kitty keyboard protocol binds ⌥⌫ / ⌥←→ itself, as Orca lets it.
+    "context": "Terminal && kitty_keyboard",
+    "use_key_equivalents": true,
+    "bindings": {
+      "alt-left": ["terminal::SendText", "\u001b[1;3D"],
+      "alt-right": ["terminal::SendText", "\u001b[1;3C"],
+      "alt-backspace": ["terminal::SendText", "\u001b[127;3u"],
+      "alt-delete": ["terminal::SendText", "\u001b[3;3~"],
+    },
+  },
+  {
     "context": "AgentPanel > Terminal",
     "use_key_equivalents": true,
     "bindings": {

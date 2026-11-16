@@ -80,6 +80,111 @@ async fn a_terminal_reports_a_running_command_as_busy_and_can_be_renamed() {
     assert_eq!(renamed["label"], "Run");
 }
 
+async fn next_event(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<icarus_client::Event>,
+    topic: &str,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline.into(), events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no {topic} event in time"))
+            .expect("event stream open");
+        if event.topic == topic {
+            return event.payload;
+        }
+    }
+}
+
+#[tokio::test]
+async fn unattached_clients_hear_keyboard_mode_and_label_changes() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _server = start_server(home.path());
+    let (client, mut events) = Client::connect(home.path(), "test").await.expect("connect");
+    let info = client
+        .request(
+            "terminal.create",
+            json!({ "command": ["/bin/cat"], "cwd": "/tmp" }),
+        )
+        .await
+        .expect("create");
+    let id = info["id"].as_str().expect("id").to_string();
+    assert_eq!(info["kitty_keyboard_flags"], 0);
+    assert_eq!(info["task"], false);
+
+    client
+        .request(
+            "terminal.write",
+            json!({ "id": id, "text": "\u{1b}[>1u\n" }),
+        )
+        .await
+        .expect("write");
+    let keyboard = next_event(&mut events, "terminal.keyboard").await;
+    assert_eq!(keyboard, json!({ "id": id, "flags": 1 }));
+    let info = client
+        .request("terminal.info", json!({ "id": id }))
+        .await
+        .expect("info");
+    assert_eq!(info["kitty_keyboard_flags"], 1);
+
+    client
+        .request("terminal.set_label", json!({ "id": id, "label": "Logs" }))
+        .await
+        .expect("rename");
+    let label = next_event(&mut events, "terminal.label").await;
+    assert_eq!(label, json!({ "id": id, "label": "Logs" }));
+    client
+        .request("terminal.write", json!({ "id": id, "text": "\u{1b}[<u\n" }))
+        .await
+        .expect("write");
+    let keyboard = next_event(&mut events, "terminal.keyboard").await;
+    assert_eq!(keyboard["flags"], 0);
+}
+
+#[tokio::test]
+async fn a_task_terminal_runs_its_command_and_is_listed_as_a_task() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let info = client
+        .request(
+            "terminal.create",
+            json!({
+                "command": ["/bin/sh", "-c", "echo task-ran-$GREETING; exit 4"],
+                "env": { "GREETING": "hi" },
+                "cwd": "/tmp",
+                "label": "greet",
+                "task": true,
+            }),
+        )
+        .await
+        .expect("create");
+    let id = info["id"].as_str().expect("id").to_string();
+    let done = client
+        .request(
+            "terminal.wait",
+            json!({ "id": id, "exit": true, "timeout_ms": 10_000 }),
+        )
+        .await
+        .expect("wait");
+    assert_eq!(done["exit_code"], 4);
+    let listed = client
+        .request("terminal.list", json!({}))
+        .await
+        .expect("list");
+    let task = listed
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == json!(id)))
+        .expect("listed");
+    assert_eq!(task["task"], true);
+    assert_eq!(task["label"], "greet");
+    let read = client
+        .request("terminal.read", json!({ "id": id }))
+        .await
+        .expect("read");
+    assert!(read["text"].as_str().unwrap_or("").contains("task-ran-hi"));
+}
+
 #[tokio::test]
 async fn terminal_outlives_its_client_and_resumes_by_sequence() {
     let home = tempfile::tempdir().expect("tempdir");

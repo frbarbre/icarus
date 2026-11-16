@@ -97,10 +97,24 @@ pub(crate) struct Script {
 pub(crate) struct ProjectHooks {
     pub setup: Option<Script>,
     pub archive: Option<Script>,
+    /// The repository's own part of `setup` / `archive`, which runs only once trusted.
+    pub shared_setup: Option<String>,
+    pub shared_archive: Option<String>,
     pub run_policy: RunPolicy,
     pub wait_for_setup: bool,
     pub setup_timeout_ms: Option<u64>,
     pub archive_timeout_ms: u64,
+    pub default_tabs: Vec<DefaultTab>,
+    pub shared_directories: Vec<String>,
+}
+
+/// One of `orca.yaml`'s `defaultTabs`: a terminal a new workspace opens with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DefaultTab {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// The parts of `orca.yaml` Icarus honours.
@@ -109,6 +123,28 @@ pub(crate) struct OrcaYaml {
     pub setup: Option<String>,
     pub archive: Option<String>,
     pub wait_for_setup: bool,
+    pub default_tabs: Vec<DefaultTab>,
+    pub shared_directories: Vec<String>,
+}
+
+const MAX_SHARED_DIRECTORIES: usize = 100;
+const MAX_DEFAULT_TABS: usize = 100;
+
+/// Orca's rule: repo-relative, no `..`, `.` or `.git` segments, never absolute.
+pub(crate) fn safe_relative_path(raw: &str) -> Option<String> {
+    let normalized = raw.trim().replace('\\', "/");
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    let normalized = normalized.trim_end_matches('/');
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.as_bytes().get(1) == Some(&b':')
+    {
+        return None;
+    }
+    normalized
+        .split('/')
+        .all(|segment| !matches!(segment, "" | "." | ".." | ".git"))
+        .then(|| normalized.to_owned())
 }
 
 pub(crate) fn read_orca_yaml(dir: &Path) -> Option<OrcaYaml> {
@@ -127,11 +163,69 @@ pub(crate) fn parse_orca_yaml(text: &str) -> Option<OrcaYaml> {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
     };
+    let text_of = |value: &yaml_rust2::Yaml| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let default_tabs = root["defaultTabs"]
+        .as_vec()
+        .filter(|tabs| tabs.len() <= MAX_DEFAULT_TABS)
+        .into_iter()
+        .flatten()
+        .filter_map(|tab| {
+            let tab = DefaultTab {
+                title: text_of(&tab["title"]),
+                command: text_of(&tab["command"]),
+            };
+            (tab.title.is_some() || tab.command.is_some()).then_some(tab)
+        })
+        .collect();
+    let mut shared_directories: Vec<String> = Vec::new();
+    for entry in root["worktree"]["sharedDirectories"]
+        .as_vec()
+        .into_iter()
+        .flatten()
+        .take(MAX_SHARED_DIRECTORIES)
+    {
+        if let Some(path) = entry.as_str().and_then(safe_relative_path)
+            && !shared_directories.contains(&path)
+        {
+            shared_directories.push(path);
+        }
+    }
     Some(OrcaYaml {
         setup: script("setup"),
         archive: script("archive"),
         wait_for_setup: root["setupAgentStartupPolicy"].as_str() == Some("wait-for-setup"),
+        default_tabs,
+        shared_directories,
     })
+}
+
+/// `.worktreeinclude`: literal repo-relative paths, one per line; globs and negations aren't supported.
+pub(crate) fn parse_worktree_include(text: &str) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with('!')
+            || line.contains(['*', '?'])
+        {
+            continue;
+        }
+        if let Some(path) = safe_relative_path(line)
+            && !entries.contains(&path)
+        {
+            entries.push(path);
+        }
+        if entries.len() >= 1000 {
+            break;
+        }
+    }
+    entries
 }
 
 fn trimmed(value: Option<&Value>) -> Option<String> {
@@ -206,9 +300,22 @@ pub(crate) fn project_hooks(
     };
     let hooks = hooks_in(resolved);
     let policy = hooks["commandSourcePolicy"].as_str();
+    let shared_setup = shared("setup", yaml.setup);
+    let shared_archive = shared("archive", yaml.archive);
+    let setup = effective_script(shared_setup.clone(), local("setup"), policy);
+    let archive = effective_script(shared_archive.clone(), local("archive"), policy);
+    let uses_shared = |script: &Option<Script>| {
+        script
+            .as_ref()
+            .is_some_and(|s| matches!(s.source, ScriptSource::Shared | ScriptSource::Both))
+    };
     ProjectHooks {
-        setup: effective_script(shared("setup", yaml.setup), local("setup"), policy),
-        archive: effective_script(shared("archive", yaml.archive), local("archive"), policy),
+        shared_setup: shared_setup.filter(|_| uses_shared(&setup)),
+        shared_archive: shared_archive.filter(|_| uses_shared(&archive)),
+        setup,
+        archive,
+        default_tabs: yaml.default_tabs,
+        shared_directories: yaml.shared_directories,
         run_policy: match hooks["setupRunPolicy"].as_str() {
             Some("ask") => RunPolicy::Ask,
             Some("skip-by-default") => RunPolicy::SkipByDefault,
@@ -353,18 +460,64 @@ pub(crate) fn setup_key(workspace_id: &str) -> String {
     format!("workspace.setup.{workspace_id}")
 }
 
-/// Shows the Setup terminal in a layout: in its first plain terminal tab, else after the first pane's tabs.
-pub(crate) fn show_setup_terminal(layout: &mut LayoutNode, terminal: &str) {
-    for tab in layout.tabs_mut() {
-        if let Tab::Terminal {
-            command: None,
-            terminal_id: terminal_id @ None,
-        } = tab
-        {
-            *terminal_id = Some(terminal.to_owned());
-            return;
-        }
-    }
+/// What a repository runs on the user's machine from its committed files, each trusted separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ScriptKind {
+    Setup,
+    Archive,
+    DefaultTabs,
+}
+
+fn trust_key(project_id: &str) -> String {
+    format!("project.trust.{project_id}")
+}
+
+/// Keeps the store bounded; the newest approvals win.
+const MAX_TRUSTED_DIGESTS: usize = 64;
+
+fn digest(kind: ScriptKind, content: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(format!("{kind:?}").as_bytes());
+    hasher.update([0]);
+    hasher.update(content.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn default_tab_commands(hooks: &ProjectHooks) -> Option<String> {
+    let commands: Vec<&str> = hooks
+        .default_tabs
+        .iter()
+        .filter_map(|tab| tab.command.as_deref())
+        .collect();
+    (!commands.is_empty()).then(|| commands.join("\n"))
+}
+
+/// The committed scripts in `hooks` that need the user's trust before they run.
+pub(crate) fn committed_scripts(hooks: &ProjectHooks) -> Vec<(ScriptKind, String)> {
+    [
+        (ScriptKind::Setup, hooks.shared_setup.clone()),
+        (ScriptKind::Archive, hooks.shared_archive.clone()),
+        (ScriptKind::DefaultTabs, default_tab_commands(hooks)),
+    ]
+    .into_iter()
+    .filter_map(|(kind, content)| Some((kind, content?)))
+    .collect()
+}
+
+pub(crate) fn untrusted_message(project_id: &str, what: &str) -> String {
+    format!(
+        "this project's {what} comes from its committed files (orca.yaml or icarus.json) and isn't trusted yet; review it with `icarus project scripts {project_id}`, then run `icarus project trust {project_id}` (or create with --trust)"
+    )
+}
+
+/// Adds a terminal tab after the first pane's tabs.
+pub(crate) fn add_terminal_tab(layout: &mut LayoutNode, terminal: &str) {
     let mut node = layout;
     loop {
         match node {
@@ -383,9 +536,27 @@ pub(crate) fn show_setup_terminal(layout: &mut LayoutNode, terminal: &str) {
     }
 }
 
+/// Shows the Setup terminal in a layout: in its first plain terminal tab, else after the first pane's tabs.
+pub(crate) fn show_setup_terminal(layout: &mut LayoutNode, terminal: &str) {
+    for tab in layout.tabs_mut() {
+        if let Tab::Terminal {
+            command: None,
+            terminal_id: terminal_id @ None,
+        } = tab
+        {
+            *terminal_id = Some(terminal.to_owned());
+            return;
+        }
+    }
+    add_terminal_tab(layout, terminal);
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ArchiveOutcome {
     pub success: bool,
+    /// Why the script didn't run although the project has one (e.g. it isn't trusted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub timed_out: bool,
@@ -422,6 +593,7 @@ pub(crate) async fn run_archive_script(
         Err(error) => {
             return ArchiveOutcome {
                 success: false,
+                skipped: None,
                 exit_code: None,
                 timed_out: false,
                 output: format!("could not start the archive script: {error}"),
@@ -452,6 +624,7 @@ pub(crate) async fn run_archive_script(
             }
             ArchiveOutcome {
                 success: code == Some(0),
+                skipped: None,
                 exit_code: code,
                 timed_out: false,
                 output: text,
@@ -460,6 +633,7 @@ pub(crate) async fn run_archive_script(
         }
         Ok(Err(error)) => ArchiveOutcome {
             success: false,
+            skipped: None,
             exit_code: None,
             timed_out: false,
             output: format!("the archive script failed: {error}"),
@@ -471,6 +645,7 @@ pub(crate) async fn run_archive_script(
             }
             ArchiveOutcome {
                 success: false,
+                skipped: None,
                 exit_code: None,
                 timed_out: true,
                 output: format!("Hook timed out after {}ms.", timeout.as_millis()),
@@ -562,10 +737,20 @@ impl Server {
         decision: SetupDecision,
     ) -> Result<Option<SetupStatus>, RpcError> {
         let hooks = self.hooks_for(project_root, &workspace.path);
-        let Some(script) = hooks.setup else {
+        let Some(script) = hooks.setup.clone() else {
             return Ok(None);
         };
-        if !should_run_setup(hooks.run_policy, decision)? {
+        let runs = should_run_setup(hooks.run_policy, decision)?;
+        if runs
+            && let Some(shared) = &hooks.shared_setup
+            && !self.is_trusted(&workspace.project_id, ScriptKind::Setup, shared)
+        {
+            return Err(rpc(
+                "untrusted_scripts",
+                untrusted_message(&workspace.project_id, "setup script"),
+            ));
+        }
+        if !runs {
             let status = SetupStatus {
                 state: SetupState::Skipped,
                 terminal: None,
@@ -728,6 +913,19 @@ impl Server {
     ) -> Option<ArchiveOutcome> {
         let hooks = self.hooks_for(project_root, project_root);
         let script = hooks.archive?;
+        if let Some(shared) = &hooks.shared_archive
+            && !self.is_trusted(&workspace.project_id, ScriptKind::Archive, shared)
+        {
+            // Declining Orca's prompt skips the script rather than keeping the workspace.
+            return Some(ArchiveOutcome {
+                success: true,
+                skipped: Some(untrusted_message(&workspace.project_id, "archive script")),
+                exit_code: None,
+                timed_out: false,
+                output: String::new(),
+                source: script.source,
+            });
+        }
         let env = hook_env(project_root, &workspace.path, &workspace.id);
         Some(
             run_archive_script(
@@ -738,6 +936,128 @@ impl Server {
             )
             .await,
         )
+    }
+
+    fn trusted_digests(&self, project_id: &str) -> Vec<String> {
+        self.store
+            .kv_get(&trust_key(project_id))
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn is_trusted(&self, project_id: &str, kind: ScriptKind, content: &str) -> bool {
+        self.trusted_digests(project_id)
+            .contains(&digest(kind, content))
+    }
+
+    /// Trusts every committed script in `hooks` as it is now; a later change asks again.
+    pub(crate) fn trust_hooks(
+        &self,
+        project_id: &str,
+        hooks: &ProjectHooks,
+    ) -> Result<(), RpcError> {
+        let mut digests = self.trusted_digests(project_id);
+        for (kind, content) in committed_scripts(hooks) {
+            let digest = digest(kind, &content);
+            digests.retain(|known| *known != digest);
+            digests.push(digest);
+        }
+        let excess = digests.len().saturating_sub(MAX_TRUSTED_DIGESTS);
+        digests.drain(..excess);
+        self.store
+            .kv_set(&trust_key(project_id), &json!(digests))
+            .map_err(|e| rpc("internal", e))
+    }
+
+    pub(crate) fn untrust_project(&self, project_id: &str) -> Result<(), RpcError> {
+        self.store
+            .kv_delete(&trust_key(project_id))
+            .map(|_| ())
+            .map_err(|e| rpc("internal", e))
+    }
+
+    /// What `project.scripts` reports: each committed script, whether it's trusted, and the setup policy.
+    pub(crate) fn scripts_view(&self, project_id: &str, hooks: &ProjectHooks) -> Value {
+        let entry = |script: &Option<Script>, shared: &Option<String>, kind: ScriptKind| {
+            script.as_ref().map(|script| {
+                json!({
+                    "command": script.command,
+                    "source": script.source,
+                    "trusted": shared
+                        .as_ref()
+                        .is_none_or(|shared| self.is_trusted(project_id, kind, shared)),
+                })
+            })
+        };
+        let tabs_trusted = default_tab_commands(hooks)
+            .is_none_or(|commands| self.is_trusted(project_id, ScriptKind::DefaultTabs, &commands));
+        let untrusted: Vec<ScriptKind> = committed_scripts(hooks)
+            .into_iter()
+            .filter(|(kind, content)| !self.is_trusted(project_id, *kind, content))
+            .map(|(kind, _)| kind)
+            .collect();
+        json!({
+            "project": project_id,
+            "setup": entry(&hooks.setup, &hooks.shared_setup, ScriptKind::Setup),
+            "archive": entry(&hooks.archive, &hooks.shared_archive, ScriptKind::Archive),
+            "default_tabs": hooks.default_tabs,
+            "default_tabs_trusted": tabs_trusted,
+            "shared_directories": hooks.shared_directories,
+            "run_policy": match hooks.run_policy {
+                RunPolicy::Ask => "ask",
+                RunPolicy::RunByDefault => "run-by-default",
+                RunPolicy::SkipByDefault => "skip-by-default",
+            },
+            "trusted": untrusted.is_empty(),
+            "untrusted": untrusted,
+        })
+    }
+
+    /// Starts the terminals of `orca.yaml`'s `defaultTabs`; their commands run only when trusted.
+    pub(crate) fn start_default_tabs(
+        &self,
+        workspace: &Workspace,
+        project_root: &Path,
+    ) -> Vec<String> {
+        let hooks = self.hooks_for(project_root, &workspace.path);
+        let run_commands = default_tab_commands(&hooks).is_some_and(|commands| {
+            self.is_trusted(&workspace.project_id, ScriptKind::DefaultTabs, &commands)
+        });
+        let shell = default_shell();
+        let mut terminals = Vec::new();
+        for tab in &hooks.default_tabs {
+            let command = tab
+                .command
+                .as_ref()
+                .filter(|_| run_commands)
+                .map(|command| {
+                    vec![
+                        shell.clone(),
+                        "-lc".into(),
+                        format!("{command}\nexec {} -l", single_quoted(&shell)),
+                    ]
+                });
+            let label = tab
+                .title
+                .clone()
+                .or_else(|| tab.command.clone())
+                .unwrap_or_else(|| "Terminal".into());
+            match self.terminals.create(SpawnOptions {
+                cwd: workspace.path.clone(),
+                command,
+                env: hook_env(project_root, &workspace.path, &workspace.id),
+                columns: 120,
+                rows: 32,
+                label: Some(label),
+                workspace: Some(workspace.id.clone()),
+            }) {
+                Ok(session) => terminals.push(session.id().to_owned()),
+                Err(error) => tracing::warn!("default tab for {}: {error:#}", workspace.name),
+            }
+        }
+        terminals
     }
 }
 
@@ -786,6 +1106,57 @@ mod tests {
         assert_eq!(parsed.archive.as_deref(), Some("echo bye"));
         assert!(parsed.wait_for_setup);
         assert_eq!(parse_orca_yaml("scripts: [").map(|_| ()), None);
+    }
+
+    #[test]
+    fn default_tabs_and_shared_paths_parse_like_orca() {
+        let parsed = parse_orca_yaml(
+            "defaultTabs:\n  - title: Dev\n    command: pnpm dev\n  - color: '#fff'\n  - command: ' '\n  - title: Logs\nworktree:\n  sharedDirectories: [node_modules, ./node_modules/, /abs, ../up, a/./b, .git/x, C:/win, packages/web/.next]\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed.default_tabs,
+            [
+                DefaultTab {
+                    title: Some("Dev".into()),
+                    command: Some("pnpm dev".into())
+                },
+                DefaultTab {
+                    title: Some("Logs".into()),
+                    command: None
+                },
+            ]
+        );
+        assert_eq!(
+            parsed.shared_directories,
+            ["node_modules", "packages/web/.next"]
+        );
+        assert_eq!(
+            parse_worktree_include("# c\n.env\n./.env\n*.key\n!x\n../y\nconfig/local.json/\n"),
+            [".env", "config/local.json"]
+        );
+    }
+
+    #[test]
+    fn only_the_repositorys_own_scripts_need_trust() {
+        let stack = layers(
+            hooks(json!({ "setup": "shared", "archive": "bye" })),
+            hooks(json!({ "setup": "local" })),
+            json!({}),
+        );
+        let got = project_hooks(&stack, &resolve(&stack), None);
+        assert_eq!(
+            got.shared_setup, None,
+            "the local setup replaces the shared one"
+        );
+        assert_eq!(
+            committed_scripts(&got),
+            [(ScriptKind::Archive, "bye".to_owned())]
+        );
+        assert_ne!(
+            digest(ScriptKind::Setup, "bye"),
+            digest(ScriptKind::Archive, "bye")
+        );
     }
 
     #[test]

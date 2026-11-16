@@ -366,6 +366,42 @@ const MAPPINGS: &[Mapping] = &[
         &["Mod+Shift+Enter"],
     ),
     map(
+        "terminal.equalizePaneSizes",
+        "workspace::ResetPaneSizes",
+        Scope::Terminal,
+        &[],
+        &[],
+    ),
+    map(
+        "terminal.setTitle",
+        "icarus::SetPaneTitle",
+        Scope::Terminal,
+        &[],
+        &[],
+    ),
+    map(
+        "terminal.clearPaneTitle",
+        "icarus::ClearPaneTitle",
+        Scope::Terminal,
+        &[],
+        &[],
+    ),
+    // ⌥⌘←/→ already fall back to history with a single group, so only remapped keys are added.
+    map(
+        "worktree.history.back",
+        "pane::GoBack",
+        Scope::Global,
+        &[],
+        &[],
+    ),
+    map(
+        "worktree.history.forward",
+        "pane::GoForward",
+        Scope::Global,
+        &[],
+        &[],
+    ),
+    map(
         "tabGroup.focusLeft",
         "icarus::FocusGroupLeft",
         Scope::Global,

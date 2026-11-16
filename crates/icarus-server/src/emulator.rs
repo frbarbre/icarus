@@ -6,7 +6,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler};
 
 pub const SCROLLBACK_LINES: usize = 10_000;
@@ -29,6 +29,8 @@ pub struct Effects {
     pub pty_replies: Vec<u8>,
     pub title: Option<Option<String>>,
     pub bell: bool,
+    /// The program changed its kitty keyboard flags (`CSI > flags u` and friends) to these.
+    pub keyboard: Option<u8>,
 }
 
 /// Headless terminal state kept by the server so it can answer "what is on screen" without a client.
@@ -44,6 +46,7 @@ impl Emulator {
         let events = Collector::default();
         let config = Config {
             scrolling_history: SCROLLBACK_LINES,
+            kitty_keyboard: true,
             ..Config::default()
         };
         let size = TermSize::new(usize::from(columns.max(2)), usize::from(rows.max(1)));
@@ -56,14 +59,21 @@ impl Emulator {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Effects {
+        let keyboard_before = self.keyboard_flags();
         self.parser.advance(&mut self.term, bytes);
         let drained = match self.events.0.lock() {
             Ok(mut events) => std::mem::take(&mut *events),
             Err(_) => Vec::new(),
         };
         let mut effects = Effects::default();
+        let keyboard_after = self.keyboard_flags();
+        if keyboard_after != keyboard_before {
+            effects.keyboard = Some(keyboard_after);
+        }
         for event in drained {
             match event {
+                // The app encodes keys the legacy way, so claiming kitty support would mislead programs.
+                Event::PtyWrite(text) if is_keyboard_mode_report(&text) => {}
                 Event::PtyWrite(text) => effects.pty_replies.extend_from_slice(text.as_bytes()),
                 Event::Title(title) => {
                     self.title = Some(title.clone());
@@ -93,6 +103,12 @@ impl Emulator {
 
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// The kitty keyboard protocol flags the program enabled (0: legacy keys).
+    pub fn keyboard_flags(&self) -> u8 {
+        let mode = *self.term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL;
+        (mode.bits() / TermMode::DISAMBIGUATE_ESC_CODES.bits()) as u8
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -184,8 +200,23 @@ impl Emulator {
         }
         let cursor = self.term.grid().cursor.point;
         let _ = write!(out, "\x1b[{};{}H", cursor.line.0 + 1, cursor.column.0 + 1);
+        let keyboard = self.keyboard_flags();
+        if keyboard != 0 {
+            let _ = write!(out, "\x1b[>{keyboard}u");
+        }
+        if let Some(title) = &self.title {
+            let title: String = title.chars().filter(|c| !c.is_control()).collect();
+            let _ = write!(out, "\x1b]2;{title}\x07");
+        }
         out
     }
+}
+
+/// `CSI ? flags u`, the answer to a program asking which kitty keyboard flags are on.
+fn is_keyboard_mode_report(text: &str) -> bool {
+    text.strip_prefix("\x1b[?")
+        .and_then(|rest| rest.strip_suffix('u'))
+        .is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn is_blank(cell: &Cell) -> bool {
@@ -311,6 +342,37 @@ mod tests {
         let mut emulator = Emulator::new(10, 3);
         let effects = emulator.feed(b"\x1b[6n");
         assert_eq!(effects.pty_replies, b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn kitty_keyboard_push_and_pop_are_tracked_without_answering_queries() {
+        let mut emulator = Emulator::new(10, 3);
+        assert_eq!(emulator.keyboard_flags(), 0);
+        let effects = emulator.feed(b"\x1b[>1u");
+        assert_eq!(effects.keyboard, Some(1));
+        assert_eq!(emulator.keyboard_flags(), 1);
+        let effects = emulator.feed(b"\x1b[>3u");
+        assert_eq!(effects.keyboard, Some(3));
+        assert_eq!(emulator.feed(b"plain").keyboard, None, "unchanged flags");
+        let effects = emulator.feed(b"\x1b[?u");
+        assert!(
+            effects.pty_replies.is_empty(),
+            "the query goes unanswered: {:?}",
+            effects.pty_replies
+        );
+        assert_eq!(emulator.feed(b"\x1b[<u").keyboard, Some(1));
+        assert_eq!(emulator.feed(b"\x1b[<u").keyboard, Some(0));
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_keyboard_flags_and_title() {
+        let mut source = Emulator::new(20, 3);
+        source.feed(b"\x1b]0;claude\x07\x1b[>1uhello");
+        let mut replica = Emulator::new(20, 3);
+        replica.feed(source.snapshot_vt().as_bytes());
+        assert_eq!(replica.keyboard_flags(), 1);
+        assert_eq!(replica.title(), Some("claude"));
+        assert_eq!(replica.screen_text(), "hello\n");
     }
 
     #[test]

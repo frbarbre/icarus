@@ -527,6 +527,11 @@ impl TerminalView {
                     Some(new_label)
                 }
             };
+            if let Some(external_id) = self.terminal.read(cx).external_id().map(str::to_owned)
+                && let Some(retitled) = cx.try_global::<ExternalTerminalRetitled>().cloned()
+            {
+                (retitled.0)(external_id, label.clone(), cx);
+            }
             self.set_custom_title(label, cx);
         }
         cx.notify();
@@ -1139,6 +1144,11 @@ impl TerminalView {
         if mode.contains(Modes::BRACKETED_PASTE) {
             dispatch_context.add("bracketed_paste");
         }
+        if let Some(external_id) = self.terminal.read(cx).external_id()
+            && let Some(extend) = cx.try_global::<ExternalKeyContext>()
+        {
+            (extend.0)(external_id, &mut dispatch_context, cx);
+        }
         if mode.intersects(Modes::MOUSE_MODE) {
             dispatch_context.add("any_mouse_reporting");
         }
@@ -1180,7 +1190,14 @@ impl TerminalView {
     ) {
         self._terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, self.workspace.clone(), window, cx);
-        self.terminal = terminal;
+        // A rerun replaces the task's terminal; a routed one would keep running where it was routed.
+        let replaced = std::mem::replace(&mut self.terminal, terminal);
+        if let Some(external_id) = replaced.read(cx).external_id().map(str::to_owned)
+            && self.terminal.read(cx).external_id() != Some(external_id.as_str())
+            && let Some(closer) = cx.try_global::<ExternalTerminalCloser>().cloned()
+        {
+            (closer.0)(external_id, cx);
+        }
     }
 
     fn rerun_button(&self, task: &TaskState) -> Option<IconButton> {
@@ -2039,7 +2056,8 @@ impl SerializableItem for TerminalView {
         cx: &mut Context<Self>,
     ) -> Option<Task<anyhow::Result<()>>> {
         let terminal = self.terminal().read(cx);
-        if terminal.task().is_some() {
+        // A routed task keeps running elsewhere, so its tab can come back attached to it.
+        if terminal.task().is_some() && terminal.external_id().is_none() {
             return None;
         }
 
@@ -2305,6 +2323,18 @@ fn external_terminal_key(workspace_id: WorkspaceId, item_id: workspace::ItemId) 
 pub struct ExternalTerminalCloser(pub std::sync::Arc<dyn Fn(String, &mut App)>);
 
 impl gpui::Global for ExternalTerminalCloser {}
+
+/// Renaming a routed terminal's tab names it where it runs, so the embedder can share the title.
+#[derive(Clone)]
+pub struct ExternalTerminalRetitled(pub std::sync::Arc<dyn Fn(String, Option<String>, &mut App)>);
+
+impl gpui::Global for ExternalTerminalRetitled {}
+
+/// Lets an embedder add key-context entries for a routed terminal, e.g. its program's keyboard mode.
+#[derive(Clone)]
+pub struct ExternalKeyContext(pub std::sync::Arc<dyn Fn(&str, &mut KeyContext, &App)>);
+
+impl gpui::Global for ExternalKeyContext {}
 
 /// Gets the working directory for the given workspace, respecting the user's settings.
 /// Falls back to home directory when no project directory is available.
@@ -2894,6 +2924,129 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[gpui::test]
+    async fn a_kitty_keyboard_program_gets_option_keys_untranslated(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let kitty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cx.update(|cx| {
+            load_default_keymap(cx);
+            let kitty = kitty.clone();
+            cx.set_global(ExternalKeyContext(std::sync::Arc::new(
+                move |id, context, _| {
+                    if id == "term-1" && kitty.load(std::sync::atomic::Ordering::SeqCst) {
+                        context.add("kitty_keyboard");
+                    }
+                },
+            )));
+        });
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        terminal.update(cx, |terminal, _| {
+            terminal.set_external_id(Some("term-1".into()))
+        });
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            sent(&terminal, "alt-backspace", &mut cx),
+            vec![b"\x1b\x7f".to_vec()]
+        );
+
+        kitty.store(true, std::sync::atomic::Ordering::SeqCst);
+        terminal_view.update(&mut cx, |_, cx| cx.notify());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            sent(&terminal, "alt-backspace", &mut cx),
+            vec![b"\x1b[127;3u".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "alt-left", &mut cx),
+            vec![b"\x1b[1;3D".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "alt-right", &mut cx),
+            vec![b"\x1b[1;3C".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "cmd-left", &mut cx),
+            vec![b"\x01".to_vec()],
+            "⌘ keys still translate"
+        );
+    }
+
+    #[gpui::test]
+    async fn renaming_a_routed_terminal_names_it_where_it_runs(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let titles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        cx.update(|cx| {
+            let titles = titles.clone();
+            cx.set_global(ExternalTerminalRetitled(std::sync::Arc::new(
+                move |id, title, _| titles.lock().expect("titles").push((id, title)),
+            )));
+        });
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        terminal.update(cx, |terminal, _| {
+            terminal.set_external_id(Some("term-1".into()))
+        });
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        terminal_view.update_in(&mut cx, |view, window, cx| {
+            view.rename_terminal(&RenameTerminal, window, cx);
+            let editor = view.rename_editor.clone().expect("rename editor");
+            editor.update(cx, |editor, cx| editor.set_text("Logs", window, cx));
+            view.finish_renaming(true, window, cx);
+        });
+        assert_eq!(
+            *titles.lock().expect("titles"),
+            vec![("term-1".to_string(), Some("Logs".to_string()))]
+        );
+        terminal_view.read_with(&cx, |view, _| {
+            assert_eq!(view.custom_title(), Some("Logs"));
+        });
+    }
+
+    #[gpui::test]
+    async fn replacing_a_routed_terminal_ends_the_one_it_replaced(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let closed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        cx.update(|cx| {
+            let closed = closed.clone();
+            cx.set_global(ExternalTerminalCloser(std::sync::Arc::new(move |id, _| {
+                closed.lock().expect("closed").push(id);
+            })));
+        });
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        terminal.update(cx, |terminal, _| {
+            terminal.set_external_id(Some("term-1".into()))
+        });
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let rerun = cx.update(|_, cx| {
+            cx.new(|cx| {
+                let mut terminal = terminal::TerminalBuilder::new_display_only(
+                    CursorShape::default(),
+                    terminal::terminal_settings::AlternateScroll::On,
+                    None,
+                    0,
+                    cx.background_executor(),
+                    PathStyle::local(),
+                )
+                .subscribe(cx);
+                terminal.set_external_id(Some("term-2".into()));
+                terminal
+            })
+        });
+        terminal_view.update_in(&mut cx, |view, window, cx| {
+            view.set_terminal(rerun, window, cx)
+        });
+        assert_eq!(*closed.lock().expect("closed"), vec!["term-1".to_string()]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
     async fn cmd_up_and_down_jump_to_the_ends_of_the_scrollback(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         cx.update(load_default_keymap);
@@ -2958,7 +3111,77 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn user_tasks_go_to_the_router_but_agent_and_debugger_tasks_stay_local(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (project, _workspace, _window_handle) = init_test_with_window(cx).await;
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        cx.update(|cx| {
+            let requests = requests.clone();
+            cx.set_global(project::terminals::ShellRouter(std::sync::Arc::new(
+                move |request, _| {
+                    let task = request.task?;
+                    requests.lock().expect("requests").push((
+                        task.label,
+                        task.command,
+                        task.env.get("GREETING").cloned(),
+                    ));
+                    Some(Task::ready(Ok(project::terminals::RoutedShell {
+                        shell: util::shell::Shell::WithArguments {
+                            program: "/bin/sh".into(),
+                            args: vec!["-c".into(), "exit 0".into()],
+                            title_override: None,
+                        },
+                        external_id: "term-7".into(),
+                        fallback_title: None,
+                    })))
+                },
+            )));
+        });
+        let task = task::SpawnInTerminal {
+            full_label: "greet".into(),
+            label: "greet".into(),
+            command: Some("/bin/echo".into()),
+            args: vec!["hi".into()],
+            cwd: Some(std::env::temp_dir()),
+            env: [("GREETING".to_string(), "hello".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let routed = project
+            .update(cx, |project, cx| {
+                project.create_user_terminal_task(task.clone(), cx)
+            })
+            .await
+            .expect("routed task");
+        routed.read_with(cx, |terminal, _| {
+            assert_eq!(terminal.external_id(), Some("term-7"));
+            assert!(
+                terminal.task().is_some(),
+                "it keeps Zed's task status and rerun"
+            );
+        });
+        let local = project
+            .update(cx, |project, cx| project.create_terminal_task(task, cx))
+            .await
+            .expect("local task");
+        local.read_with(cx, |terminal, _| assert_eq!(terminal.external_id(), None));
+        assert_eq!(
+            *requests.lock().expect("requests"),
+            vec![(
+                "greet".to_string(),
+                Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
+                Some("hello".to_string())
+            )]
+        );
+    }
+
+    #[gpui::test]
     async fn splitting_a_routed_terminal_starts_a_new_routed_shell(cx: &mut TestAppContext) {
+        // The router's failure falls back to a real local shell, whose PTY reader is its own thread.
+        cx.executor().allow_parking();
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         cx.update(|cx| {

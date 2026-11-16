@@ -1037,6 +1037,7 @@ impl TerminalBuilder {
             output_generation: 0,
             title_override: None,
             external_id: None,
+            fallback_title: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
                 terminal_bounds,
@@ -1328,6 +1329,7 @@ impl TerminalBuilder {
                 output_generation: 0,
                 title_override: terminal_title_override,
                 external_id: None,
+                fallback_title: None,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
                 last_mouse: None,
@@ -1546,6 +1548,8 @@ pub struct Terminal {
     title_override: Option<String>,
     /// Where the shell really runs when an embedder routes it elsewhere (Icarus: a server terminal id).
     external_id: Option<String>,
+    /// A routed shell's title until its program sets one; the local process is only the attaching client.
+    fallback_title: Option<String>,
     scroll_px: Pixels,
     next_link_id: usize,
     selection_phase: SelectionPhase,
@@ -1649,6 +1653,10 @@ impl Terminal {
         self.external_id = external_id;
     }
 
+    pub fn set_fallback_title(&mut self, fallback_title: Option<String>) {
+        self.fallback_title = fallback_title;
+    }
+
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
             PtyEvent::Event(event, generation) => {
@@ -1676,10 +1684,16 @@ impl Terminal {
 
                 self.breadcrumb_text = title;
                 cx.emit(Event::BreadcrumbsChanged);
+                if self.external_id.is_some() {
+                    cx.emit(Event::TitleChanged);
+                }
             }
             TerminalBackendEvent::ResetTitle => {
                 self.breadcrumb_text = String::new();
                 cx.emit(Event::BreadcrumbsChanged);
+                if self.external_id.is_some() {
+                    cx.emit(Event::TitleChanged);
+                }
             }
             TerminalBackendEvent::ClipboardStore(data) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(data))
@@ -3075,8 +3089,19 @@ impl Terminal {
             }
             None => self
                 .title_override
-                .as_ref()
-                .map(|title_override| title_override.to_string())
+                .clone()
+                .or_else(|| {
+                    let program_title = Some(self.breadcrumb_text.trim())
+                        .filter(|title| self.external_id.is_some() && !title.is_empty())
+                        .map(|title| {
+                            if truncate {
+                                truncate_and_trailoff(title, MAX_CHARS)
+                            } else {
+                                title.to_string()
+                            }
+                        });
+                    program_title.or_else(|| self.fallback_title.clone())
+                })
                 .unwrap_or_else(|| match &self.terminal_type {
                     TerminalType::Pty { info, .. } => info
                         .current
@@ -5239,6 +5264,34 @@ mod tests {
                 cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
             assert_eq!(clipboard_text.as_deref(), Some("original"));
         }
+    }
+
+    #[gpui::test]
+    async fn a_routed_terminal_shows_its_programs_title_over_the_fallback(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        terminal.update(cx, |terminal, _| {
+            terminal.breadcrumb_text = "vim notes.md".into();
+            assert_eq!(
+                terminal.title(false),
+                "Terminal",
+                "a local terminal ignores it"
+            );
+            terminal.set_external_id(Some("term-1".into()));
+            terminal.set_fallback_title(Some("demo — zsh".into()));
+            assert_eq!(terminal.title(false), "vim notes.md");
+            terminal.breadcrumb_text.clear();
+            assert_eq!(terminal.title(false), "demo — zsh");
+        });
     }
 
     mod hyperlinks {

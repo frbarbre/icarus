@@ -1,15 +1,17 @@
 //! Orca's keyboard movement between tab groups (panes) and between terminal panes.
 
-use gpui::{App, Bounds, Context, Entity, Focusable as _, Pixels, Window, actions, px};
+use gpui::{
+    App, Bounds, Context, Entity, Focusable as _, Pixels, TaskExt as _, Window, actions, px,
+};
 use terminal_view::TerminalView;
 use workspace::{Pane, Workspace};
 
 actions!(
     icarus,
     [
-        /// Focuses the tab group to the left of the focused one (⌥⌘←); does nothing at the edge.
+        /// Focuses the tab group to the left of the focused one (⌥⌘←); with a single group, goes back in history.
         FocusGroupLeft,
-        /// Focuses the tab group to the right of the focused one (⌥⌘→); does nothing at the edge.
+        /// Focuses the tab group to the right of the focused one (⌥⌘→); with a single group, goes forward in history.
         FocusGroupRight,
         /// Focuses the tab group above the focused one (⌥⌘↑); does nothing at the edge.
         FocusGroupUp,
@@ -86,15 +88,26 @@ fn focus_group(
     cx: &mut Context<Workspace>,
 ) {
     let active = workspace.active_pane().clone();
-    let Some(current) = workspace.bounding_box_for_pane(&active) else {
-        return;
-    };
     let panes: Vec<Entity<Pane>> = workspace
         .center_pane_group()
         .panes()
         .into_iter()
         .cloned()
         .collect();
+    // As in Orca, a lone group gives ⌥⌘←/→ back to history: here the pane's back/forward navigation.
+    if panes.len() == 1 {
+        let pane = active.downgrade();
+        let navigation = match direction {
+            Direction::Left => workspace.go_back(pane, window, cx),
+            Direction::Right => workspace.go_forward(pane, window, cx),
+            Direction::Up | Direction::Down => return,
+        };
+        navigation.detach_and_log_err(cx);
+        return;
+    }
+    let Some(current) = workspace.bounding_box_for_pane(&active) else {
+        return;
+    };
     let mut rects = Vec::new();
     let mut targets = Vec::new();
     for pane in panes {
@@ -197,8 +210,11 @@ mod tests {
             register(cx);
         });
         let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree("/project", serde_json::json!({ "a.txt": "" }))
-            .await;
+        fs.insert_tree(
+            "/project",
+            serde_json::json!({ "a.txt": "a", "b.txt": "b" }),
+        )
+        .await;
         let project = Project::test(fs, [Path::new("/project")], cx).await;
         let multi_workspace =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -262,6 +278,70 @@ mod tests {
         cx.dispatch_action(FocusGroupUp);
         cx.run_until_parked();
         assert_eq!(active(&workspace, &mut cx), top_left);
+    }
+
+    #[gpui::test]
+    async fn a_lone_group_moves_through_history_and_split_groups_only_move_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, project, mut cx) = grid_window(cx).await;
+        cx.update(|_, cx| editor::init(cx));
+        let worktree_id = project.read_with(&cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        for name in ["a.txt", "b.txt"] {
+            workspace
+                .update_in(&mut cx, |workspace, window, cx| {
+                    workspace.open_path(
+                        (worktree_id, util::rel_path::rel_path(name)),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .expect("open");
+            cx.run_until_parked();
+        }
+        let active_title = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_item(cx)
+                    .map(|item| item.tab_content_text(0, cx).to_string())
+            })
+        };
+        assert_eq!(active_title(&mut cx).as_deref(), Some("b.txt"));
+
+        cx.dispatch_action(FocusGroupLeft);
+        cx.run_until_parked();
+        assert_eq!(active_title(&mut cx).as_deref(), Some("a.txt"), "back");
+        cx.dispatch_action(FocusGroupRight);
+        cx.run_until_parked();
+        assert_eq!(active_title(&mut cx).as_deref(), Some("b.txt"), "forward");
+
+        let left = active(&workspace, &mut cx);
+        let right = workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.split_pane(left.clone(), SplitDirection::Right, window, cx)
+        });
+        cx.run_until_parked();
+        focus(&workspace, &left, &mut cx);
+        cx.dispatch_action(FocusGroupLeft);
+        cx.run_until_parked();
+        assert_eq!(active(&workspace, &mut cx), left, "nothing at the edge");
+        assert_eq!(
+            active_title(&mut cx).as_deref(),
+            Some("b.txt"),
+            "no history step with two groups"
+        );
+        cx.dispatch_action(FocusGroupRight);
+        cx.run_until_parked();
+        assert_eq!(active(&workspace, &mut cx), right);
     }
 
     fn add_terminal(

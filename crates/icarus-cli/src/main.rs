@@ -542,6 +542,24 @@ enum ProjectCommand {
     Remove {
         id: String,
     },
+    /// Show the scripts the repository's committed files (orca.yaml, icarus.json) run, and whether you trust them.
+    Scripts {
+        id: String,
+        /// Read orca.yaml from this workspace's checkout instead of the project root.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Trust the project's committed scripts as they are now; a later change asks again.
+    Trust {
+        id: String,
+        /// Also trust the scripts in this workspace's checkout.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Forget every trusted version of the project's committed scripts.
+    Untrust {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -550,8 +568,9 @@ enum WorkspaceCommand {
     Create {
         #[arg(long)]
         project: String,
-        /// Defaults to the Linear issue's identifier, lowercased (e.g. abc-12), with --from-linear.
-        #[arg(required_unless_present = "from_linear")]
+        /// Defaults to the Linear issue's identifier, lowercased (e.g. abc-12), with --from-linear,
+        /// and to the pull request's head branch with --from-pr.
+        #[arg(required_unless_present_any = ["from_linear", "from_pr"])]
         name: Option<String>,
         #[arg(long)]
         branch: Option<String>,
@@ -566,6 +585,9 @@ enum WorkspaceCommand {
         /// Link a Linear issue by identifier, e.g. ABC-12; it names the workspace, and Linear's branch name is the branch.
         #[arg(long)]
         from_linear: Option<String>,
+        /// Start from a pull request (number or URL): its head branch, on its base.
+        #[arg(long, value_name = "NUMBER|URL", conflicts_with = "base")]
+        from_pr: Option<String>,
         #[arg(long)]
         no_agent: bool,
         /// Open the workspace with this tab layout (see `icarus layout list`).
@@ -586,6 +608,9 @@ enum WorkspaceCommand {
         /// Don't run the project's setup script.
         #[arg(long)]
         no_setup: bool,
+        /// Trust the project's committed scripts (see `icarus project scripts`) and run them.
+        #[arg(long)]
+        trust: bool,
     },
     List {
         #[arg(long)]
@@ -594,6 +619,9 @@ enum WorkspaceCommand {
     /// Run the project's setup script again, in a new Setup terminal.
     Setup {
         id: String,
+        /// Trust the committed setup script in this workspace's checkout first.
+        #[arg(long)]
+        trust: bool,
     },
     /// Arrange the workspace's tabs with a named layout; an app that opens later applies it then.
     Layout {
@@ -844,6 +872,8 @@ enum TerminalCommand {
     },
     /// Resize a terminal.
     Resize { id: String, columns: u16, rows: u16 },
+    /// Set the title its tabs and panes show (Orca's pane title); omit it to clear.
+    Rename { id: String, label: Option<String> },
     /// Kill a terminal's process.
     Kill {
         id: String,
@@ -1105,6 +1135,55 @@ fn remote_control_summary(v: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn scripts_summary(value: &Value) -> String {
+    let mut lines = Vec::new();
+    let mut script = |label: &str, entry: &Value| {
+        if let Some(command) = entry["command"].as_str() {
+            let trust = if entry["trusted"] == true {
+                "trusted"
+            } else {
+                "NOT TRUSTED"
+            };
+            lines.push(format!(
+                "{label} ({}, {trust}):",
+                entry["source"].as_str().unwrap_or("?")
+            ));
+            lines.extend(command.lines().map(|line| format!("  {line}")));
+        }
+    };
+    script("setup", &value["setup"]);
+    script("archive", &value["archive"]);
+    if let Some(tabs) = value["default_tabs"].as_array().filter(|t| !t.is_empty()) {
+        let trust = if value["default_tabs_trusted"] == true {
+            "trusted"
+        } else {
+            "NOT TRUSTED"
+        };
+        lines.push(format!("default tabs ({trust}):"));
+        for tab in tabs {
+            lines.push(format!(
+                "  {}: {}",
+                tab["title"].as_str().unwrap_or("Terminal"),
+                tab["command"].as_str().unwrap_or("(shell)")
+            ));
+        }
+    }
+    if lines.is_empty() {
+        lines.push("no scripts".into());
+    }
+    lines.push(format!(
+        "setup policy: {}",
+        value["run_policy"].as_str().unwrap_or("?")
+    ));
+    if value["trusted"] != true {
+        lines.push(format!(
+            "trust them with `icarus project trust {}`",
+            value["project"].as_str().unwrap_or("<id>")
+        ));
+    }
+    lines.join("\n")
 }
 
 fn print(cli: &Cli, value: &Value, human: impl FnOnce(&Value) -> String) {
@@ -1757,6 +1836,28 @@ async fn main() -> Result<()> {
                         .request("project.remove", json!({ "id": id }))
                         .await?
                 }
+                ProjectCommand::Scripts { id, workspace }
+                | ProjectCommand::Trust { id, workspace } => {
+                    let method = if matches!(command, ProjectCommand::Trust { .. }) {
+                        "project.trust"
+                    } else {
+                        "project.scripts"
+                    };
+                    let value = client
+                        .request(method, json!({ "id": id, "workspace": workspace }))
+                        .await?;
+                    print(&cli, &value, scripts_summary);
+                    return Ok(());
+                }
+                ProjectCommand::Untrust { id } => {
+                    let value = client
+                        .request("project.untrust", json!({ "id": id }))
+                        .await?;
+                    print(&cli, &value, |_| {
+                        "no versions of its scripts are trusted now".into()
+                    });
+                    return Ok(());
+                }
             };
             print(&cli, &value, |v| match v.as_array() {
                 Some(items) => items
@@ -1813,6 +1914,8 @@ async fn main() -> Result<()> {
                     remote_control,
                     setup,
                     no_setup,
+                    from_pr,
+                    trust,
                 } => {
                     let issue = from_linear
                         .as_ref()
@@ -1822,20 +1925,44 @@ async fn main() -> Result<()> {
                         (_, true) => json!("skip"),
                         _ => Value::Null,
                     };
-                    let value = client
-                        .request_timeout(
-                            "workspace.create",
-                            json!({
-                                "project": project, "name": name, "branch": branch, "base": base,
-                                "fetch": fetch, "status": status, "prompt": prompt, "issue": issue,
-                                "agent": !no_agent, "layout": layout, "pr_url": pr_url,
-                                "account": account, "remote_control": remote_control.map(Switch::enabled),
-                                "setup": setup,
-                            }),
-                            Duration::from_secs(300),
-                        )
-                        .await?;
+                    let create_id = format!(
+                        "cli-{}-{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or_default()
+                    );
+                    let create = client.request_timeout(
+                        "workspace.create",
+                        json!({
+                            "project": project, "name": name, "branch": branch, "base": base,
+                            "fetch": fetch, "status": status, "prompt": prompt, "issue": issue,
+                            "agent": !no_agent, "layout": layout, "pr_url": pr_url,
+                            "account": account, "remote_control": remote_control.map(Switch::enabled),
+                            "setup": setup, "pr": from_pr, "trust": trust, "create_id": create_id,
+                        }),
+                        Duration::from_secs(300),
+                    );
+                    tokio::pin!(create);
+                    let value = tokio::select! {
+                        value = &mut create => value?,
+                        _ = tokio::signal::ctrl_c() => {
+                            eprintln!("cancelling…");
+                            client
+                                .request(
+                                    "workspace.create_cancel",
+                                    json!({ "create_id": create_id }),
+                                )
+                                .await?;
+                            // The server answers the create once it has cleaned up.
+                            create.await?
+                        }
+                    };
                     print(&cli, &value, summary);
+                    for warning in value["warnings"].as_array().into_iter().flatten() {
+                        eprintln!("warning: {}", warning.as_str().unwrap_or_default());
+                    }
                 }
                 WorkspaceCommand::Layout { id, layout, pr_url } => {
                     let value = client
@@ -1987,9 +2114,9 @@ async fn main() -> Result<()> {
                         }
                     });
                 }
-                WorkspaceCommand::Setup { id } => {
+                WorkspaceCommand::Setup { id, trust } => {
                     let value = client
-                        .request("workspace.setup", json!({ "id": id }))
+                        .request("workspace.setup", json!({ "id": id, "trust": trust }))
                         .await?;
                     print(&cli, &value, |v| {
                         format!(
@@ -2469,18 +2596,24 @@ async fn main() -> Result<()> {
                                 items
                                     .iter()
                                     .map(|t| {
+                                        let name = t["label"]
+                                            .as_str()
+                                            .or(t["title"].as_str())
+                                            .unwrap_or("-");
                                         format!(
-                                            "{}  {}  {}  {}",
+                                            "{}  {}  {}{}  {}",
                                             t["id"].as_str().unwrap_or_default(),
                                             if t["running"] == json!(true) {
                                                 "running"
                                             } else {
                                                 "exited"
                                             },
-                                            t["label"]
-                                                .as_str()
-                                                .or(t["title"].as_str())
-                                                .unwrap_or("-"),
+                                            if t["task"] == json!(true) {
+                                                "task: "
+                                            } else {
+                                                ""
+                                            },
+                                            name,
                                             t["cwd"].as_str().unwrap_or_default()
                                         )
                                     })
@@ -2545,6 +2678,14 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     print(&cli, &value, |_| String::new());
+                }
+                TerminalCommand::Rename { id, label } => {
+                    let value = client
+                        .request("terminal.set_label", json!({ "id": id, "label": label }))
+                        .await?;
+                    print(&cli, &value, |v| {
+                        v["label"].as_str().unwrap_or("(no label)").to_owned()
+                    });
                 }
                 TerminalCommand::Kill { id, remove } => {
                     let value = client

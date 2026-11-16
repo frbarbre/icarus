@@ -1,5 +1,5 @@
 //! Agent tabs for workspaces on a saved server: `icarus --server <name> acp`, so the session runs on
-//! that server. Projects opened over SSH need nothing: Zed already starts `icarus acp` on that host.
+//! that server. Projects opened over SSH run `icarus acp` on that host, installing it first if asked.
 
 use std::rc::Rc;
 
@@ -9,12 +9,13 @@ use anyhow::Result;
 use gpui::{App, Entity, Task};
 use project::agent_server_store::AgentServerCommand;
 use project::{AgentId, Project};
+use remote::RemoteConnectionOptions;
 
 use crate::routing::{self, ServerRef};
 use crate::terminals::icarus_program;
 
 /// The agent id Icarus registers in the default settings (`agent_servers.Icarus`).
-const ICARUS_AGENT: &str = "Icarus";
+pub(crate) const ICARUS_AGENT: &str = "Icarus";
 
 pub struct IcarusOnServer {
     server: String,
@@ -72,8 +73,8 @@ impl AgentServer for IcarusOnServer {
 }
 
 /// The agent server for a new tab in `project`: the saved server that owns a local folder's
-/// workspace; `None` (the configured `icarus acp`) for this machine's workspaces and for projects
-/// opened over SSH, whose agent Zed already starts on that host.
+/// workspace; `icarus acp` on the host (installed on request) for projects opened over SSH; `None`
+/// (the configured `icarus acp`) for this machine's workspaces and other remote kinds.
 pub fn agent_server_for_project(
     project: &Entity<Project>,
     cx: &App,
@@ -82,8 +83,13 @@ pub fn agent_server_for_project(
         return None;
     }
     let project = project.read(cx);
-    if project.remote_connection_options(cx).is_some() {
-        return None;
+    if let Some(options) = project.remote_connection_options(cx) {
+        return match options {
+            RemoteConnectionOptions::Ssh(_) => Some(Rc::new(
+                crate::ssh_install::IcarusOverSsh::new(options.display_name()),
+            )),
+            _ => None,
+        };
     }
     match routing::server_for_project(project, cx) {
         ServerRef::Primary => routing::primary(cx)

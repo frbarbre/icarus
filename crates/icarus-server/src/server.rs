@@ -91,6 +91,7 @@ pub struct Server {
     pub(crate) automation: crate::automation::Automation,
     pub(crate) ports: crate::ports::Ports,
     pub(crate) history: Arc<crate::history::HistoryIndex>,
+    pub(crate) creates: crate::create::Creates,
     /// Connected clients, for requests the server forwards to editors (e.g. open a file).
     clients: std::sync::Mutex<Vec<(String, String, Outbound)>>,
     shutdown: Notify,
@@ -201,6 +202,7 @@ impl Server {
             automation: crate::automation::Automation::default(),
             ports: crate::ports::Ports::default(),
             history: Arc::default(),
+            creates: crate::create::Creates::default(),
             paths,
             token,
             started_at_ms: SystemTime::now()
@@ -291,6 +293,7 @@ impl Server {
         crate::settings::spawn(Arc::clone(&self));
         crate::linear::spawn(Arc::clone(&self));
         crate::updates::spawn(Arc::clone(&self));
+        self.spawn_terminal_changes();
         self.resume_setups();
         // launchd and systemd stop (and restart) the service with SIGTERM; nothing may die.
         let mut terminate =
@@ -468,6 +471,22 @@ impl Server {
                                 client_id: id,
                                 token: issued_token,
                                 paired_client_id,
+                            });
+                        }
+                        // Off the connection's loop, so `workspace.create_cancel` can reach a slow create.
+                        ClientMessage::Request { id, method, params }
+                            if authenticated && method == "workspace.create" =>
+                        {
+                            let server = Arc::clone(&self);
+                            let outbound = outbound.clone();
+                            tokio::spawn(async move {
+                                let (result, error) =
+                                    match server.workspace_dispatch(&method, params).await {
+                                        Ok(value) => (Some(value), None),
+                                        Err(error) => (None, Some(error)),
+                                    };
+                                let _ =
+                                    outbound.send(ServerMessage::Response { id, result, error });
                             });
                         }
                         ClientMessage::Request { id, method, params } => {
@@ -985,6 +1004,8 @@ impl Server {
                     rows: Option<u16>,
                     label: Option<String>,
                     workspace: Option<String>,
+                    #[serde(default)]
+                    task: bool,
                 }
                 let p: P = params(params_value)?;
                 let cwd = match p.cwd {
@@ -997,18 +1018,21 @@ impl Server {
                         format!("{} is not a directory", cwd.display()),
                     ));
                 }
-                let session = self
-                    .terminals
-                    .create(SpawnOptions {
-                        cwd,
-                        command: p.command,
-                        env: p.env,
-                        columns: p.columns.unwrap_or(120),
-                        rows: p.rows.unwrap_or(32),
-                        label: p.label,
-                        workspace: p.workspace,
-                    })
-                    .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
+                let options = SpawnOptions {
+                    cwd,
+                    command: p.command,
+                    env: p.env,
+                    columns: p.columns.unwrap_or(120),
+                    rows: p.rows.unwrap_or(32),
+                    label: p.label,
+                    workspace: p.workspace,
+                };
+                let session = if p.task {
+                    self.terminals.create_task(options)
+                } else {
+                    self.terminals.create(options)
+                }
+                .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
                 to_value(session.info())
             }
             "terminal.list" => to_value(self.terminals.list()),
@@ -1126,8 +1150,9 @@ impl Server {
                     .terminals
                     .get(&p.id)
                     .ok_or_else(|| rpc("not_found", &p.id))?;
-                session.set_label(p.label.filter(|label| !label.trim().is_empty()));
-                self.terminals.save_registry();
+                if session.set_label(p.label.filter(|label| !label.trim().is_empty())) {
+                    self.terminals.save_registry();
+                }
                 to_value(session.info())
             }
             "terminal.resize" => {
@@ -1326,6 +1351,33 @@ impl Server {
 
     pub(crate) fn client_count(&self) -> usize {
         self.clients.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Tells every client when a terminal's keyboard mode or label changes, attached or not.
+    fn spawn_terminal_changes(self: &Arc<Self>) {
+        let mut changes = self.terminals.subscribe_changes();
+        let server = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let change = match changes.recv().await {
+                    Ok(change) => change,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(server) = server.upgrade() else {
+                    break;
+                };
+                let (topic, payload) = match change {
+                    crate::terminal::TerminalChange::Keyboard { id, flags } => {
+                        ("terminal.keyboard", json!({ "id": id, "flags": flags }))
+                    }
+                    crate::terminal::TerminalChange::Label { id, label } => {
+                        ("terminal.label", json!({ "id": id, "label": label }))
+                    }
+                };
+                server.broadcast(topic, payload);
+            }
+        });
     }
 
     /// Sends an event to every connected client; returns how many received it.

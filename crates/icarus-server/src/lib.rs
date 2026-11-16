@@ -4,6 +4,7 @@ pub mod attachments;
 pub mod automation;
 pub mod changes;
 pub mod codex;
+pub mod create;
 pub mod emulator;
 pub mod github;
 pub mod gitops;

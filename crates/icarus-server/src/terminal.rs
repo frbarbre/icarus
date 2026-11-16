@@ -3,7 +3,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +30,20 @@ pub enum TerminalEvent {
     Title(Option<String>),
     Bell,
     Exit { code: Option<u32> },
+}
+
+/// A change every client hears about, not only the ones attached to the terminal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TerminalChange {
+    /// The program turned the kitty keyboard protocol on (flags > 0) or off.
+    Keyboard {
+        id: String,
+        flags: u8,
+    },
+    Label {
+        id: String,
+        label: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +77,12 @@ pub struct TerminalInfo {
     /// A command, not the shell, holds the foreground (quick commands interrupt it rather than type).
     #[serde(default)]
     pub busy: bool,
+    /// An editor task (tasks.json) rather than a shell.
+    #[serde(default)]
+    pub task: bool,
+    /// The kitty keyboard protocol flags the program enabled; 0 means legacy key encoding.
+    #[serde(default)]
+    pub kitty_keyboard_flags: u8,
 }
 
 /// What a client gets when it (re)attaches: either the missing output or a full screen snapshot.
@@ -87,6 +108,8 @@ pub struct TerminalRecord {
     pub created_at_ms: u64,
     pub columns: u16,
     pub rows: u16,
+    #[serde(default)]
+    pub task: bool,
 }
 
 /// A terminal as handed to the next server: its record, live state and screen.
@@ -135,9 +158,11 @@ pub struct TerminalSession {
     command: Vec<String>,
     env: BTreeMap<String, String>,
     created_at_ms: u64,
+    task: AtomicBool,
     state: Mutex<State>,
     io: Mutex<Option<Io>>,
     events: broadcast::Sender<TerminalEvent>,
+    changes: OnceLock<broadcast::Sender<TerminalChange>>,
 }
 
 type Child = Box<dyn portable_pty::Child + Send + Sync>;
@@ -226,9 +251,11 @@ impl TerminalSession {
             command: record.command,
             env: record.env,
             created_at_ms: record.created_at_ms,
+            task: AtomicBool::new(record.task),
             state: Mutex::new(state),
             io: Mutex::new(None),
             events,
+            changes: OnceLock::new(),
         })
     }
 
@@ -275,6 +302,7 @@ impl TerminalSession {
                 created_at_ms: now_ms(),
                 columns: size.cols,
                 rows: size.rows,
+                task: false,
             },
             state,
         );
@@ -430,6 +458,12 @@ impl TerminalSession {
         if let Some(title) = effects.title {
             let _ = self.events.send(TerminalEvent::Title(title));
         }
+        if let Some(flags) = effects.keyboard {
+            self.announce(TerminalChange::Keyboard {
+                id: self.id.clone(),
+                flags,
+            });
+        }
         if effects.bell {
             let _ = self.events.send(TerminalEvent::Bell);
         }
@@ -482,6 +516,7 @@ impl TerminalSession {
             created_at_ms: self.created_at_ms,
             columns,
             rows,
+            task: self.task.load(Ordering::Relaxed),
         }
     }
 
@@ -489,8 +524,30 @@ impl TerminalSession {
         &self.id
     }
 
-    pub fn set_label(&self, label: Option<String>) {
-        *lock(&self.label) = label;
+    fn announce(&self, change: TerminalChange) {
+        if let Some(changes) = self.changes.get() {
+            let _ = changes.send(change);
+        }
+    }
+
+    /// Returns whether the label changed; every client hears about a change.
+    pub fn set_label(&self, label: Option<String>) -> bool {
+        {
+            let mut current = lock(&self.label);
+            if *current == label {
+                return false;
+            }
+            current.clone_from(&label);
+        }
+        self.announce(TerminalChange::Label {
+            id: self.id.clone(),
+            label,
+        });
+        true
+    }
+
+    pub fn is_task(&self) -> bool {
+        self.task.load(Ordering::Relaxed)
     }
 
     /// Whether a program other than the shell holds the terminal's foreground (a command is running).
@@ -525,6 +582,8 @@ impl TerminalSession {
             created_at_ms: self.created_at_ms,
             next_seq: state.next_seq,
             lost: state.lost,
+            task: self.task.load(Ordering::Relaxed),
+            kitty_keyboard_flags: state.emulator.keyboard_flags(),
         }
     }
 
@@ -624,11 +683,21 @@ impl TerminalSession {
     }
 }
 
-#[derive(Default)]
 pub struct TerminalManager {
     sessions: Mutex<BTreeMap<String, Arc<TerminalSession>>>,
     /// `terminals.json`; absent in tests that need no persistence.
     registry: Option<PathBuf>,
+    changes: broadcast::Sender<TerminalChange>,
+}
+
+impl Default for TerminalManager {
+    fn default() -> Self {
+        Self {
+            sessions: Mutex::default(),
+            registry: None,
+            changes: broadcast::channel(256).0,
+        }
+    }
 }
 
 impl TerminalManager {
@@ -657,11 +726,24 @@ impl TerminalManager {
             sessions.insert(record.id.clone(), TerminalSession::lost(record));
         }
         let manager = Self {
-            sessions: Mutex::new(sessions),
             registry: Some(registry),
+            ..Self::default()
         };
+        for session in sessions.values() {
+            manager.watch(session);
+        }
+        *lock(&manager.sessions) = sessions;
         manager.save();
         manager
+    }
+
+    fn watch(&self, session: &TerminalSession) {
+        let _ = session.changes.set(self.changes.clone());
+    }
+
+    /// Keyboard-mode and label changes of every terminal, for the server to pass on to its clients.
+    pub fn subscribe_changes(&self) -> broadcast::Receiver<TerminalChange> {
+        self.changes.subscribe()
     }
 
     pub fn save_registry(&self) {
@@ -688,8 +770,19 @@ impl TerminalManager {
     }
 
     pub fn create(&self, options: SpawnOptions) -> Result<Arc<TerminalSession>> {
+        self.create_kind(options, false)
+    }
+
+    /// Like `create`, for an editor task: listed and restored as a task rather than a shell.
+    pub fn create_task(&self, options: SpawnOptions) -> Result<Arc<TerminalSession>> {
+        self.create_kind(options, true)
+    }
+
+    fn create_kind(&self, options: SpawnOptions, task: bool) -> Result<Arc<TerminalSession>> {
         let id = format!("term-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
         let session = TerminalSession::spawn(id.clone(), options)?;
+        session.task.store(task, Ordering::Relaxed);
+        self.watch(&session);
         lock(&self.sessions).insert(id, Arc::clone(&session));
         self.save();
         Ok(session)
@@ -892,5 +985,56 @@ mod tests {
         second.forget_all();
         let third = TerminalManager::restore(registry, Vec::new());
         assert!(third.list().is_empty());
+    }
+
+    #[test]
+    fn keyboard_modes_and_labels_reach_every_listener() {
+        let manager = TerminalManager::default();
+        let mut changes = manager.subscribe_changes();
+        let session = manager.create(options(&["/bin/cat"])).expect("spawn");
+        let id = session.id().to_string();
+        session.write(b"\x1b[>1u\n").expect("write");
+        wait_until(|| session.info().kitty_keyboard_flags == 1);
+        assert_eq!(
+            changes.try_recv().expect("keyboard change"),
+            TerminalChange::Keyboard {
+                id: id.clone(),
+                flags: 1
+            }
+        );
+        assert!(session.set_label(Some("Build".into())));
+        assert!(!session.set_label(Some("Build".into())), "unchanged");
+        assert_eq!(
+            changes.try_recv().expect("label change"),
+            TerminalChange::Label {
+                id,
+                label: Some("Build".into())
+            }
+        );
+        assert!(changes.try_recv().is_err(), "an unchanged label is quiet");
+        session.kill().expect("kill");
+    }
+
+    #[test]
+    fn a_task_terminal_stays_a_task_across_a_restore() {
+        let dir = tempfile::tempdir().expect("dir");
+        let registry = dir.path().join("terminals.json");
+        let first = TerminalManager::restore(registry.clone(), Vec::new());
+        let task = first
+            .create_task(SpawnOptions {
+                label: Some("cargo test".into()),
+                ..options(&["/bin/sh", "-c", "exit 0"])
+            })
+            .expect("spawn");
+        let shell = first.create(options(&["/bin/cat"])).expect("spawn");
+        assert!(task.info().task && !shell.info().task);
+        shell.kill().expect("kill");
+        let id = task.id().to_string();
+        drop(first);
+
+        let second = TerminalManager::restore(registry, Vec::new());
+        let info = second.get(&id).expect("listed").info();
+        assert!(info.task);
+        assert_eq!(info.label.as_deref(), Some("cargo test"));
     }
 }

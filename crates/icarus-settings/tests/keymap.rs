@@ -198,6 +198,33 @@ fn terminal_panes_and_group_focus_map_to_their_actions() {
 }
 
 #[test]
+fn pane_titles_equalize_and_history_bind_without_unbinding_group_focus() {
+    let orca = json!({ "version": 1, "platforms": { "darwin": {
+        "terminal.equalizePaneSizes": ["Mod+Alt+0"],
+        "terminal.setTitle": ["Mod+Shift+R"],
+        "terminal.clearPaneTitle": ["Mod+Alt+Shift+0"],
+        "worktree.history.back": ["Ctrl+Minus"],
+        "worktree.history.forward": ["Ctrl+Shift+Minus"],
+    } } });
+    let translation = translate(&orca, Platform::Mac);
+    let terminal = section(&translation, "Terminal").expect("terminal section");
+    assert_eq!(terminal["alt-cmd-0"], "workspace::ResetPaneSizes");
+    assert_eq!(terminal["shift-cmd-r"], "icarus::SetPaneTitle");
+    assert_eq!(terminal["alt-shift-cmd-0"], "icarus::ClearPaneTitle");
+    let workspace = section(&translation, "Workspace").expect("global section");
+    assert_eq!(workspace["ctrl--"], "pane::GoBack");
+    assert_eq!(workspace["ctrl-shift--"], "pane::GoForward");
+    assert!(
+        translation.sections[0].get("unbind").is_none()
+            || translation.sections[0]["unbind"]
+                .get("alt-cmd-left")
+                .is_none(),
+        "⌥⌘← keeps focusing groups"
+    );
+    assert!(translation.skipped.is_empty(), "{:?}", translation.skipped);
+}
+
+#[test]
 fn an_empty_list_unbinds_the_default_without_a_new_key() {
     let orca = json!({ "version": 1, "platforms": { "darwin": { "editor.showEdit": [] } } });
     let translation = translate(&orca, Platform::Mac);

@@ -724,7 +724,7 @@ impl TerminalPanel {
                 .workspace
                 .update(cx, |workspace, cx| {
                     Self::add_center_terminal(workspace, window, cx, |project, cx| {
-                        project.create_terminal_task(spawn_task, cx)
+                        project.create_user_terminal_task(spawn_task, cx)
                     })
                 })
                 .unwrap_or_else(|e| Task::ready(Err(e))),
@@ -892,7 +892,9 @@ impl TerminalPanel {
             }
             let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
             let terminal = project
-                .update(cx, |project, cx| project.create_terminal_task(task, cx))
+                .update(cx, |project, cx| {
+                    project.create_user_terminal_task(task, cx)
+                })
                 .await?;
             let pane = terminal_panel
                 .read_with(cx, |terminal_panel, _| terminal_panel.active_pane.clone())?;
@@ -1111,7 +1113,7 @@ impl TerminalPanel {
             })??;
             let new_terminal = project
                 .update(cx, |project, cx| {
-                    project.create_terminal_task(spawn_task, cx)
+                    project.create_user_terminal_task(spawn_task, cx)
                 })
                 .await?;
             terminal_to_replace.update_in(cx, |terminal_to_replace, window, cx| {

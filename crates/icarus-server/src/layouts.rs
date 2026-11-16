@@ -105,6 +105,17 @@ impl Server {
         name: &str,
         pr_url: Option<String>,
     ) -> Result<Value, RpcError> {
+        self.apply_layout_with(workspace, name, pr_url, &[]).await
+    }
+
+    /// `apply_layout`, plus existing server terminals (e.g. `defaultTabs`) added after the first pane's tabs.
+    pub(crate) async fn apply_layout_with(
+        self: &Arc<Self>,
+        workspace: &Workspace,
+        name: &str,
+        pr_url: Option<String>,
+        extra_terminals: &[String],
+    ) -> Result<Value, RpcError> {
         let root = self.project_root_of(workspace);
         let layouts = self.layouts_for(root.as_deref())?;
         let mut layout = find_layout(&layouts, name).ok_or_else(|| {
@@ -134,6 +145,9 @@ impl Server {
             .and_then(|status| status.terminal)
         {
             crate::hooks::show_setup_terminal(&mut layout, &terminal);
+        }
+        for terminal in extra_terminals {
+            crate::hooks::add_terminal_tab(&mut layout, terminal);
         }
         let payload = json!({
             "workspace_id": workspace.id,

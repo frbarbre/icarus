@@ -1431,6 +1431,15 @@
     },
   },
   {
+    // Icarus: a program that turned on the kitty keyboard protocol binds these keys itself, as Orca lets it.
+    "context": "Terminal && kitty_keyboard",
+    "bindings": {
+      "ctrl-left": ["terminal::SendText", "\u001b[1;5D"],
+      "ctrl-right": ["terminal::SendText", "\u001b[1;5C"],
+      "alt-backspace": ["terminal::SendText", "\u001b[127;3u"],
+    },
+  },
+  {
     "context": "AgentPanel > Terminal",
     "use_key_equivalents": true,
     "bindings": {

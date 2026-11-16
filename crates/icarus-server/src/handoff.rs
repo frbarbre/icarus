@@ -340,6 +340,7 @@ mod tests {
                     created_at_ms: 0,
                     columns: 80,
                     rows: 24,
+                    task: false,
                 },
                 title: None,
                 pid: None,

@@ -4,13 +4,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use icarus_git::{CreateWorktree, RemoveError};
+use icarus_git::RemoveError;
 use icarus_protocol::RpcError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::agent::{AgentOptions, AgentState};
-use crate::hooks::{SetupDecision, setup_key, should_run_setup};
+use crate::create::{
+    CancelFlag, PrHead, WorktreePlan, add_worktree, branch_exists, discard_worktree,
+    materialize_shared_paths, or_cancelled, parse_pr, pull_ref, read_worktree_include,
+    relink_shared_paths, unlink_shared_paths,
+};
+use crate::hooks::{ScriptKind, SetupDecision, setup_key, should_run_setup, untrusted_message};
 use crate::next_action;
 use crate::server::{Server, params, rpc, to_value};
 use crate::state::{Workspace, workspace_slug};
@@ -140,182 +145,62 @@ impl Server {
                 Ok(json!({ "removed": self.store.remove_project(&project.id).map_err(internal)? }))
             }
             "workspace.create" => {
+                let p: CreateParams = params(p)?;
+                let create_id = p
+                    .create_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+                let flag = self.creates.begin(&create_id);
+                let result = self.create_workspace(p, &flag).await;
+                self.creates.finish(&create_id);
+                result
+            }
+            "workspace.create_cancel" => {
                 #[derive(Deserialize)]
                 struct P {
-                    project: String,
-                    /// Optional when `issue` links a Linear issue: then it comes from the issue.
-                    name: Option<String>,
-                    branch: Option<String>,
-                    base: Option<String>,
-                    #[serde(default)]
-                    fetch: bool,
-                    status: Option<String>,
-                    title: Option<String>,
-                    issue: Option<Value>,
-                    prompt: Option<String>,
-                    /// Every workspace gets an agent unless this is false (plan §3-0).
-                    #[serde(default = "yes")]
-                    agent: bool,
-                    provider: Option<String>,
-                    model: Option<String>,
-                    agent_command: Option<Vec<String>>,
-                    /// Account id or label for the agent; `system` for the provider's own login.
-                    account: Option<String>,
-                    /// A name under `layouts`, applied once the agent exists (plan D32).
-                    layout: Option<String>,
-                    pr_url: Option<String>,
-                    /// Start the agent with Claude Code's Remote Control; default `agents.remote_control`.
-                    remote_control: Option<bool>,
-                    /// The project's setup script: run, skip, inherit (its `setupRunPolicy`) or auto.
-                    setup: Option<Value>,
+                    create_id: String,
+                }
+                let p: P = params(p)?;
+                Ok(json!({ "cancelled": self.creates.cancel(&p.create_id) }))
+            }
+            "project.scripts" | "project.trust" => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                    /// Read `orca.yaml` from this workspace's checkout as well as the project root.
+                    workspace: Option<String>,
                 }
                 let p: P = params(p)?;
                 let project = self
                     .store
-                    .project(&p.project)
+                    .project(&p.id)
                     .map_err(internal)?
-                    .ok_or_else(|| rpc("not_found", format!("project {}", p.project)))?;
-                let setup_decision = SetupDecision::parse(p.setup.as_ref())?;
-                // Decided before the worktree exists, so an "ask" project leaves nothing behind.
-                let hooks = self.hooks_for(&project.root, &project.root);
-                if hooks.setup.is_some() {
-                    should_run_setup(hooks.run_policy, setup_decision)?;
-                }
-                // Checked before the worktree exists, so a typo leaves nothing behind.
-                if let Some(key) = p
-                    .account
-                    .as_deref()
-                    .filter(|k| *k != crate::accounts::SYSTEM)
-                {
-                    self.find_account(key)?;
-                }
-                let mut issue = p.issue;
-                let linked = issue.as_ref().and_then(crate::linear::linear_issue_id);
-                let from_linear = match &linked {
-                    Some(identifier) => self.linear_issue_for_create(identifier).await,
-                    None => None,
+                    .ok_or_else(|| rpc("not_found", &p.id))?;
+                let yaml_dir = match &p.workspace {
+                    Some(key) => self.workspace_by_key(key)?.path,
+                    None => project.root.clone(),
                 };
-                if let (Some(stored), Some(identifier)) = (issue.as_mut(), &linked) {
-                    stored["id"] = json!(identifier);
-                    if let Some(found) = &from_linear
-                        && stored["title"].as_str().is_none_or(str::is_empty)
-                    {
-                        stored["title"] = json!(found.title);
+                let hooks = self.hooks_for(&project.root, &yaml_dir);
+                if method == "project.trust" {
+                    self.trust_hooks(&project.id, &hooks)?;
+                    if p.workspace.is_some() {
+                        self.trust_hooks(
+                            &project.id,
+                            &self.hooks_for(&project.root, &project.root),
+                        )?;
                     }
                 }
-                let name = p
-                    .name
-                    .filter(|name| !name.trim().is_empty())
-                    // Why: the identifier alone keeps `<slug>.localhost` dev URLs under the 63-char DNS label limit.
-                    .or_else(|| linked.as_ref().map(|identifier| identifier.to_lowercase()))
-                    .ok_or_else(|| rpc("invalid_params", "name is required"))?;
-                let slug = workspace_slug(&name, SLUG_MAX);
-                let repo_dir = workspace_slug(&project.name, SLUG_MAX);
-                let path = self.workspace_root.join(repo_dir).join(&slug);
-                if path.exists() {
-                    return Err(rpc("exists", format!("{} already exists", path.display())));
-                }
-                let branch = p
-                    .branch
-                    .or_else(|| from_linear.as_ref()?.branch_name.clone())
-                    .unwrap_or_else(|| slug.clone());
-                let base = p
-                    .base
-                    .or_else(|| project.base_ref.clone())
-                    .ok_or_else(|| rpc("no_base", "project has no base ref; pass base"))?;
-                let root = project.root.clone();
-                let (path_c, branch_c, base_c, fetch) =
-                    (path.clone(), branch.clone(), base.clone(), p.fetch);
-                tokio::task::spawn_blocking(move || {
-                    icarus_git::create_worktree(&CreateWorktree {
-                        repo: &root,
-                        path: &path_c,
-                        branch: &branch_c,
-                        base: &base_c,
-                        fetch,
-                    })
-                })
-                .await
-                .map_err(internal)?
-                .map_err(|e| rpc("git_failed", format!("{e:#}")))?;
-                let workspace = Workspace {
-                    id: format!("ws-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]),
-                    project_id: project.id.clone(),
-                    name: slug,
-                    path: path.clone(),
-                    branch: Some(branch),
-                    base_ref: Some(base),
-                    status: p.status,
-                    title: p.title,
-                    issue,
-                    pull_request: None,
-                    created_at_ms: now_ms(),
-                    pinned: false,
-                };
-                self.store.insert_workspace(&workspace).map_err(internal)?;
-                if let Err(error) = self.start_setup(&workspace, &project.root, setup_decision) {
-                    tracing::warn!("setup for {}: {}", workspace.name, error.message);
-                    self.record_setup_failure(&workspace.id, error.message);
-                }
-                if p.agent {
-                    let settings = self.resolved_settings(Some(&project.root));
-                    let provider = p
-                        .provider
-                        .unwrap_or_else(|| next_action::default_provider(&settings));
-                    let command = p
-                        .agent_command
-                        .or_else(|| next_action::configured_command(&settings, &provider));
-                    let mut options = AgentOptions {
-                        provider,
-                        cwd: path,
-                        workspace: Some(workspace.id.clone()),
-                        title: Some("Agent".into()),
-                        model: p.model,
-                        bypass_permissions: true,
-                        resume: None,
-                        command,
-                        env: Default::default(),
-                        account: None,
-                        remote_control: p
-                            .remote_control
-                            .unwrap_or_else(|| next_action::remote_control_default(&settings)),
-                    };
-                    self.apply_account(&mut options, p.account.as_deref())?;
-                    let agent = self
-                        .agents
-                        .create(options)
-                        .await
-                        .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
-                    if let Some(prompt) = p.prompt {
-                        if self.agent_waits_for_setup(&workspace.id) {
-                            // `wait-for-setup`: the agent exists now, its first prompt goes once setup ends.
-                            let server = Arc::clone(self);
-                            let workspace_id = workspace.id.clone();
-                            tokio::spawn(async move {
-                                server.wait_for_setup(&workspace_id).await;
-                                if let Err(error) = agent.send(&prompt, &[]).await {
-                                    tracing::warn!(
-                                        "first prompt after setup of {workspace_id}: {error:#}"
-                                    );
-                                }
-                            });
-                        } else {
-                            agent
-                                .send(&prompt, &[])
-                                .await
-                                .map_err(|e| rpc("send_failed", format!("{e:#}")))?;
-                        }
-                    }
-                }
-                let mut value = self.workspace_json(&workspace);
-                let layout = p.layout.or_else(|| {
-                    p.agent
-                        .then(|| icarus_protocol::layout::DEFAULT_LAYOUT.to_owned())
-                });
-                if let Some(layout) = layout {
-                    value["layout"] = self.apply_layout(&workspace, &layout, p.pr_url).await?;
-                }
-                Ok(value)
+                Ok(self.scripts_view(&project.id, &hooks))
+            }
+            "project.untrust" => {
+                let key: Key = params(p)?;
+                let project = self
+                    .store
+                    .project(&key.id)
+                    .map_err(internal)?
+                    .ok_or_else(|| rpc("not_found", &key.id))?;
+                self.untrust_project(&project.id)?;
+                Ok(json!({ "trusted": false }))
             }
             "workspace.list" => {
                 #[derive(Deserialize)]
@@ -452,8 +337,12 @@ impl Server {
                         ),
                     ));
                 }
+                let shared = self
+                    .hooks_for(&project.root, &project.root)
+                    .shared_directories;
+                let unlinked = unlink_shared_paths(&project.root, &workspace.path, &shared);
                 let (root, path, force, delete_branch) = (
-                    project.root,
+                    project.root.clone(),
                     workspace.path.clone(),
                     p.force,
                     p.delete_branch,
@@ -467,6 +356,9 @@ impl Server {
                 })
                 .await
                 .map_err(internal)?;
+                if result.is_err() && workspace.path.is_dir() {
+                    relink_shared_paths(&project.root, &workspace.path, &unlinked);
+                }
                 match result {
                     Err(RemoveError::Dirty) => return Err(rpc("dirty", RemoveError::Dirty)),
                     Err(error) => return Err(rpc("git_failed", format!("{error:#}"))),
@@ -503,7 +395,13 @@ impl Server {
                 Ok(json!({ "removed": true, "archive": archive }))
             }
             "workspace.setup" => {
-                let key: Key = params(p)?;
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                    #[serde(default)]
+                    trust: bool,
+                }
+                let key: P = params(p)?;
                 let workspace = self.workspace_by_key(&key.id)?;
                 if self
                     .setup_status(&workspace.id)
@@ -516,6 +414,9 @@ impl Server {
                     .project(&workspace.project_id)
                     .map_err(internal)?
                     .ok_or_else(|| rpc("not_found", "project"))?;
+                if key.trust {
+                    self.trust_hooks(&project.id, &self.hooks_for(&project.root, &workspace.path))?;
+                }
                 match self.start_setup(&workspace, &project.root, SetupDecision::Run)? {
                     Some(status) => Ok(json!(status)),
                     None => Err(rpc(
@@ -617,6 +518,313 @@ impl Server {
             }
             other => Err(rpc("unknown_method", other)),
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateParams {
+    project: String,
+    /// Optional when `issue` links a Linear issue or `pr` names a pull request.
+    name: Option<String>,
+    branch: Option<String>,
+    base: Option<String>,
+    #[serde(default)]
+    fetch: bool,
+    status: Option<String>,
+    title: Option<String>,
+    issue: Option<Value>,
+    prompt: Option<String>,
+    /// Every workspace gets an agent unless this is false (plan §3-0).
+    #[serde(default = "yes")]
+    agent: bool,
+    provider: Option<String>,
+    model: Option<String>,
+    agent_command: Option<Vec<String>>,
+    /// Account id or label for the agent; `system` for the provider's own login.
+    account: Option<String>,
+    /// A name under `layouts`, applied once the agent exists (plan D32).
+    layout: Option<String>,
+    pr_url: Option<String>,
+    /// Start the agent with Claude Code's Remote Control; default `agents.remote_control`.
+    remote_control: Option<bool>,
+    /// The project's setup script: run, skip, inherit (its `setupRunPolicy`) or auto.
+    setup: Option<Value>,
+    /// Trust the project's committed scripts as they are now (`project.trust`).
+    #[serde(default)]
+    trust: bool,
+    /// Start from this pull request (number or URL): its head branch, with its base as the base.
+    pr: Option<Value>,
+    /// Chosen by the client so `workspace.create_cancel` can name this create.
+    create_id: Option<String>,
+}
+
+/// What a pull request start point resolved to on GitHub.
+struct PrStart {
+    head: PrHead,
+    base_branch: String,
+    url: String,
+    title: String,
+}
+
+impl Server {
+    async fn resolve_pr_start(
+        &self,
+        project: &crate::state::Project,
+        pr: &Value,
+    ) -> Result<PrStart, RpcError> {
+        let (named, number) = parse_pr(pr)?;
+        let repo = crate::github::repo_ref(project).ok_or_else(|| {
+            rpc(
+                "no_github",
+                format!(
+                    "{} has no GitHub remote to find pull requests in",
+                    project.name
+                ),
+            )
+        })?;
+        if let Some((owner, name)) = &named
+            && !(owner.eq_ignore_ascii_case(&repo.owner) && name.eq_ignore_ascii_case(&repo.name))
+        {
+            return Err(rpc(
+                "wrong_repository",
+                format!(
+                    "that pull request is in {owner}/{name}, but {} is {}",
+                    project.name,
+                    repo.slug()
+                ),
+            ));
+        }
+        let details = self
+            .github
+            .client
+            .pull_request(&repo, number)
+            .await
+            .map_err(|e| rpc("github_failed", format!("pull request #{number}: {e}")))?;
+        Ok(PrStart {
+            head: PrHead {
+                number,
+                head_branch: details.pr.head_ref_name.clone(),
+                cross_repository: details.is_cross_repository,
+            },
+            base_branch: details.pr.base_ref_name.clone(),
+            url: details.pr.url.clone(),
+            title: details.pr.title.clone(),
+        })
+    }
+
+    async fn create_workspace(
+        self: &Arc<Self>,
+        p: CreateParams,
+        flag: &CancelFlag,
+    ) -> Result<Value, RpcError> {
+        let project = self
+            .store
+            .project(&p.project)
+            .map_err(internal)?
+            .ok_or_else(|| rpc("not_found", format!("project {}", p.project)))?;
+        let setup_decision = SetupDecision::parse(p.setup.as_ref())?;
+        // Decided before the worktree exists, so an "ask" or untrusted project leaves nothing behind.
+        let root_hooks = self.hooks_for(&project.root, &project.root);
+        let runs_setup = match root_hooks.setup {
+            Some(_) => should_run_setup(root_hooks.run_policy, setup_decision)?,
+            None => false,
+        };
+        if p.trust {
+            self.trust_hooks(&project.id, &root_hooks)?;
+        } else if runs_setup
+            && setup_decision != SetupDecision::Auto
+            && let Some(shared) = &root_hooks.shared_setup
+            && !self.is_trusted(&project.id, ScriptKind::Setup, shared)
+        {
+            return Err(rpc(
+                "untrusted_scripts",
+                untrusted_message(&project.id, "setup script"),
+            ));
+        }
+        // Checked before the worktree exists, so a typo leaves nothing behind.
+        if let Some(key) = p
+            .account
+            .as_deref()
+            .filter(|k| *k != crate::accounts::SYSTEM)
+        {
+            self.find_account(key)?;
+        }
+        let mut issue = p.issue;
+        let linked = issue.as_ref().and_then(crate::linear::linear_issue_id);
+        let (from_linear, pr) = or_cancelled(flag, async {
+            let from_linear = match &linked {
+                Some(identifier) => self.linear_issue_for_create(identifier).await,
+                None => None,
+            };
+            let pr = match &p.pr {
+                Some(pr) => Some(self.resolve_pr_start(&project, pr).await?),
+                None => None,
+            };
+            Ok((from_linear, pr))
+        })
+        .await?;
+        if let (Some(stored), Some(identifier)) = (issue.as_mut(), &linked) {
+            stored["id"] = json!(identifier);
+            if let Some(found) = &from_linear
+                && stored["title"].as_str().is_none_or(str::is_empty)
+            {
+                stored["title"] = json!(found.title);
+            }
+        }
+        let name = p
+            .name
+            .filter(|name| !name.trim().is_empty())
+            // Why: the identifier alone keeps `<slug>.localhost` dev URLs under the 63-char DNS label limit.
+            .or_else(|| linked.as_ref().map(|identifier| identifier.to_lowercase()))
+            .or_else(|| pr.as_ref().map(|pr| pr.head.head_branch.clone()))
+            .ok_or_else(|| rpc("invalid_params", "name is required"))?;
+        let slug = workspace_slug(&name, SLUG_MAX);
+        let repo_dir = workspace_slug(&project.name, SLUG_MAX);
+        let path = self.workspace_root.join(repo_dir).join(&slug);
+        if path.exists() {
+            return Err(rpc("exists", format!("{} already exists", path.display())));
+        }
+        let branch = p
+            .branch
+            .or_else(|| pr.as_ref().map(|pr| pr.head.head_branch.clone()))
+            .or_else(|| from_linear.as_ref()?.branch_name.clone())
+            .unwrap_or_else(|| slug.clone());
+        let base = p
+            .base
+            .or_else(|| pr.as_ref().map(|pr| format!("origin/{}", pr.base_branch)))
+            .or_else(|| project.base_ref.clone())
+            .ok_or_else(|| rpc("no_base", "project has no base ref; pass base"))?;
+        let plan = WorktreePlan {
+            repo: project.root.clone(),
+            path: path.clone(),
+            branch_existed: branch_exists(&project.root, &branch).await,
+            branch: branch.clone(),
+            start: match &pr {
+                Some(pr) => pull_ref(pr.head.number),
+                None => base.clone(),
+            },
+            fetch: (p.fetch || pr.is_some()).then(|| base.clone()),
+            pr: pr.as_ref().map(|pr| pr.head.clone()),
+        };
+        let prepared = or_cancelled(flag, async {
+            add_worktree(&plan).await?;
+            let includes = read_worktree_include(&project.root);
+            Ok(materialize_shared_paths(
+                &project.root,
+                &path,
+                &root_hooks.shared_directories,
+                &includes,
+            )
+            .await)
+        })
+        .await;
+        let warnings = match prepared {
+            Ok(warnings) => warnings,
+            Err(error) => {
+                discard_worktree(&plan).await;
+                return Err(error);
+            }
+        };
+        for warning in &warnings {
+            tracing::warn!("shared paths for {slug}: {warning}");
+        }
+        if p.trust {
+            self.trust_hooks(&project.id, &self.hooks_for(&project.root, &path))?;
+        }
+        let workspace = Workspace {
+            id: format!("ws-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]),
+            project_id: project.id.clone(),
+            name: slug,
+            path: path.clone(),
+            branch: Some(branch),
+            base_ref: Some(base),
+            status: p.status,
+            title: p.title.or_else(|| pr.as_ref().map(|pr| pr.title.clone())),
+            issue,
+            pull_request: pr
+                .as_ref()
+                .map(|pr| json!({ "number": pr.head.number, "url": pr.url })),
+            created_at_ms: now_ms(),
+            pinned: false,
+        };
+        self.store.insert_workspace(&workspace).map_err(internal)?;
+        if let Err(error) = self.start_setup(&workspace, &project.root, setup_decision) {
+            tracing::warn!("setup for {}: {}", workspace.name, error.message);
+            self.record_setup_failure(&workspace.id, error.message);
+        }
+        if p.agent {
+            let settings = self.resolved_settings(Some(&project.root));
+            let provider = p
+                .provider
+                .unwrap_or_else(|| next_action::default_provider(&settings));
+            let command = p
+                .agent_command
+                .or_else(|| next_action::configured_command(&settings, &provider));
+            let mut options = AgentOptions {
+                provider,
+                cwd: path,
+                workspace: Some(workspace.id.clone()),
+                title: Some("Agent".into()),
+                model: p.model,
+                bypass_permissions: true,
+                resume: None,
+                command,
+                env: Default::default(),
+                account: None,
+                remote_control: p
+                    .remote_control
+                    .unwrap_or_else(|| next_action::remote_control_default(&settings)),
+            };
+            self.apply_account(&mut options, p.account.as_deref())?;
+            let agent = self
+                .agents
+                .create(options)
+                .await
+                .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
+            if let Some(prompt) = p.prompt {
+                if self.agent_waits_for_setup(&workspace.id) {
+                    // `wait-for-setup`: the agent exists now, its first prompt goes once setup ends.
+                    let server = Arc::clone(self);
+                    let workspace_id = workspace.id.clone();
+                    tokio::spawn(async move {
+                        server.wait_for_setup(&workspace_id).await;
+                        if let Err(error) = agent.send(&prompt, &[]).await {
+                            tracing::warn!("first prompt after setup of {workspace_id}: {error:#}");
+                        }
+                    });
+                } else {
+                    agent
+                        .send(&prompt, &[])
+                        .await
+                        .map_err(|e| rpc("send_failed", format!("{e:#}")))?;
+                }
+            }
+        }
+        let layout = p.layout.or_else(|| {
+            p.agent
+                .then(|| icarus_protocol::layout::DEFAULT_LAYOUT.to_owned())
+        });
+        // Orca opens `defaultTabs` when the workspace first opens, so only a workspace with a layout gets them.
+        let default_tabs = if layout.is_some() {
+            self.start_default_tabs(&workspace, &project.root)
+        } else {
+            Vec::new()
+        };
+        let mut value = self.workspace_json(&workspace);
+        if let Some(layout) = layout {
+            value["layout"] = self
+                .apply_layout_with(
+                    &workspace,
+                    &layout,
+                    p.pr_url.or_else(|| pr.map(|pr| pr.url)),
+                    &default_tabs,
+                )
+                .await?;
+        }
+        if !warnings.is_empty() {
+            value["warnings"] = json!(warnings);
+        }
+        Ok(value)
     }
 }
 

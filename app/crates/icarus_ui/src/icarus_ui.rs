@@ -23,6 +23,7 @@ pub mod routing;
 pub mod servers;
 pub mod settings_view;
 pub mod sidebar;
+mod ssh_install;
 pub mod status_style;
 pub(crate) mod terminals;
 mod worktree_trust;
@@ -728,6 +729,15 @@ fn start_app_connection(cx: &mut App) {
                     | "config.changed" => {
                         cx.update(|cx| handle_view_event(&event.topic, event.payload, cx));
                     }
+                    "terminal.keyboard" | "terminal.label" => cx.update(|cx| {
+                        let primary = routing::primary(cx);
+                        terminals::terminal_changed(
+                            primary.as_deref(),
+                            &event.topic,
+                            &event.payload,
+                            cx,
+                        )
+                    }),
                     "notification" | "notifications.changed" => {
                         cx.update(|cx| {
                             notifications::handle_event(&event.topic, event.payload, cx)

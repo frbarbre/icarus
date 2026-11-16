@@ -461,6 +461,72 @@ pub enum StartPoint {
     Base,
     Branch,
     Commit,
+    PullRequest,
+}
+
+/// `project.scripts`: what the project's committed files run, and whether the user trusts it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ProjectScripts {
+    #[serde(default)]
+    pub setup: Option<ProjectScript>,
+    #[serde(default)]
+    pub default_tabs: Vec<DefaultTabScript>,
+    #[serde(default = "trusted_by_default")]
+    pub default_tabs_trusted: bool,
+    #[serde(default)]
+    pub run_policy: String,
+}
+
+fn trusted_by_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ProjectScript {
+    pub command: String,
+    pub trusted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DefaultTabScript {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+impl ProjectScripts {
+    fn asks_for_setup(&self) -> bool {
+        self.setup.is_some() && self.run_policy == "ask"
+    }
+
+    fn setup_runs(&self, run_setup: bool) -> bool {
+        self.setup.is_some()
+            && match self.run_policy.as_str() {
+                "ask" => run_setup,
+                "skip-by-default" => false,
+                _ => true,
+            }
+    }
+
+    fn untrusted_tab_commands(&self) -> Vec<&str> {
+        if self.default_tabs_trusted {
+            return Vec::new();
+        }
+        self.default_tabs
+            .iter()
+            .filter_map(|tab| tab.command.as_deref())
+            .collect()
+    }
+}
+
+fn next_create_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "app-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -516,8 +582,17 @@ pub struct NewWorkspaceModal {
     loading: bool,
     creating: bool,
     error: Option<String>,
+    notice: Option<&'static str>,
+    scripts: Option<ProjectScripts>,
+    /// The choice for a project whose setup policy is `ask`.
+    run_setup: bool,
+    trust_prompt: bool,
+    create_id: Option<String>,
+    cancelling: bool,
     load_task: Task<()>,
     layouts_task: Task<()>,
+    scripts_task: Task<()>,
+    cancel_task: Task<()>,
     search_task: Task<()>,
     create_task: Task<()>,
     _issue_edits: gpui::Subscription,
@@ -589,8 +664,16 @@ impl NewWorkspaceModal {
             loading: true,
             creating: false,
             error: None,
+            notice: None,
+            scripts: None,
+            run_setup: true,
+            trust_prompt: false,
+            create_id: None,
+            cancelling: false,
             load_task: Task::ready(()),
             layouts_task: Task::ready(()),
+            scripts_task: Task::ready(()),
+            cancel_task: Task::ready(()),
             search_task: Task::ready(()),
             create_task: Task::ready(()),
             _issue_edits: issue_edits,
@@ -704,6 +787,7 @@ impl NewWorkspaceModal {
                         }
                         this.projects = projects;
                         this.load_layouts(window, cx);
+                        this.load_scripts(window, cx);
                     }
                     Err(error) => this.error = Some(error_text(&error)),
                 }
@@ -769,14 +853,81 @@ impl NewWorkspaceModal {
 
     pub fn set_project(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.project = Some(id);
+        self.trust_prompt = false;
         self.load_layouts(window, cx);
+        self.load_scripts(window, cx);
         cx.notify();
+    }
+
+    fn load_scripts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.scripts = None;
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let scripts = request(
+            &ServerRef::Primary,
+            "project.scripts",
+            json!({ "id": project }),
+            cx,
+        );
+        self.scripts_task = cx.spawn_in(window, async move |this, cx| {
+            let scripts = scripts
+                .await
+                .and_then(|value| Ok(serde_json::from_value::<ProjectScripts>(value)?))
+                .log_err();
+            this.update(cx, |this, cx| {
+                if this.project.as_deref() == Some(project.as_str()) {
+                    this.scripts = scripts;
+                    cx.notify();
+                }
+            })
+            .log_err();
+        });
+    }
+
+    pub fn scripts(&self) -> Option<&ProjectScripts> {
+        self.scripts.as_ref()
+    }
+
+    pub fn is_trust_prompt_open(&self) -> bool {
+        self.trust_prompt
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice
+    }
+
+    pub fn set_run_setup(&mut self, run_setup: bool, cx: &mut Context<Self>) {
+        self.run_setup = run_setup;
+        cx.notify();
+    }
+
+    /// The committed scripts this create would run that the user hasn't trusted yet.
+    fn untrusted_scripts(&self) -> Vec<String> {
+        let Some(scripts) = &self.scripts else {
+            return Vec::new();
+        };
+        let mut untrusted = Vec::new();
+        if let Some(setup) = &scripts.setup
+            && !setup.trusted
+            && scripts.setup_runs(self.run_setup)
+        {
+            untrusted.push(setup.command.clone());
+        }
+        untrusted.extend(
+            scripts
+                .untrusted_tab_commands()
+                .into_iter()
+                .map(str::to_owned),
+        );
+        untrusted
     }
 
     pub fn set_start(&mut self, start: StartPoint, window: &mut Window, cx: &mut Context<Self>) {
         self.start = start;
         let placeholder = match start {
             StartPoint::Commit => "Commit SHA",
+            StartPoint::PullRequest => "Pull request number or URL",
             StartPoint::Base | StartPoint::Branch => "origin/feature or a local branch",
         };
         self.start_ref.update(cx, |editor, cx| {
@@ -811,7 +962,8 @@ impl NewWorkspaceModal {
             }
             None => None,
         };
-        if name.is_empty() && issue.is_none() {
+        let start_ref = editor_text(&self.start_ref, cx);
+        if name.is_empty() && issue.is_none() && self.start != StartPoint::PullRequest {
             return Err("Name the workspace, or link a Linear issue.");
         }
         let mut params = json!({ "project": project, "provider": self.provider });
@@ -822,7 +974,6 @@ impl NewWorkspaceModal {
         if !branch.is_empty() {
             params["branch"] = json!(branch);
         }
-        let start_ref = editor_text(&self.start_ref, cx);
         match self.start {
             StartPoint::Base => {}
             StartPoint::Branch if start_ref.is_empty() => {
@@ -831,14 +982,25 @@ impl NewWorkspaceModal {
             StartPoint::Commit if start_ref.is_empty() => {
                 return Err("Enter the commit to start from.");
             }
+            StartPoint::PullRequest if start_ref.is_empty() => {
+                return Err("Enter the pull request's number or URL.");
+            }
             StartPoint::Branch => {
                 params["base"] = json!(start_ref);
                 params["fetch"] = json!(true);
             }
             StartPoint::Commit => params["base"] = json!(start_ref),
+            StartPoint::PullRequest => params["pr"] = json!(start_ref),
         }
         if let Some(layout) = &self.layout {
             params["layout"] = json!(layout);
+        }
+        if self
+            .scripts
+            .as_ref()
+            .is_some_and(ProjectScripts::asks_for_setup)
+        {
+            params["setup"] = json!(if self.run_setup { "run" } else { "skip" });
         }
         if let Some(issue) = issue {
             params["issue"] = issue;
@@ -854,7 +1016,8 @@ impl NewWorkspaceModal {
             window.focus(&self.name.focus_handle(cx), cx);
             return;
         }
-        if self.creating || self.loading {
+        // A trust prompt is answered with its buttons, never by a stray Enter.
+        if self.creating || self.loading || self.trust_prompt {
             return;
         }
         let params = match self.create_params(cx) {
@@ -865,8 +1028,54 @@ impl NewWorkspaceModal {
                 return;
             }
         };
+        if !self.untrusted_scripts().is_empty() {
+            self.trust_prompt = true;
+            self.error = None;
+            cx.notify();
+            return;
+        }
+        self.start_create(params, window, cx);
+    }
+
+    /// The trust prompt's "Trust and Create".
+    pub fn trust_and_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.creating {
+            return;
+        }
+        let Ok(mut params) = self.create_params(cx) else {
+            return;
+        };
+        params["trust"] = json!(true);
+        self.trust_prompt = false;
+        self.start_create(params, window, cx);
+    }
+
+    /// The trust prompt's "Create without running them": setup is skipped and default tabs open as plain shells.
+    pub fn create_without_scripts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.creating {
+            return;
+        }
+        let Ok(mut params) = self.create_params(cx) else {
+            return;
+        };
+        params["setup"] = json!("skip");
+        self.trust_prompt = false;
+        self.start_create(params, window, cx);
+    }
+
+    pub fn close_trust_prompt(&mut self, cx: &mut Context<Self>) {
+        self.trust_prompt = false;
+        cx.notify();
+    }
+
+    fn start_create(&mut self, mut params: Value, window: &mut Window, cx: &mut Context<Self>) {
+        let create_id = next_create_id();
+        params["create_id"] = json!(create_id);
+        self.create_id = Some(create_id);
         self.creating = true;
+        self.cancelling = false;
         self.error = None;
+        self.notice = None;
         cx.notify();
         let create = request(&ServerRef::Primary, "workspace.create", params, cx);
         let workspace = self.workspace.clone();
@@ -875,9 +1084,21 @@ impl NewWorkspaceModal {
             let path = match created {
                 Ok(created) => created["path"].as_str().map(PathBuf::from),
                 Err(error) => {
-                    this.update(cx, |this, cx| {
+                    this.update_in(cx, |this, window, cx| {
                         this.creating = false;
-                        this.error = Some(error_text(&error));
+                        this.cancelling = false;
+                        this.create_id = None;
+                        match error_code(&error).as_deref() {
+                            Some("cancelled") => {
+                                this.notice = Some("Cancelled; nothing was created.");
+                            }
+                            // The scripts changed since the dialog read them: ask again.
+                            Some("untrusted_scripts") => {
+                                this.load_scripts(window, cx);
+                                this.error = Some(error_text(&error));
+                            }
+                            _ => this.error = Some(error_text(&error)),
+                        }
                         cx.notify();
                     })
                     .log_err();
@@ -895,8 +1116,127 @@ impl NewWorkspaceModal {
         });
     }
 
+    /// Asks the server to stop the create in flight; it answers the create with `cancelled` once it has cleaned up.
+    pub fn cancel_create(&mut self, cx: &mut Context<Self>) {
+        let Some(create_id) = self.create_id.clone().filter(|_| self.creating) else {
+            return;
+        };
+        if self.cancelling {
+            return;
+        }
+        self.cancelling = true;
+        cx.notify();
+        let cancel = request(
+            &ServerRef::Primary,
+            "workspace.create_cancel",
+            json!({ "create_id": create_id }),
+            cx,
+        );
+        self.cancel_task = cx.spawn(async move |this, cx| {
+            if let Err(error) = cancel.await {
+                this.update(cx, |this, cx| {
+                    this.cancelling = false;
+                    this.error = Some(error_text(&error));
+                    cx.notify();
+                })
+                .log_err();
+            }
+        });
+    }
+
     fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(DismissEvent);
+        if self.creating {
+            self.cancel_create(cx);
+        } else if self.trust_prompt {
+            self.close_trust_prompt(cx);
+        } else {
+            cx.emit(DismissEvent);
+        }
+    }
+
+    fn render_trust_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let project = self
+            .project
+            .as_ref()
+            .and_then(|id| self.projects.iter().find(|project| &project.id == id))
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| "this project".into());
+        let scripts = self.untrusted_scripts().join("\n");
+        let setup_untrusted = self
+            .scripts
+            .as_ref()
+            .and_then(|scripts| scripts.setup.as_ref())
+            .is_some_and(|setup| !setup.trusted);
+        v_flex()
+            .gap_1p5()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().status().warning_border)
+            .bg(cx.theme().status().warning_background)
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::Small)
+                            .color(Color::Warning),
+                    )
+                    .child(
+                        Label::new(format!("Run scripts from {project}?"))
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::SEMIBOLD),
+                    ),
+            )
+            .child(
+                Label::new(format!(
+                    "{project}'s committed orca.yaml (or icarus.json) runs these on your machine when the workspace is created. Only run them if you trust {project}; you're asked again when they change."
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .px_1p5()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().editor_background)
+                    .font_buffer(cx)
+                    .text_xs()
+                    .max_h(rems(10.))
+                    .overflow_hidden()
+                    .child(scripts),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        Button::new("icarus-trust-back", "Back").on_click(
+                            cx.listener(|this, _, _, cx| this.close_trust_prompt(cx)),
+                        ),
+                    )
+                    .child(
+                        Button::new(
+                            "icarus-trust-skip",
+                            if setup_untrusted {
+                                "Create without running them"
+                            } else {
+                                "Create without the tab commands"
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.create_without_scripts(window, cx)
+                        })),
+                    )
+                    .child(
+                        Button::new("icarus-trust-run", "Trust and Create")
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.trust_and_create(window, cx)
+                            })),
+                    ),
+            )
     }
 
     fn render_issue_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1109,8 +1449,13 @@ impl Render for NewWorkspaceModal {
             (StartPoint::Base, base_label),
             (StartPoint::Branch, "Branch".to_owned()),
             (StartPoint::Commit, "Commit".to_owned()),
+            (StartPoint::PullRequest, "Pull request".to_owned()),
         ];
         let failed = self.error.is_some() && !self.creating;
+        let asks_for_setup = self
+            .scripts
+            .as_ref()
+            .is_some_and(ProjectScripts::asks_for_setup);
         modal_frame("IcarusNewWorkspace", "New workspace", cx)
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
@@ -1155,33 +1500,78 @@ impl Render for NewWorkspaceModal {
                     })),
             ))
             .child(row("Layout", self.render_layout_picker(cx)))
+            .when(asks_for_setup, |modal| {
+                modal.child(row(
+                    "Setup script",
+                    h_flex().gap_1().children(
+                        [(true, "Run setup"), (false, "Skip")]
+                            .into_iter()
+                            .map(|(run, label)| {
+                                Button::new(
+                                    SharedString::from(format!("icarus-setup-{run}")),
+                                    label,
+                                )
+                                .style(ButtonStyle::Subtle)
+                                .toggle_state(self.run_setup == run)
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.set_run_setup(run, cx)),
+                                )
+                            }),
+                    ),
+                ))
+            })
             .when(self.creating, |modal| {
-                modal.child(render_busy("Creating the worktree and starting setup…"))
+                modal.child(render_busy(if self.cancelling {
+                    "Cancelling and cleaning up…"
+                } else {
+                    "Creating the worktree and starting setup…"
+                }))
             })
             .when_some(self.error.as_deref(), |modal, error| {
                 modal.child(render_error(error))
             })
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_1()
-                    .child(
-                        Button::new("icarus-new-workspace-cancel", "Cancel").on_click(cx.listener(
-                            |this, _, window, cx| this.cancel(&menu::Cancel, window, cx),
-                        )),
-                    )
-                    .child(
-                        Button::new(
-                            "icarus-new-workspace-confirm",
-                            if failed { "Retry" } else { "Create" },
+            .when_some(self.notice, |modal, notice| {
+                modal.child(
+                    Label::new(notice)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .when(self.trust_prompt, |modal| {
+                modal.child(self.render_trust_prompt(cx))
+            })
+            .when(!self.trust_prompt, |modal| {
+                modal.child(
+                    h_flex()
+                        .justify_end()
+                        .gap_1()
+                        .child(
+                            Button::new(
+                                "icarus-new-workspace-cancel",
+                                if self.creating {
+                                    "Cancel Create"
+                                } else {
+                                    "Cancel"
+                                },
+                            )
+                            .disabled(self.cancelling)
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.cancel(&menu::Cancel, window, cx),
+                            )),
                         )
-                        .style(ButtonStyle::Filled)
-                        .disabled(self.creating || self.loading || self.projects.is_empty())
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.confirm(&menu::Confirm, window, cx)
-                        })),
-                    ),
-            )
+                        .child(
+                            Button::new(
+                                "icarus-new-workspace-confirm",
+                                if failed { "Retry" } else { "Create" },
+                            )
+                            .style(ButtonStyle::Filled)
+                            .disabled(self.creating || self.loading || self.projects.is_empty())
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.confirm(&menu::Confirm, window, cx),
+                            )),
+                        ),
+                )
+            })
     }
 }
 
@@ -1759,10 +2149,22 @@ mod tests {
             "project": "proj-a", "name": "Fix login", "provider": "claude",
             "base": "origin/nope", "fetch": true, "layout": "review",
         });
-        assert_eq!(
-            calls_to(&calls, "workspace.create"),
-            std::slice::from_ref(&expected)
-        );
+        let creates = |calls: &Calls| {
+            calls_to(calls, "workspace.create")
+                .into_iter()
+                .map(|mut params| {
+                    assert!(
+                        params["create_id"].is_string(),
+                        "each create can be cancelled"
+                    );
+                    if let Some(object) = params.as_object_mut() {
+                        object.remove("create_id");
+                    }
+                    params
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(creates(&calls), std::slice::from_ref(&expected));
         modal.read_with(cx, |modal, _| {
             assert_eq!(modal.error(), Some("fatal: invalid reference: origin/nope"));
             assert!(!modal.is_creating());
@@ -1774,10 +2176,7 @@ mod tests {
 
         cx.dispatch_action(menu::Confirm);
         cx.run_until_parked();
-        assert_eq!(
-            calls_to(&calls, "workspace.create"),
-            [expected.clone(), expected]
-        );
+        assert_eq!(creates(&calls), [expected.clone(), expected]);
         assert!(
             active::<NewWorkspaceModal>(&workspace, cx).is_none(),
             "success closes the dialog"
@@ -1856,6 +2255,166 @@ mod tests {
                 .map(|params| params["issue"].clone()),
             Ok(json!({ "provider": "linear", "id": "XYZ-3" })),
             "a typed identifier links without picking"
+        );
+    }
+
+    fn scripts_stub(cx: &mut VisualTestContext, scripts: Value) -> Calls {
+        cx.update(|_, cx| {
+            stub_rpc(cx, move |method, params| match method {
+                "project.list" => {
+                    Ok(json!([{ "id": "proj-a", "name": "api", "base_ref": "origin/main" }]))
+                }
+                "config.get" => Ok(json!("claude")),
+                "layout.list" => Ok(json!([{ "name": "default" }])),
+                "project.scripts" => Ok(scripts.clone()),
+                "workspace.create_cancel" => Ok(json!({ "cancelled": true })),
+                "workspace.create" if params["name"] == "slow" => {
+                    Err(rpc_error("cancelled", "the workspace create was cancelled"))
+                }
+                "workspace.create" => Ok(json!({ "id": "ws-new", "path": "/project" })),
+                other => Err(anyhow::anyhow!("unexpected {other}")),
+            })
+        })
+    }
+
+    async fn open_dialog(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<NewWorkspaceModal> {
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_new_workspace(None, workspace, window, cx)
+        });
+        cx.run_until_parked();
+        active::<NewWorkspaceModal>(workspace, cx).expect("dialog")
+    }
+
+    #[gpui::test]
+    async fn a_pull_request_start_point_needs_no_name(cx: &mut gpui::TestAppContext) {
+        let (workspace, _, mut cx) = panel_window(Vec::new(), cx).await;
+        let cx = &mut cx;
+        scripts_stub(cx, json!({ "run_policy": "run-by-default" }));
+        let modal = open_dialog(&workspace, cx).await;
+        let start_ref = modal.read_with(cx, |modal, _| modal.start_ref.clone());
+        modal.update_in(cx, |modal, window, cx| {
+            modal.set_start(StartPoint::PullRequest, window, cx)
+        });
+        assert_eq!(
+            modal.read_with(cx, |modal, cx| modal.create_params(cx)),
+            Err("Enter the pull request's number or URL.")
+        );
+        type_into(&start_ref, "https://github.com/acme/api/pull/12", cx);
+        assert_eq!(
+            modal.read_with(cx, |modal, cx| modal.create_params(cx)),
+            Ok(json!({
+                "project": "proj-a", "provider": "claude",
+                "pr": "https://github.com/acme/api/pull/12",
+            })),
+            "the server names it after the pull request's branch"
+        );
+    }
+
+    #[gpui::test]
+    async fn untrusted_scripts_prompt_before_creating(cx: &mut gpui::TestAppContext) {
+        let (workspace, _, mut cx) = panel_window(Vec::new(), cx).await;
+        let cx = &mut cx;
+        let calls = scripts_stub(
+            cx,
+            json!({
+                "run_policy": "ask",
+                "setup": { "command": "pnpm install", "source": "shared", "trusted": false },
+                "default_tabs": [{ "title": "Dev", "command": "pnpm dev" }],
+                "default_tabs_trusted": false,
+            }),
+        );
+        let modal = open_dialog(&workspace, cx).await;
+        assert_eq!(
+            calls_to(&calls, "project.scripts"),
+            [json!({ "id": "proj-a" })]
+        );
+        let name = modal.read_with(cx, |modal, _| modal.name.clone());
+        type_into(&name, "feature", cx);
+        assert_eq!(
+            modal
+                .read_with(cx, |modal, cx| modal.create_params(cx))
+                .map(|params| params["setup"].clone()),
+            Ok(json!("run")),
+            "an `ask` project gets the dialog's choice"
+        );
+
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(modal.read_with(cx, |modal, _| modal.is_trust_prompt_open()));
+        assert!(
+            calls_to(&calls, "workspace.create").is_empty(),
+            "nothing runs before an answer"
+        );
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.untrusted_scripts()),
+            ["pnpm install", "pnpm dev"]
+        );
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(
+            calls_to(&calls, "workspace.create").is_empty(),
+            "Enter doesn't answer the prompt"
+        );
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(!modal.read_with(cx, |modal, _| modal.is_trust_prompt_open()));
+        assert!(
+            active::<NewWorkspaceModal>(&workspace, cx).is_some(),
+            "Escape goes back"
+        );
+
+        cx.dispatch_action(menu::Confirm);
+        modal.update_in(cx, |modal, window, cx| {
+            modal.create_without_scripts(window, cx)
+        });
+        cx.run_until_parked();
+        let created = calls_to(&calls, "workspace.create");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["setup"], "skip");
+        assert!(created[0]["trust"].is_null());
+
+        let modal = open_dialog(&workspace, cx).await;
+        let name = modal.read_with(cx, |modal, _| modal.name.clone());
+        type_into(&name, "trusted", cx);
+        cx.dispatch_action(menu::Confirm);
+        modal.update_in(cx, |modal, window, cx| modal.trust_and_create(window, cx));
+        cx.run_until_parked();
+        let created = calls_to(&calls, "workspace.create");
+        assert_eq!(created[1]["trust"], true);
+        assert_eq!(created[1]["setup"], "run");
+    }
+
+    #[gpui::test]
+    async fn a_create_in_flight_can_be_cancelled(cx: &mut gpui::TestAppContext) {
+        let (workspace, _, mut cx) = panel_window(Vec::new(), cx).await;
+        let cx = &mut cx;
+        let calls = scripts_stub(cx, json!({ "run_policy": "run-by-default" }));
+        let modal = open_dialog(&workspace, cx).await;
+        let name = modal.read_with(cx, |modal, _| modal.name.clone());
+        type_into(&name, "slow", cx);
+        modal.update_in(cx, |modal, window, cx| {
+            modal.confirm(&menu::Confirm, window, cx);
+            assert!(modal.is_creating());
+            modal.cancel(&menu::Cancel, window, cx);
+            assert!(modal.cancelling, "Escape while creating cancels the create");
+        });
+        cx.run_until_parked();
+        let create_id = calls_to(&calls, "workspace.create")[0]["create_id"].clone();
+        assert_eq!(
+            calls_to(&calls, "workspace.create_cancel"),
+            [json!({ "create_id": create_id })]
+        );
+        modal.read_with(cx, |modal, _| {
+            assert!(!modal.is_creating());
+            assert_eq!(modal.error(), None);
+            assert_eq!(modal.notice(), Some("Cancelled; nothing was created."));
+        });
+        assert!(
+            active::<NewWorkspaceModal>(&workspace, cx).is_some(),
+            "the dialog stays open to try again"
         );
     }
 

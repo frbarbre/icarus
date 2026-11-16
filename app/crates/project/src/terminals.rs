@@ -30,17 +30,27 @@ pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
 }
 
-/// A local interactive shell an embedder wants to run elsewhere.
+/// A local interactive shell or task an embedder wants to run elsewhere.
 pub struct ShellRequest {
     pub cwd: Option<PathBuf>,
     /// The external terminal a restored tab was showing, to show again.
     pub reattach: Option<String>,
+    pub task: Option<TaskRequest>,
+}
+
+/// A task to run instead of a shell: its label, program and arguments (none: the login shell) and environment.
+pub struct TaskRequest {
+    pub label: String,
+    pub command: Option<Vec<String>>,
+    pub env: HashMap<String, String>,
 }
 
 /// The program that shows a routed shell, and the external id it runs under.
 pub struct RoutedShell {
     pub shell: Shell,
     pub external_id: String,
+    /// The tab title while the program has set none of its own.
+    pub fallback_title: Option<String>,
 }
 
 /// Lets an embedder run local interactive shells elsewhere; Icarus runs them on its server so they outlive the app.
@@ -87,6 +97,25 @@ impl Project {
     pub fn create_terminal_task(
         &mut self,
         spawn_task: SpawnInTerminal,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_task_internal(spawn_task, false, cx)
+    }
+
+    /// A task the user started (tasks.json, `task: spawn`), which a [`ShellRouter`] may run elsewhere.
+    /// Agent and debugger terminals stay local: they stop their command through the local process.
+    pub fn create_user_terminal_task(
+        &mut self,
+        spawn_task: SpawnInTerminal,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_task_internal(spawn_task, true, cx)
+    }
+
+    fn create_terminal_task_internal(
+        &mut self,
+        spawn_task: SpawnInTerminal,
+        routable: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let is_via_remote = self.remote_client.is_some();
@@ -177,7 +206,10 @@ impl Project {
             .await
             .unwrap_or_default();
 
-            let builder = project
+            let task_label = spawn_task.full_label.clone();
+            let route_cwd = local_path.as_ref().map(|path| path.to_path_buf());
+            let builder_activation_script = activation_script.clone();
+            let (shell, env, routed) = project
                 .update(cx, move |_, cx| {
                     let format_to_run = |spawn_task: &SpawnInTerminal| {
                         format_task_for_activation(
@@ -260,6 +292,51 @@ impl Project {
                             },
                         }
                     };
+                    let routed = if is_via_remote || !routable {
+                        None
+                    } else {
+                        cx.try_global::<ShellRouter>().cloned().and_then(|router| {
+                            let command = match &shell {
+                                Shell::System => None,
+                                Shell::Program(program) => Some(vec![program.clone()]),
+                                Shell::WithArguments { program, args, .. } => Some(
+                                    std::iter::once(program.clone())
+                                        .chain(args.iter().cloned())
+                                        .collect(),
+                                ),
+                            };
+                            (router.0)(
+                                ShellRequest {
+                                    cwd: route_cwd,
+                                    reattach: None,
+                                    task: Some(TaskRequest {
+                                        label: task_label,
+                                        command,
+                                        env: env.clone(),
+                                    }),
+                                },
+                                cx,
+                            )
+                        })
+                    };
+                    anyhow::Ok((shell, env, routed))
+                })
+                .context("the project closed before the task started")??;
+            // An unreachable router (e.g. the Icarus server is down) runs the task locally instead.
+            let routed = match routed {
+                Some(task) => task.await.log_err(),
+                None => None,
+            };
+            let (shell, external_id, fallback_title) = match routed {
+                Some(routed) => (
+                    routed.shell,
+                    Some(routed.external_id),
+                    routed.fallback_title,
+                ),
+                None => (shell, None, None),
+            };
+            let builder = project
+                .update(cx, move |_, cx| {
                     anyhow::Ok(TerminalBuilder::new(
                         local_path.map(|path| path.to_path_buf()),
                         terminal_mode,
@@ -273,13 +350,18 @@ impl Project {
                         is_via_remote,
                         cx.entity_id().as_u64(),
                         cx,
-                        activation_script,
+                        builder_activation_script,
                         path_style,
                     ))
                 })??
                 .await?;
             project.update(cx, move |this, cx| {
-                let terminal_handle = cx.new(|cx| builder.subscribe(cx));
+                let terminal_handle = cx.new(|cx| {
+                    let mut terminal = builder.subscribe(cx);
+                    terminal.set_external_id(external_id);
+                    terminal.set_fallback_title(fallback_title);
+                    terminal
+                });
 
                 this.terminals
                     .local_handles
@@ -357,6 +439,7 @@ impl Project {
                     ShellRequest {
                         cwd: cwd.clone(),
                         reattach,
+                        task: None,
                     },
                     cx,
                 )
@@ -476,6 +559,9 @@ impl Project {
                 None => None,
             };
             let external_id = routed.as_ref().map(|routed| routed.external_id.clone());
+            let fallback_title = routed
+                .as_ref()
+                .and_then(|routed| routed.fallback_title.clone());
             let builder = project
                 .update(cx, move |_, cx| {
                     let (shell, env) = {
@@ -519,6 +605,7 @@ impl Project {
                 let terminal_handle = cx.new(|cx| {
                     let mut terminal = builder.subscribe(cx);
                     terminal.set_external_id(external_id);
+                    terminal.set_fallback_title(fallback_title);
                     terminal
                 });
 
