@@ -15,7 +15,7 @@ Each task gets its own worktree, its own agents (Claude Code or Codex) and its o
 - **Review:** a per-file diff tab with edit/diff toggle, PR threads and drafts in the gutter, queued review comments, reviewers and verdicts, all without leaving the editor.
 - **Source Control:** changes against the branch's base, staging, agent turns and commits, with a diff tab per file.
 - **GitHub and Linear:** PR status, checks, merge queues, stacks and auto-merge on each card; Linear issues linked to workspaces.
-- **Automations:** rules that move workspaces between columns on PR and review events. Icarus imports an [Orca](https://github.com/stablyai/orca) settings export and reproduces its automations.
+- **Automations:** rules that move workspaces between columns on PR and review events, configurable per project.
 - **Remote:** run the server headless on another machine and connect over SSH or Tailscale; one app talks to several servers.
 - **Configurable everything:** layered JSON settings (defaults < presets < user < project < project-local), named tab layouts, rebindable shortcuts, and a CLI that covers every setting and action, so agents can drive Icarus as well as people.
 
