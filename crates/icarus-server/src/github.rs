@@ -347,6 +347,9 @@ fn rest_fixture(fixtures: &Value, request: &GhRequest) -> (u16, Value) {
             )
         }
         ("PUT", ["repos", _, _, "pulls", _, "merge-async"]) => (200, json!({ "status": "merged" })),
+        ("POST" | "DELETE", ["repos", _, _, "pulls", number, "requested_reviewers"]) => {
+            (200, json!({ "number": number.parse::<u64>().ok() }))
+        }
         ("GET", ["repos", _, _, rest @ ..])
             if rest.first().is_some_and(|p| p.starts_with("deployments")) =>
         {

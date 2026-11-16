@@ -979,6 +979,68 @@ fn icarus_ports(workspace: &str) -> Vec<icarus_ui::PortEntry> {
     serde_json::from_value(ports).unwrap_or_default()
 }
 
+/// A PR someone else wrote with one queued draft: the Review section with reviewers, base picker and verdicts.
+fn icarus_review_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "now": "2026-11-15T12:00:00Z",
+        "current": "ws-billing-api",
+        "workspaces": [
+            { "id": "ws-billing-api", "path": "/tmp/icarus-preview/billing-api", "branch": "billing-api", "pull_request": { "number": 811 } },
+        ],
+        "uncommitted": 2,
+        "pr_status": {
+            "known": true,
+            "error": null,
+            "pull_request": {
+                "repo": { "owner": "acme", "name": "billing" },
+                "number": 811,
+                "title": "Billing export API",
+                "url": "https://github.com/acme/billing/pull/811",
+                "author": "devon",
+                "state": "OPEN",
+                "is_draft": false,
+                "head_ref_name": "billing-api",
+                "base_ref_name": "main",
+                "mergeable": "MERGEABLE",
+                "merge_state_status": "CLEAN",
+                "review_decision": "REVIEW_REQUIRED",
+                "requested_reviewers": [
+                    { "kind": "user", "login": "frederik" },
+                    { "kind": "team", "slug": "acme/payments" },
+                ],
+                "latest_reviews": [
+                    { "login": "maria", "state": "APPROVED" },
+                    { "login": "devbot", "state": "COMMENTED" },
+                ],
+                "checks": [],
+                "updated_at": "2026-11-15T11:48:00Z",
+            },
+            "stack": null,
+            "merge_metadata": null,
+        },
+        "review": {
+            "workspace": "ws-billing-api",
+            "pr": { "repo": "acme/billing", "number": 811, "base_ref_name": "main", "author": "devon" },
+            "viewer": "frederik",
+            "standing": "pending",
+            "verdicts": ["comment", "request-changes", "approve"],
+            "can_submit": { "comment": true, "request-changes": true, "approve": true },
+            "base": {
+                "selected": "since-review", "default": "since-review",
+                "options": [
+                    { "value": "since-review", "label": "Since your last review (Review 2)", "available": true },
+                    { "value": "commit:9f3c2a1", "label": "9f3c2a1 Export totals per currency", "tags": ["Review 2"], "available": true },
+                    { "value": "whole", "label": "main · target branch", "available": true },
+                ],
+            },
+            "drafts": [
+                { "id": "d1", "path": "src/export.rs", "line": 42, "subject": "line", "body": "Round before summing?" },
+            ],
+            "summary": "Two small things, otherwise good.",
+        },
+    })
+}
+
 fn icarus_github_empty_fixture() -> serde_json::Value {
     serde_json::json!({
         "now": "2026-11-15T12:00:00Z",
@@ -1061,6 +1123,26 @@ fn run_icarus_github_panel_tests(
             hide(panel, cx);
         }
         Err(error) => results.push(("icarus_github_panel", Err(error))),
+    }
+
+    match show(icarus_review_fixture(), cx) {
+        Ok(panel) => {
+            cx.run_until_parked();
+            // The Review section is created on first render; draw once more so its editors fill in.
+            workspace_window
+                .update(cx, |_, window, _| window.refresh())
+                .log_err();
+            cx.run_until_parked();
+            results.extend(run_icarus_dark_and_light(
+                "icarus_review_section",
+                "icarus_review_section_light",
+                workspace_window.into(),
+                cx,
+                update_baseline,
+            ));
+            hide(panel, cx);
+        }
+        Err(error) => results.push(("icarus_review_section", Err(error))),
     }
 
     match show(icarus_github_empty_fixture(), cx) {
@@ -2885,13 +2967,23 @@ fn run_icarus_tab_types_tests(
 ) -> Vec<(&'static str, Result<TestResult>)> {
     match open_icarus_tab_types_window(app_state, cx) {
         Ok(window) => {
-            let results = run_icarus_dark_and_light(
+            let mut results = run_icarus_dark_and_light(
                 "icarus_sidebar",
                 "icarus_sidebar_light",
                 window.into(),
                 cx,
                 update_baseline,
             );
+            match show_icarus_review_in_diff_tab(window, cx) {
+                Ok(()) => results.extend(run_icarus_dark_and_light(
+                    "icarus_review_diff",
+                    "icarus_review_diff_light",
+                    window.into(),
+                    cx,
+                    update_baseline,
+                )),
+                Err(error) => results.push(("icarus_review_diff", Err(error))),
+            }
             window
                 .update(cx, |workspace, _window, cx| {
                     let project = workspace.project().clone();
@@ -2911,6 +3003,68 @@ fn run_icarus_tab_types_tests(
         }
         Err(error) => vec![("icarus_sidebar", Err(error))],
     }
+}
+
+/// The diff tab's review layer: an open thread, a resolved one, a queued draft and an open comment box.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn show_icarus_review_in_diff_tab(
+    window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+) -> Result<()> {
+    use icarus_ui::review::{ComposerTarget, ReviewDraft, ReviewThread};
+
+    let threads: Vec<ReviewThread> = serde_json::from_value(serde_json::json!([
+        {
+            "id": "T1", "path": "src/login.rs", "line": 2, "is_resolved": false,
+            "viewer_can_resolve": true, "viewer_can_reply": true,
+            "comments": [
+                { "id": "C1", "author": "maria", "body": "Does check_password hash before comparing?",
+                  "reactions": [{ "content": "+1", "count": 2, "viewer_has_reacted": true }] },
+                { "id": "C2", "author": "devon", "body": "Yes, it uses argon2 under the hood." },
+            ],
+            "placement": { "line": 2, "label": "Line 2" },
+        },
+        {
+            "id": "T2", "path": "src/login.rs", "line": 5, "is_resolved": true,
+            "viewer_can_unresolve": true,
+            "comments": [{ "id": "C3", "author": "devbot", "is_bot": true, "body": "logout() has no test." }],
+            "placement": { "line": 5, "label": "Line 5" },
+        },
+    ]))?;
+    let drafts: Vec<ReviewDraft> = serde_json::from_value(serde_json::json!([
+        { "id": "D1", "path": "src/login.rs", "line": 1, "start_line": 1, "subject": "line",
+          "body": "Take the password as a typed secret, not &str." },
+    ]))?;
+    window.update(cx, |workspace, window, cx| {
+        let root = workspace
+            .project()
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tab = workspace.items_of_type::<icarus_ui::DiffTab>(cx).next();
+        if let Some(tab) = tab {
+            tab.update(cx, |tab, cx| {
+                tab.enable_review(root, "src/login.rs".into(), cx)
+            });
+            if let Some(review) = tab.read(cx).review().cloned() {
+                review.update(cx, |review, cx| {
+                    review.set_preview(threads, drafts, cx);
+                    review.open_composer(
+                        ComposerTarget::Lines { start: 4, end: 4 },
+                        "Should logout also clear the session token?".into(),
+                        window,
+                        cx,
+                    );
+                });
+            }
+        }
+    })?;
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _cx| window.refresh())?;
+    cx.run_until_parked();
+    Ok(())
 }
 
 /// The right sidebar on Source Control (uncommitted scope, a type filter on) beside a diff tab in diff mode.

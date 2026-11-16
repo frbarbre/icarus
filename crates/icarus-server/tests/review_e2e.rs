@@ -380,6 +380,56 @@ async fn drafts_survive_a_restart_and_submit_as_one_review() {
 }
 
 #[tokio::test]
+async fn reviewers_are_requested_and_removed_with_teams_split_out() {
+    let world = World::new(json!({ "viewer": "me" })).await;
+    let (ws, _path, head) = world.workspace("rev").await;
+    world.set_fixtures(&fixtures(&head, "someone"));
+    let requested = world
+        .request(
+            "review.request_reviewers",
+            json!({ "workspace": ws, "reviewers": ["@alice", "acme/backend, bob"] }),
+        )
+        .await;
+    assert_eq!(requested["requested"], true);
+    let removed = world
+        .request(
+            "review.remove_reviewers",
+            json!({ "workspace": ws, "reviewers": ["alice"] }),
+        )
+        .await;
+    assert_eq!(removed["requested"], false);
+    let log = std::fs::read_to_string(format!("{}.requests.jsonl", world.fixtures.display()))
+        .unwrap_or_default();
+    let calls: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("requested_reviewers"))
+        .collect();
+    assert_eq!(calls.len(), 2, "{log}");
+    assert!(
+        calls[0].contains("POST")
+            && calls[0].contains("\"team_reviewers\":[\"backend\"]")
+            && calls[0].contains("\"alice\",\"bob\""),
+        "users and the team slug go in separate lists: {}",
+        calls[0]
+    );
+    assert!(
+        calls[1].contains("DELETE"),
+        "removal uses DELETE: {}",
+        calls[1]
+    );
+    let empty = world
+        .error(
+            "review.request_reviewers",
+            json!({ "workspace": ws, "reviewers": [" "] }),
+        )
+        .await;
+    assert!(empty.contains("at least one reviewer"), "{empty}");
+    world
+        .request("workspace.remove", json!({ "id": ws, "force": true }))
+        .await;
+}
+
+#[tokio::test]
 async fn own_pull_request_is_comment_only_and_a_refused_submit_keeps_drafts() {
     let world = World::new(json!({ "viewer": "me" })).await;
     let (ws, _path, head) = world.workspace("rev").await;

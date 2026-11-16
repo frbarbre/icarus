@@ -22,6 +22,8 @@ use workspace::item::{Item, ItemEvent, SaveOptions, SerializableItem};
 use workspace::searchable::SearchableItemHandle;
 use workspace::{ItemHandle as _, ItemId, ItemNavHistory, Pane, Workspace, WorkspaceId};
 
+use crate::review::{AddReviewComment, DiffReview};
+
 actions!(
     icarus,
     [
@@ -57,6 +59,9 @@ pub struct DiffTab {
     project_path: ProjectPath,
     buffer: Entity<Buffer>,
     editor: Entity<Editor>,
+    /// Review drafts, PR threads and the comment box; only when Icarus runs.
+    review: Option<Entity<DiffReview>>,
+    _review_changes: Option<Subscription>,
     _editor_events: Subscription,
 }
 
@@ -87,6 +92,24 @@ impl DiffTab {
         let editor_events = cx.subscribe(&editor, |_, _, event: &EditorEvent, cx| {
             cx.emit(event.clone())
         });
+        let root = project
+            .read(cx)
+            .worktree_for_id(project_path.worktree_id, cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
+        let review = root.filter(|_| crate::enabled(cx)).map(|root| {
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let editor = editor.downgrade();
+            let buffer = buffer.clone();
+            let root = root.to_string_lossy().into_owned();
+            cx.new(|cx| DiffReview::new(editor, buffer, root, relative, cx))
+        });
+        let review_changes = review
+            .as_ref()
+            .map(|review| cx.observe(review, |_, _, cx| cx.notify()));
         let mut tab = Self {
             path,
             base,
@@ -95,6 +118,8 @@ impl DiffTab {
             project_path,
             buffer,
             editor,
+            review,
+            _review_changes: review_changes,
             _editor_events: editor_events,
         };
         tab.apply_mode(cx);
@@ -115,6 +140,25 @@ impl DiffTab {
 
     pub fn editor(&self) -> &Entity<Editor> {
         &self.editor
+    }
+
+    pub fn review(&self) -> Option<&Entity<DiffReview>> {
+        self.review.as_ref()
+    }
+
+    /// The review layer for tests and previews, which run without `icarus_ui::init`.
+    pub fn enable_review(&mut self, workspace_key: String, path: String, cx: &mut Context<Self>) {
+        let editor = self.editor.downgrade();
+        let buffer = self.buffer.clone();
+        let review = cx.new(|cx| DiffReview::new(editor, buffer, workspace_key, path, cx));
+        self._review_changes = Some(cx.observe(&review, |_, _, cx| cx.notify()));
+        self.review = Some(review);
+    }
+
+    fn add_review_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(review) = &self.review {
+            review.update(cx, |review, cx| review.open_on_selection(window, cx));
+        }
     }
 
     pub fn set_mode(&mut self, mode: DiffTabMode, cx: &mut Context<Self>) {
@@ -280,6 +324,20 @@ pub fn open_diff_tab(
 
 pub fn register(cx: &mut App) {
     workspace::register_serializable_item::<DiffTab>(cx);
+    // From the palette or another app the tab isn't focused, so the workspace forwards the action.
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(|workspace, _: &AddReviewComment, window, cx| {
+            let tab = workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<DiffTab>());
+            if let Some(tab) = tab {
+                window.defer(cx, move |window, cx| {
+                    tab.update(cx, |tab, cx| tab.add_review_comment(window, cx));
+                });
+            }
+        });
+    })
+    .detach();
 }
 
 impl EventEmitter<EditorEvent> for DiffTab {}
@@ -430,6 +488,9 @@ impl Render for DiffTab {
             .on_action(
                 cx.listener(|this, _: &ShowDiff, _, cx| this.set_mode(DiffTabMode::Diff, cx)),
             )
+            .on_action(cx.listener(|this, _: &AddReviewComment, window, cx| {
+                this.add_review_comment(window, cx)
+            }))
             .child(
                 h_flex()
                     .px_2()
@@ -457,9 +518,46 @@ impl Render for DiffTab {
                         .label_size(LabelSize::Small),
                     )
                     .child(
-                        Label::new(against)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_2()
+                            .when_some(
+                                self.review
+                                    .as_ref()
+                                    .and_then(|review| review.read(cx).error().map(str::to_owned)),
+                                |row, error| {
+                                    row.child(
+                                        Label::new(error)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Error)
+                                            .truncate(),
+                                    )
+                                },
+                            )
+                            .when(self.review.is_some(), |row| {
+                                row.child(
+                                    Button::new("diff-tab-comment", "Comment")
+                                        .style(ButtonStyle::Subtle)
+                                        .label_size(LabelSize::Small)
+                                        .start_icon(
+                                            Icon::new(IconName::Chat).size(IconSize::XSmall),
+                                        )
+                                        .tooltip(|_window, cx| {
+                                            ui::Tooltip::for_action(
+                                                "Comment on the selected lines",
+                                                &AddReviewComment,
+                                                cx,
+                                            )
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.add_review_comment(window, cx)
+                                        })),
+                                )
+                            })
+                            .child(
+                                Label::new(against)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
                     ),
             )
             .child(div().flex_1().min_h_0().child(self.editor.clone()))
@@ -732,5 +830,172 @@ pub(crate) mod tests {
             assert_eq!(restored.base(), &DiffBase::Uncommitted);
             assert_eq!(restored.mode(), DiffTabMode::Edit);
         });
+    }
+
+    fn thread_json(id: &str, line: u32, resolved: bool) -> serde_json::Value {
+        json!({
+            "id": id, "path": "src/app.rs", "line": line, "is_resolved": resolved,
+            "viewer_can_resolve": true, "viewer_can_unresolve": true, "viewer_can_reply": true,
+            "comments": [{ "id": format!("{id}-c1"), "author": "alice", "body": "Why this?",
+                "reactions": [{ "content": "+1", "count": 2, "viewer_has_reacted": false }] }],
+            "placement": { "file": false, "outdated": false, "line": line, "label": format!("Line {line}") },
+        })
+    }
+
+    #[gpui::test]
+    async fn review_comments_queue_edit_reply_resolve_and_reach_the_agent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::review::tests::{calls_to, stub_rpc};
+        use crate::review::{ComposerTarget, Destination, SubmitReviewComment};
+
+        let (workspace, mut cx) = git_workspace(cx).await;
+        let cx = &mut cx;
+        let drafts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let stored = drafts.clone();
+        let calls = cx.update(|_, cx| {
+            stub_rpc(cx, move |method, params| {
+                let mut drafts = stored.lock().unwrap_or_else(|p| p.into_inner());
+                match method {
+                    "review.threads" => Ok(json!({ "threads": [thread_json("T1", 1, false), thread_json("T2", 2, true)] })),
+                    "review.comment.list" => Ok(json!({ "drafts": *drafts })),
+                    "review.comment.add" if params["body"] == "fail" => {
+                        Err(anyhow::anyhow!("Pull request review thread line must be part of the diff"))
+                    }
+                    "review.comment.add" => {
+                        drafts.push(json!({ "id": "d1", "path": params["path"], "line": params["line"],
+                            "subject": "line", "body": params["body"] }));
+                        Ok(json!({}))
+                    }
+                    _ => Ok(json!({})),
+                }
+            })
+        });
+        let tab = open(&workspace, "/project/src/app.rs", DiffBase::Uncommitted, cx);
+        cx.run_until_parked();
+        let tab = tab.await.expect("diff tab");
+        let review = tab.update(cx, |tab, cx| {
+            tab.enable_review("/project".into(), "src/app.rs".into(), cx);
+            tab.review().cloned().expect("review")
+        });
+        review.update(cx, |review, cx| review.reload(cx));
+        cx.run_until_parked();
+        review.read_with(cx, |review, _| {
+            assert_eq!(review.threads().len(), 2);
+            assert!(review.drafts().is_empty());
+        });
+        assert_eq!(
+            calls_to(&calls, "review.threads")[0],
+            json!({ "workspace": "/project", "path": "src/app.rs" })
+        );
+
+        // ⌘⇧A opens the box on the cursor's line.
+        let focus = tab.read_with(cx, |tab, cx| tab.editor().focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.dispatch_action(crate::review::AddReviewComment);
+        cx.run_until_parked();
+        let composer = review.read_with(cx, |review, _| review.composer().cloned().expect("open"));
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.target().clone()),
+            ComposerTarget::Lines { start: 1, end: 1 }
+        );
+
+        // A failed add keeps the box and shows GitHub's words; a good one queues a draft.
+        let type_text = |text: &str, cx: &mut gpui::VisualTestContext| {
+            let editor = composer.read_with(cx, |composer, _| composer.editor().clone());
+            editor.update_in(cx, |editor, window, cx| editor.set_text(text, window, cx));
+        };
+        type_text("fail", cx);
+        review.update_in(cx, |review, window, cx| {
+            review.submit_composer(Destination::Review, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(review.read_with(cx, |review, _| review.composer().is_some()));
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.error_text()),
+            Some("Pull request review thread line must be part of the diff".to_owned())
+        );
+        type_text("Rename this", cx);
+        let focus = composer.read_with(cx, |composer, cx| composer.editor().focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.dispatch_action(SubmitReviewComment);
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "review.comment.add").last().cloned(),
+            Some(
+                json!({ "workspace": "/project", "path": "src/app.rs", "line": 1,
+                "start_line": null, "body": "Rename this" })
+            )
+        );
+        review.read_with(cx, |review, _| {
+            assert!(review.composer().is_none(), "the box closes after queueing");
+            assert_eq!(review.drafts().len(), 1, "the draft shows inline");
+        });
+
+        // Editing a draft, replying, resolving, reacting and handing a thread to the agent.
+        review.update_in(cx, |review, window, cx| {
+            review.open_composer(
+                ComposerTarget::EditDraft { id: "d1".into() },
+                "Rename this, please".into(),
+                window,
+                cx,
+            );
+            review.submit_composer(Destination::Review, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "review.comment.edit"),
+            [json!({ "workspace": "/project", "id": "d1", "body": "Rename this, please" })]
+        );
+        review.update_in(cx, |review, window, cx| {
+            review.open_composer(
+                ComposerTarget::Reply {
+                    thread: "T1".into(),
+                },
+                "Because".into(),
+                window,
+                cx,
+            );
+            review.submit_composer(Destination::Review, window, cx);
+            review.set_resolved("T1", true, cx);
+            review.toggle_reaction("T1-c1", false, cx);
+            review.add_to_agent("T2", cx);
+            review.remove_draft("d1", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "review.reply"),
+            [json!({ "workspace": "/project", "thread": "T1", "body": "Because" })]
+        );
+        assert_eq!(
+            calls_to(&calls, "review.resolve"),
+            [json!({ "workspace": "/project", "thread": "T1" })]
+        );
+        assert_eq!(calls_to(&calls, "review.react")[0]["reaction"], "+1");
+        assert_eq!(
+            calls_to(&calls, "attach.pr_comments"),
+            [json!({ "workspace": "/project", "ids": ["T2"] })]
+        );
+        assert_eq!(calls_to(&calls, "review.comment.remove")[0]["id"], "d1");
+
+        // A note for the agent goes to the composer as a text attachment.
+        review.update_in(cx, |review, window, cx| {
+            review.open_composer(
+                ComposerTarget::Lines { start: 1, end: 2 },
+                "Check both lines".into(),
+                window,
+                cx,
+            );
+            review.submit_composer(Destination::Agent, window, cx);
+        });
+        cx.run_until_parked();
+        let notes = calls_to(&calls, "attach.text");
+        assert_eq!(notes[0]["title"], "src/app.rs:lines 1-2");
+        assert!(
+            notes[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.ends_with("Check both lines")),
+            "{notes:?}"
+        );
     }
 }

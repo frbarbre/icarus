@@ -54,7 +54,7 @@ fn show_sidebar_panel(
     cx: &mut Context<Workspace>,
 ) {
     match request {
-        Tab::Diff { scope } => {
+        Tab::Diff { scope, .. } => {
             let scope = diff_scope(scope.as_deref());
             if let Some(panel) = crate::changes_tab::reveal_source_control(workspace, window, cx) {
                 panel.update(cx, |panel, cx| panel.set_scope(scope, cx));
@@ -90,9 +90,10 @@ fn diff_scope(scope: Option<&str>) -> crate::changes_tab::ChangesScope {
     }
 }
 
-/// Explorer and diff entries show sidebar panels rather than tabs (plan D31).
+/// Explorer entries and diff entries without a file show sidebar panels rather than tabs (plan D31);
+/// a diff entry naming a file is that file's diff tab.
 fn is_sidebar_entry(tab: &Tab) -> bool {
-    matches!(tab, Tab::Explorer | Tab::Diff { .. })
+    matches!(tab, Tab::Explorer | Tab::Diff { path: None, .. })
 }
 
 /// The sidebar panel a layout asks for: its first explorer or diff entry, in layout order.
@@ -393,8 +394,23 @@ impl Build<'_> {
             Tab::Browser { url } => {
                 crate::browser::open_browser_tab(url.clone(), pane, false, workspace, window, cx);
             }
+            Tab::Diff {
+                path: Some(path),
+                scope,
+            } => {
+                let task = open_diff(
+                    worktree_root.join(path),
+                    diff_tab_base(scope.as_deref()),
+                    index,
+                    pane,
+                    workspace,
+                    window,
+                    cx,
+                );
+                self.pending.push(task);
+            }
             // Pruned before building: these show sidebar panels, not tabs.
-            Tab::Diff { .. } | Tab::Explorer => {}
+            Tab::Diff { path: None, .. } | Tab::Explorer => {}
             Tab::File { path, line } => {
                 let path = if path.is_absolute() {
                     path.clone()
@@ -470,6 +486,41 @@ fn open_file(
                 editor.go_to_singleton_buffer_point(point, window, cx);
             })?;
         }
+        anyhow::Ok(())
+    })
+}
+
+/// A diff tab's base from its entry's scope: `base:<ref>` (the server fills it in), else uncommitted changes.
+fn diff_tab_base(scope: Option<&str>) -> crate::diff_tab::DiffBase {
+    use crate::diff_tab::DiffBase;
+    match scope.and_then(|scope| scope.strip_prefix("base:")) {
+        Some(base) if !base.is_empty() => DiffBase::MergeBase(base.to_owned()),
+        _ => DiffBase::Uncommitted,
+    }
+}
+
+fn open_diff(
+    path: PathBuf,
+    base: crate::diff_tab::DiffBase,
+    index: usize,
+    pane: &Entity<Pane>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<()>> {
+    let open = crate::diff_tab::open_diff_tab(
+        path,
+        base,
+        crate::diff_tab::DiffTabMode::Diff,
+        Some(pane.clone()),
+        workspace,
+        window,
+        cx,
+    );
+    let pane = pane.clone();
+    cx.spawn_in(window, async move |_, cx| {
+        let tab = open.await?;
+        cx.update(|window, cx| place_at(&pane, tab.entity_id(), index, window, cx))?;
         anyhow::Ok(())
     })
 }
@@ -578,19 +629,38 @@ mod tests {
     #[test]
     fn the_first_explorer_or_diff_entry_picks_the_sidebar_panel() {
         let layout = node(json!({ "split": "row", "children": [
-            { "tabs": [{ "type": "agent" }] },
+            { "tabs": [{ "type": "agent" }, { "type": "diff", "path": "a.rs" }] },
             { "tabs": [{ "type": "diff", "scope": "uncommitted" }, { "type": "explorer" }] },
         ]}));
         assert_eq!(
             sidebar_request(&layout),
             Some(Tab::Diff {
-                scope: Some("uncommitted".into())
-            })
+                scope: Some("uncommitted".into()),
+                path: None,
+            }),
+            "a diff naming a file is a tab, not the panel"
         );
         assert_eq!(
             sidebar_request(&node(json!({ "tabs": [{ "type": "agent" }] }))),
             None
         );
+        let pruned = prune(&layout).expect("tabs left");
+        assert_eq!(
+            pruned.tabs().len(),
+            2,
+            "the agent and the file's diff tab stay"
+        );
+    }
+
+    #[test]
+    fn a_diff_tab_entry_opens_against_the_base_the_server_named() {
+        use crate::diff_tab::DiffBase;
+        assert_eq!(
+            diff_tab_base(Some("base:origin/main")),
+            DiffBase::MergeBase("origin/main".into())
+        );
+        assert_eq!(diff_tab_base(None), DiffBase::Uncommitted);
+        assert_eq!(diff_tab_base(Some("base:")), DiffBase::Uncommitted);
     }
 
     #[test]

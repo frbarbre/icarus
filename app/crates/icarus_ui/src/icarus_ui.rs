@@ -6,6 +6,7 @@ pub mod layout;
 pub mod links;
 mod model;
 mod next_action;
+pub mod review;
 pub mod sidebar;
 pub mod status_style;
 mod terminals;
@@ -564,6 +565,7 @@ fn start_app_connection(cx: &mut App) {
                         };
                         cx.update(|cx| dispatch_action(request, cx));
                     }
+                    "review.changed" => cx.update(review::review_changed),
                     "ports.changed" => {
                         cx.update(|cx| links::ports_changed(event.payload, cx));
                     }

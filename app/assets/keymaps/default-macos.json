@@ -706,6 +706,21 @@
     "bindings": {
       "cmd-alt-e": "icarus::ShowEdit",
       "cmd-alt-d": "icarus::ShowDiff",
+      // Orca's editor.addReviewNote.
+      "cmd-shift-a": "icarus::AddReviewComment",
+    },
+  },
+  {
+    "context": "IcarusReviewComposer > Editor",
+    "bindings": {
+      "cmd-enter": "icarus::SubmitReviewComment",
+      "escape": "icarus::CancelReviewComment",
+    },
+  },
+  {
+    "context": "IcarusReviewerInput > Editor",
+    "bindings": {
+      "enter": "icarus::RequestTypedReviewers",
     },
   },
   {

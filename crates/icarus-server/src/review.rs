@@ -18,7 +18,7 @@ use icarus_github::review::{CommentTarget, DraftComment, Reaction, Side, Verdict
 use icarus_github::review_context::ReviewContext;
 use icarus_github::review_threads::PrThread;
 use icarus_protocol::RpcError;
-use icarus_rules::facts::RepoRef;
+use icarus_rules::facts::{RepoRef, RequestedReviewer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -488,6 +488,33 @@ struct React {
 }
 
 #[derive(Deserialize)]
+struct Reviewers {
+    /// Logins, or `org/team` for a team.
+    reviewers: Vec<String>,
+}
+
+/// `org/team` (or `@org/team`) names a team; anything else is a user login.
+pub fn parse_reviewers(names: &[String]) -> Result<Vec<RequestedReviewer>, RpcError> {
+    let reviewers: Vec<RequestedReviewer> = names
+        .iter()
+        .flat_map(|name| name.split([',', ' ']))
+        .map(|name| name.trim().trim_start_matches('@'))
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            if name.contains('/') {
+                RequestedReviewer::team(name)
+            } else {
+                RequestedReviewer::user(name)
+            }
+        })
+        .collect();
+    if reviewers.is_empty() {
+        return Err(rpc("invalid", "Enter at least one reviewer"));
+    }
+    Ok(reviewers)
+}
+
+#[derive(Deserialize)]
 struct Upload {
     #[serde(default)]
     path: Option<String>,
@@ -702,6 +729,29 @@ impl Server {
                     "reaction": reaction.short(),
                     "reacted": !react.remove,
                 }))
+            }
+            "review.request_reviewers" | "review.remove_reviewers" => {
+                let at: At = params(p.clone())?;
+                let names: Reviewers = params(p)?;
+                let reviewers = parse_reviewers(&names.reviewers)?;
+                let (workspace, target) = self.review_target(&at).await?;
+                let client = &self.github.client;
+                if method == "review.request_reviewers" {
+                    client
+                        .request_reviewers(&target.repo, target.number, &reviewers)
+                        .await
+                } else {
+                    client
+                        .remove_reviewers(&target.repo, target.number, &reviewers)
+                        .await
+                }
+                .map_err(github_error)?;
+                // The panel's reviewer rows come from the cached PR snapshot.
+                self.github.invalidate(&workspace.project_id);
+                self.review_changed(Some(&workspace.id), None);
+                Ok(
+                    json!({ "reviewers": reviewers, "requested": method == "review.request_reviewers" }),
+                )
             }
             "review.upload" => {
                 let at: At = params(p.clone())?;

@@ -5,7 +5,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use icarus_protocol::RpcError;
-use icarus_protocol::layout::{LayoutNode, Tab, builtin_layouts, fill_placeholders, placeholders};
+use icarus_protocol::layout::{
+    FIRST_CHANGED_FILE, LayoutNode, Tab, builtin_layouts, fill_placeholders, placeholders,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -62,6 +64,40 @@ impl Server {
         layout_definitions(&self.resolved_settings(root)).map_err(|e| rpc("settings_invalid", e))
     }
 
+    /// Points `{first_changed_file}` diffs at the Changes list's first row; with no changes they fall back
+    /// to showing the Source Control panel.
+    async fn resolve_first_changed_file(
+        self: &Arc<Self>,
+        workspace: &Workspace,
+        layout: &mut LayoutNode,
+    ) {
+        let wanted = layout.tabs().into_iter().any(
+            |tab| matches!(tab, Tab::Diff { path: Some(path), .. } if path == FIRST_CHANGED_FILE),
+        );
+        if !wanted {
+            return;
+        }
+        let first = self
+            .changes_dispatch("workspace.changes", json!({ "id": workspace.id }))
+            .await
+            .ok()
+            .and_then(|listing| listing["rows"][0]["path"].as_str().map(str::to_owned));
+        for tab in layout.tabs_mut() {
+            if let Tab::Diff { path, scope } = tab
+                && path.as_deref() == Some(FIRST_CHANGED_FILE)
+            {
+                *path = first.clone();
+                // The app opens the tab against this base; only the server knows it.
+                if path.is_some() && scope.is_none() {
+                    *scope = workspace
+                        .base_ref
+                        .as_ref()
+                        .map(|base| format!("base:{base}"));
+                }
+            }
+        }
+    }
+
     /// Resolves `name` for `workspace`, binds its agent tabs, stores it as pending and pushes it to the app.
     pub(crate) async fn apply_layout(
         self: &Arc<Self>,
@@ -88,6 +124,8 @@ impl Server {
                 *url = fill_placeholders(url, |key| values.get(key).cloned().flatten());
             }
         }
+        self.resolve_first_changed_file(workspace, &mut layout)
+            .await;
         self.bind_agent_tabs(workspace, root.as_deref(), &mut layout)
             .await?;
         let payload = json!({

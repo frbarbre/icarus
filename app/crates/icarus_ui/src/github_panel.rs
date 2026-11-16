@@ -18,6 +18,7 @@ use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
 use workspace::{OpenOptions, Workspace};
 
 use crate::links::{PreviewDeployment, ordered_previews};
+use crate::review::{ReviewSection, ReviewView};
 use crate::{server_home, status_style};
 
 actions!(
@@ -896,6 +897,10 @@ struct PreviewFixture {
     workspaces: Vec<WorkspaceEntry>,
     current: Option<String>,
     pr_status: Option<PrStatus>,
+    /// `review.get`'s answer, to show the Review section.
+    review: Option<ReviewView>,
+    /// Uncommitted files, which disable re-request.
+    uncommitted: usize,
 }
 
 pub struct GitHubPanel {
@@ -909,6 +914,10 @@ pub struct GitHubPanel {
     stack_expanded: bool,
     fixed_now: Option<i64>,
     animate: bool,
+    review: Option<Entity<ReviewSection>>,
+    /// The PR update time the review section last loaded at; a change reloads it.
+    review_loaded_at: Option<String>,
+    preview_review: Option<(ReviewView, usize)>,
     _poll: Task<()>,
 }
 
@@ -991,7 +1000,56 @@ impl GitHubPanel {
             stack_expanded: false,
             fixed_now: None,
             animate: false,
+            review: None,
+            review_loaded_at: None,
+            preview_review: None,
             _poll: Task::ready(()),
+        }
+    }
+
+    pub fn review_section(&self) -> Option<&Entity<ReviewSection>> {
+        self.review.as_ref()
+    }
+
+    /// Keeps the Review section on the current workspace's PR, reloading it when the PR changes.
+    fn sync_review_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let (Some(current), Some(pull_request)) = (
+            snapshot.current.clone(),
+            snapshot
+                .status
+                .as_ref()
+                .and_then(|status| status.pull_request.clone()),
+        ) else {
+            self.review = None;
+            return;
+        };
+        let stale = self
+            .review
+            .as_ref()
+            .is_none_or(|section| section.read(cx).workspace() != current.id);
+        if stale {
+            let client = self.client.clone();
+            let preview = self.preview_review.clone();
+            self.review = Some(cx.new(|cx| match preview {
+                Some((view, uncommitted)) => {
+                    ReviewSection::preview(view, &pull_request, uncommitted, window, cx)
+                }
+                None => ReviewSection::new(current.id.clone(), client, window, cx),
+            }));
+            self.review_loaded_at = pull_request.updated_at.clone();
+        }
+        if let Some(section) = &self.review {
+            let reload = !stale && self.review_loaded_at != pull_request.updated_at;
+            self.review_loaded_at = pull_request.updated_at.clone();
+            section.update(cx, |section, cx| {
+                section.set_pull_request(&pull_request);
+                if reload {
+                    section.reload(window, cx);
+                }
+            });
         }
     }
 
@@ -1017,6 +1075,7 @@ impl GitHubPanel {
                     current,
                     status: fixture.pr_status,
                 });
+                panel.preview_review = fixture.review.map(|review| (review, fixture.uncommitted));
             }
             Err(error) => panel.offline = Some(format!("invalid preview fixture: {error}")),
         }
@@ -1774,7 +1833,10 @@ impl GitHubPanel {
             .children(self.render_attention(pull_request))
             .children(self.render_previews(status, cx))
             .child(self.render_checks(pull_request))
-            .child(self.render_reviews(pull_request, cx))
+            .map(|column| match &self.review {
+                Some(section) => column.child(section.clone()),
+                None => column.child(self.render_reviews(pull_request, cx)),
+            })
     }
 
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1837,7 +1899,10 @@ impl GitHubPanel {
 }
 
 impl Render for GitHubPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if crate::enabled(cx) || self.preview_review.is_some() {
+            self.sync_review_section(window, cx);
+        }
         v_flex()
             .key_context("IcarusGitHubPanel")
             .track_focus(&self.focus_handle)

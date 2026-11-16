@@ -640,6 +640,25 @@
     },
   },
   {
+    "context": "IcarusDiffTab > Editor",
+    "bindings": {
+      "ctrl-shift-a": "icarus::AddReviewComment",
+    },
+  },
+  {
+    "context": "IcarusReviewComposer > Editor",
+    "bindings": {
+      "ctrl-enter": "icarus::SubmitReviewComment",
+      "escape": "icarus::CancelReviewComment",
+    },
+  },
+  {
+    "context": "IcarusReviewerInput > Editor",
+    "bindings": {
+      "enter": "icarus::RequestTypedReviewers",
+    },
+  },
+  {
     "context": "Workspace",
     "bindings": {
       "ctrl-alt-enter": "icarus::RunNextAction",

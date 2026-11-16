@@ -105,13 +105,18 @@ async fn a_workspace_created_with_the_review_layout_puts_its_agent_left_and_the_
         .expect("create");
     let agent_id = created["agents"][0]["id"].as_str().expect("agent");
     let layout = &created["layout"]["layout"];
-    assert_eq!(tab_types(layout), ["agent", "browser"]);
+    assert_eq!(tab_types(layout), ["agent", "diff", "browser"]);
     assert_eq!(layout["split"], "row");
     assert_eq!(
         layout["children"][0]["tabs"][0]["agent_id"], agent_id,
         "the workspace's own agent sits in the left tab"
     );
-    assert_eq!(layout["children"][1]["tabs"][0]["url"], pr_url);
+    assert!(
+        layout["children"][1]["tabs"][0].get("path").is_none(),
+        "nothing changed yet, so the diff entry shows the Source Control panel"
+    );
+    assert_eq!(layout["children"][1]["tabs"][1]["url"], pr_url);
+    assert_eq!(layout["children"][1]["active"], 1, "the PR stays in front");
     assert_eq!(created["layout"]["delivered"], 1);
 
     let event = tokio::time::timeout(Duration::from_secs(5), app_events.recv())
@@ -132,6 +137,26 @@ async fn a_workspace_created_with_the_review_layout_puts_its_agent_left_and_the_
         .await
         .expect("take again");
     assert_eq!(again, Value::Null, "a pending layout applies once");
+
+    let worktree = std::path::PathBuf::from(created["path"].as_str().expect("path"));
+    std::fs::write(worktree.join("billing.rs"), "fn total() {}\n").expect("change a file");
+    let reapplied = client
+        .request_timeout(
+            "workspace.layout",
+            json!({ "id": created["id"], "layout": "review", "pr_url": pr_url }),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("apply review again");
+    let changes = &reapplied["layout"]["children"][1]["tabs"][0];
+    assert_eq!(
+        changes["path"], "billing.rs",
+        "the first changed file opens next to the PR"
+    );
+    assert_eq!(
+        changes["scope"], "base:main",
+        "against the workspace's base"
+    );
 }
 
 #[tokio::test]

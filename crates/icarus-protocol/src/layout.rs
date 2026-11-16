@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub const REVIEW_LAYOUT: &str = "review";
+/// A diff path the server replaces with the workspace's first changed file.
+pub const FIRST_CHANGED_FILE: &str = "{first_changed_file}";
 /// What a new workspace opens with when nothing else is asked for: one agent tab.
 pub const DEFAULT_LAYOUT: &str = "default";
 
@@ -50,9 +52,13 @@ pub enum Tab {
     Browser {
         url: String,
     },
+    /// Without a path, the Source Control panel; with one, that file's diff tab
+    /// (`{first_changed_file}` is the first file in the workspace's Changes list).
     Diff {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
     Explorer,
     File {
@@ -142,11 +148,18 @@ pub fn builtin_layouts() -> BTreeMap<String, LayoutNode> {
                 split: SplitAxis::Row,
                 children: vec![
                     agent_pane(),
+                    // github-review.md: the first changed file plus the PR, which stays in front.
                     LayoutNode::Pane {
-                        tabs: vec![Tab::Browser {
-                            url: "{pr_url}".into(),
-                        }],
-                        active: None,
+                        tabs: vec![
+                            Tab::Diff {
+                                scope: None,
+                                path: Some(FIRST_CHANGED_FILE.into()),
+                            },
+                            Tab::Browser {
+                                url: "{pr_url}".into(),
+                            },
+                        ],
+                        active: Some(1),
                     },
                 ],
                 sizes: None,
@@ -203,13 +216,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn review_layout_is_an_agent_left_and_the_pr_right() {
+    fn review_layout_is_an_agent_left_and_the_changes_and_pr_right() {
         let review = &builtin_layouts()[REVIEW_LAYOUT];
         assert_eq!(
             serde_json::to_value(review).expect("serialize"),
             json!({ "split": "row", "children": [
                 { "tabs": [{ "type": "agent" }] },
-                { "tabs": [{ "type": "browser", "url": "{pr_url}" }] },
+                { "tabs": [
+                    { "type": "diff", "path": "{first_changed_file}" },
+                    { "type": "browser", "url": "{pr_url}" },
+                ], "active": 1 },
             ]})
         );
     }
