@@ -1,6 +1,7 @@
 [package]
 name = "icarus-server"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -27,12 +28,12 @@ base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
 filedescriptor = "0.8.3"
-icarus-git = { version = "0.1.0", path = "../icarus-git" }
-icarus-github = { version = "0.1.0", path = "../icarus-github" }
-icarus-linear = { version = "0.1.0", path = "../icarus-linear" }
-icarus-protocol = { version = "0.1.0", path = "../icarus-protocol" }
-icarus-rules = { version = "0.1.0", path = "../icarus-rules" }
-icarus-settings = { version = "0.1.0", path = "../icarus-settings" }
+icarus-git = { path = "../icarus-git" }
+icarus-github = { path = "../icarus-github" }
+icarus-linear = { path = "../icarus-linear" }
+icarus-protocol = { path = "../icarus-protocol" }
+icarus-rules = { path = "../icarus-rules" }
+icarus-settings = { path = "../icarus-settings" }
 indexmap = "2.14.2"
 portable-pty = "0.9.0"
 rcgen = { version = "0.14.10", default-features = false, features = [

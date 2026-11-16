@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-client"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-git"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "globset",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-github"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "icarus-rules",
  "regex",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-linear"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "rustls",
  "rustls-native-certs",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-protocol"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-rules"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-server"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-settings"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "indexmap 2.14.2",
  "serde",
