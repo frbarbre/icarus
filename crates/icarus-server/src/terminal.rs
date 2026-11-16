@@ -926,14 +926,15 @@ mod tests {
     fn reattach_resumes_from_sequence_or_falls_back_to_snapshot() {
         let manager = TerminalManager::default();
         let session = manager.create(options(&["/bin/cat"])).expect("spawn");
+        // Twice: the tty's echo, then cat's own copy; a late copy would otherwise land after the resume point.
         session.write(b"first\n").expect("write");
-        wait_until(|| session.screen_text().contains("first"));
+        wait_until(|| session.screen_text().matches("first").count() >= 2);
         let (fresh, _) = session.attach(None);
         assert!(fresh.snapshot.as_deref().unwrap_or("").contains("first"));
         let resume_from = fresh.next_seq;
 
         session.write(b"second\n").expect("write");
-        wait_until(|| session.screen_text().contains("second"));
+        wait_until(|| session.screen_text().matches("second").count() >= 2);
         let (resumed, _) = session.attach(Some(resume_from));
         assert!(resumed.snapshot.is_none());
         let replay: Vec<u8> = resumed.chunks.iter().flat_map(|(_, d)| d.clone()).collect();
