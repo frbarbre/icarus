@@ -97,6 +97,8 @@ jobs:
           shared-key: app-visual-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: xcrun -sdk macosx metal --version
+      # The dark baselines follow the system appearance once One Light is registered; runners default to light.
+      - run: defaults write -g AppleInterfaceStyle Dark
       - run: cargo build -p zed --bin zed-visual-test-runner --features visual-tests
       - run: cargo run -p zed --bin zed-visual-test-runner --features visual-tests
         env:
