@@ -75,6 +75,7 @@ pub fn normalize_identifier(raw: &str) -> Result<String> {
     Ok(format!("{}-{number}", team.to_ascii_uppercase()))
 }
 
+const ISSUE_SELECTION: &str = "id identifier title description priority priorityLabel url branchName updatedAt state { name type color } assignee { name displayName avatarUrl } labels(first: 20) { nodes { name color } } team { key }";
 const ISSUE_FIELDS: &str = "fragment IssueFields on Issue { id identifier title description priority priorityLabel url branchName updatedAt state { name type color } assignee { name displayName avatarUrl } labels(first: 20) { nodes { name color } } team { key } }";
 
 /// One query for several issues: an aliased `issue(id:)` per identifier, which Linear resolves by identifier too.
@@ -102,7 +103,8 @@ pub const SEARCH_MAX: usize = 50;
 pub fn search_query(term: &str, first: usize) -> (String, Value) {
     (
         format!(
-            "query SearchIssues($term: String!, $first: Int!) {{ searchIssues(term: $term, first: $first) {{ nodes {{ ...IssueFields }} }} }} {ISSUE_FIELDS}"
+            // `searchIssues` returns IssueSearchResult, not Issue, so the Issue fragment can't be spread there.
+            "query SearchIssues($term: String!, $first: Int!) {{ searchIssues(term: $term, first: $first) {{ nodes {{ {ISSUE_SELECTION} }} }} }}"
         ),
         serde_json::json!({ "term": term, "first": first.clamp(1, SEARCH_MAX) }),
     )
@@ -242,6 +244,17 @@ mod tests {
         assert_eq!(
             variables,
             serde_json::json!({ "i0": "ABC-1", "i1": "ABC-2" })
+        );
+    }
+
+    #[test]
+    fn search_selects_the_issue_fields_inline_because_its_nodes_are_not_issues() {
+        let (query, _) = search_query("keyframe", 10);
+        assert!(!query.contains("...IssueFields"));
+        assert!(query.contains(&format!("nodes {{ {ISSUE_SELECTION} }}")));
+        assert_eq!(
+            ISSUE_FIELDS,
+            format!("fragment IssueFields on Issue {{ {ISSUE_SELECTION} }}")
         );
     }
 
