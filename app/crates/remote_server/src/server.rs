@@ -1459,7 +1459,8 @@ fn cleanup_old_binaries_wsl() {
 fn is_new_version(version: &str) -> bool {
     semver::Version::from_str(version)
         .ok()
-        .zip(semver::Version::from_str(env!("ZED_PKG_VERSION")).ok())
+        // Host binaries are named after the Icarus release (see the SSH transport), not Zed's.
+        .zip(semver::Version::from_str(release_channel::ICARUS_VERSION).ok())
         .is_some_and(|(version, current_version)| version >= current_version)
 }
 

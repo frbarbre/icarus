@@ -17,7 +17,6 @@ use parking_lot::Mutex;
 use paths::remote_server_dir_relative;
 use release_channel::{AppVersion, ReleaseChannel};
 use rpc::proto::Envelope;
-use semver::Version;
 pub use settings_content::SshPortForwardOption;
 use smol::fs;
 use std::{
@@ -1005,10 +1004,9 @@ impl SshRemoteConnection {
             ssh_home_dir,
         };
 
-        let (release_channel, version) =
-            cx.update(|cx| (ReleaseChannel::global(cx), AppVersion::global(cx)));
+        let release_channel = cx.update(|cx| ReleaseChannel::global(cx));
         this.remote_binary_path = Some(
-            this.ensure_server_binary(&delegate, release_channel, version, cx)
+            this.ensure_server_binary(&delegate, release_channel, cx)
                 .await?,
         );
 
@@ -1019,12 +1017,13 @@ impl SshRemoteConnection {
         &self,
         delegate: &Arc<dyn RemoteClientDelegate>,
         release_channel: ReleaseChannel,
-        version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
+        // Named after the Icarus release, not the Zed base, so an Icarus upgrade replaces the
+        // host's server even when the Zed version stays the same.
         let version_str = match release_channel {
             ReleaseChannel::Dev => "build".to_string(),
-            _ => version.to_string(),
+            _ => release_channel::ICARUS_VERSION.to_string(),
         };
         let binary_name = format!(
             "zed-remote-server-{}-{}{}",

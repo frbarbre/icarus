@@ -683,6 +683,12 @@ impl AutoUpdater {
         arch: &str,
         cx: &mut AsyncApp,
     ) -> Result<ReleaseAsset> {
+        if asset == "zed-remote-server"
+            && let Some(release) = icarus_remote_server_asset(release_channel, os, arch)
+        {
+            return Ok(release);
+        }
+
         let client = this.read_with(cx, |this, _| this.client.clone());
 
         let (system_id, metrics_id, is_staff) = if client.telemetry().metrics_enabled() {
@@ -994,6 +1000,28 @@ impl AutoUpdater {
             Ok(kvp.read_kvp(SHOULD_SHOW_UPDATE_NOTIFICATION_KEY)?.is_some())
         })
     }
+}
+
+// zed.dev's remote server is built from upstream Zed and may not speak this fork's protocol,
+// so Icarus releases serve their own build from the matching GitHub release.
+fn icarus_remote_server_asset(
+    release_channel: ReleaseChannel,
+    os: &str,
+    arch: &str,
+) -> Option<ReleaseAsset> {
+    if !matches!(
+        release_channel,
+        ReleaseChannel::Stable | ReleaseChannel::Preview
+    ) {
+        return None;
+    }
+    let version = Version::parse(release_channel::ICARUS_VERSION).ok()?;
+    Some(ReleaseAsset {
+        url: format!(
+            "https://github.com/frbarbre/icarus/releases/download/v{version}/icarus-remote-server-{version}-{os}-{arch}.gz"
+        ),
+        version: version.to_string(),
+    })
 }
 
 async fn download_remote_server_binary(
@@ -1616,6 +1644,22 @@ mod tests {
 
         let downloaded_len = std::fs::metadata(&target_path).unwrap().len();
         assert_eq!(downloaded_len, content_length as u64);
+    }
+
+    #[test]
+    fn test_icarus_remote_server_asset_comes_from_the_icarus_release() {
+        let version = release_channel::ICARUS_VERSION;
+        let release = icarus_remote_server_asset(ReleaseChannel::Stable, "linux", "x86_64")
+            .expect("stable builds use Icarus's own remote server");
+        assert_eq!(release.version, version);
+        assert_eq!(
+            release.url,
+            format!(
+                "https://github.com/frbarbre/icarus/releases/download/v{version}/icarus-remote-server-{version}-linux-x86_64.gz"
+            )
+        );
+        assert!(icarus_remote_server_asset(ReleaseChannel::Nightly, "linux", "x86_64").is_none());
+        assert!(icarus_remote_server_asset(ReleaseChannel::Dev, "linux", "x86_64").is_none());
     }
 
     #[test]
