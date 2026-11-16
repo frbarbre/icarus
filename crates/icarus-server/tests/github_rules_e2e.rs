@@ -284,6 +284,19 @@ async fn pr_status_maps_the_branch_pull_request_in_one_batched_snapshot() {
         .request("workspace.info", json!({ "id": with_pr }))
         .await;
     assert_eq!(info["pr_author"]["login"], "me");
+    assert_eq!(
+        info["pr"]["number"], 5,
+        "cards get the PR summary from the cache"
+    );
+    assert_eq!(info["pr"]["state"], "draft");
+    assert!(info["pr"]["additions"].is_u64());
+    let summary_of = |id: &str| {
+        listed
+            .iter()
+            .find(|w| w["id"] == id)
+            .map(|w| w["pr"].clone())
+    };
+    assert_eq!(summary_of(&without_pr), Some(Value::Null));
     assert_eq!(pr["is_draft"], true);
     assert_eq!(pr["head_ref_name"], "feat-a");
     assert_eq!(pr["head_ref_oid"], head.as_str());

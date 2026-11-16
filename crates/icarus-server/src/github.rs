@@ -416,6 +416,31 @@ impl GitHubService {
             })
             .unwrap_or(Value::Null)
     }
+
+    /// What a workspace card shows about its pull request, from the cache only.
+    pub(crate) fn cached_pr_summary(&self, project_id: &str, branch: &str) -> Value {
+        let prs = lock(&self.prs);
+        prs.get(project_id)
+            .and_then(|cached| cached.by_branch.get(branch)?.as_ref())
+            .map(|details| {
+                let pr = &details.pr;
+                json!({
+                    "number": pr.number,
+                    "url": pr.url,
+                    "state": pr.lifecycle(),
+                    "additions": details.additions,
+                    "deletions": details.deletions,
+                    "checks": pr.checks_rollup,
+                    "in_merge_queue": pr.is_in_merge_queue,
+                    "stack": pr.stack.as_ref().map(|stack| json!({
+                        "number": stack.number,
+                        "position": stack.position,
+                        "size": stack.size,
+                    })),
+                })
+            })
+            .unwrap_or(Value::Null)
+    }
 }
 
 /// `github.com/owner/name` → the repository on GitHub; other hosts have no GitHub repository.

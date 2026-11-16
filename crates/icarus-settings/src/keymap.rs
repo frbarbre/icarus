@@ -386,20 +386,41 @@ const MAPPINGS: &[Mapping] = &[
         &["Mod+Alt+Enter"],
         &["Mod+Alt+Enter"],
     ),
+    // Orca leaves these unbound by default; its ⌥⌘P menu key is Icarus's Open preview.
+    map(
+        "tab.runQuickCommand",
+        "icarus::RunQuickCommand",
+        Scope::Global,
+        &[],
+        &[],
+    ),
+    map(
+        "tab.openQuickCommandsMenu",
+        "icarus::OpenQuickCommandsMenu",
+        Scope::Global,
+        &[],
+        &[],
+    ),
+    // On Linux Ctrl+Alt+L is Zed's language-server menu, so Icarus binds it on macOS only.
+    map(
+        "workspace.openLinearIssue",
+        "icarus::OpenLinearIssue",
+        Scope::Global,
+        &["Mod+Alt+L"],
+        &[],
+    ),
+    map(
+        "worktree.palette",
+        "icarus::OpenWorkspaceSwitcher",
+        Scope::Global,
+        &["Mod+J"],
+        &["Mod+J"],
+    ),
 ];
 
 /// Orca actions the app has no equivalent for yet, with why.
 const UNSUPPORTED: &[(&str, &str)] = &[
     ("tab.rename", "the app has no tab rename yet"),
-    ("tab.runQuickCommand", "the app has no quick commands yet"),
-    (
-        "tab.openQuickCommandsMenu",
-        "the app has no quick commands yet",
-    ),
-    (
-        "worktree.palette",
-        "the app has no workspace switcher palette yet",
-    ),
     (
         "sourceControl.sendQueuedComments",
         "the composer replaces the comment queue (attachments)",

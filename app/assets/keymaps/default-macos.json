@@ -160,7 +160,8 @@
       "cmd-shift-enter": "editor::NewlineAbove",
       "cmd-k z": "editor::ToggleSoftWrap",
       "cmd-f": "buffer_search::Deploy",
-      "cmd-alt-l": ["buffer_search::Deploy", { "selection_search_enabled": true }],
+      // Icarus: Orca's ⌥⌘L opens the workspace's Linear issue; selection search keeps it inside the search bar.
+      "cmd-alt-l": "icarus::OpenLinearIssue",
       "cmd-e": "buffer_search::UseSelectionForFind",
       "cmd->": "agent::AddSelectionToThread",
       "cmd-alt-e": "editor::SelectEnclosingSymbol",
@@ -556,7 +557,8 @@
       "cmd-g": "search::SelectNextMatch",
       "cmd-shift-g": "search::SelectPreviousMatch",
       "cmd-shift-h": "search::ToggleReplace",
-      "cmd-alt-l": "search::ToggleSelection",
+      // Icarus: ⌥⌘L is Orca's Open Linear issue; the search bar's own binding still toggles selection.
+      "cmd-alt-l": "icarus::OpenLinearIssue",
       "alt-enter": "search::SelectAllMatches",
       "alt-cmd-c": "search::ToggleCaseSensitive",
       "alt-cmd-w": "search::ToggleWholeWord",
@@ -750,6 +752,7 @@
       "cmd-alt-t": "icarus::NewAgent",
       "cmd-shift-b": "icarus::OpenFrontend",
       "cmd-alt-p": "icarus::OpenPreview",
+      "cmd-alt-l": "icarus::OpenLinearIssue",
       "cmd-alt-u": "icarus::ToggleUncommittedChanges",
       "cmd-alt-shift-t": "icarus::OpenLatestAgentTurn",
       "alt-f7": "icarus::NextChangedFile",
@@ -793,7 +796,8 @@
       "cmd-b": "workspace::ToggleLeftDock",
       "cmd-alt-b": "workspace::ToggleRightDock",
       "cmd-r": "workspace::ToggleRightDock",
-      "cmd-j": "workspace::ToggleBottomDock",
+      // Icarus: Orca's Mod+J workspace switcher; the bottom dock stays in the View menu and palette.
+      "cmd-j": "icarus::OpenWorkspaceSwitcher",
       "cmd-alt-j": "multi_workspace::ToggleWorkspaceSidebar",
       "cmd-alt-;": "multi_workspace::FocusWorkspaceSidebar",
       "alt-cmd-y": "workspace::ToggleAllDocks",

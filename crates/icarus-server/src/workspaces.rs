@@ -67,6 +67,11 @@ impl Server {
             .as_deref()
             .map(|branch| self.github.cached_pr_author(&workspace.project_id, branch))
             .unwrap_or(Value::Null);
+        value["pr"] = workspace
+            .branch
+            .as_deref()
+            .map(|branch| self.github.cached_pr_summary(&workspace.project_id, branch))
+            .unwrap_or(Value::Null);
         self.enrich_issue(&mut value["issue"]);
         value
     }

@@ -25,6 +25,9 @@ pub struct WorkspaceSummary {
     pub agents: Vec<AgentSummary>,
     #[serde(default)]
     pub pr_author: Option<PrAuthor>,
+    /// The pull request as the server last cached it; listing never waits on GitHub.
+    #[serde(default)]
+    pub pr: Option<PrSummary>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -32,6 +35,43 @@ pub struct PrAuthor {
     pub login: String,
     #[serde(default)]
     pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct PrSummary {
+    pub number: u64,
+    #[serde(default)]
+    pub url: String,
+    /// open, draft, closed or merged.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+    /// success, failure, pending or neutral.
+    #[serde(default)]
+    pub checks: Option<String>,
+    #[serde(default)]
+    pub in_merge_queue: bool,
+    #[serde(default)]
+    pub stack: Option<StackPlace>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+pub struct StackPlace {
+    pub number: u64,
+    /// 1 is the PR on the stack's base; the highest is furthest from main.
+    pub position: u32,
+    #[serde(default)]
+    pub size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct IssueLabel {
+    pub name: String,
+    #[serde(default)]
+    pub color: String,
 }
 
 impl WorkspaceSummary {
@@ -56,6 +96,114 @@ impl WorkspaceSummary {
     pub fn working_agents(&self) -> usize {
         self.agents.iter().filter(|a| a.state == "working").count()
     }
+
+    /// The linked issue's labels from the server's Linear cache.
+    pub fn issue_labels(&self) -> Vec<IssueLabel> {
+        self.issue
+            .as_ref()
+            .and_then(|issue| issue.get("labels").cloned())
+            .and_then(|labels| serde_json::from_value(labels).ok())
+            .unwrap_or_default()
+    }
+
+    /// The linked issue's page, once the server has fetched it.
+    pub fn issue_url(&self) -> Option<String> {
+        self.issue
+            .as_ref()
+            .and_then(|issue| issue["url"].as_str())
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+    }
+
+    pub fn stack(&self) -> Option<StackPlace> {
+        self.pr.as_ref().and_then(|pr| pr.stack)
+    }
+}
+
+/// Which lane a workspace takes when the list is grouped by stack.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StackLane {
+    /// Someone else's pull request (the status the rules give `reviewing`), stacked or not.
+    Reviewing,
+    Stack {
+        project_id: String,
+        number: u64,
+    },
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StackGroup {
+    pub lane: StackLane,
+    pub workspaces: Vec<WorkspaceSummary>,
+}
+
+/// Orca's stack grouping: reviewing first, then newest stack first (each listed from the PR
+/// furthest from main down, or up when `ascending`), then everything outside a stack in status order.
+pub fn group_by_stack(
+    workspaces: &[WorkspaceSummary],
+    status_order: &[String],
+    reviewing_status: Option<&str>,
+    ascending: bool,
+) -> Vec<StackGroup> {
+    let lane_of = |workspace: &WorkspaceSummary| {
+        if reviewing_status.is_some() && workspace.status.as_deref() == reviewing_status {
+            return StackLane::Reviewing;
+        }
+        match workspace.stack() {
+            Some(stack) => StackLane::Stack {
+                project_id: workspace.project_id.clone(),
+                number: stack.number,
+            },
+            None => StackLane::None,
+        }
+    };
+    let mut reviewing = Vec::new();
+    let mut stacks: BTreeMap<(u64, String), Vec<WorkspaceSummary>> = BTreeMap::new();
+    let mut loose = Vec::new();
+    for workspace in workspaces {
+        match lane_of(workspace) {
+            StackLane::Reviewing => reviewing.push(workspace.clone()),
+            StackLane::Stack { project_id, number } => stacks
+                .entry((number, project_id))
+                .or_default()
+                .push(workspace.clone()),
+            StackLane::None => loose.push(workspace.clone()),
+        }
+    }
+    let position = |workspace: &WorkspaceSummary| workspace.stack().map_or(0, |s| s.position);
+    let status_rank = |workspace: &WorkspaceSummary| {
+        workspace
+            .status
+            .as_ref()
+            .and_then(|status| status_order.iter().position(|id| id == status))
+            .unwrap_or(status_order.len())
+    };
+    loose.sort_by_key(|workspace| status_rank(workspace));
+    let mut groups = Vec::new();
+    if !reviewing.is_empty() {
+        groups.push(StackGroup {
+            lane: StackLane::Reviewing,
+            workspaces: reviewing,
+        });
+    }
+    for ((number, project_id), mut items) in stacks.into_iter().rev() {
+        items.sort_by_key(|workspace| position(workspace));
+        if !ascending {
+            items.reverse();
+        }
+        groups.push(StackGroup {
+            lane: StackLane::Stack { project_id, number },
+            workspaces: items,
+        });
+    }
+    if !loose.is_empty() {
+        groups.push(StackGroup {
+            lane: StackLane::None,
+            workspaces: loose,
+        });
+    }
+    groups
 }
 
 /// A user-defined workspace status column from `workspace.statuses`.
@@ -125,7 +273,98 @@ mod tests {
             issue: None,
             agents: Vec::new(),
             pr_author: None,
+            pr: None,
         }
+    }
+
+    fn stacked(name: &str, status: Option<&str>, stack: u64, position: u32) -> WorkspaceSummary {
+        let mut w = workspace(name, status);
+        w.pr = Some(PrSummary {
+            number: u64::from(position) + stack * 100,
+            stack: Some(StackPlace {
+                number: stack,
+                position,
+                size: 3,
+            }),
+            ..PrSummary::default()
+        });
+        w
+    }
+
+    fn names(groups: &[StackGroup]) -> Vec<(StackLane, Vec<&str>)> {
+        groups
+            .iter()
+            .map(|g| {
+                (
+                    g.lane.clone(),
+                    g.workspaces.iter().map(|w| w.name.as_str()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stacks_list_newest_first_furthest_from_main_down_then_the_rest() {
+        let workspaces = [
+            workspace("loose", Some("todo")),
+            stacked("bottom", None, 7, 1),
+            stacked("top", None, 7, 3),
+            stacked("other", None, 9, 1),
+            stacked("middle", None, 7, 2),
+        ];
+        let stack = |number| StackLane::Stack {
+            project_id: "p".into(),
+            number,
+        };
+        assert_eq!(
+            names(&group_by_stack(&workspaces, &[], None, false)),
+            [
+                (stack(9), vec!["other"]),
+                (stack(7), vec!["top", "middle", "bottom"]),
+                (StackLane::None, vec!["loose"]),
+            ]
+        );
+        assert_eq!(
+            names(&group_by_stack(&workspaces, &[], None, true))[1],
+            (stack(7), vec!["bottom", "middle", "top"]),
+            "ascending lists a stack from the PR on main up"
+        );
+    }
+
+    #[test]
+    fn reviewing_comes_first_even_when_stacked_and_the_rest_follow_status_order() {
+        let workspaces = [
+            workspace("done", Some("completed")),
+            stacked("top", Some("in-review"), 7, 3),
+            workspace("waiting", Some("todo")),
+            stacked("middle", None, 7, 2),
+        ];
+        let groups = group_by_stack(
+            &workspaces,
+            &["todo".into(), "completed".into()],
+            Some("in-review"),
+            false,
+        );
+        assert_eq!(
+            names(&groups),
+            [
+                (StackLane::Reviewing, vec!["top"]),
+                (
+                    StackLane::Stack {
+                        project_id: "p".into(),
+                        number: 7
+                    },
+                    vec!["middle"]
+                ),
+                (StackLane::None, vec!["waiting", "done"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_pr_data_everything_is_outside_a_stack() {
+        let groups = group_by_stack(&[workspace("a", None)], &[], None, false);
+        assert_eq!(names(&groups), [(StackLane::None, vec!["a"])]);
     }
 
     #[test]

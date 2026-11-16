@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod cards;
 pub mod changes_tab;
 pub mod commit_modal;
 pub mod diff_tab;
@@ -7,6 +8,8 @@ pub mod layout;
 pub mod links;
 mod model;
 mod next_action;
+pub mod palettes;
+pub mod quick_commands;
 pub mod review;
 pub mod sidebar;
 pub mod status_style;
@@ -40,7 +43,8 @@ use workspace::{AppState, MultiWorkspace, OpenOptions, Workspace};
 use crate::github_panel::{AvatarKind, render_avatar};
 
 pub use model::{
-    AgentSummary, PrAuthor, StatusColumn, StatusGroup, WorkspaceSummary, group_by_status,
+    AgentSummary, IssueLabel, PrAuthor, PrSummary, StackGroup, StackLane, StackPlace, StatusColumn,
+    StatusGroup, WorkspaceSummary, group_by_stack, group_by_status,
 };
 
 actions!(
@@ -64,6 +68,8 @@ actions!(
         ActivateNextItemOfSameType,
         /// Activates the previous tab of the active tab's kind.
         ActivatePreviousItemOfSameType,
+        /// Jumps to another workspace by name, issue, title, branch or status.
+        OpenWorkspaceSwitcher,
     ]
 );
 
@@ -677,6 +683,7 @@ pub fn init(cx: &mut App) {
     diff_tab::register(cx);
     sidebar::register(cx);
     zed_import::register(cx);
+    quick_commands::register(cx);
     terminals::register(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_some() {
@@ -719,8 +726,141 @@ pub fn init(cx: &mut App) {
                 panel.update(cx, |panel, cx| panel.refresh(cx));
             }
         });
+        register_panel_actions(workspace);
     })
     .detach();
+}
+
+/// `#rrggbb` (Linear's label colours) as a colour.
+fn parse_hex_color(hex: &str) -> Option<gpui::Hsla> {
+    let digits = hex.strip_prefix('#').unwrap_or(hex);
+    if digits.len() != 6 {
+        return None;
+    }
+    u32::from_str_radix(digits, 16)
+        .ok()
+        .map(|value| gpui::rgb(value).into())
+}
+
+fn toast(workspace: &mut Workspace, message: &'static str, cx: &mut Context<Workspace>) {
+    struct IcarusPanelToast;
+    workspace.show_toast(
+        workspace::Toast::new(
+            workspace::notifications::NotificationId::unique::<IcarusPanelToast>(),
+            message,
+        )
+        .autohide(),
+        cx,
+    );
+}
+
+/// The workspaces panel's view actions, the workspace switcher and Open Linear issue.
+pub fn register_panel_actions(workspace: &mut Workspace) {
+    workspace.register_action(|workspace, action: &cards::ToggleCardField, _, cx| {
+        if let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) {
+            panel.update(cx, |panel, cx| panel.toggle_card_field(&action.field, cx));
+        }
+    });
+    workspace.register_action(|workspace, action: &cards::SetWorkspaceGrouping, _, cx| {
+        if let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) {
+            let group_by = cards::GroupBy::parse(&action.group_by);
+            panel.update(cx, |panel, cx| panel.set_group_by(group_by, cx));
+        }
+    });
+    workspace.register_action(|workspace, _: &cards::ToggleGroupByStack, _, cx| {
+        if let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                let group_by = if panel.view.group_by == cards::GroupBy::Stack {
+                    cards::GroupBy::Status
+                } else {
+                    cards::GroupBy::Stack
+                };
+                panel.set_group_by(group_by, cx)
+            });
+        }
+    });
+    workspace.register_action(|workspace, _: &cards::OpenLinearIssue, _, cx| {
+        let roots: Vec<PathBuf> = workspace
+            .root_paths(cx)
+            .iter()
+            .map(|root| root.to_path_buf())
+            .collect();
+        let found = workspace.panel::<WorkspacesPanel>(cx).and_then(|panel| {
+            panel
+                .read(cx)
+                .workspace_for_roots(&roots)
+                .map(|w| (w.issue.is_some(), w.issue_url()))
+        });
+        match found {
+            Some((_, Some(url))) => cx.open_url(&url),
+            Some((true, None)) => toast(
+                workspace,
+                "The linked issue hasn't loaded yet; check the Linear key (`icarus issue status`).",
+                cx,
+            ),
+            Some((false, _)) => toast(workspace, "This workspace has no linked issue.", cx),
+            None => toast(workspace, "This window isn't an Icarus workspace.", cx),
+        }
+    });
+    workspace.register_action(|workspace, _: &OpenWorkspaceSwitcher, window, cx| {
+        open_workspace_switcher(workspace, window, cx);
+    });
+}
+
+/// The switcher's rows, one per workspace in the panel's order; the filter also matches the
+/// name, title, issue title, branch, status and PR number.
+pub fn switcher_items(panel: &WorkspacesPanel) -> Vec<palettes::PaletteItem> {
+    panel
+        .workspaces
+        .iter()
+        .map(|w| palettes::PaletteItem {
+            label: w.display_title(),
+            detail: w.status.as_deref().map(|status| panel.status_label(status)),
+            keywords: [
+                w.name.clone(),
+                w.title.clone().unwrap_or_default(),
+                w.subtitle().unwrap_or_default(),
+                w.branch.clone().unwrap_or_default(),
+                w.status.clone().unwrap_or_default(),
+                w.pr.as_ref()
+                    .map(|pr| format!("#{}", pr.number))
+                    .unwrap_or_default(),
+            ]
+            .join(" "),
+        })
+        .collect()
+}
+
+/// ⌘J: a palette over every workspace; Enter opens it (or focuses its window).
+pub fn open_workspace_switcher(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+        return;
+    };
+    let (workspaces, items) = {
+        let panel = panel.read(cx);
+        (panel.workspaces.clone(), switcher_items(panel))
+    };
+    let panel = panel.downgrade();
+    workspace.toggle_modal(window, cx, move |window, cx| {
+        palettes::Palette::new(
+            "Switch to a workspace…",
+            items,
+            move |index, window, cx| {
+                let Some(path) = workspaces.get(index).map(|w| w.path.clone()) else {
+                    return;
+                };
+                panel
+                    .update(cx, |panel, cx| panel.open_workspace(path, window, cx))
+                    .log_err();
+            },
+            window,
+            cx,
+        )
+    });
 }
 
 /// The Icarus server this client talks to; `ICARUS_HOME` selects a non-default one.
@@ -738,21 +878,46 @@ pub enum Connection {
 struct Snapshot {
     workspaces: Vec<WorkspaceSummary>,
     statuses: Vec<StatusColumn>,
+    view: cards::CardView,
+    project_names: collections::HashMap<String, String>,
 }
 
 async fn fetch_snapshot(client: Arc<Client>) -> Result<Snapshot> {
+    let get = |key: &'static str| {
+        let client = client.clone();
+        async move {
+            client
+                .request("config.get", serde_json::json!({ "key": key }))
+                .await
+        }
+    };
     let workspaces = client
         .request("workspace.list", serde_json::json!({}))
         .await?;
-    let statuses = client
-        .request(
-            "config.get",
-            serde_json::json!({ "key": "workspace.statuses" }),
-        )
-        .await?;
+    let statuses = get("workspace.statuses").await?;
+    let card_fields = get("workspace.cardFields").await.unwrap_or_default();
+    let sidebar = get("sidebar").await.unwrap_or_default();
+    let rules = get("rules.orca_compat").await.unwrap_or_default();
+    let projects = client
+        .request("project.list", serde_json::json!({}))
+        .await
+        .unwrap_or_default();
+    let project_names = projects
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|project| {
+            Some((
+                project["id"].as_str()?.to_string(),
+                project["name"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
     Ok(Snapshot {
         workspaces: serde_json::from_value(workspaces)?,
         statuses: serde_json::from_value(statuses).unwrap_or_default(),
+        view: cards::CardView::from_settings(&card_fields, &sidebar, &rules),
+        project_names,
     })
 }
 
@@ -765,6 +930,8 @@ pub struct WorkspacesPanel {
     workspaces: Vec<WorkspaceSummary>,
     statuses: Vec<StatusColumn>,
     status_order: Vec<String>,
+    view: cards::CardView,
+    project_names: collections::HashMap<String, String>,
     ports_requested: HashSet<String>,
     _poll: Task<()>,
     _ports_observation: Subscription,
@@ -783,6 +950,7 @@ impl WorkspacesPanel {
         if !enabled(cx) {
             return panel;
         }
+        panel.view = cards::CardView::default();
         panel._poll = cx.spawn(async move |this, cx| {
             loop {
                 let client = match this.read_with(cx, |panel, _| panel.client.clone()) {
@@ -845,6 +1013,8 @@ impl WorkspacesPanel {
             workspaces: Vec::new(),
             statuses: Vec::new(),
             status_order: Vec::new(),
+            view: cards::CardView::showing_all(),
+            project_names: collections::HashMap::default(),
             ports_requested: HashSet::default(),
             _poll: Task::ready(()),
             _ports_observation: cx.observe(&ports, |_, _, cx| cx.notify()),
@@ -859,13 +1029,84 @@ impl WorkspacesPanel {
     }
 
     fn apply_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
-        if self.workspaces != snapshot.workspaces || self.statuses != snapshot.statuses {
+        if self.workspaces != snapshot.workspaces
+            || self.statuses != snapshot.statuses
+            || self.view != snapshot.view
+            || self.project_names != snapshot.project_names
+        {
             self.status_order = snapshot.statuses.iter().map(|s| s.id.clone()).collect();
             self.workspaces = snapshot.workspaces;
             self.statuses = snapshot.statuses;
+            self.view = snapshot.view;
+            self.project_names = snapshot.project_names;
             cx.notify();
         }
         self.fetch_missing_ports(cx);
+    }
+
+    pub fn view(&self) -> &cards::CardView {
+        &self.view
+    }
+
+    /// For previews and tests; the live panel takes these from the server's settings.
+    pub fn set_view(&mut self, view: cards::CardView, cx: &mut Context<Self>) {
+        self.view = view;
+        cx.notify();
+    }
+
+    pub fn set_project_names(
+        &mut self,
+        names: collections::HashMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_names = names;
+        cx.notify();
+    }
+
+    /// The Icarus workspace a window with these folders shows.
+    pub fn workspace_for_roots(&self, roots: &[PathBuf]) -> Option<&WorkspaceSummary> {
+        self.workspaces
+            .iter()
+            .find(|w| roots.iter().any(|root| root.starts_with(&w.path)))
+    }
+
+    /// Writes a view setting to the server; the panel shows it at once.
+    fn save_setting(&self, key: &'static str, value: serde_json::Value, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        Tokio::spawn_result(cx, async move {
+            client
+                .request(
+                    "config.set",
+                    serde_json::json!({ "key": key, "value": value }),
+                )
+                .await
+        })
+        .detach_and_log_err(cx);
+    }
+
+    pub fn toggle_card_field(&mut self, field: &str, cx: &mut Context<Self>) {
+        let fields = self.view.toggled(field);
+        self.view.fields = fields.clone();
+        cx.notify();
+        self.save_setting("workspace.cardFields", serde_json::json!(fields), cx);
+    }
+
+    pub fn set_group_by(&mut self, group_by: cards::GroupBy, cx: &mut Context<Self>) {
+        self.view.group_by = group_by;
+        cx.notify();
+        self.save_setting("sidebar.groupBy", serde_json::json!(group_by.setting()), cx);
+    }
+
+    fn set_stack_ascending(&mut self, ascending: bool, cx: &mut Context<Self>) {
+        self.view.stack_ascending = ascending;
+        cx.notify();
+        self.save_setting(
+            "sidebar.stackOrder",
+            serde_json::json!(if ascending { "asc" } else { "desc" }),
+            cx,
+        );
     }
 
     /// Loads each workspace's ports once; `ports.changed` events keep them current afterwards.
@@ -1261,6 +1502,260 @@ impl WorkspacesPanel {
         })
     }
 
+    /// The list's sections for the chosen grouping: header icon, title, colour and cards.
+    fn sections(&self, cx: &App) -> Vec<(Icon, String, Color, Vec<WorkspaceSummary>)> {
+        let no_status_icon = || {
+            Icon::from_path(status_style::icon_path("", Some("circle-dashed")))
+                .size(IconSize::Small)
+                .color(Color::Muted)
+        };
+        match self.view.group_by {
+            cards::GroupBy::Status => group_by_status(&self.workspaces, &self.status_order)
+                .into_iter()
+                .map(|group| match group.status.as_deref() {
+                    Some(id) => (
+                        self.status_icon(id, cx),
+                        self.status_label(id),
+                        self.status_color(id, cx),
+                        group.workspaces,
+                    ),
+                    None => (
+                        no_status_icon(),
+                        "No status".into(),
+                        Color::Default,
+                        group.workspaces,
+                    ),
+                })
+                .collect(),
+            cards::GroupBy::Stack => group_by_stack(
+                &self.workspaces,
+                &self.status_order,
+                self.view.reviewing_status.as_deref(),
+                self.view.stack_ascending,
+            )
+            .into_iter()
+            .map(|group| match group.lane {
+                StackLane::Reviewing => {
+                    let id = self.view.reviewing_status.clone().unwrap_or_default();
+                    (
+                        self.status_icon(&id, cx),
+                        self.status_label(&id),
+                        self.status_color(&id, cx),
+                        group.workspaces,
+                    )
+                }
+                StackLane::Stack { number, .. } => (
+                    Icon::new(IconName::ListTree)
+                        .size(IconSize::Small)
+                        .color(Color::Accent),
+                    format!("Stack #{number}"),
+                    Color::Default,
+                    group.workspaces,
+                ),
+                StackLane::None => (
+                    no_status_icon(),
+                    "Not in a stack".into(),
+                    Color::Default,
+                    group.workspaces,
+                ),
+            })
+            .collect(),
+            cards::GroupBy::None => vec![(
+                Icon::new(IconName::GitBranch)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+                "All workspaces".into(),
+                Color::Default,
+                self.workspaces.clone(),
+            )],
+        }
+    }
+
+    /// Grouping, stack order and which card fields show (plan §3a).
+    fn render_view_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = self.view.clone();
+        let panel = cx.entity().downgrade();
+        PopoverMenu::new("icarus-workspaces-view")
+            .trigger_with_tooltip(
+                IconButton::new("icarus-workspaces-view-button", IconName::Settings)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted),
+                Tooltip::text("Group and card display"),
+            )
+            .menu(move |window, cx| {
+                let view = view.clone();
+                let panel = panel.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.header("Group by");
+                    for (group_by, label) in [
+                        (cards::GroupBy::Status, "Status"),
+                        (cards::GroupBy::Stack, "Stack"),
+                        (cards::GroupBy::None, "None"),
+                    ] {
+                        let panel = panel.clone();
+                        menu = menu.toggleable_entry(
+                            label,
+                            view.group_by == group_by,
+                            ui::IconPosition::Start,
+                            Some(Box::new(cards::SetWorkspaceGrouping {
+                                group_by: group_by.setting().into(),
+                            })),
+                            move |_, cx| {
+                                panel
+                                    .update(cx, |panel, cx| panel.set_group_by(group_by, cx))
+                                    .log_err();
+                            },
+                        );
+                    }
+                    if view.group_by == cards::GroupBy::Stack {
+                        let panel = panel.clone();
+                        let ascending = view.stack_ascending;
+                        menu = menu.toggleable_entry(
+                            "Stack from main up",
+                            ascending,
+                            ui::IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                panel
+                                    .update(cx, |panel, cx| {
+                                        panel.set_stack_ascending(!ascending, cx)
+                                    })
+                                    .log_err();
+                            },
+                        );
+                    }
+                    menu = menu.separator().header("Card");
+                    for field in cards::CARD_FIELDS {
+                        let panel = panel.clone();
+                        menu = menu.toggleable_entry(
+                            field.label,
+                            view.shows(field.id),
+                            ui::IconPosition::Start,
+                            Some(Box::new(cards::ToggleCardField {
+                                field: field.id.into(),
+                            })),
+                            move |_, cx| {
+                                panel
+                                    .update(cx, |panel, cx| panel.toggle_card_field(field.id, cx))
+                                    .log_err();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
+    }
+
+    fn render_pr_chips(&self, workspace: &WorkspaceSummary) -> Option<impl IntoElement> {
+        let pr = workspace.pr.as_ref()?;
+        let view = &self.view;
+        let state_color = match pr.state.as_str() {
+            "merged" => Color::Accent,
+            "closed" => Color::Error,
+            "draft" => Color::Muted,
+            _ => Color::Success,
+        };
+        let checks_color = match pr.checks.as_deref() {
+            Some("failure") => Some(Color::Error),
+            Some("pending") => Some(Color::Warning),
+            Some("success") => Some(Color::Success),
+            _ => None,
+        };
+        let mut row = h_flex().gap_1p5();
+        if view.shows("pr") {
+            row = row.child(
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        Icon::new(IconName::PullRequest)
+                            .size(IconSize::XSmall)
+                            .color(state_color),
+                    )
+                    .child(
+                        Label::new(format!("#{}", pr.number))
+                            .size(LabelSize::XSmall)
+                            .color(state_color),
+                    )
+                    .when(pr.in_merge_queue, |chip| {
+                        chip.child(
+                            Label::new("queued")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .children(checks_color.map(|color| Indicator::dot().color(color))),
+            );
+        }
+        if view.shows("pr-diff") && (pr.additions > 0 || pr.deletions > 0) {
+            row = row.child(
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        Label::new(format!("+{}", pr.additions))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Created),
+                    )
+                    .child(
+                        Label::new(format!("−{}", pr.deletions))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Deleted),
+                    ),
+            );
+        }
+        if let (true, Some(stack)) = (view.shows("stack"), pr.stack) {
+            row = row.child(
+                Label::new(format!(
+                    "{}/{}",
+                    stack.position,
+                    stack.size.max(stack.position)
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            );
+        }
+        Some(row)
+    }
+
+    fn render_issue(&self, workspace: &WorkspaceSummary) -> Option<impl IntoElement> {
+        if !self.view.shows("linear-title") {
+            return None;
+        }
+        let subtitle = workspace.subtitle();
+        let labels = workspace.issue_labels();
+        if subtitle.is_none() && labels.is_empty() {
+            return None;
+        }
+        let pills = labels.into_iter().map(|label| {
+            let color = parse_hex_color(&label.color);
+            h_flex()
+                .px_1()
+                .gap_1()
+                .rounded_full()
+                .border_1()
+                .border_color(color.map_or(gpui::transparent_black(), |c| c.opacity(0.5)))
+                .child(
+                    div()
+                        .size(px(6.))
+                        .rounded_full()
+                        .when_some(color, |dot, color| dot.bg(color)),
+                )
+                .child(Label::new(label.name).size(LabelSize::XSmall))
+        });
+        Some(
+            v_flex()
+                .gap_0p5()
+                .when_some(subtitle, |column, subtitle| {
+                    column.child(
+                        Label::new(subtitle)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                })
+                .child(h_flex().flex_wrap().gap_1().children(pills)),
+        )
+    }
+
     fn render_card(
         &self,
         workspace: &WorkspaceSummary,
@@ -1269,6 +1764,11 @@ impl WorkspacesPanel {
         let path = workspace.path.clone();
         let working = workspace.working_agents();
         let agent_count = workspace.agents.len();
+        let view = self.view.clone();
+        let project = view
+            .shows("project")
+            .then(|| self.project_names.get(&workspace.project_id).cloned())
+            .flatten();
         v_flex()
             .id(SharedString::from(format!(
                 "icarus-workspace-{}",
@@ -1294,7 +1794,7 @@ impl WorkspacesPanel {
                     )
                     .child(Label::new(workspace.display_title()).size(LabelSize::Default))
                     .child(div().flex_1())
-                    .when(agent_count > 0, |row| {
+                    .when(view.shows("inline-agents") && agent_count > 0, |row| {
                         row.child(
                             Label::new(if working > 0 {
                                 format!("{working} working")
@@ -1309,51 +1809,68 @@ impl WorkspacesPanel {
                             }),
                         )
                     })
-                    .when_some(workspace.pr_author.as_ref(), |row, author| {
-                        row.child(
-                            div()
-                                .id(SharedString::from(format!(
-                                    "icarus-author-{}",
-                                    workspace.id
-                                )))
-                                .tooltip(Tooltip::text(format!("@{}", author.login)))
-                                .child(render_avatar(
-                                    author.avatar_url.as_deref(),
-                                    &author.login,
-                                    AvatarKind::Person,
-                                    px(16.),
-                                    cx,
-                                )),
-                        )
-                    }),
+                    .when_some(
+                        workspace
+                            .pr_author
+                            .as_ref()
+                            .filter(|_| view.shows("pr-author")),
+                        |row, author| {
+                            row.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "icarus-author-{}",
+                                        workspace.id
+                                    )))
+                                    .tooltip(Tooltip::text(format!("@{}", author.login)))
+                                    .child(render_avatar(
+                                        author.avatar_url.as_deref(),
+                                        &author.login,
+                                        AvatarKind::Person,
+                                        px(16.),
+                                        cx,
+                                    )),
+                            )
+                        },
+                    ),
             )
             .child(
                 h_flex()
                     .gap_1()
-                    .child(self.render_status_menu(workspace, cx))
+                    .flex_wrap()
+                    .when(view.shows_status_chip(), |row| {
+                        row.child(self.render_status_menu(workspace, cx))
+                    })
                     .when_some(workspace.branch.clone(), |row, branch| {
                         row.child(
                             Label::new(branch)
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         )
+                    })
+                    .children(self.render_pr_chips(workspace))
+                    .when_some(project, |row, project| {
+                        row.child(
+                            h_flex()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(cx.theme().colors().element_background)
+                                .child(
+                                    Label::new(project)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
                     }),
             )
-            .children(self.render_port_chips(workspace, cx))
-            .when_some(workspace.subtitle(), |card, subtitle| {
-                card.child(
-                    Label::new(subtitle)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .truncate(),
-                )
+            .when(view.shows("ports"), |card| {
+                card.children(self.render_port_chips(workspace, cx))
             })
+            .children(self.render_issue(workspace))
     }
 }
 
 impl Render for WorkspacesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let groups = group_by_status(&self.workspaces, &self.status_order);
         // Same height as the centre's tab bar, so the two bottom borders line up across the window.
         let header = h_flex()
             .flex_none()
@@ -1368,6 +1885,7 @@ impl Render for WorkspacesPanel {
                     .color(Color::Muted),
             )
             .child(div().flex_1())
+            .child(self.render_view_menu(cx))
             .child(match &self.connection {
                 Connection::Connecting => Label::new("connecting…")
                     .size(LabelSize::XSmall)
@@ -1403,21 +1921,7 @@ impl Render for WorkspacesPanel {
                     ),
             );
         }
-        for group in groups {
-            let title = group
-                .status
-                .as_deref()
-                .map(|id| self.status_label(id))
-                .unwrap_or_else(|| "No status".into());
-            let (header_icon, header_color) = match group.status.as_deref() {
-                Some(id) => (self.status_icon(id, cx), self.status_color(id, cx)),
-                None => (
-                    Icon::from_path(status_style::icon_path("", Some("circle-dashed")))
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                    Color::Default,
-                ),
-            };
+        for (header_icon, title, header_color, workspaces) in self.sections(cx) {
             let mut section = v_flex().gap_0p5().child(
                 h_flex()
                     .px_2()
@@ -1430,12 +1934,12 @@ impl Render for WorkspacesPanel {
                             .weight(gpui::FontWeight::SEMIBOLD),
                     )
                     .child(
-                        Label::new(group.workspaces.len().to_string())
+                        Label::new(workspaces.len().to_string())
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     ),
             );
-            for workspace in &group.workspaces {
+            for workspace in &workspaces {
                 section = section.child(self.render_card(workspace, cx));
             }
             body = body.child(section);
@@ -1520,6 +2024,235 @@ impl Panel for WorkspacesPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(name: &str, path: &str, status: Option<&str>) -> WorkspaceSummary {
+        WorkspaceSummary {
+            id: format!("ws-{name}"),
+            project_id: "p".into(),
+            name: name.into(),
+            path: PathBuf::from(path),
+            branch: Some(name.into()),
+            status: status.map(str::to_string),
+            title: None,
+            issue: None,
+            agents: Vec::new(),
+            pr_author: None,
+            pr: None,
+        }
+    }
+
+    fn stacked(name: &str, stack: u64, position: u32) -> WorkspaceSummary {
+        let mut w = summary(name, &format!("/w/{name}"), None);
+        w.pr = Some(PrSummary {
+            number: u64::from(position),
+            state: "open".into(),
+            stack: Some(StackPlace {
+                number: stack,
+                position,
+                size: 2,
+            }),
+            ..PrSummary::default()
+        });
+        w
+    }
+
+    /// A window on `/project` with the workspaces panel (preview mode, no server) and its actions.
+    async fn panel_window(
+        workspaces: Vec<WorkspaceSummary>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<WorkspacesPanel>,
+        gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            // The palettes' query box is an editor.
+            editor::init(cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/project", serde_json::json!({ "a.txt": "" }))
+            .await;
+        let project = project::Project::test(fs, [Path::new("/project")], cx).await;
+        let multi_workspace = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let mut cx = gpui::VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            register_panel_actions(workspace);
+            let panel = cx.new(|cx| WorkspacesPanel::preview(workspace.weak_handle(), cx));
+            panel.update(cx, |panel, cx| panel.set_workspaces(workspaces, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        cx.run_until_parked();
+        (workspace, panel, cx)
+    }
+
+    fn section_titles(
+        panel: &Entity<WorkspacesPanel>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<String> {
+        panel.read_with(cx, |panel, cx| {
+            panel
+                .sections(cx)
+                .into_iter()
+                .map(|(_, title, _, items)| {
+                    format!(
+                        "{title}: {}",
+                        items
+                            .iter()
+                            .map(|w| w.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    async fn card_fields_and_grouping_follow_their_actions(cx: &mut gpui::TestAppContext) {
+        let (_, panel, mut cx) = panel_window(
+            vec![
+                summary("loose", "/w/loose", None),
+                stacked("bottom", 7, 1),
+                stacked("top", 7, 2),
+                stacked("newer", 9, 1),
+            ],
+            cx,
+        )
+        .await;
+        assert!(panel.read_with(&cx, |panel, _| panel.view().shows("pr")));
+        cx.dispatch_action(cards::ToggleCardField { field: "pr".into() });
+        assert!(!panel.read_with(&cx, |panel, _| panel.view().shows("pr")));
+        cx.dispatch_action(cards::ToggleCardField { field: "pr".into() });
+        assert!(panel.read_with(&cx, |panel, _| panel.view().shows("pr")));
+
+        cx.dispatch_action(cards::SetWorkspaceGrouping {
+            group_by: "stack".into(),
+        });
+        assert_eq!(
+            section_titles(&panel, &mut cx),
+            [
+                "Stack #9: newer",
+                "Stack #7: top,bottom",
+                "Not in a stack: loose"
+            ]
+        );
+        cx.dispatch_action(cards::ToggleGroupByStack);
+        assert_eq!(
+            panel.read_with(&cx, |panel, _| panel.view().group_by),
+            cards::GroupBy::Status
+        );
+        assert_eq!(
+            section_titles(&panel, &mut cx),
+            ["No status: loose,bottom,top,newer"]
+        );
+        cx.dispatch_action(cards::ToggleGroupByStack);
+        assert_eq!(
+            panel.read_with(&cx, |panel, _| panel.view().group_by),
+            cards::GroupBy::Stack
+        );
+    }
+
+    #[gpui::test]
+    async fn open_linear_issue_opens_the_windows_issue(cx: &mut gpui::TestAppContext) {
+        let mut linked = summary("abc-12", "/project", None);
+        linked.issue = Some(serde_json::json!({
+            "provider": "linear",
+            "id": "ABC-12",
+            "url": "https://linear.app/acme/issue/ABC-12",
+            "labels": [{ "name": "Bug", "color": "#eb5757" }],
+        }));
+        let (_, panel, mut cx) = panel_window(vec![linked], cx).await;
+        cx.dispatch_action(cards::OpenLinearIssue);
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://linear.app/acme/issue/ABC-12")
+        );
+        let labels = panel.read_with(&cx, |panel, _| panel.workspaces[0].issue_labels());
+        assert_eq!(labels[0].name, "Bug");
+        assert!(parse_hex_color(&labels[0].color).is_some());
+        assert!(parse_hex_color("not-a-colour").is_none());
+    }
+
+    #[gpui::test]
+    async fn the_switcher_filters_workspaces_and_enter_picks_one(cx: &mut gpui::TestAppContext) {
+        let mut issue = summary("abc-12", "/w/abc-12", Some("todo"));
+        issue.issue =
+            Some(serde_json::json!({ "provider": "linear", "id": "ABC-12", "title": "Fix login" }));
+        let (workspace, _, mut cx) = panel_window(
+            vec![
+                summary("main", "/w/main", None),
+                issue,
+                summary("docs", "/w/docs", None),
+            ],
+            cx,
+        )
+        .await;
+        cx.dispatch_action(OpenWorkspaceSwitcher);
+        cx.run_until_parked();
+        let palette = workspace
+            .read_with(&cx, |workspace, cx| {
+                workspace.active_modal::<palettes::Palette>(cx)
+            })
+            .expect("the switcher is open");
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            palette.read_with(cx, |palette, cx| {
+                palette.picker().read(cx).delegate.visible()
+            })
+        };
+        assert_eq!(shown(&mut cx), [0, 1, 2]);
+        cx.simulate_input("login");
+        cx.run_until_parked();
+        assert_eq!(shown(&mut cx), [1], "the issue title matches");
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(
+            workspace.read_with(&cx, |workspace, cx| workspace
+                .active_modal::<palettes::Palette>(cx)
+                .is_none()),
+            "Enter closes the switcher"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_palette_confirms_the_original_index_of_the_filtered_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, _, mut cx) = panel_window(Vec::new(), cx).await;
+        let picked = std::rc::Rc::new(std::cell::Cell::new(None));
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let picked = picked.clone();
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                palettes::Palette::new(
+                    "Run a quick command…",
+                    ["Run", "Local Backend", "Preview"]
+                        .iter()
+                        .map(|label| palettes::PaletteItem {
+                            label: label.to_string(),
+                            detail: None,
+                            keywords: String::new(),
+                        })
+                        .collect(),
+                    move |index, _, _| picked.set(Some(index)),
+                    window,
+                    cx,
+                )
+            });
+        });
+        cx.simulate_input("prev");
+        cx.run_until_parked();
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert_eq!(picked.get(), Some(2));
+    }
 
     #[test]
     fn parses_composer_attach_payload() {

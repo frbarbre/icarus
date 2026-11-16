@@ -59,6 +59,9 @@ pub struct TerminalInfo {
     pub next_seq: u64,
     /// The server stopped without handing this terminal on, so its process and output are gone.
     pub lost: bool,
+    /// A command, not the shell, holds the foreground (quick commands interrupt it rather than type).
+    #[serde(default)]
+    pub busy: bool,
 }
 
 /// What a client gets when it (re)attaches: either the missing output or a full screen snapshot.
@@ -126,7 +129,7 @@ struct Io {
 
 pub struct TerminalSession {
     id: String,
-    label: Option<String>,
+    label: Mutex<Option<String>>,
     workspace: Option<String>,
     cwd: PathBuf,
     command: Vec<String>,
@@ -217,7 +220,7 @@ impl TerminalSession {
         let (events, _) = broadcast::channel(4096);
         Arc::new(Self {
             id: record.id,
-            label: record.label,
+            label: Mutex::new(record.label),
             workspace: record.workspace,
             cwd: record.cwd,
             command: record.command,
@@ -471,7 +474,7 @@ impl TerminalSession {
     fn record_sized(&self, columns: u16, rows: u16) -> TerminalRecord {
         TerminalRecord {
             id: self.id.clone(),
-            label: self.label.clone(),
+            label: lock(&self.label).clone(),
             workspace: self.workspace.clone(),
             cwd: self.cwd.clone(),
             command: self.command.clone(),
@@ -486,12 +489,30 @@ impl TerminalSession {
         &self.id
     }
 
+    pub fn set_label(&self, label: Option<String>) {
+        *lock(&self.label) = label;
+    }
+
+    /// Whether a program other than the shell holds the terminal's foreground (a command is running).
+    pub fn busy(&self) -> bool {
+        let pid = lock(&self.state).pid;
+        let io = lock(&self.io);
+        match (io.as_ref(), pid) {
+            (Some(io), Some(pid)) => rustix::termios::tcgetpgrp(&io.master)
+                .map(|group| group.as_raw_nonzero().get() as u32 != pid)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
     pub fn info(&self) -> TerminalInfo {
+        let busy = self.busy();
         let state = lock(&self.state);
         let (columns, rows) = state.emulator.size();
         TerminalInfo {
+            busy,
             id: self.id.clone(),
-            label: self.label.clone(),
+            label: lock(&self.label).clone(),
             workspace: self.workspace.clone(),
             cwd: self.cwd.clone(),
             command: self.command.clone(),
@@ -641,6 +662,10 @@ impl TerminalManager {
         };
         manager.save();
         manager
+    }
+
+    pub fn save_registry(&self) {
+        self.save();
     }
 
     fn save(&self) {

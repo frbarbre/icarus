@@ -155,6 +155,25 @@ fn linux_uses_its_own_map_and_ctrl_for_mod() {
 }
 
 #[test]
+fn quick_commands_and_the_switcher_map_to_their_icarus_actions() {
+    let orca = json!({ "version": 1, "platforms": { "darwin": {
+        "tab.runQuickCommand": ["Mod+R"],
+        "tab.openQuickCommandsMenu": ["Ctrl+P"],
+        "worktree.palette": ["Mod+Alt+J"],
+    } } });
+    let translation = translate(&orca, Platform::Mac);
+    let workspace = section(&translation, "Workspace").expect("global section");
+    assert_eq!(workspace["cmd-r"], "icarus::RunQuickCommand");
+    assert_eq!(workspace["ctrl-p"], "icarus::OpenQuickCommandsMenu");
+    assert_eq!(workspace["alt-cmd-j"], "icarus::OpenWorkspaceSwitcher");
+    assert_eq!(
+        translation.sections[0]["unbind"]["cmd-j"], "icarus::OpenWorkspaceSwitcher",
+        "the switcher's default gives way to the remap"
+    );
+    assert!(translation.skipped.is_empty(), "{:?}", translation.skipped);
+}
+
+#[test]
 fn an_empty_list_unbinds_the_default_without_a_new_key() {
     let orca = json!({ "version": 1, "platforms": { "darwin": { "editor.showEdit": [] } } });
     let translation = translate(&orca, Platform::Mac);

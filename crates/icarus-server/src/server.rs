@@ -1062,6 +1062,21 @@ impl Server {
                     .map_err(|e| rpc("write_failed", format!("{e:#}")))?;
                 Ok(json!({ "written": bytes.len() }))
             }
+            "terminal.set_label" => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                    label: Option<String>,
+                }
+                let p: P = params(params_value)?;
+                let session = self
+                    .terminals
+                    .get(&p.id)
+                    .ok_or_else(|| rpc("not_found", &p.id))?;
+                session.set_label(p.label.filter(|label| !label.trim().is_empty()));
+                self.terminals.save_registry();
+                to_value(session.info())
+            }
             "terminal.resize" => {
                 #[derive(Deserialize)]
                 struct P {

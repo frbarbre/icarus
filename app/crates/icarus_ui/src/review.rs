@@ -462,7 +462,7 @@ fn reaction_emoji(content: &str) -> &'static str {
     }
 }
 
-fn app_client(cx: &App) -> Option<Arc<Client>> {
+pub(crate) fn app_client(cx: &App) -> Option<Arc<Client>> {
     cx.try_global::<AppConnection>()
         .and_then(|connection| connection.client.clone())
 }

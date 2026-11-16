@@ -35,6 +35,52 @@ fn start_server(home: &Path) -> ServerProcess {
 }
 
 #[tokio::test]
+async fn a_terminal_reports_a_running_command_as_busy_and_can_be_renamed() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let info = client
+        .request(
+            "terminal.create",
+            json!({ "command": ["/bin/sh"], "cwd": "/tmp" }),
+        )
+        .await
+        .expect("create");
+    let id = info["id"].as_str().expect("id").to_string();
+    async fn wait_for_busy(client: &Client, id: &str, want: bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let info = client
+                .request("terminal.info", json!({ "id": id }))
+                .await
+                .expect("info");
+            if info["busy"].as_bool() == Some(want) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "busy never became {want}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    wait_for_busy(&client, &id, false).await;
+    client
+        .request("terminal.write", json!({ "id": id, "text": "sleep 30\r" }))
+        .await
+        .expect("write");
+    wait_for_busy(&client, &id, true).await;
+    client
+        .request("terminal.write", json!({ "id": id, "text": "\u{3}" }))
+        .await
+        .expect("interrupt");
+    wait_for_busy(&client, &id, false).await;
+
+    let renamed = client
+        .request("terminal.set_label", json!({ "id": id, "label": "Run" }))
+        .await
+        .expect("rename");
+    assert_eq!(renamed["label"], "Run");
+}
+
+#[tokio::test]
 async fn terminal_outlives_its_client_and_resumes_by_sequence() {
     let home = tempfile::tempdir().expect("tempdir");
     let _server = start_server(home.path());

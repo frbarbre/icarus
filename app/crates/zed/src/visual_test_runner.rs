@@ -429,6 +429,19 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             }
         }
     }
+    println!("\n--- Icarus: icarus_workspaces_stack ---");
+    for (name, result) in
+        run_icarus_workspaces_stack_tests(workspace_window, &mut cx, update_baseline)
+    {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
     println!("\n--- Icarus: icarus_title_bar_actions ---");
     for (name, result) in run_icarus_title_bar_actions_tests(&mut cx, update_baseline) {
         match result {
@@ -792,6 +805,7 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
                 })
                 .collect(),
             pr_author: None,
+            pr: None,
         }
     };
     let with_author = |mut workspace: icarus_ui::WorkspaceSummary, login: &str| {
@@ -1370,6 +1384,160 @@ fn run_icarus_title_bar_actions_tests(
         update_baseline,
     );
     cx.update_window(window.into(), |_, window, _cx| window.remove_window())
+        .log_err();
+    cx.run_until_parked();
+    results
+}
+
+/// The list grouped by stack (reviewing first, then stacks newest first, then the rest) with PR,
+/// diff, stack, project and Linear chips, then the ⌘J switcher over it.
+fn run_icarus_workspaces_stack_tests(
+    workspace_window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    let pr = |number: u64, state: &str, stack: Option<(u64, u32, u32)>| {
+        Some(icarus_ui::PrSummary {
+            number,
+            url: format!("https://github.com/acme/app/pull/{number}"),
+            state: state.into(),
+            additions: number * 7 % 400 + 12,
+            deletions: number * 3 % 90,
+            checks: Some(
+                if number.is_multiple_of(3) {
+                    "pending"
+                } else {
+                    "success"
+                }
+                .into(),
+            ),
+            in_merge_queue: false,
+            stack: stack.map(|(number, position, size)| icarus_ui::StackPlace {
+                number,
+                position,
+                size,
+            }),
+        })
+    };
+    let mut workspaces = icarus_preview_workspaces();
+    for workspace in &mut workspaces {
+        match workspace.name.as_str() {
+            "abc-101" => workspace.pr = pr(4129, "open", Some((7, 2, 2))),
+            "abc-98" => workspace.pr = pr(4111, "open", Some((7, 1, 2))),
+            "abc-77" => workspace.pr = pr(4136, "draft", Some((9, 1, 1))),
+            "pr-412" => workspace.pr = pr(412, "open", None),
+            _ => {}
+        }
+        if let Some(issue) = workspace.issue.as_mut() {
+            issue["labels"] = serde_json::json!([
+                { "name": "Frontend", "color": "#5e6ad2" },
+                { "name": "Bug", "color": "#eb5757" },
+            ]);
+        }
+    }
+    let panel = workspace_window.update(cx, |workspace, window, cx| {
+        if let Some(previous) = workspace.panel::<icarus_ui::WorkspacesPanel>(cx) {
+            workspace.remove_panel(&previous, window, cx);
+        }
+        icarus_ui::register_panel_actions(workspace);
+        let weak = workspace.weak_handle();
+        let panel = cx.new(|cx| icarus_ui::WorkspacesPanel::preview(weak, cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_statuses(
+                [
+                    ("Conflicts", "Conflicts", "rose", "circle-alert"),
+                    ("Reviewing", "Reviewing", "emerald", "conductor-progress"),
+                    ("PM Approval", "PM Approval", "blue", "conductor-done"),
+                    (
+                        "Review",
+                        "In review",
+                        "conductor-review",
+                        "conductor-review",
+                    ),
+                    ("Draft", "Draft", "neutral", "circle"),
+                ]
+                .map(|(id, label, color, icon)| icarus_ui::StatusColumn {
+                    id: id.into(),
+                    label: label.into(),
+                    color: Some(color.into()),
+                    icon: Some(icon.into()),
+                })
+                .to_vec(),
+                cx,
+            );
+            panel.set_workspaces(workspaces, cx);
+            let mut view = icarus_ui::cards::CardView::showing_all();
+            view.group_by = icarus_ui::cards::GroupBy::Stack;
+            view.reviewing_status = Some("Reviewing".into());
+            panel.set_view(view, cx);
+            panel.set_project_names(
+                [("proj-demo".to_string(), "acme/app".to_string())]
+                    .into_iter()
+                    .collect(),
+                cx,
+            );
+        });
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<icarus_ui::WorkspacesPanel>(window, cx);
+        panel
+    });
+    let panel = match panel {
+        Ok(panel) => panel,
+        Err(error) => return vec![("icarus_workspaces_stack", Err(error))],
+    };
+    cx.run_until_parked();
+    let mut results = run_icarus_dark_and_light(
+        "icarus_workspaces_stack",
+        "icarus_workspaces_stack_light",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+    // The runner's window has no multi-workspace, which is what draws modals, so the switcher gets its own.
+    let items = cx.update(|cx| icarus_ui::switcher_items(panel.read(cx)));
+    let switcher = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(560.0), px(320.0)),
+                })),
+                focus: false,
+                show: false,
+                ..Default::default()
+            },
+            |window, cx| {
+                cx.new(|cx| {
+                    icarus_ui::palettes::Palette::new(
+                        "Switch to a workspace…",
+                        items,
+                        |_, _, _| {},
+                        window,
+                        cx,
+                    )
+                })
+            },
+        )
+    });
+    match switcher {
+        Ok(switcher) => {
+            cx.run_until_parked();
+            results.extend(run_icarus_dark_and_light(
+                "icarus_workspace_switcher",
+                "icarus_workspace_switcher_light",
+                switcher.into(),
+                cx,
+                update_baseline,
+            ));
+            cx.update_window(switcher.into(), |_, window, _cx| window.remove_window())
+                .log_err();
+        }
+        Err(error) => results.push(("icarus_workspace_switcher", Err(error))),
+    }
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            workspace.remove_panel(&panel, window, cx)
+        })
         .log_err();
     cx.run_until_parked();
     results
