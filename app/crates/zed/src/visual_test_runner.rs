@@ -408,6 +408,11 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     let mut failed = 0;
     let mut updated = 0;
 
+    #[cfg(all(target_os = "macos", feature = "visual-tests"))]
+    if let Ok(dir) = std::env::var("ICARUS_DOCS_SCREENSHOTS_DIR") {
+        return capture_icarus_docs_screenshots(app_state.clone(), &mut cx, PathBuf::from(dir));
+    }
+
     println!("\n--- Icarus: icarus_workspaces_panel ---");
     let icarus_result =
         run_icarus_workspaces_panel_test(workspace_window, &mut cx, update_baseline);
@@ -3631,6 +3636,182 @@ fn show_icarus_notes_in_diff_tab(
     cx.run_until_parked();
     cx.update_window(window.into(), |_, window, _cx| window.refresh())?;
     cx.run_until_parked();
+    Ok(())
+}
+
+/// Writes the README's harness-only screenshots to `dir` instead of running the tests, so no baseline moves.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn capture_icarus_docs_screenshots(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    dir: PathBuf,
+) -> Result<()> {
+    use icarus_ui::changes_tab::{ChangesScope, Listing, SourceControlPanel};
+    use icarus_ui::diff_tab::{DiffBase, DiffTabMode, open_diff_tab};
+
+    cx.update(|cx| {
+        languages::init(
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            app_state.node_runtime.clone(),
+            cx,
+        )
+    });
+    let project_path = tempfile::tempdir()?.keep().canonicalize()?.join("acme-shop");
+    std::fs::create_dir_all(project_path.join("src"))?;
+    let checkout_before = "import { subtotal, type Cart } from \"./cart\";\nimport { applyTax, type Money } from \"./pricing\";\n\nexport type CheckoutSummary = {\n  subtotal: Money;\n  tax: Money;\n  total: Money;\n};\n\nconst TAX_RATE = 0.0825;\n\nexport function summarize(cart: Cart): CheckoutSummary {\n  const before = subtotal(cart);\n  const total = applyTax(before, TAX_RATE);\n  return {\n    subtotal: before,\n    tax: { ...before, cents: total.cents - before.cents },\n    total,\n  };\n}\n\nexport async function placeOrder(cart: Cart, paymentToken: string): Promise<string> {\n  const summary = summarize(cart);\n  const response = await fetch(\"/api/orders\", {\n    method: \"POST\",\n    headers: { \"Content-Type\": \"application/json\" },\n    body: JSON.stringify({ cartId: cart.id, total: summary.total, paymentToken }),\n  });\n  if (!response.ok) {\n    throw new Error(`Order failed: ${response.status}`);\n  }\n  const { orderId } = await response.json();\n  return orderId;\n}\n";
+    let checkout_after = "import { subtotal, type Cart } from \"./cart\";\nimport { applyDiscount, type DiscountCode } from \"./discounts\";\nimport { applyTax, type Money } from \"./pricing\";\n\nexport type CheckoutSummary = {\n  subtotal: Money;\n  discount: Money;\n  tax: Money;\n  total: Money;\n};\n\nconst TAX_RATE = 0.0825;\n\nexport function summarize(cart: Cart, code?: DiscountCode): CheckoutSummary {\n  const before = subtotal(cart);\n  const discounted = code ? applyDiscount(before, code) : before;\n  const total = applyTax(discounted, TAX_RATE);\n  return {\n    subtotal: before,\n    discount: { ...before, cents: before.cents - discounted.cents },\n    tax: { ...before, cents: total.cents - discounted.cents },\n    total,\n  };\n}\n\nexport async function placeOrder(cart: Cart, paymentToken: string, code?: DiscountCode): Promise<string> {\n  const summary = summarize(cart, code);\n  const response = await fetch(\"/api/orders\", {\n    method: \"POST\",\n    headers: { \"Content-Type\": \"application/json\" },\n    body: JSON.stringify({ cartId: cart.id, total: summary.total, paymentToken }),\n  });\n  if (!response.ok) {\n    throw new Error(`Order failed: ${response.status}`);\n  }\n  const { orderId } = await response.json();\n  return orderId;\n}\n";
+    std::fs::write(project_path.join("src/checkout.ts"), checkout_before)?;
+    let git = |args: &[&str]| -> Result<()> {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_path)
+            .args(["-c", "user.name=Sam", "-c", "user.email=sam@example.com"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .status()?;
+        anyhow::ensure!(status.success(), "git {args:?} failed");
+        Ok(())
+    };
+    git(&["init", "-q", "-b", "acme-142-discount-codes-at-checkout"])?;
+    git(&["add", "."])?;
+    git(&["commit", "-q", "-m", "Add checkout summary and order placement"])?;
+    std::fs::write(project_path.join("src/checkout.ts"), checkout_after)?;
+    let project = cx.update(|cx| {
+        project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    let add_worktree = project.update(cx, |project, cx| {
+        project.find_or_create_worktree(&project_path, true, cx)
+    });
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(add_worktree)
+        .context("Failed to add worktree")?;
+    cx.background_executor.forbid_parking();
+
+    let listing: Listing = serde_json::from_value(serde_json::json!({
+        "compare": { "status": "ready", "base": "origin/main" },
+        "rows": [
+            { "path": "src/checkout.ts", "status": "modified", "added": 9, "removed": 4, "unstaged": true },
+            { "path": "src/components/CartSummary.tsx", "status": "modified", "added": 6, "staged": true },
+            { "path": "src/discounts.ts", "status": "added", "added": 26, "committed": true, "unstaged": true },
+            { "path": "tests/discounts.test.ts", "status": "added", "added": 19, "committed": true },
+            { "path": "README.md", "status": "modified", "added": 4, "removed": 1, "unstaged": true },
+        ],
+        "totals": { "files": 5, "added": 64, "removed": 5 },
+        "unfiltered": { "files": 5, "added": 64, "removed": 5 },
+    }))?;
+
+    // Off every display, so the real mouse pointer never hovers anything in the frame.
+    let bounds = Bounds {
+        origin: point(px(6000.0), px(4000.0)),
+        size: size(px(1440.0), px(660.0)),
+    };
+    let window: WindowHandle<Workspace> = cx
+        .update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    cx.new(|cx| {
+                        Workspace::new(None, project.clone(), app_state.clone(), window, cx)
+                    })
+                },
+            )
+        })
+        .context("Failed to open the docs window")?;
+    cx.run_until_parked();
+
+    let open = window.update(cx, |workspace, window, cx| {
+        let panel = cx.new(|cx| {
+            let mut panel = SourceControlPanel::preview(listing, ChangesScope::Base, Some(0), cx);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or_default();
+            let turns = serde_json::from_value(serde_json::json!([
+                { "name": "t3", "files": 1, "added": 5, "removed": 0,
+                  "meta": { "prompt": "Also reject codes once they hit their usage limit", "agentId": "a", "provider": "claude", "completedAt": now_ms.saturating_sub(120_000) } },
+                { "name": "t2", "files": 1, "added": 6, "removed": 0,
+                  "meta": { "prompt": "Now show the discount in the cart summary", "agentId": "a", "provider": "claude", "completedAt": now_ms.saturating_sub(840_000) } },
+                { "name": "t1", "files": 3, "added": 47, "removed": 3,
+                  "meta": { "prompt": "Add discount codes at checkout (ACME-142)", "agentId": "a", "provider": "claude", "completedAt": now_ms.saturating_sub(1_500_000) } },
+            ]))
+            .unwrap_or_default();
+            let sync = serde_json::from_value(serde_json::json!({
+                "branch": "acme-142-discount-codes-at-checkout",
+                "upstream": "origin/acme-142-discount-codes-at-checkout", "published": true,
+                "ahead": 1, "behind": 0, "has_uncommitted_changes": true
+            }))
+            .unwrap_or_default();
+            panel.set_git_preview(turns, sync, cx);
+            let now_seconds = (now_ms / 1000) as i64;
+            let commits = serde_json::from_value(serde_json::json!([
+                { "oid": ("4f9d2c1".repeat(5) + "abcde"), "short": "4f9d2c1", "subject": "Reject expired discount codes",
+                  "author": "Sam Rivera", "time": now_seconds - 40 * 60 },
+                { "oid": ("55b024b".repeat(5) + "abcde"), "short": "55b024b", "subject": "Add discount codes module",
+                  "author": "Sam Rivera", "time": now_seconds - 2 * 3600 },
+            ]))
+            .unwrap_or_default();
+            let files = serde_json::from_value(serde_json::json!([
+                { "path": "src/discounts.ts", "status": "modified" },
+                { "path": "tests/discounts.test.ts", "status": "modified" },
+            ]))
+            .unwrap_or_default();
+            panel.set_commits_preview(commits, vec![("4f9d2c1".repeat(5) + "abcde", files)], cx);
+            panel
+        });
+        workspace.add_panel(panel, window, cx);
+        workspace.open_panel::<SourceControlPanel>(window, cx);
+        open_diff_tab(
+            project_path.join("src/checkout.ts"),
+            DiffBase::Uncommitted,
+            DiffTabMode::Diff,
+            None,
+            workspace,
+            window,
+            cx,
+        )
+    })?;
+    cx.background_executor.allow_parking();
+    let opened = cx.foreground_executor.block_test(open);
+    cx.background_executor.forbid_parking();
+    opened.context("Failed to open the diff tab")?;
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _cx| window.refresh())?;
+    cx.run_until_parked();
+
+    // Grammars load on real background threads, so give them wall-clock time before the frame.
+    cx.background_executor.allow_parking();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+    cx.background_executor.forbid_parking();
+    cx.update_window(window.into(), |_, window, _cx| window.refresh())?;
+    cx.run_until_parked();
+
+    std::fs::create_dir_all(&dir)?;
+    let screenshot = cx.capture_screenshot(window.into())?;
+    let path = dir.join("source-control.png");
+    screenshot.save(&path)?;
+    println!("Saved {}", path.display());
     Ok(())
 }
 

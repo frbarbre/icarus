@@ -4,10 +4,13 @@ A fast, native workspace for running coding agents in parallel git worktrees.
 
 Each task gets its own worktree, its own agents (Claude Code or Codex) and its own terminals. A background server owns all of it, so restarting, updating or crashing the app never stops an agent. The app is a soft fork of [Zed](https://zed.dev), so editing, language servers, themes and extensions are Zed's own.
 
+![Icarus with the Workspaces sidebar, an agent tab and the Source Control panel](docs/images/overview.png)
+
 ## Features
 
 - **Workspaces:** one git worktree per task. Create one from a branch, a commit, a pull request or a Linear issue, with setup and archive scripts and a trust prompt for a repo's committed scripts.
-- **Agents:** Claude Code and Codex in chat tabs with one shared composer. Attach PR comments, review threads, notes, files and agent turns to a prompt as chips.
+- **Agents:** Claude Code and Codex in chat tabs with one shared composer. Attach PR review threads, failed checks, notes, files and agent turns to a prompt as chips. Several accounts per provider, session history, and Claude Code's Remote Control.
+- **Notes:** comments on lines of code for you and your agents; replying to one starts a short-lived agent that answers in the thread.
 - **Server-owned terminals:** shells, dev servers and Zed tasks run on the server and survive app restarts.
 - **Review:** a per-file diff tab with edit/diff toggle, PR threads and drafts in the gutter, queued review comments, reviewers and verdicts, all without leaving the editor.
 - **Source Control:** changes against the branch's base, staging, agent turns and commits, with a diff tab per file.
@@ -15,6 +18,15 @@ Each task gets its own worktree, its own agents (Claude Code or Codex) and its o
 - **Automations:** rules that move workspaces between columns on PR and review events. Icarus imports an [Orca](https://github.com/stablyai/orca) settings export and reproduces its automations.
 - **Remote:** run the server headless on another machine and connect over SSH or Tailscale; one app talks to several servers.
 - **Configurable everything:** layered JSON settings (defaults < presets < user < project < project-local), named tab layouts, rebindable shortcuts, and a CLI that covers every setting and action, so agents can drive Icarus as well as people.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![An agent at work, with attachment chips in the composer](docs/images/agent-chat.png) | ![A diff tab with a review thread, a draft comment and an agent note](docs/images/review-diff.png) |
+| Agent tab and shared composer | Review in the diff tab |
+| ![Server terminals in split panes](docs/images/terminals.png) | ![Icarus settings](docs/images/settings.png) |
+| Server terminals | Settings |
 
 ## Install
 
@@ -46,7 +58,9 @@ icarus config set sidebar.sortBy name
 - Server and CLI: `cargo build` in the repository root (toolchain via `mise install`).
 - App: `cargo run -p zed` in `app/`. It needs Xcode and CMake on macOS.
 
-The repository layout, design and progress are in [`docs/`](docs/index.md).
+## Documentation
+
+The user guide is in [`docs/`](docs/README.md). Requirements, design notes and progress are in [`spec/`](spec/README.md).
 
 ## License
 
