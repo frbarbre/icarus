@@ -52,7 +52,6 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `workspace sleep` / `wake <ws>` | Park and restart a workspace. |
 | `workspace remove <ws> [--force] [--keep-branch] [--skip-archive] [--allow-failed-archive]` | Remove a workspace. |
 | `layout list [--project]` / `show <name>` | Tab layouts. |
-| `recipe list <project>` / `envs` / `suspend` / `resume` / `destroy <instance>` | Environment recipes. See [Remote servers](remote.md#environment-recipes). |
 
 ### Agents
 
@@ -121,9 +120,6 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `config get [key]` / `set <key> <value>` / `unset <key>` `[--layer] [--project]` | Read and change settings. |
 | `config explain <key>` | Which layer a value comes from. |
 | `config schema` | The settings JSON Schema. |
-| `settings import <file>` / `export` | Orca settings export, in and out. |
-| `settings import-orca-state` | Orca's per-workspace state. |
-| `settings import-keybindings <file>` | Orca keybindings into the app's keymap. |
 | `settings import-zed` | A Zed install's setup into the app. |
 | `theme import vscode\|warp <file> [--select]` | Convert a colour theme. |
 | `file open <path[:line[:col]]> [--focus]` | Open a file in the window that owns its worktree. |

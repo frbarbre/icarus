@@ -123,7 +123,6 @@ icarus notifications --unread
 icarus notifications read --all
 ```
 
-## Coming from Zed or Orca
+## Coming from Zed
 
-- On first launch, if you have Zed installed, the app offers to import your Zed settings, keymap, theme and extensions. See [Settings](settings.md#importing-from-zed).
-- To bring over an Orca setup (statuses, automations, scripts, keybindings, notes), see [Automations](automations.md#importing-from-orca).
+On first launch, if you have Zed installed, the app offers to import your Zed settings, keymap, theme and extensions. See [Settings](settings.md#importing-from-zed).

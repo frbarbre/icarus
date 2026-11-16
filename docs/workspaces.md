@@ -42,7 +42,7 @@ icarus workspace create --project my-repo --from-issue https://github.com/acme/m
 | `--base <ref>` | Start from this ref instead of the project's base. `--fetch` fetches it first. |
 | `--from-pr <n\|url>` | Start from a pull request. |
 | `--from-linear <id>` | Link a Linear issue; the name and branch come from it. |
-| `--from-issue <url>` | Link a GitHub issue; the project's `issueCommand` runs for it. |
+| `--from-issue <url>` | Link a GitHub issue; your [issue command](#issue-command) runs for it. |
 | `--prompt <text>` | The agent's first message. |
 | `--no-agent` | Don't start an agent. |
 | `--account <id>` | Run the agent on this account. See [Accounts](using-agents.md#accounts). |
@@ -50,9 +50,8 @@ icarus workspace create --project my-repo --from-issue https://github.com/acme/m
 | `--status <id>` | Start in this status column. |
 | `--setup` / `--no-setup` | Run or skip the setup script, whatever the policy says. |
 | `--trust` / `--always-trust` | Trust the repository's committed scripts. See [Trust](#trusting-committed-scripts). |
-| `--no-issue-command` | Don't run the `issueCommand`. |
+| `--no-issue-command` | Don't run the issue command. |
 | `--remote-control on\|off` | Start the agent with Claude Code's Remote Control. |
-| `--recipe <id>` | Create it in a new environment. See [Environment recipes](remote.md#environment-recipes). |
 
 Ctrl-C cancels a create in progress.
 
@@ -68,10 +67,10 @@ icarus workspace set fix-login --title "Fix the login redirect"
 
 ## Setup and archive scripts
 
-A setup script runs when a workspace is created; an archive script runs before one is removed. Icarus reads them from the same places Orca does:
+A setup script runs when a workspace is created; an archive script runs before one is removed. Both live under `project.hooks.scripts` (`setup` and `archive`):
 
-- **Shared** (committed): `scripts.setup` / `scripts.archive` in the repository's `orca.yaml`, else `project.hooks.scripts` in the committed `icarus.json`.
-- **Local** (yours): `project.hooks.scripts` in `icarus.local.json` or your user settings.
+- **Shared** (committed): in the repository's `icarus.json`.
+- **Local** (yours): in `icarus.local.json` or your user settings.
 
 `project.hooks.commandSourcePolicy` picks which run: `shared-only`, `local-only` or `run-both`. Unset means the local script wins when there is one.
 
@@ -79,9 +78,9 @@ The setup script runs in a terminal tab titled **Setup**, through `bash` with `s
 
 | Variable | Value |
 |---|---|
-| `ORCA_ROOT_PATH`, `ICARUS_ROOT_PATH` | The repository's main checkout. |
-| `ORCA_WORKTREE_PATH`, `ICARUS_WORKTREE_PATH` | The new worktree. |
-| `ORCA_WORKSPACE_NAME`, `ICARUS_WORKSPACE_NAME` | The workspace name. |
+| `ICARUS_ROOT_PATH` | The repository's main checkout. |
+| `ICARUS_WORKTREE_PATH` | The new worktree. |
+| `ICARUS_WORKSPACE_NAME` | The workspace name. |
 | `ICARUS_WORKSPACE_ID` | The workspace id. |
 
 While it runs the card shows **Setting up**; if it fails, **Setup failed** with the reason in a tooltip. To run it again, right-click the card and choose **Re-run Setup**, or run `icarus workspace setup <workspace>`.
@@ -93,7 +92,7 @@ Policies (in `project.hooks`, any layer):
 | Key | Values |
 |---|---|
 | `setupRunPolicy` | `run-by-default` (default), `skip-by-default`, `ask` |
-| `setupAgentStartupPolicy` | `start-immediately` (default) or `wait-for-setup`: the agent exists at once, but its first prompt waits until setup ends. Also read from `orca.yaml`. |
+| `setupAgentStartupPolicy` | `start-immediately` (default) or `wait-for-setup`: the agent exists at once, but its first prompt waits until setup ends. |
 | `setupTimeoutMs` | Stop the setup script after this long. No limit by default. |
 | `archiveTimeoutMs` | Default 120000. |
 
@@ -110,32 +109,9 @@ Example `icarus.local.json`:
 }
 ```
 
-## orca.yaml
+### Issue command
 
-Icarus reads these keys from `orca.yaml` in the repository root:
-
-```yaml
-scripts:
-  setup: |
-    pnpm install
-  archive: |
-    docker compose down
-setupAgentStartupPolicy: wait-for-setup
-defaultTabs:
-  - title: Dev server
-    command: pnpm dev
-    color: "#3b82f6"
-  - title: Logs
-worktree:
-  sharedDirectories:
-    - node_modules
-issueCommand: gh issue view {{issue}}
-environmentRecipes: []   # see remote.md
-```
-
-- **`defaultTabs`**: terminal tabs added to a new workspace, titled by `title`. A `command` runs in the tab (the shell stays afterwards) only when the scripts are trusted; otherwise the tab is a plain shell. `color` (`#rgb` or `#rrggbb`) shows as a dot on the tab.
-- **`worktree.sharedDirectories`**: gitignored folders in the main checkout that every worktree shares through a symlink, so one install serves all of them.
-- **`issueCommand`**: runs in an **Issue command** terminal when a workspace is linked to a GitHub pull request or issue. `{{issue}}` and `{{artifact_url}}` are filled in. A `.orca/issue-command` file in the main checkout (yours, not committed) or `project.hooks.issueCommand` in local settings overrides it. Linear issues don't run it.
+`project.hooks.issueCommand` in `icarus.local.json` or your user settings runs in an **Issue command** terminal when a workspace is linked to a GitHub pull request or issue. `{{issue}}` and `{{artifact_url}}` are filled in, for example `gh issue view {{issue}}`. Linear issues don't run it.
 
 ### .worktreeinclude
 
@@ -143,7 +119,7 @@ List gitignored files to copy into every new worktree (for example `.env`), one 
 
 ## Trusting committed scripts
 
-Committed scripts (setup and archive from `orca.yaml` or `icarus.json`, `defaultTabs` commands, `issueCommand` and environment recipes) only run after you trust that exact content. Local scripts need no trust.
+Committed scripts (setup and archive from `icarus.json`) only run after you trust that exact content. Local scripts need no trust.
 
 When you create a workspace in a project with untrusted scripts, the dialog shows them with **Trust and Create**, **Create without running them** and **Back**. Tick **Always trust scripts from …** to trust every later version too. If the scripts change, Icarus asks again.
 
@@ -252,7 +228,7 @@ Choose what cards show in the View menu's **Card** list, or with ⌘K C followed
 | 9 | `ports` | Running services. See [Ports](terminals.md#ports-and-dev-servers). |
 | 0 | `project` | The project name. |
 
-The shared setting is `workspace.cardFields` (Orca's ids are accepted). Toggling a field in the app writes the app's own `client.json`, so each app can show different fields; **Use Shared Card Fields** in the View menu drops that override.
+The shared setting is `workspace.cardFields`. Toggling a field in the app writes the app's own `client.json`, so each app can show different fields; **Use Shared Card Fields** in the View menu drops that override.
 
 ```sh
 icarus config set workspace.cardFields '["unread","inline-agents","pr","ports"]'   # every app

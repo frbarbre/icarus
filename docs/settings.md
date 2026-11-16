@@ -130,5 +130,3 @@ Language support is Zed's own: install language extensions from the Extensions p
   }
 }
 ```
-
-`icarus settings import` translates Orca's language server, formatter and linter choices into these Zed settings. See [Importing from Orca](automations.md#importing-from-orca).

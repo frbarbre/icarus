@@ -97,30 +97,3 @@ Zed's SSH remoting runs a small server on the remote host. Release builds of Ica
 Agent tabs in an SSH project need the `icarus` CLI on the host. If it's missing, the app asks **Install Icarus on <host>?** and installs the release matching the app into `~/.icarus/bin` on the host, checked against the release's checksums. The agent tab then starts the host's server if needed.
 
 Terminals in an SSH project are Zed's remote shells, not server terminals, so they don't survive an app restart.
-
-## Environment recipes
-
-An environment recipe creates a fresh machine (or container) for one workspace, using commands from the repository's `orca.yaml`. The machine runs its own Icarus server, which Icarus pairs with and creates the workspace on.
-
-```yaml
-environmentRecipes:
-  - id: sandbox
-    name: Sandbox VM
-    create: ./scripts/vm-create.sh
-    suspend: ./scripts/vm-suspend.sh
-    resume: ./scripts/vm-resume.sh
-    destroy: ./scripts/vm-destroy.sh
-```
-
-The `create` command prints JSON describing how to reach the new machine: either an Icarus pairing code (`{"schemaVersion": 1, "pairingCode": "icarus://pair?address=HOST:PORT&code=CODE", "projectRoot": "/srv/my-repo"}`) or an SSH connection. Commands get Orca's `ORCA_VM_*`, `ORCA_RECIPE_*` and `ORCA_REPO_*` variables (and `ICARUS_` versions). Recipes are committed scripts, so they need [trust](workspaces.md#trusting-committed-scripts).
-
-```sh
-icarus recipe list my-repo
-icarus workspace create --project my-repo --recipe sandbox try-idea
-icarus recipe envs
-icarus recipe suspend <instance>
-icarus recipe resume <instance>
-icarus recipe destroy <instance>     # also forgets the saved server
-```
-
-`workspace create --recipe` saves the new server as `env-<name>`. If anything fails after the machine was created, it's destroyed again. Recipes are CLI-only for now: the app has no recipe picker, and sleeping a workspace doesn't suspend its machine.

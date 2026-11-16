@@ -7,13 +7,13 @@ Icarus is a native workspace for running coding agents (Claude Code and Codex) i
 ## Guides
 
 - [Getting started](getting-started.md): install, update, add a project, create your first workspace, and find your way around the window.
-- [Workspaces](workspaces.md): creating workspaces, setup and archive scripts, `orca.yaml`, the sidebar, cards, sleep and delete, layouts.
+- [Workspaces](workspaces.md): creating workspaces, setup and archive scripts, the sidebar, cards, sleep and delete, layouts.
 - [Agents](using-agents.md): agent tabs, the shared composer and attachments, notes, accounts, Claude Code and Codex, Remote Control.
 - [Terminals](terminals.md): server-owned terminals, tasks, splits, quick commands, ports, and `icarus terminal`.
 - [Review](review.md): diff tabs, reviewing pull requests, and the Source Control panel.
 - [GitHub and Linear](github-and-linear.md): pull request status, checks, merge queues, stacks, auto-merge, previews and Linear issues.
-- [Automations](automations.md): statuses, rules, and importing from Orca.
-- [Remote servers](remote.md): headless servers, pairing, Tailscale and SSH, SSH projects, environment recipes.
+- [Automations](automations.md): statuses, rules and presets.
+- [Remote servers](remote.md): headless servers, pairing, Tailscale and SSH, SSH projects.
 - [Settings](settings.md): settings layers and files, `icarus config`, importing from Zed, language servers.
 - [Keyboard shortcuts](shortcuts.md): the default shortcuts and how to rebind them.
 - [CLI reference](cli.md): every command, with examples.

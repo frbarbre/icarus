@@ -99,14 +99,3 @@ You can also run any action from the shell, which is handy for scripts and agent
 icarus app dispatch icarus::NewAgent
 icarus app dispatch icarus::SetWorkspaceSort --args '{"sort_by": "name"}'
 ```
-
-### Importing Orca keybindings
-
-To bring over your Orca shortcuts:
-
-```sh
-icarus settings import-keybindings ~/.orca/keybindings.json --dry-run
-icarus settings import-keybindings ~/.orca/keybindings.json
-```
-
-It also accepts an `orca settings export` file, and `icarus settings import` runs it too. A remapped Orca action unbinds the Icarus default and binds your keys; actions the file doesn't mention keep their defaults. Actions with no Icarus equivalent are reported. Importing again replaces only what the last import wrote. `--platform mac|linux` picks which platform's bindings to use.

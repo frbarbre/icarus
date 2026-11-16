@@ -49,7 +49,7 @@ icarus rules tick     # run now
 
 ## Rules
 
-The rules use Orca's model and live under `rules.orca_compat`. Settings → Automation and Pull request rules edit them.
+The rules live under the `rules.orca_compat` settings key. Settings → Automation and Pull request rules edit them.
 
 ### Move cards by pull request state
 
@@ -119,58 +119,3 @@ Two shipped presets set up common flows. List them in your user settings:
 - `review-inbox`: review requests become workspaces in In review.
 
 Presets sit between the built-in defaults and your own settings, so anything you set wins. You still need `rules.projects` and `rules.armed`.
-
-## Importing from Orca
-
-Icarus can take over an [Orca](https://github.com/stablyai/orca) setup.
-
-### Settings
-
-In Orca, export your settings (`orca settings export`), then:
-
-```sh
-icarus settings import orca-settings.json --dry-run   # show what maps where
-icarus settings import orca-settings.json
-```
-
-What maps:
-
-| Orca | Icarus |
-|---|---|
-| Workspace statuses | `workspace.statuses` |
-| Status rules (`workspaceStatusRules`) | `rules.orca_compat` |
-| Card properties | `workspace.cardFields` |
-| Sidebar grouping, sorting, stack order | `sidebar.*` |
-| Terminal quick commands | `quickCommands` |
-| "Open Claude tabs in web view" | `agents.remote_control` |
-| Status bar items | `statusBar.*` |
-| Per-repository settings (setup and archive scripts and policies, CI triage, base ref, port labels command, …) | The project's untracked `icarus.local.json`, for projects whose remote matches |
-| Keybindings | The app's `keymap.json` (see [Shortcuts](shortcuts.md#importing-orca-keybindings)) |
-| Theme mode, fonts, terminal line height, inactive pane opacity | The app's Zed `settings.json` |
-| Editor and terminal colour themes | A Zed theme, `themes/icarus-imported.json` |
-| Language servers, formatters, linters | Zed's `languages`, `lsp` and `auto_install_extensions` |
-
-Settings you already set in the app's Zed `settings.json` are kept and listed; the original is saved once as `settings.json.before-icarus-import`. `--skip-zed` leaves Zed's settings alone; `--print-zed` prints what it would write.
-
-Orca's export doesn't carry which projects its rules act on, so set `rules.projects` afterwards, and `rules.armed` when you're happy with a dry run.
-
-To go the other way, `icarus settings export --output orca-settings.json` writes Orca's format.
-
-### Workspace state
-
-Orca keeps per-workspace state outside the settings export. To bring it over, create (or keep) the matching Icarus workspaces, then:
-
-```sh
-icarus settings import-orca-state --dry-run
-icarus settings import-orca-state
-```
-
-It reads Orca's files read-only (by default from Orca's data folder; `--from` and `--drafts` point elsewhere) and matches each Orca worktree to an Icarus workspace by path, else by repository and folder name. It brings over:
-
-- the status,
-- a pinned display name, as the title,
-- the linked Linear issue,
-- diff notes and agent notes, with their replies, as [notes](using-agents.md#notes),
-- unsent PR review comments and the review summary, as drafts on the workspace's pull request.
-
-Values you already set on a workspace win. Running it again adds nothing twice.
