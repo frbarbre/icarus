@@ -609,20 +609,14 @@ impl workspace::SerializableItem for Onboarding {
 
     fn deserialize(
         _project: Entity<project::Project>,
-        workspace: WeakEntity<Workspace>,
-        workspace_id: workspace::WorkspaceId,
-        item_id: workspace::ItemId,
-        window: &mut Window,
-        cx: &mut App,
+        _workspace: WeakEntity<Workspace>,
+        _workspace_id: workspace::WorkspaceId,
+        _item_id: workspace::ItemId,
+        _window: &mut Window,
+        _cx: &mut App,
     ) -> gpui::Task<gpui::Result<Entity<Self>>> {
-        let db = persistence::OnboardingPagesDb::global(cx);
-        window.spawn(cx, async move |cx| {
-            if let Some(_) = db.get_onboarding_page(item_id, workspace_id)? {
-                workspace.update(cx, |workspace, cx| Onboarding::new(workspace, cx))
-            } else {
-                Err(anyhow::anyhow!("No onboarding page to deserialize"))
-            }
-        })
+        // Icarus has no Zed onboarding; a tab saved by an earlier build must not come back.
+        gpui::Task::ready(Err(anyhow::anyhow!("Zed onboarding is not restored in Icarus")))
     }
 
     fn serialize(
