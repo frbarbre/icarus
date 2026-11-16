@@ -55,18 +55,76 @@ icarus workspace create --project my-repo --from-issue https://github.com/acme/m
 
 Ctrl-C cancels a create in progress.
 
-### Adopt an existing worktree
+## Worktrees made elsewhere
 
-A worktree made outside Icarus (by Orca, or with `git worktree add`) can become a workspace where it is:
+Icarus finds worktrees on its own, the way Orca does. It lists each project's worktrees with `git worktree list`: when the workspace list loads, every 15 seconds while an app is connected, and on `icarus workspace list`. Every worktree that isn't a workspace yet becomes one. That covers worktrees made by Orca, Conductor, Claude Code or plain `git worktree add`. The folder stays where it is. Nothing runs: no setup script, no agent, no new branch. The name is the folder's name, made DNS-safe and unique in the project (`fix-login-2` for a second one). A detached worktree is listed without a branch. The project's main checkout is the project itself, never a workspace. Orca's half-created worktrees (the ones it locks while preparing them) are skipped.
+
+Icarus still creates its own workspaces in `workspace.root`. Discovery never changes where new ones go.
+
+The workspace list never waits for discovery: it shows what Icarus already knows, and worktrees found later show up when the scan ends. If git doesn't answer within 10 seconds, Icarus stops it, keeps that project's workspaces as they were, and tries again a minute later. On macOS this happens with a repository in a protected folder such as ~/Documents until the server is allowed in System Settings › Privacy & Security.
+
+Each workspace has an **origin**. The sidebar marks every origin except native.
+
+| Origin | Where the worktree is |
+|---|---|
+| `native` | In Icarus's folder (`workspace.root`) |
+| `adopted` | Brought in with `icarus workspace adopt` |
+| `claude` | `<project>/.claude/worktrees/` (Claude Code) |
+| `gsd` | `<project>/.gsd-workspaces/` |
+| `custom:<id>` | Under a folder listed in `workspace.worktreeSources` |
+| `external` | Anywhere else. Lists group these by parent folder. |
+
+### Which worktrees show
+
+Native and adopted workspaces always show. The others follow these settings:
+
+| Setting | Default | |
+|---|---|---|
+| `workspace.external` | `hide` | External worktrees, in every project. |
+| `project.externalWorktreeVisibility` | | The same choice for one project (`show` or `hide`). Set it in the project's `icarus.local.json`. It wins over `workspace.external`. |
+| `workspace.worktreeSources` | `[]` | Your own sources: `[{"id": "conductor", "root": "~/conductor/workspaces"}]`. At most 32. |
+| `workspace.sourceVisibility` | | `show` or `hide` per source id (`claude`, `gsd` or one of yours). Sources are hidden unless set to `show`. |
+| `project.worktreeVisibilitySourcePreferences` | | Per project: `{"builtIn": {"claude": "show"}, "custom": {"conductor": "show"}}`. |
+| `project.agentWorktreeVisibility` | | Per project, for `claude` and `gsd` when the project sets no source preference. |
+
+For each worktree, the first match decides:
+
+1. Your own choice for that worktree (**Show**, **Hide**, `icarus workspace hide` or `unhide`).
+2. The project's setting.
+3. The default.
+
+A hidden workspace is left out of the sidebar, the rules and PR polling, but Icarus still knows it: `icarus workspace list --all` lists it marked `hidden`.
+
+Importing Orca settings carries this over. `worktreeVisibilityDefaults` becomes `workspace.external`, `workspace.worktreeSources` and `workspace.sourceVisibility`. Each repo's `externalWorktreeVisibility` and source preferences go to that project's `icarus.local.json`. Orca's export leaves out the folders of custom sources, so add their `root` yourself.
+
+Orca shows external worktrees in repos added before it began hiding them, and it records that as the repo's `externalWorktreeVisibility: "show"`. Icarus has no such legacy rule, since it never showed worktrees it hadn't made or adopted. A new project hides external worktrees, and a project whose Orca repo showed them keeps showing them through the imported setting.
+
+### New worktrees inbox
+
+While a project hides external worktrees, the external and custom-source worktrees found since you last looked wait in a **New worktrees** row at the top of the project's group. Each one offers **Show**, **Hide**, and **Show all from this source**. That last option sets the project's setting for the source, for example `project.externalWorktreeVisibility: "show"`. Claude Code and GSD worktrees stay out of the inbox, as in Orca.
 
 ```sh
-icarus workspace adopt ~/orca/workspaces/my-repo/fix-login
+icarus workspace inbox
+icarus workspace unhide fix-login                 # show it
+icarus workspace hide fix-login
+icarus workspace unhide fix-login --follow-settings
+icarus workspace show-source external --project my-repo
+```
+
+### Removed elsewhere
+
+When git stops listing a worktree (someone ran `git worktree remove`), its workspace drops out. Icarus keeps the record, keyed by the folder. If a worktree comes back at the same path, it gets its old record back, with its status, notes and show/hide choice.
+
+### Adopt a worktree from another clone
+
+Discovery only sees the project's own repository. To bring in a worktree of another clone of the same repository, use adopt:
+
+```sh
+icarus workspace adopt ~/other-clone-worktrees/fix-login
 icarus workspace adopt ../fix-login --project my-repo --name login
 ```
 
-Icarus matches the worktree's repository to a project by its main checkout or, for another clone, by its remote; `--project` picks one yourself. The branch is whatever the worktree has checked out, and the name defaults to the folder's name (made DNS-safe, and unique in the project). Nothing runs: no setup script, no agent, no new branch, and the folder stays where it is. Removing an adopted workspace removes its worktree like any other.
-
-Adopt refuses a main checkout (add that with `icarus project add`), a detached HEAD (check out a branch first), and a folder that is already a workspace.
+Icarus matches the worktree's repository to a project, first by its main checkout and then by its remote. `--project` picks the project yourself. The branch is whatever the worktree has checked out. Adopting a worktree that discovery already found keeps its record and shows it, whatever the settings say. Adopt refuses a main checkout (add that with `icarus project add`), a detached HEAD, and a folder that is already a workspace.
 
 ## Naming
 
@@ -161,7 +219,7 @@ Open the gear (View) menu in the panel header.
 |---|---|---|
 | Status | `workspace-status` | Your status columns. Only columns with workspaces show. |
 | PR | `pr-status` | Done (merged), In review (open), In progress (no PR or a draft), Closed. |
-| Stack | `stack` | One section per GitHub stack, then "Not in a stack". **Stack from main up** flips the order inside a stack. |
+| Stack | `stack` | One section per stack, then "Not in a stack". A stack is a GitHub stack, or open PRs each based on the branch of the one below. **Stack from main up** flips the order inside a stack. |
 | Project | `repo` | One section per project, including empty ones. This is the default. |
 | None | `none` | One list. |
 
@@ -179,6 +237,10 @@ The same choices are the settings `sidebar.groupBy` and `sidebar.sortBy`:
 icarus config set sidebar.groupBy pr-status
 icarus config set sidebar.sortBy smart
 ```
+
+Click a section header to fold its cards away; click it again to show them. Each grouping remembers its folded sections in this app's `client.json` (`sidebar.collapsedGroups`).
+
+Clicking a card shows that workspace: the window already showing it comes to the front, otherwise the front window switches to it.
 
 ### Filter
 
@@ -231,13 +293,13 @@ Choose what cards show in the View menu's **Card** list, or with ⌘K C followed
 | Key | Field id | Shows |
 |---|---|---|
 | 1 | `unread` | The unread dot. |
-| 2 | `workspace-status` | The status chip, in groupings other than Status. (Grouped by status, the chip always shows.) |
-| 3 | `inline-agents` | The workspace's agents and their state. |
-| 4 | `pr` | The pull request chip with a checks dot. |
+| 2 | `workspace-status` | The status chip, in groupings other than Status (grouped by status, the section header says it). Older settings may call it `status`; both work. |
+| 3 | `inline-agents` | The agent row: the latest agent's finished turn in one line, or a pill with the lead agent and how many more. Click it to list every agent. |
+| 4 | `pr` | The pull request icon before the title, coloured by state (number, checks and merge queue on hover), and a Merge queue chip. |
 | 5 | `pr-author` | The PR author's avatar. |
 | 6 | `pr-diff` | The PR's +N −M. |
-| 7 | `stack` | The position in its stack. |
-| 8 | `linear-title` | The Linear issue's title and labels. |
+| 7 | `stack` | The position in its stack, such as 2/2. |
+| 8 | `linear-title` | The Linear link, the issue's labels and its title. |
 | 9 | `ports` | Running services. See [Ports](terminals.md#ports-and-dev-servers). |
 | 0 | `project` | The project name. |
 
@@ -252,9 +314,10 @@ icarus app config set workspace.cardFields '["pr","ports"]'                     
 
 Right-click a card:
 
-- **Sleep** puts its agents to sleep and stops its terminals' processes. Screens and scrollback stay. The card shows "Asleep".
+- **Sleep** puts its agents to sleep and stops its terminals' processes. Screens and scrollback stay. The card shows a moon and a dimmed title, as do worktrees found on disk that have no PR and no agents.
 - **Wake** restarts exactly what was put to sleep. A sleeping agent also wakes on its next message.
 - **Delete** runs the archive script, then removes the worktree and the branch. Icarus refuses when the worktree has uncommitted changes, when you have unsent review comments on its pull request, or when the archive script fails. It says why and offers **Force Delete**.
+- A worktree Icarus didn't create (any origin but native, or one found in its folder) is never deleted by accident. Removing it only hides it and stops its agents and terminals. `--delete-worktree` deletes it. Its branch is then kept unless you also pass `--delete-branch`.
 
 ```sh
 icarus workspace sleep fix-login
@@ -264,6 +327,7 @@ icarus workspace remove fix-login --keep-branch
 icarus workspace remove fix-login --force                  # ignore local changes and a failed archive script
 icarus workspace remove fix-login --skip-archive
 icarus workspace remove fix-login --allow-failed-archive   # still refuses local changes
+icarus workspace remove orca-fix --delete-worktree         # a discovered worktree; its branch stays
 ```
 
 ## Layouts

@@ -288,6 +288,8 @@ pub struct Dock {
     active_panel_index: Option<usize>,
     focus_handle: FocusHandle,
     restoration: DockRestoreState,
+    /// Set once a saved layout was applied; a panel added later then doesn't override it with `starts_open`.
+    restored_active_panel: bool,
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
     _subscriptions: [Subscription; 2],
@@ -455,6 +457,7 @@ impl Dock {
                 focus_handle: focus_handle.clone(),
                 _subscriptions: [focus_subscription, zoom_subscription],
                 restoration: DockRestoreState::Restoring { pending: None },
+                restored_active_panel: false,
                 zoom_layer_open: false,
                 modal_layer,
             }
@@ -814,7 +817,7 @@ impl Dock {
 
         self.replay_pending_serialized_state(window, cx);
 
-        if panel.read(cx).starts_open(window, cx) {
+        if !self.restored_active_panel && panel.read(cx).starts_open(window, cx) {
             self.activate_panel_internal(index, window, cx);
             self.set_open_internal(true, window, cx);
         }
@@ -878,12 +881,18 @@ impl Dock {
         {
             self.activate_panel_internal(idx, window, cx);
         }
+        self.restored_active_panel = true;
         if serialized.zoom
             && let Some(panel) = self.active_panel()
         {
             panel.set_zoomed(true, window, cx)
         }
         self.set_open_internal(serialized.visible, window, cx);
+    }
+
+    /// Whether a saved layout chose this dock's state, rather than the panels' `starts_open`.
+    pub fn restored_saved_layout(&self) -> bool {
+        self.restored_active_panel
     }
 
     pub(crate) fn finish_restoration(&mut self) {

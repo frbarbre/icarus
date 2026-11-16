@@ -843,7 +843,8 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
                     id: format!("agent-{id}-{index}"),
                     title: Some("Agent".into()),
                     state: state.to_string(),
-                    provider: "claude".into(),
+                    provider: if index == 1 { "codex" } else { "claude" }.into(),
+                    ..icarus_ui::AgentSummary::default()
                 })
                 .collect(),
             pr_author: None,
@@ -1005,6 +1006,37 @@ fn icarus_github_fixture() -> serde_json::Value {
             "previews": icarus_preview_deployments()["previews"].clone(),
             "primary_preview": icarus_preview_deployments()["primary"].clone(),
         },
+        "audience": "all",
+        "description": "Exports **totals per currency** for the billing CSV.\n\n![Totals export](https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555)\nhttps://github.com/user-attachments/assets/66666666-7777-8888-9999-000000000000\n",
+        "description_collapsed": true,
+        "threads": [
+            {
+                "id": "T1", "path": "src/export/totals.rs", "line": 42, "is_resolved": false,
+                "viewer_can_resolve": true, "viewer_can_reply": true,
+                "placement": { "line": 42 },
+                "comments": [
+                    { "id": "C1", "author": "maria", "created_at": "2026-11-15T11:51:00Z",
+                      "body": "**Rounding**: totals are summed before rounding, so `EUR` exports drift by a cent.\n\n- round each line first\n- then sum",
+                      "reactions": [{ "content": "+1", "count": 2, "viewer_has_reacted": true }] },
+                    { "id": "C2", "author": "frederik", "created_at": "2026-11-15T11:58:00Z",
+                      "body": "Good catch, fixing. Before and after:\n\n<img width=\"400\" alt=\"Rounded totals\" src=\"https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555\" />" },
+                ],
+            },
+            {
+                "id": "T2", "path": "src/export/csv.rs", "line": 9, "is_resolved": false,
+                "viewer_can_resolve": true, "viewer_can_reply": true,
+                "placement": { "line": 9 },
+                "comments": [
+                    { "id": "C3", "author": "review-bot", "is_bot": true, "created_at": "2026-11-15T10:00:00Z",
+                      "body": "Consider streaming rows instead of collecting them into a `Vec`." },
+                ],
+            },
+            {
+                "id": "T3", "path": "src/export/mod.rs", "line": 3, "is_resolved": true,
+                "viewer_can_unresolve": true, "placement": { "line": 3 },
+                "comments": [{ "id": "C4", "author": "devon", "body": "Typo in the module doc." }],
+            },
+        ],
     })
 }
 
@@ -1115,7 +1147,7 @@ fn icarus_review_fixture() -> serde_json::Value {
             "base": {
                 "selected": "since-review", "default": "since-review",
                 "options": [
-                    { "value": "since-review", "label": "Since your last review (Review 2)", "available": true },
+                    { "value": "since-review", "label": "Since your last review (Review 2) · billing-api-export-totals-per-currency-and-rounding", "available": true },
                     { "value": "commit:9f3c2a1", "label": "9f3c2a1 Export totals per currency", "tags": ["Review 2"], "available": true },
                     { "value": "whole", "label": "main · target branch", "available": true },
                 ],
@@ -1210,6 +1242,57 @@ fn run_icarus_github_panel_tests(
             hide(panel, cx);
         }
         Err(error) => results.push(("icarus_github_panel", Err(error))),
+    }
+
+    cx.update(|cx| {
+        icarus_ui::media::preload_media(
+            "https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555",
+            "image/png",
+            include_bytes!("../../../../docs/images/icarus-mark-512.png").to_vec(),
+            cx,
+        )
+    });
+    let mut description = icarus_github_fixture();
+    description["description_collapsed"] = serde_json::json!(false);
+    description["collapsed"] = serde_json::json!({
+        "pr-attention": true, "pr-previews": true, "pr-checks": true, "pr-review": true,
+    });
+    match show(description, cx) {
+        Ok(panel) => {
+            panel.update(cx, |panel, cx| panel.set_stack_expanded(false, cx));
+            cx.run_until_parked();
+            results.push((
+                "icarus_github_panel_description",
+                run_visual_test(
+                    "icarus_github_panel_description",
+                    workspace_window.into(),
+                    cx,
+                    update_baseline,
+                ),
+            ));
+            hide(panel, cx);
+        }
+        Err(error) => results.push(("icarus_github_panel_description", Err(error))),
+    }
+
+    let mut comments = icarus_github_fixture();
+    comments["collapsed"] = serde_json::json!({
+        "pr-attention": true, "pr-previews": true, "pr-checks": true, "pr-review": true,
+    });
+    match show(comments, cx) {
+        Ok(panel) => {
+            panel.update(cx, |panel, cx| panel.set_stack_expanded(false, cx));
+            cx.run_until_parked();
+            results.extend(run_icarus_dark_and_light(
+                "icarus_github_panel_comments",
+                "icarus_github_panel_comments_light",
+                workspace_window.into(),
+                cx,
+                update_baseline,
+            ));
+            hide(panel, cx);
+        }
+        Err(error) => results.push(("icarus_github_panel_comments", Err(error))),
     }
 
     match show(icarus_review_fixture(), cx) {
@@ -1728,6 +1811,60 @@ fn run_icarus_title_bar_actions_tests(
 
 /// The list grouped by stack (reviewing first, then stacks newest first, then the rest) with PR,
 /// diff, stack, project and Linear chips, then the ⌘J switcher over it.
+/// The preview cards filled in the way a real list looks: PRs, Linear labels, a finished agent turn
+/// and a sleeping workspace.
+#[cfg(target_os = "macos")]
+fn icarus_orca_style_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
+    let pr = |number: u64, state: &str, additions: u64, deletions: u64| {
+        Some(icarus_ui::PrSummary {
+            number,
+            title: format!("Pull request {number}"),
+            url: format!("https://github.com/acme/app/pull/{number}"),
+            state: state.into(),
+            additions,
+            deletions,
+            checks: Some("success".into()),
+            in_merge_queue: false,
+            stack: None,
+        })
+    };
+    let mut workspaces = icarus_preview_workspaces();
+    for workspace in &mut workspaces {
+        match workspace.name.as_str() {
+            "abc-101" => workspace.pr = pr(4129, "open", 4999, 434),
+            "pr-412" => {
+                workspace.pr = pr(412, "open", 705, 159);
+                if let Some(agent) = workspace.agents.first_mut() {
+                    agent.turns = 3;
+                    agent.title =
+                        Some("Ready for review - PR #412 is marked ready for review".into());
+                }
+            }
+            "abc-98" => workspace.pr = pr(4111, "open", 1599, 439),
+            "abc-77" => {
+                workspace.pr = pr(4136, "draft", 66, 24);
+                if let Some(pr) = workspace.pr.as_mut() {
+                    pr.stack = Some(icarus_ui::StackPlace {
+                        number: 9,
+                        position: 2,
+                        size: 2,
+                    });
+                }
+            }
+            "main" => workspace.sleeping = true,
+            _ => {}
+        }
+        if let Some(issue) = workspace.issue.as_mut() {
+            issue["url"] = serde_json::json!("https://linear.app/acme/issue/ABC-1");
+            issue["labels"] = serde_json::json!([
+                { "name": "Feature", "color": "#bb87fc" },
+                { "name": "Frontend", "color": "#f2558c" },
+            ]);
+        }
+    }
+    workspaces
+}
+
 fn run_icarus_workspaces_stack_tests(
     workspace_window: WindowHandle<Workspace>,
     cx: &mut VisualTestAppContext,
@@ -1912,7 +2049,7 @@ fn run_icarus_workspaces_panel_test(
                 .to_vec(),
                 cx,
             );
-            panel.set_workspaces(icarus_preview_workspaces(), cx);
+            panel.set_workspaces(icarus_orca_style_workspaces(), cx);
         });
         workspace.add_panel(panel.clone(), window, cx);
         workspace.open_panel::<icarus_ui::WorkspacesPanel>(window, cx);
@@ -3305,6 +3442,19 @@ fn run_icarus_agent_tabs_tests(
     cx: &mut VisualTestAppContext,
     update_baseline: bool,
 ) -> Vec<(&'static str, Result<TestResult>)> {
+    // As in the app, where agent tabs replace Zed's agent panel and its status bar button.
+    cx.update(|cx| cx.set_global(agent_ui::agent_tab::AgentTabsEnabled));
+    let results = run_icarus_agent_tabs_screens(app_state, cx, update_baseline);
+    cx.update(|cx| cx.remove_global::<agent_ui::agent_tab::AgentTabsEnabled>());
+    results
+}
+
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn run_icarus_agent_tabs_screens(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
     match open_icarus_agent_tabs_window(app_state, cx) {
         Ok(window) => {
             let mut results = run_icarus_dark_and_light(
@@ -3502,6 +3652,13 @@ fn run_icarus_tab_types_tests(
                 )),
                 Err(error) => results.push(("icarus_review_diff", Err(error))),
             }
+            match show_icarus_reply_in_diff_tab(window, cx) {
+                Ok(()) => results.push((
+                    "icarus_review_reply",
+                    run_visual_test("icarus_review_reply", window.into(), cx, update_baseline),
+                )),
+                Err(error) => results.push(("icarus_review_reply", Err(error))),
+            }
             match show_icarus_notes_in_diff_tab(window, cx) {
                 Ok(()) => results.extend(run_icarus_dark_and_light(
                     "icarus_notes_diff",
@@ -3595,6 +3752,35 @@ fn show_icarus_review_in_diff_tab(
     Ok(())
 }
 
+/// The review scenario with a reply box open at the bottom of the first thread's card.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn show_icarus_reply_in_diff_tab(
+    window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+) -> Result<()> {
+    use icarus_ui::review::ComposerTarget;
+
+    window.update(cx, |workspace, window, cx| {
+        let tab = workspace.items_of_type::<icarus_ui::DiffTab>(cx).next();
+        if let Some(review) = tab.and_then(|tab| tab.read(cx).review().cloned()) {
+            review.update(cx, |review, cx| {
+                review.open_composer(
+                    ComposerTarget::Reply {
+                        thread: "T1".into(),
+                    },
+                    String::new(),
+                    window,
+                    cx,
+                );
+            });
+        }
+    })?;
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _cx| window.refresh())?;
+    cx.run_until_parked();
+    Ok(())
+}
+
 /// Notes in the diff tab: a user note answered by a reply session (with a changed file) and one still
 /// thinking, plus a note an agent left. Runs after the review scenario, on the same diff tab.
 #[cfg(all(target_os = "macos", feature = "visual-tests"))]
@@ -3657,7 +3843,10 @@ fn capture_icarus_docs_screenshots(
             cx,
         )
     });
-    let project_path = tempfile::tempdir()?.keep().canonicalize()?.join("acme-shop");
+    let project_path = tempfile::tempdir()?
+        .keep()
+        .canonicalize()?
+        .join("acme-shop");
     std::fs::create_dir_all(project_path.join("src"))?;
     let checkout_before = "import { subtotal, type Cart } from \"./cart\";\nimport { applyTax, type Money } from \"./pricing\";\n\nexport type CheckoutSummary = {\n  subtotal: Money;\n  tax: Money;\n  total: Money;\n};\n\nconst TAX_RATE = 0.0825;\n\nexport function summarize(cart: Cart): CheckoutSummary {\n  const before = subtotal(cart);\n  const total = applyTax(before, TAX_RATE);\n  return {\n    subtotal: before,\n    tax: { ...before, cents: total.cents - before.cents },\n    total,\n  };\n}\n\nexport async function placeOrder(cart: Cart, paymentToken: string): Promise<string> {\n  const summary = summarize(cart);\n  const response = await fetch(\"/api/orders\", {\n    method: \"POST\",\n    headers: { \"Content-Type\": \"application/json\" },\n    body: JSON.stringify({ cartId: cart.id, total: summary.total, paymentToken }),\n  });\n  if (!response.ok) {\n    throw new Error(`Order failed: ${response.status}`);\n  }\n  const { orderId } = await response.json();\n  return orderId;\n}\n";
     let checkout_after = "import { subtotal, type Cart } from \"./cart\";\nimport { applyDiscount, type DiscountCode } from \"./discounts\";\nimport { applyTax, type Money } from \"./pricing\";\n\nexport type CheckoutSummary = {\n  subtotal: Money;\n  discount: Money;\n  tax: Money;\n  total: Money;\n};\n\nconst TAX_RATE = 0.0825;\n\nexport function summarize(cart: Cart, code?: DiscountCode): CheckoutSummary {\n  const before = subtotal(cart);\n  const discounted = code ? applyDiscount(before, code) : before;\n  const total = applyTax(discounted, TAX_RATE);\n  return {\n    subtotal: before,\n    discount: { ...before, cents: before.cents - discounted.cents },\n    tax: { ...before, cents: total.cents - discounted.cents },\n    total,\n  };\n}\n\nexport async function placeOrder(cart: Cart, paymentToken: string, code?: DiscountCode): Promise<string> {\n  const summary = summarize(cart, code);\n  const response = await fetch(\"/api/orders\", {\n    method: \"POST\",\n    headers: { \"Content-Type\": \"application/json\" },\n    body: JSON.stringify({ cartId: cart.id, total: summary.total, paymentToken }),\n  });\n  if (!response.ok) {\n    throw new Error(`Order failed: ${response.status}`);\n  }\n  const { orderId } = await response.json();\n  return orderId;\n}\n";
@@ -3675,7 +3864,12 @@ fn capture_icarus_docs_screenshots(
     };
     git(&["init", "-q", "-b", "acme-142-discount-codes-at-checkout"])?;
     git(&["add", "."])?;
-    git(&["commit", "-q", "-m", "Add checkout summary and order placement"])?;
+    git(&[
+        "commit",
+        "-q",
+        "-m",
+        "Add checkout summary and order placement",
+    ])?;
     std::fs::write(project_path.join("src/checkout.ts"), checkout_after)?;
     let project = cx.update(|cx| {
         project::Project::local(

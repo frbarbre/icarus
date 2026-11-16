@@ -3,14 +3,16 @@
 //! so an Orca import, `icarus config set` and the panel's View menu all change the same values.
 
 use editor::{Editor, EditorEvent};
-use gpui::{Action, Context, Entity, Focusable as _, Modifiers, Render, Window};
+use gpui::{Action, Context, Entity, Focusable as _, Modifiers, Pixels, Render, Window};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use ui::prelude::*;
 use util::ResultExt as _;
 
 use crate::WorkspacesPanel;
-use crate::model::{Unread, UnreadKind, WorkspaceSummary, matches_filter, sort_workspaces};
+use crate::model::{
+    AgentSummary, PrSummary, Unread, UnreadKind, WorkspaceSummary, matches_filter, sort_workspaces,
+};
 use crate::routing::ServerRef;
 
 /// A card field the panel can draw, under Orca's `worktreeCardProperties` id.
@@ -51,7 +53,7 @@ pub const CARD_FIELDS: &[CardField] = &[
     },
     CardField {
         id: "linear-title",
-        label: "Linear title and labels",
+        label: "Linear link, labels and title",
     },
     CardField {
         id: "ports",
@@ -63,9 +65,33 @@ pub const CARD_FIELDS: &[CardField] = &[
     },
 ];
 
+pub const STATUS_FIELD: &str = "workspace-status";
+/// What older defaults called the status chip; still read so existing settings keep working.
+const STATUS_FIELD_ALIAS: &str = "status";
+
+/// The field id `id` stands for.
+fn canonical_field(id: &str) -> &str {
+    if id == STATUS_FIELD_ALIAS {
+        STATUS_FIELD
+    } else {
+        id
+    }
+}
+
+/// `fields` without every id that stands for `field`, or `None` when none did.
+pub fn without_field(fields: &[String], field: &str) -> Option<Vec<String>> {
+    let field = canonical_field(field);
+    let kept: Vec<String> = fields
+        .iter()
+        .filter(|id| canonical_field(id) != field)
+        .cloned()
+        .collect();
+    (kept.len() != fields.len()).then_some(kept)
+}
+
 /// Orca's default card properties (its `DEFAULT_WORKTREE_CARD_PROPERTIES`); the rest are opt-in.
 const DEFAULT_FIELDS: &[&str] = &[
-    "status",
+    STATUS_FIELD,
     "unread",
     "issue",
     "linear-issue",
@@ -198,9 +224,9 @@ impl CardView {
         view
     }
 
-    /// The status chip doubles as the status menu, so grouping by status keeps it on.
+    /// Grouped by status, the section header already says it.
     pub fn shows_status_chip(&self) -> bool {
-        self.group_by == GroupBy::Status || self.shows("workspace-status")
+        self.group_by != GroupBy::Status && self.shows(STATUS_FIELD)
     }
 
     /// Reads `workspace.cardFields`, the `sidebar` object and `rules.pr`.
@@ -247,18 +273,14 @@ impl CardView {
     }
 
     pub fn shows(&self, field: &str) -> bool {
-        self.shown_fields().iter().any(|id| id == field)
+        without_field(self.shown_fields(), field).is_some()
     }
 
     /// The fields after flipping `field`, keeping every other id and their order.
     pub fn toggled(&self, field: &str) -> Vec<String> {
         let shown = self.shown_fields();
-        if self.shows(field) {
-            shown
-                .iter()
-                .filter(|id| id.as_str() != field)
-                .cloned()
-                .collect()
+        if let Some(hidden) = without_field(shown, field) {
+            hidden
         } else {
             let mut fields = shown.to_vec();
             fields.push(field.to_string());
@@ -317,6 +339,106 @@ pub fn render_unread_dot(workspace_id: &str, unread: &Unread, cx: &App) -> impl 
         .id(SharedString::from(format!("icarus-unread-{workspace_id}")))
         .tooltip(ui::Tooltip::text(tooltip))
         .child(div().size_2().rounded_full().bg(color.color(cx)))
+}
+
+pub const MOON_ICON: &str = "icons/icarus/moon.svg";
+const STACK_ICON: &str = "icons/icarus/layers.svg";
+const FINISHED_ICON: &str = "icons/icarus/circle_check.svg";
+const CLAUDE_ORANGE: u32 = 0xd97757;
+
+/// How far a card's rows below the title are indented, so they line up with the title text.
+pub const CARD_INDENT: Pixels = px(20.);
+
+/// The colour GitHub gives a pull request in `state`.
+pub fn pr_state_color(state: &str) -> Color {
+    match state {
+        "merged" => Color::Accent,
+        "closed" => Color::Error,
+        "draft" => Color::Muted,
+        _ => Color::Success,
+    }
+}
+
+/// What the card's PR icon says on hover.
+pub fn pr_tooltip(pr: &PrSummary) -> String {
+    let state = if pr.state.is_empty() { "open" } else { &pr.state };
+    let mut text = format!("#{} · {state}", pr.number);
+    match pr.checks.as_deref() {
+        Some("failure") => text.push_str(" · checks failing"),
+        Some("pending") => text.push_str(" · checks running"),
+        Some("success") => text.push_str(" · checks passed"),
+        _ => {}
+    }
+    if pr.in_merge_queue {
+        text.push_str(" · in merge queue");
+    }
+    text
+}
+
+/// `1599` as `1,599`, like the diff counts on Orca's cards.
+pub fn with_thousands(count: u64) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// `10h`, `3d`: how long ago `at_ms` was, as short as the card's activity line needs.
+pub fn short_age(at_ms: u64, now_ms: u64) -> String {
+    let seconds = now_ms.saturating_sub(at_ms) / 1000;
+    match seconds {
+        0..60 => "now".into(),
+        60..3600 => format!("{}m", seconds / 60),
+        3600..86_400 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
+pub fn stack_icon() -> Icon {
+    Icon::from_path(STACK_ICON)
+        .size(IconSize::XSmall)
+        .color(Color::Muted)
+}
+
+pub fn agent_state_icon(agent: &AgentSummary) -> Icon {
+    let icon = match agent.state.as_str() {
+        "working" => Icon::new(IconName::LoadCircle).color(Color::Accent),
+        "idle" if agent.turns > 0 => Icon::from_path(FINISHED_ICON).color(Color::Success),
+        "sleeping" => Icon::from_path(MOON_ICON).color(Color::Muted),
+        "exited" => Icon::new(IconName::XCircle).color(Color::Muted),
+        _ => Icon::from_path(crate::status_style::icon_path("", Some("circle-dashed")))
+            .color(Color::Muted),
+    };
+    icon.size(IconSize::XSmall)
+}
+
+pub fn agent_provider_icon(provider: &str) -> Icon {
+    let icon = match provider {
+        "claude" => {
+            Icon::new(IconName::AiClaude).color(Color::Custom(gpui::rgb(CLAUDE_ORANGE).into()))
+        }
+        "codex" => Icon::new(IconName::AiOpenAi).color(Color::Default),
+        _ => Icon::new(IconName::Sparkle).color(Color::Muted),
+    };
+    icon.size(IconSize::XSmall)
+}
+
+/// A small rounded tag on a card: status, Linear label, project or merge queue.
+pub fn chip(cx: &App) -> gpui::Div {
+    h_flex()
+        .flex_none()
+        .h(px(18.))
+        .px_1()
+        .gap_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(cx.theme().colors().border_variant)
+        .bg(cx.theme().colors().element_background)
 }
 
 /// A card in the panel: its server and workspace id.
@@ -395,6 +517,147 @@ pub fn count_label(verb: &str, count: usize) -> String {
 struct SortChangedToast;
 
 impl WorkspacesPanel {
+    pub fn agents_expanded(&self, workspace_id: &str) -> bool {
+        self.expanded_agents.contains(workspace_id)
+    }
+
+    pub fn toggle_agents(&mut self, workspace_id: &str, cx: &mut Context<Self>) {
+        if !self.expanded_agents.remove(workspace_id) {
+            self.expanded_agents.insert(workspace_id.to_owned());
+        }
+        cx.notify();
+    }
+
+    /// The card's agent row: the latest agent's finished turn in one line when there is one, else a pill
+    /// with the lead agent and how many more; either opens the full list.
+    pub(crate) fn render_agents(
+        &self,
+        workspace: &WorkspaceSummary,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.view.shows("inline-agents") {
+            return None;
+        }
+        let latest = workspace
+            .agents
+            .iter()
+            .rev()
+            .max_by_key(|agent| agent.last_activity_ms)?;
+        let expanded = self.agents_expanded(&workspace.id);
+        let toggle = {
+            let workspace_id = workspace.id.clone();
+            cx.listener(move |panel, _: &gpui::ClickEvent, _, cx| {
+                cx.stop_propagation();
+                panel.toggle_agents(&workspace_id, cx);
+            })
+        };
+        let colors = cx.theme().colors();
+        let row_id = SharedString::from(format!("icarus-agents-{}", workspace.id));
+        let row = match latest.finished_summary().filter(|_| !expanded) {
+            Some(summary) => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_millis() as u64);
+                h_flex()
+                    .id(row_id.clone())
+                    .debug_selector(|| row_id.to_string())
+                    .min_w_0()
+                    .gap_1()
+                    .cursor_pointer()
+                    .child(agent_state_icon(latest))
+                    .child(agent_provider_icon(&latest.provider))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(summary.to_owned())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    )
+                    .when(latest.last_activity_ms > 0, |row| {
+                        row.child(
+                            Label::new(short_age(latest.last_activity_ms, now_ms))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .on_click(toggle)
+            }
+            None => {
+                let lead = workspace
+                    .agents
+                    .iter()
+                    .find(|agent| agent.state == "working")
+                    .unwrap_or(latest);
+                let more = workspace.agents.len() - 1;
+                h_flex()
+                    .id(row_id.clone())
+                    .debug_selector(|| row_id.to_string())
+                    .h(px(22.))
+                    .px_1p5()
+                    .gap_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.element_background.opacity(0.5))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .child(agent_state_icon(lead))
+                    .child(agent_provider_icon(&lead.provider))
+                    .when(more > 0, |pill| {
+                        pill.child(
+                            Label::new(format!("+{more}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .on_click(toggle)
+            }
+        };
+        let list = expanded.then(|| {
+            v_flex().pl_1p5().gap_0p5().children(workspace.agents.iter().map(|agent| {
+                let title = agent
+                    .title
+                    .clone()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| crate::accounts::provider_name(&agent.provider).to_owned());
+                h_flex()
+                    .gap_1()
+                    .child(agent_state_icon(agent))
+                    .child(agent_provider_icon(&agent.provider))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(title)
+                                .size(LabelSize::XSmall)
+                                .truncate(),
+                        ),
+                    )
+                    .child(
+                        Label::new(agent.state.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+            }))
+        });
+        Some(
+            v_flex()
+                .gap_0p5()
+                .child(row)
+                .children(list)
+                .into_any_element(),
+        )
+    }
+
     /// The workspaces the text filter keeps, in the chosen sort order (before grouping and pins).
     pub(crate) fn arranged_workspaces(&self) -> Vec<WorkspaceSummary> {
         self.arranged(&self.workspaces)
@@ -424,7 +687,7 @@ impl WorkspacesPanel {
         let mut cards: Vec<(CardKey, WorkspaceSummary)> = self
             .sections(cx)
             .into_iter()
-            .flat_map(|(_, _, _, workspaces)| workspaces)
+            .flat_map(|(_, _, workspaces)| workspaces)
             .map(|workspace| {
                 (
                     CardKey {
@@ -761,8 +1024,36 @@ mod tests {
             "opt-in in Orca"
         );
         assert!(
-            defaults.shows_status_chip(),
-            "grouped by status, the chip is the status menu"
+            !defaults.shows_status_chip(),
+            "grouped by status, the section header already says it"
+        );
+        let by_pr = CardView {
+            group_by: GroupBy::PrStatus,
+            ..defaults
+        };
+        assert!(
+            by_pr.shows_status_chip(),
+            "on by default in other groupings"
+        );
+        let hidden = CardView {
+            local_fields: Some(by_pr.toggled(STATUS_FIELD)),
+            ..by_pr
+        };
+        assert!(!hidden.shows_status_chip(), "turned off, it never shows");
+
+        let old_alias = CardView::from_settings(
+            &json!(["status", "pr"]),
+            &json!({ "groupBy": "pr-status" }),
+            &json!(null),
+        );
+        assert!(old_alias.shows(STATUS_FIELD), "older settings say `status`");
+        assert_eq!(old_alias.toggled(STATUS_FIELD), ["pr"]);
+        assert!(
+            !CardView {
+                fields: old_alias.toggled(STATUS_FIELD),
+                ..old_alias
+            }
+            .shows_status_chip()
         );
         let all = CardView::showing_all();
         assert!(CARD_FIELDS.iter().all(|field| all.shows(field.id)));
@@ -808,7 +1099,7 @@ mod tests {
             panel
                 .sections(cx)
                 .into_iter()
-                .map(|(_, title, _, items)| {
+                .map(|(_, title, items)| {
                     let names: Vec<&str> = items.iter().map(|w| w.name.as_str()).collect();
                     format!("{title}: {}", names.join(","))
                 })
@@ -1128,6 +1419,131 @@ mod tests {
             assert!(panel.select_on_click(&saved_key("gamma"), Modifiers::shift(), cx));
             assert_eq!(panel.selection().len(), 3);
         });
+    }
+
+    #[test]
+    fn card_numbers_and_agent_lines_read_like_orcas() {
+        assert_eq!(with_thousands(0), "0");
+        assert_eq!(with_thousands(999), "999");
+        assert_eq!(with_thousands(1599), "1,599");
+        assert_eq!(with_thousands(1_234_567), "1,234,567");
+        let hour_ms = 3_600_000;
+        assert_eq!(short_age(0, 30_000), "now");
+        assert_eq!(short_age(0, 10 * hour_ms), "10h");
+        assert_eq!(short_age(0, 50 * hour_ms), "2d");
+
+        let agent = |state: &str, turns: u64, title: Option<&str>| AgentSummary {
+            state: state.into(),
+            turns,
+            title: title.map(str::to_string),
+            ..AgentSummary::default()
+        };
+        assert_eq!(
+            agent("idle", 2, Some("Ready for review")).finished_summary(),
+            Some("Ready for review")
+        );
+        assert_eq!(
+            agent("working", 2, Some("Ready")).finished_summary(),
+            None,
+            "a working agent gets the pill"
+        );
+        assert_eq!(
+            agent("idle", 0, Some("Agent")).finished_summary(),
+            None,
+            "nothing finished yet"
+        );
+        assert_eq!(agent("idle", 1, Some("  ")).finished_summary(), None);
+        let pr = PrSummary {
+            number: 4143,
+            state: "open".into(),
+            checks: Some("failure".into()),
+            ..PrSummary::default()
+        };
+        assert_eq!(pr_tooltip(&pr), "#4143 · open · checks failing");
+    }
+
+    #[gpui::test]
+    async fn the_agent_row_opens_the_list_and_quiet_found_worktrees_sleep(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::tests::summary;
+        let mut busy = summary("busy", "/w/busy", None);
+        busy.agents = vec![
+            AgentSummary {
+                id: "a".into(),
+                state: "working".into(),
+                provider: "claude".into(),
+                ..AgentSummary::default()
+            },
+            AgentSummary {
+                id: "b".into(),
+                state: "idle".into(),
+                provider: "codex".into(),
+                ..AgentSummary::default()
+            },
+        ];
+        let mut asleep = summary("asleep", "/w/asleep", None);
+        asleep.sleeping = true;
+        let found = summary("found", "/w/found", None);
+        let mut found_with_pr = with_pr(summary("found-pr", "/w/found-pr", None), 3, "open");
+        found_with_pr.id = "ws-found-pr".into();
+        let (_, panel, mut cx) =
+            crate::tests::panel_window(vec![busy, asleep, found, found_with_pr], cx).await;
+        let cx = &mut cx;
+        panel.update(cx, |panel, cx| {
+            panel.discovered = crate::worktree_inbox::Discovered::new(
+                &json!([
+                    { "id": "ws-found", "origin": "claude" },
+                    { "id": "ws-found-pr", "origin": "claude" },
+                    { "id": "ws-busy", "origin": "native" },
+                ]),
+                json!([]),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let inactive = panel.read_with(cx, |panel, _| {
+            panel
+                .workspaces
+                .iter()
+                .filter(|workspace| panel.is_inactive(workspace))
+                .map(|workspace| workspace.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            inactive,
+            ["asleep", "found"],
+            "a found worktree with a PR is not dimmed"
+        );
+
+        cx.simulate_resize(gpui::size(px(1280.), px(800.)));
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .workspace
+                .update(cx, |workspace, cx| {
+                    workspace.open_panel::<WorkspacesPanel>(window, cx)
+                })
+                .ok();
+        });
+        cx.run_until_parked();
+        let pill = cx
+            .debug_bounds("icarus-agents-ws-busy")
+            .expect("the agent pill is drawn");
+        cx.simulate_click(pill.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.agents_expanded("ws-busy")));
+        assert!(
+            cx.update(|_, cx| cx
+                .try_global::<crate::OpeningWorkspaces>()
+                .is_none_or(|opening| opening.latest.is_none())),
+            "the click stays on the agent row instead of opening the workspace"
+        );
+        let pill = cx
+            .debug_bounds("icarus-agents-ws-busy")
+            .expect("still drawn");
+        cx.simulate_click(pill.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(!panel.read_with(cx, |panel, _| panel.agents_expanded("ws-busy")));
     }
 
     #[test]

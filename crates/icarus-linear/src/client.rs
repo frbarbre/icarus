@@ -8,11 +8,23 @@ use crate::error::{LinearError, Result};
 use crate::issue::{
     BATCH_MAX, Issue, batch_query, my_issues_query, normalize_identifier, parse_issue, search_query,
 };
-use crate::key::KeyResolver;
+use crate::key::{ApiKey, KeyResolver};
 use crate::transport::{LinearRequest, LinearResponse, Transport};
 
 const DEFAULT_RATE_WAIT: Duration = Duration::from_secs(60);
 const MAX_RATE_WAIT: Duration = Duration::from_secs(3600);
+const VIEWER_QUERY: &str = "query Viewer { viewer { name } }";
+
+fn unauthorized(response: &LinearResponse, body: &Value) -> bool {
+    response.status == 401 || has_code(body, &["AUTHENTICATION_ERROR", "UNAUTHENTICATED"])
+}
+
+fn viewer_name(data: &Value) -> Result<String> {
+    data["viewer"]["name"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| LinearError::Malformed("no viewer name".into()))
+}
 
 pub struct Linear<T> {
     transport: T,
@@ -126,52 +138,79 @@ impl<T: Transport> Linear<T> {
             let (key, source) = self.keys.key().await?;
             let response = self.transport.post(&key, request).await?;
             let body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
-            let unauthorized = response.status == 401
-                || has_code(&body, &["AUTHENTICATION_ERROR", "UNAUTHENTICATED"]);
-            if unauthorized {
+            if unauthorized(&response, &body) {
                 if self.keys.rejected(source, retried).await {
                     retried = true;
                     continue;
                 }
                 return Err(LinearError::Unauthorized);
             }
-            if response.status == 429 || has_code(&body, &["RATELIMITED"]) {
-                let wait = retry_after(&response);
-                self.block_for(wait);
-                return Err(LinearError::RateLimited {
-                    retry_after: Some(wait),
-                });
-            }
-            if response.status >= 400 {
-                let mut message = messages(&body).join("; ");
-                if message.is_empty() {
-                    message = String::from_utf8_lossy(&response.body)
-                        .chars()
-                        .take(200)
-                        .collect();
-                }
-                return Err(LinearError::Http {
-                    status: response.status,
-                    message,
-                });
-            }
-            let data = &body["data"];
-            if partial && !data.is_object() && !failed_aliases(&body).is_empty() {
-                return Ok(body);
-            }
-            if !data.is_object() {
-                let errors = messages(&body);
-                return Err(if errors.is_empty() {
-                    LinearError::Malformed("no data".into())
-                } else {
-                    LinearError::GraphQl(errors)
-                });
-            }
-            if !partial && body["errors"].is_array() {
-                return Err(LinearError::GraphQl(messages(&body)));
-            }
-            return Ok(if partial { body } else { data.clone() });
+            return self.interpret(&response, body, partial);
         }
+    }
+
+    fn interpret(&self, response: &LinearResponse, body: Value, partial: bool) -> Result<Value> {
+        if response.status == 429 || has_code(&body, &["RATELIMITED"]) {
+            let wait = retry_after(response);
+            self.block_for(wait);
+            return Err(LinearError::RateLimited {
+                retry_after: Some(wait),
+            });
+        }
+        if response.status >= 400 {
+            let mut message = messages(&body).join("; ");
+            if message.is_empty() {
+                message = String::from_utf8_lossy(&response.body)
+                    .chars()
+                    .take(200)
+                    .collect();
+            }
+            return Err(LinearError::Http {
+                status: response.status,
+                message,
+            });
+        }
+        let data = &body["data"];
+        if partial && !data.is_object() && !failed_aliases(&body).is_empty() {
+            return Ok(body);
+        }
+        if !data.is_object() {
+            let errors = messages(&body);
+            return Err(if errors.is_empty() {
+                LinearError::Malformed("no data".into())
+            } else {
+                LinearError::GraphQl(errors)
+            });
+        }
+        if !partial && body["errors"].is_array() {
+            return Err(LinearError::GraphQl(messages(&body)));
+        }
+        Ok(if partial { body } else { data.clone() })
+    }
+
+    /// The signed-in user's name for `key`, without touching the resolver: checks a key before it is saved.
+    pub async fn viewer_with(&self, key: &ApiKey) -> Result<String> {
+        if let Some(wait) = self.blocked() {
+            return Err(LinearError::RateLimited {
+                retry_after: Some(wait),
+            });
+        }
+        let request = LinearRequest::new(VIEWER_QUERY, Value::Object(Default::default()));
+        let response = self.transport.post(key, &request).await?;
+        let body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+        if unauthorized(&response, &body) {
+            return Err(LinearError::Unauthorized);
+        }
+        viewer_name(&self.interpret(&response, body, false)?)
+    }
+
+    /// The signed-in user's name for the resolved key.
+    pub async fn viewer(&self) -> Result<String> {
+        viewer_name(
+            &self
+                .query(VIEWER_QUERY, Value::Object(Default::default()))
+                .await?,
+        )
     }
 
     /// A read-only GraphQL query (e.g. `viewer`); mutations are refused.
@@ -586,7 +625,10 @@ mod tests {
             2,
             "backs off instead of hammering Linear"
         );
-        assert_eq!(linear.keys().status().await, crate::KeyStatus::Rejected);
+        assert_eq!(
+            linear.keys().status().await,
+            crate::KeyStatus::Rejected(crate::KeySource::Command)
+        );
     }
 
     #[tokio::test]
@@ -712,5 +754,71 @@ mod tests {
             linear.issue("ABC-12").await,
             Err(LinearError::Unauthorized)
         ));
+    }
+
+    #[tokio::test]
+    async fn viewer_with_checks_a_candidate_key_without_the_resolver() {
+        let linear = Linear::new(
+            Arc::new(
+                FakeLinear::new()
+                    .on(
+                        "Viewer",
+                        LinearResponse::ok(json!({ "data": { "viewer": { "name": "Ada" } } })),
+                    )
+                    .on(
+                        "Viewer",
+                        LinearResponse::json(
+                            401,
+                            json!({ "errors": [{ "message": "Authentication required" }] }),
+                        ),
+                    ),
+            ),
+            KeyResolver::new(None),
+        );
+        let name = linear
+            .viewer_with(&ApiKey::new("lin_candidate"))
+            .await
+            .expect("viewer");
+        assert_eq!(name, "Ada");
+        let requests = linear.transport().requests();
+        assert_eq!(requests[0].key.expose(), "lin_candidate");
+        assert_eq!(requests[0].request.operation().as_deref(), Some("Viewer"));
+        assert!(matches!(
+            linear.viewer_with(&ApiKey::new("lin_wrong")).await,
+            Err(LinearError::Unauthorized)
+        ));
+        assert_eq!(
+            linear.keys().status().await,
+            crate::KeyStatus::NotConfigured,
+            "a rejected candidate leaves the resolver alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_key_is_used_after_env_and_command_and_a_rejection_sticks() {
+        let fake = FakeLinear::new()
+            .on(
+                "Viewer",
+                LinearResponse::ok(json!({ "data": { "viewer": { "name": "Ada" } } })),
+            )
+            .on(
+                "Viewer",
+                LinearResponse::json(401, json!({ "errors": [{ "message": "revoked" }] })),
+            );
+        let linear = Linear::new(Arc::new(fake), KeyResolver::new(None));
+        linear.keys().set_stored(Some(ApiKey::new("lin_stored")));
+        assert_eq!(linear.viewer().await.expect("viewer"), "Ada");
+        assert_eq!(linear.transport().requests()[0].key.expose(), "lin_stored");
+        assert!(matches!(
+            linear.viewer().await,
+            Err(LinearError::Unauthorized)
+        ));
+        assert_eq!(linear.transport().count(), 2, "no retry for a stored key");
+        assert_eq!(
+            linear.keys().status().await,
+            crate::KeyStatus::Rejected(crate::KeySource::Stored)
+        );
+        linear.keys().set_stored(Some(ApiKey::new("lin_new")));
+        assert_eq!(linear.keys().status().await, crate::KeyStatus::Stored);
     }
 }

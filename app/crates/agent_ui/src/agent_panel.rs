@@ -632,6 +632,10 @@ pub fn init(cx: &mut App) {
                 )
                 .register_action(
                     |workspace: &mut Workspace, _: &AddSelectionToThread, window, cx| {
+                        if cx.has_global::<crate::agent_tab::AgentTabsEnabled>() {
+                            crate::agent_tab::add_selection_to_composer(workspace, window, cx);
+                            return;
+                        }
                         let Some(agent_panel) = workspace.panel::<AgentPanel>(cx) else {
                             return;
                         };
@@ -5213,6 +5217,18 @@ impl Panel for AgentPanel {
     }
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if active && cx.has_global::<crate::agent_tab::AgentTabsEnabled>() {
+            // Icarus keeps the panel only as the tabs' session host; whatever opens it gets the composer.
+            let workspace = self.workspace.clone();
+            window.defer(cx, move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        crate::agent_tab::hide_agent_panel(workspace, window, cx)
+                    })
+                    .log_err();
+            });
+            return;
+        }
         self.is_active = active;
         if active {
             self.ensure_thread_initialized(window, cx);

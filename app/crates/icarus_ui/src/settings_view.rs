@@ -35,13 +35,16 @@ actions!(
         OpenSettings,
         /// Opens Icarus's settings at the apps in Source Control's "Open in" menu.
         CustomizeOpenInApps,
+        /// Opens Icarus's settings at the Linear API key.
+        ConnectLinear,
     ]
 );
 
 const OPEN_IN: &str = "sourceControl.openIn";
 
 /// The scrolled blocks of the view, so a block can be scrolled into view.
-const OPEN_IN_BLOCK: usize = 1;
+const LINEAR_BLOCK: usize = 1;
+const OPEN_IN_BLOCK: usize = 2;
 
 /// One app in the "Open in" list editor.
 struct OpenInRow {
@@ -279,7 +282,7 @@ const INTEGRATIONS: &[Field] = &[
     field(
         "linear.api_key_command",
         "Linear key command",
-        "A command that prints your Linear API key; Icarus never stores the key.",
+        "For headless servers: prints your Linear API key, and wins over a saved key.",
         Control::Text,
     ),
     field(
@@ -400,9 +403,47 @@ pub struct SettingsView {
     renaming: Option<String>,
     open_in_rows: Vec<OpenInRow>,
     scroll_handle: ScrollHandle,
-    /// Scroll to the "Open in" apps once the settings have loaded.
-    reveal_open_in: bool,
+    /// The block to scroll to once the settings have loaded.
+    reveal: Option<usize>,
+    /// The server's `linear.status`; never holds the key.
+    linear: Option<Value>,
+    linear_key: Entity<Editor>,
+    linear_busy: bool,
+    linear_error: Option<String>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// One line on where the Linear key comes from and whose it is.
+pub fn linear_summary(status: Option<&Value>) -> String {
+    let Some(status) = status else {
+        return "Checking…".to_owned();
+    };
+    let viewer = status["viewer"].as_str();
+    let source = status["source"].as_str();
+    if status["rejected"].as_bool() == Some(true) {
+        return match source {
+            Some("stored") => "Linear rejected the saved key; paste a new one.".to_owned(),
+            Some("env") => "Linear rejected LINEAR_API_KEY on the server.".to_owned(),
+            _ => "Linear rejected the key from the key command.".to_owned(),
+        };
+    }
+    if status["configured"].as_bool() != Some(true) {
+        return "Not connected. Paste a personal API key from Linear (Settings → Security & access)."
+            .to_owned();
+    }
+    let who = viewer.map_or_else(
+        || "Connected".to_owned(),
+        |name| format!("Connected as {name}"),
+    );
+    match source {
+        Some("stored") => match status["store"].as_str() {
+            Some("Keychain") => format!("{who} (stored in Keychain)"),
+            _ => format!("{who} (stored on the server)"),
+        },
+        Some("env") => format!("{who} (LINEAR_API_KEY on the server)"),
+        Some("command") => format!("{who} (from the key command)"),
+        _ => who,
+    }
 }
 
 #[derive(Default)]
@@ -499,6 +540,12 @@ impl SettingsView {
             editor.set_placeholder_text("New status name", window, cx);
             editor
         });
+        let linear_key = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_masked(true, cx);
+            editor.set_placeholder_text("lin_api_…", window, cx);
+            editor
+        });
         let mut view = Self {
             workspace,
             focus_handle: cx.focus_handle(),
@@ -515,7 +562,11 @@ impl SettingsView {
             renaming: None,
             open_in_rows: Vec::new(),
             scroll_handle: ScrollHandle::new(),
-            reveal_open_in: false,
+            reveal: None,
+            linear: None,
+            linear_key,
+            linear_busy: false,
+            linear_error: None,
             _subscriptions: subscriptions,
         };
         let handle = window.window_handle();
@@ -543,7 +594,82 @@ impl SettingsView {
         self.snapshot.as_ref()
     }
 
+    pub fn linear_status(&self) -> Option<&Value> {
+        self.linear.as_ref()
+    }
+
+    fn load_linear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task) = request(self.client.clone(), "linear.status", json!({}), cx) else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let status = task.await;
+            this.update(cx, |this, cx| {
+                match status {
+                    Ok(status) => this.linear = Some(status),
+                    Err(error) => {
+                        this.linear_error = Some(crate::changes_tab::git_error_text(&error))
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    pub fn save_linear_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.linear_key.read(cx).text(cx).trim().to_owned();
+        if key.is_empty() {
+            self.linear_error = Some("Paste a Linear API key first.".into());
+            cx.notify();
+            return;
+        }
+        self.run_linear("linear.set_api_key", json!({ "key": key }), window, cx);
+    }
+
+    pub fn remove_linear_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_linear("linear.clear_api_key", json!({}), window, cx);
+    }
+
+    fn run_linear(
+        &mut self,
+        method: &'static str,
+        params: Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = request(self.client.clone(), method, params, cx) else {
+            self.linear_error = Some("Not connected to the Icarus server.".into());
+            cx.notify();
+            return;
+        };
+        self.linear_busy = true;
+        self.linear_error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                this.linear_busy = false;
+                match result {
+                    Ok(status) => {
+                        this.linear = Some(status);
+                        this.linear_key
+                            .update(cx, |editor, cx| editor.set_text("", window, cx));
+                    }
+                    Err(error) => {
+                        this.linear_error = Some(crate::changes_tab::git_error_text(&error))
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_linear(window, cx);
         let client = self.client.clone();
         let root = self.root.clone();
         let keys: Vec<&'static str> = [
@@ -672,20 +798,29 @@ impl SettingsView {
         }
         self.snapshot = Some(snapshot);
         self.sync_open_in_rows(window, cx);
-        if std::mem::take(&mut self.reveal_open_in) {
-            self.scroll_handle.scroll_to_top_of_item(OPEN_IN_BLOCK);
+        if let Some(block) = self.reveal.take() {
+            self.scroll_handle.scroll_to_top_of_item(block);
         }
         cx.notify();
     }
 
-    /// Scrolls to the "Open in" apps, now or once the settings have loaded.
-    pub fn reveal_open_in(&mut self, cx: &mut Context<Self>) {
+    /// Scrolls to a block, now or once the settings have loaded.
+    fn reveal_block(&mut self, block: usize, cx: &mut Context<Self>) {
         if self.snapshot.is_some() {
-            self.scroll_handle.scroll_to_top_of_item(OPEN_IN_BLOCK);
+            self.scroll_handle.scroll_to_top_of_item(block);
             cx.notify();
         } else {
-            self.reveal_open_in = true;
+            self.reveal = Some(block);
         }
+    }
+
+    pub fn reveal_open_in(&mut self, cx: &mut Context<Self>) {
+        self.reveal_block(OPEN_IN_BLOCK, cx);
+    }
+
+    pub fn reveal_linear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reveal_block(LINEAR_BLOCK, cx);
+        window.focus(&self.linear_key.focus_handle(cx), cx);
     }
 
     /// The apps as saved (unknown fields kept), or Orca's default while none are.
@@ -1090,10 +1225,9 @@ impl SettingsView {
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(index) = fields.iter().position(|f| f == id) {
-            fields.remove(index);
-        } else {
-            fields.push(id.to_owned());
+        match crate::cards::without_field(&fields, id) {
+            Some(hidden) => fields = hidden,
+            None => fields.push(id.to_owned()),
         }
         self.write("workspace.cardFields", Some(json!(fields)), window, cx);
     }
@@ -1782,6 +1916,71 @@ impl SettingsView {
             }))
     }
 
+    fn render_linear(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let stored = self
+            .linear
+            .as_ref()
+            .is_some_and(|status| status["stored"].as_bool() == Some(true));
+        let busy = self.linear_busy;
+        v_flex()
+            .py_1p5()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_4()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(Label::new("Linear API key"))
+                            .child(
+                                Label::new(linear_summary(self.linear.as_ref()))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_none()
+                            .child(
+                                div()
+                                    .w(px(200.))
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border_variant)
+                                    .child(self.linear_key.clone()),
+                            )
+                            .child(
+                                ui::Button::new(
+                                    "icarus-linear-save",
+                                    if busy { "Checking…" } else { "Save" },
+                                )
+                                .label_size(LabelSize::Small)
+                                .disabled(busy)
+                                .on_click(cx.listener(
+                                    |view, _, window, cx| view.save_linear_key(window, cx),
+                                )),
+                            )
+                            .when(stored, |this| {
+                                this.child(
+                                    ui::Button::new("icarus-linear-remove", "Remove")
+                                        .label_size(LabelSize::Small)
+                                        .disabled(busy)
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            view.remove_linear_key(window, cx)
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .when_some(self.linear_error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
+    }
+
     fn render_cards(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let shown: Vec<String> = self
             .snapshot
@@ -1798,7 +1997,7 @@ impl SettingsView {
         let weak = cx.entity().downgrade();
         v_flex().children(CARD_FIELDS.iter().map(|field| {
             let weak = weak.clone();
-            let on = shown.iter().any(|f| f == field.id);
+            let on = crate::cards::without_field(&shown, field.id).is_some();
             h_flex()
                 .py_1()
                 .justify_between()
@@ -1937,7 +2136,10 @@ impl Render for SettingsView {
                     )
                     .children(action_prompts)
                     .child(Self::section("AGENTS", cx))
-                    .children(agents)
+                    .children(agents),
+            )
+            .child(
+                column()
                     .child(Self::section("INTEGRATIONS", cx))
                     .child(
                         h_flex()
@@ -1958,6 +2160,7 @@ impl Render for SettingsView {
                                     .on_click(cx.listener(|view, _, window, cx| view.check_gh(window, cx))),
                             ),
                     )
+                    .child(self.render_linear(cx))
                     .children(integrations)
                     .child(Self::section("NOTIFICATIONS", cx))
                     .children(notifications)
@@ -2037,6 +2240,15 @@ fn open_settings(
     view
 }
 
+/// Shows the settings tab at the Linear API key field.
+pub fn open_linear_settings(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_settings(workspace, window, cx).update(cx, |view, cx| view.reveal_linear(window, cx));
+}
+
 pub fn register(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
@@ -2044,6 +2256,9 @@ pub fn register(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &CustomizeOpenInApps, window, cx| {
             open_settings(workspace, window, cx).update(cx, |view, cx| view.reveal_open_in(cx));
+        });
+        workspace.register_action(|workspace, _: &ConnectLinear, window, cx| {
+            open_linear_settings(workspace, window, cx);
         });
     })
     .detach();
@@ -2575,12 +2790,133 @@ mod tests {
         assert_eq!(views.len(), 1);
         views[0].read_with(&cx, |view, _| {
             assert!(view.snapshot().is_some());
-            assert!(!view.reveal_open_in, "scrolled once the settings loaded");
+            assert!(view.reveal.is_none(), "scrolled once the settings loaded");
             assert_eq!(view.open_in_rows.len(), 1);
         });
         cx.dispatch_action(CustomizeOpenInApps);
         cx.run_until_parked();
         assert_eq!(open(&mut cx).len(), 1, "the open tab is reused");
+    }
+
+    #[gpui::test]
+    async fn a_pasted_linear_key_is_saved_through_the_server_and_can_be_removed(
+        cx: &mut TestAppContext,
+    ) {
+        init_settings(cx);
+        let saved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = cx.update(|cx| {
+            let saved = saved.clone();
+            stub_rpc(cx, move |method, params| {
+                let stored = json!({
+                    "configured": true, "source": "stored", "stored": true,
+                    "store": "Keychain", "viewer": "Ada", "rejected": false,
+                });
+                let missing = json!({
+                    "configured": false, "source": null, "stored": false,
+                    "store": "Keychain", "viewer": null, "rejected": false,
+                });
+                match method {
+                    "config.get" => Ok(resolved()),
+                    "linear.status" if saved.load(std::sync::atomic::Ordering::SeqCst) => {
+                        Ok(stored)
+                    }
+                    "linear.status" => Ok(missing),
+                    "linear.set_api_key" if params["key"] == "lin_api_wrong" => {
+                        Err(anyhow::anyhow!(icarus_client::ClientError::Rpc(
+                            icarus_protocol::RpcError::new(
+                                "unauthorized",
+                                "Linear rejected this API key; nothing was saved",
+                            )
+                        )))
+                    }
+                    "linear.set_api_key" => {
+                        saved.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(stored)
+                    }
+                    "linear.clear_api_key" => {
+                        saved.store(false, std::sync::atomic::Ordering::SeqCst);
+                        Ok(missing)
+                    }
+                    _ => Ok(json!({})),
+                }
+            })
+        });
+        let window = cx.add_empty_window();
+        let view = window.update(|window, cx| {
+            cx.new(|cx| SettingsView::new(WeakEntity::new_invalid(), None, window, cx))
+        });
+        window.run_until_parked();
+        view.read_with(window, |view, _| {
+            assert!(
+                linear_summary(view.linear_status()).starts_with("Not connected"),
+                "{:?}",
+                view.linear_status()
+            );
+        });
+
+        let paste = |key: &'static str, window: &mut gpui::VisualTestContext| {
+            view.update_in(window, |view, window, cx| {
+                view.linear_key
+                    .update(cx, |editor, cx| editor.set_text(key, window, cx));
+                view.save_linear_key(window, cx);
+            });
+            window.run_until_parked();
+        };
+        paste("lin_api_wrong", window);
+        view.read_with(window, |view, cx| {
+            assert_eq!(
+                view.linear_error.as_deref(),
+                Some("Linear rejected this API key; nothing was saved")
+            );
+            assert_eq!(view.linear_key.read(cx).text(cx), "lin_api_wrong");
+        });
+
+        paste(" lin_api_good ", window);
+        assert_eq!(
+            calls_to(&calls, "linear.set_api_key").last(),
+            Some(&json!({ "key": "lin_api_good" }))
+        );
+        view.read_with(window, |view, cx| {
+            assert_eq!(view.linear_error, None);
+            assert_eq!(
+                view.linear_key.read(cx).text(cx),
+                "",
+                "the field is cleared"
+            );
+            assert_eq!(
+                linear_summary(view.linear_status()),
+                "Connected as Ada (stored in Keychain)"
+            );
+        });
+
+        view.update_in(window, |view, window, cx| {
+            view.remove_linear_key(window, cx)
+        });
+        window.run_until_parked();
+        assert_eq!(calls_to(&calls, "linear.clear_api_key").len(), 1);
+        view.read_with(window, |view, _| {
+            assert!(linear_summary(view.linear_status()).starts_with("Not connected"));
+        });
+    }
+
+    #[test]
+    fn the_linear_summary_names_where_the_key_comes_from() {
+        assert_eq!(
+            linear_summary(Some(
+                &json!({ "configured": true, "source": "env", "viewer": "Ada" })
+            )),
+            "Connected as Ada (LINEAR_API_KEY on the server)"
+        );
+        assert_eq!(
+            linear_summary(Some(&json!({ "configured": true, "source": "command" }))),
+            "Connected (from the key command)"
+        );
+        assert_eq!(
+            linear_summary(Some(
+                &json!({ "configured": false, "source": "stored", "rejected": true })
+            )),
+            "Linear rejected the saved key; paste a new one."
+        );
     }
 
     #[test]

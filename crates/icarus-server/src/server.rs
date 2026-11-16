@@ -92,6 +92,7 @@ pub struct Server {
     pub(crate) ports: crate::ports::Ports,
     pub(crate) history: Arc<crate::history::HistoryIndex>,
     pub(crate) creates: crate::create::Creates,
+    pub(crate) discovery: crate::discovery::DiscoveryState,
     /// Connected clients, for requests the server forwards to editors (e.g. open a file).
     clients: std::sync::Mutex<Vec<(String, String, Outbound)>>,
     shutdown: Notify,
@@ -199,12 +200,15 @@ impl Server {
             store,
             workspace_root,
             github: crate::github::GitHubService::from_env(),
-            linear: crate::linear::LinearService::from_env(),
+            linear: crate::linear::LinearService::from_env(crate::linear_key::default_store(
+                &paths.home,
+            )),
             updates: crate::updates::Updates::from_env(),
             automation: crate::automation::Automation::default(),
             ports: crate::ports::Ports::default(),
             history: Arc::default(),
             creates: crate::create::Creates::default(),
+            discovery: crate::discovery::DiscoveryState::default(),
             paths,
             token,
             started_at_ms: SystemTime::now()
@@ -296,6 +300,7 @@ impl Server {
         crate::settings::spawn(Arc::clone(&self));
         crate::linear::spawn(Arc::clone(&self));
         crate::updates::spawn(Arc::clone(&self));
+        crate::discovery::spawn(Arc::clone(&self));
         self.spawn_terminal_changes();
         self.resume_setups();
         // launchd and systemd stop (and restart) the service with SIGTERM; nothing may die.
@@ -649,6 +654,8 @@ impl Server {
                     account: Option<String>,
                     /// Claude Code's Remote Control; default `agents.remote_control`.
                     remote_control: Option<bool>,
+                    /// Permission mode to start in; default follows `bypass_permissions`.
+                    mode: Option<String>,
                 }
                 let p: P = params(params_value)?;
                 let cwd = match p.cwd {
@@ -665,6 +672,16 @@ impl Server {
                 let provider = p
                     .provider
                     .unwrap_or_else(|| next_action::default_provider(&settings));
+                if let Some(mode) = &p.mode
+                    && !crate::agent::provider_modes(&provider)
+                        .iter()
+                        .any(|(id, _, _)| id == mode)
+                {
+                    return Err(rpc(
+                        "invalid_params",
+                        format!("{provider} has no mode {mode}"),
+                    ));
+                }
                 let command = p
                     .command
                     .or_else(|| next_action::configured_command(&settings, &provider));
@@ -682,6 +699,7 @@ impl Server {
                     remote_control: p
                         .remote_control
                         .unwrap_or_else(|| next_action::remote_control_default(&settings)),
+                    permission_mode: p.mode,
                 };
                 self.apply_account(&mut options, p.account.as_deref())?;
                 let thread = self
@@ -771,6 +789,58 @@ impl Server {
                     agents.push(info);
                 }
                 Ok(json!({ "enabled": p.enabled, "agents": agents }))
+            }
+            "agent.models" => {
+                let thread = self.agent(params_value)?;
+                let models: Vec<Value> = thread
+                    .models()
+                    .into_iter()
+                    .map(|(id, name)| json!({ "id": id, "name": name }))
+                    .collect();
+                Ok(json!({
+                    "provider": thread.options().provider,
+                    "current": thread.current_model(),
+                    "models": models,
+                }))
+            }
+            "agent.modes" => {
+                let thread = self.agent(params_value)?;
+                let modes: Vec<Value> = crate::agent::provider_modes(&thread.options().provider)
+                    .iter()
+                    .map(|(id, name, description)| {
+                        json!({ "id": id, "name": name, "description": description })
+                    })
+                    .collect();
+                Ok(json!({
+                    "provider": thread.options().provider,
+                    "current": thread.current_mode(),
+                    "modes": modes,
+                }))
+            }
+            "agent.commands" => {
+                let thread = self.agent(params_value)?;
+                Ok(json!({
+                    "provider": thread.options().provider,
+                    "commands": thread.commands(),
+                }))
+            }
+            "agent.set_model" | "agent.set_mode" => {
+                #[derive(Deserialize)]
+                struct P {
+                    model: Option<String>,
+                    mode: Option<String>,
+                }
+                let thread = self.agent(params_value.clone())?;
+                let p: P = params(params_value)?;
+                let set = if method == "agent.set_model" {
+                    let model = p.model.ok_or_else(|| rpc("invalid_params", "no model"))?;
+                    thread.set_model(&model).await
+                } else {
+                    let mode = p.mode.ok_or_else(|| rpc("invalid_params", "no mode"))?;
+                    thread.set_mode(&mode).await
+                };
+                set.map_err(|e| rpc("set_failed", format!("{e:#}")))?;
+                to_value(thread.info())
             }
             "agent.interrupt" => {
                 let thread = self.agent(params_value)?;
@@ -1332,11 +1402,15 @@ impl Server {
             other if other.starts_with("account.") => {
                 self.accounts_dispatch(other, params_value).await
             }
-            other if other.starts_with("pr.") => self.github_dispatch(other, params_value).await,
+            other if other.starts_with("pr.") || other == "github.asset" => {
+                self.github_dispatch(other, params_value).await
+            }
             other if other.starts_with("review.") => {
                 self.review_dispatch(other, params_value).await
             }
-            other if other.starts_with("issue.") => self.linear_dispatch(other, params_value).await,
+            other if other.starts_with("issue.") || other.starts_with("linear.") => {
+                self.linear_dispatch(other, params_value).await
+            }
             other if other.starts_with("ports.") => self.ports_dispatch(other, params_value).await,
             other if other.starts_with("attachment.") || other.starts_with("attach.") => {
                 self.attachments_dispatch(other, params_value).await

@@ -76,6 +76,36 @@ struct Repository {
     permissions: Option<Permissions>,
 }
 
+/// The largest attachment the server fetches for a preview.
+pub const MAX_ASSET_BYTES: usize = MAX_VIDEO_BYTES;
+
+/// Whether `url` is media GitHub hosts for comments, which may be fetched with the user's login.
+pub fn is_github_asset_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.contains(|character: char| character.is_whitespace() || character == '@') {
+        return false;
+    }
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    match host {
+        "github.com" => {
+            path.starts_with("user-attachments/assets/")
+                || path.starts_with("user-attachments/files/")
+        }
+        "private-user-images.githubusercontent.com" | "user-images.githubusercontent.com" => {
+            !path.is_empty()
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asset {
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Deserialize)]
 struct Uploaded {
     #[serde(default)]
@@ -83,6 +113,38 @@ struct Uploaded {
 }
 
 impl<G: Gh> GitHub<G> {
+    // Why through gh: it signs github.com requests with the user's login and follows GitHub's redirect to
+    // the short-lived signed file URL, so a private repository's media loads and no token reaches the app.
+    pub async fn fetch_asset(&self, url: &str) -> Result<Asset> {
+        if !is_github_asset_url(url) {
+            return Err(GitHubError::Invalid(
+                "Only media GitHub hosts for comments can be fetched.".to_owned(),
+            ));
+        }
+        let response = self
+            .send(GhRequest::get(url).header("Accept", "*/*"))
+            .await?;
+        if !response.is_success() {
+            return Err(http_error(&response));
+        }
+        if response.body.len() > MAX_ASSET_BYTES {
+            return Err(GitHubError::Invalid(format!(
+                "The attachment is larger than {} MB.",
+                MAX_ASSET_BYTES / (1024 * 1024)
+            )));
+        }
+        let content_type = response
+            .header("content-type")
+            .and_then(|value| value.split(';').next())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "application/octet-stream".to_owned());
+        Ok(Asset {
+            content_type,
+            bytes: response.body,
+        })
+    }
+
     // Why gh api with an absolute uploads URL: gh attaches its own token for *.github.com hosts, so we never handle it.
     pub async fn upload_attachment(
         &self,

@@ -15,8 +15,7 @@ use editor::display_map::{
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    PathPromptOptions, Render, SharedString, Subscription, Task, WeakEntity, Window, actions, img,
-    px,
+    PathPromptOptions, Render, SharedString, Subscription, Task, WeakEntity, Window, actions, px,
 };
 use gpui_tokio::Tokio;
 use icarus_client::Client;
@@ -50,6 +49,7 @@ actions!(
 
 const THREAD_REFRESH_INTERVAL: Duration = Duration::from_secs(45);
 const SUMMARY_SAVE_DELAY: Duration = Duration::from_millis(600);
+const REVIEWER_SLOT: gpui::Pixels = gpui::px(20.);
 /// GitHub's body cap is 65,536 characters; stay clear of it.
 const MAX_BODY_CHARS: usize = 65_000;
 
@@ -147,6 +147,7 @@ pub struct ThreadComment {
     pub is_bot: bool,
     pub body: String,
     pub url: Option<String>,
+    pub created_at: Option<String>,
     pub reactions: Vec<ReactionSummary>,
     pub viewer_can_update: bool,
     pub viewer_can_delete: bool,
@@ -410,12 +411,14 @@ pub fn markdown_images(body: &str) -> Vec<String> {
 
 /// Text lines a body takes at roughly 90 characters a line, plus room for image previews.
 fn body_lines(body: &str) -> u32 {
-    let text: u32 = body
+    let (text, media) = crate::media::split_media(body);
+    let text: u32 = text
         .lines()
         .map(|line| (line.chars().count() as u32).div_ceil(90).max(1))
         .sum::<u32>()
         .max(1);
-    text + markdown_images(body).len() as u32 * 6
+    // A row of up to three thumbnails, each at most 180 px tall.
+    text + (media.len() as u32).div_ceil(3) * 10
 }
 
 /// Editor lines a thread card needs; a resolved thread starts as one collapsed row.
@@ -423,12 +426,14 @@ pub fn thread_height(thread: &ReviewThread, expanded: bool) -> u32 {
     if thread.is_resolved && !expanded {
         return 2;
     }
+    // Each comment: author row, body, and its reactions row; the first also has its time and line.
     let comments: u32 = thread
         .comments
         .iter()
-        .map(|comment| 1 + body_lines(&comment.body) + u32::from(!comment.reactions.is_empty()))
+        .map(|comment| 2 + body_lines(&comment.body))
         .sum();
-    3 + comments
+    let meta = u32::from(!thread.comments.is_empty());
+    3 + meta + comments
 }
 
 pub fn draft_height(draft: &ReviewDraft) -> u32 {
@@ -457,7 +462,7 @@ pub fn note_height(note: &WorkspaceNote, expanded: bool) -> u32 {
     3 + body_lines(&note.body) + replies
 }
 
-fn reaction_emoji(content: &str) -> &'static str {
+pub(crate) fn reaction_emoji(content: &str) -> &'static str {
     match content {
         "+1" => "👍",
         "-1" => "👎",
@@ -1152,41 +1157,52 @@ impl ReviewSection {
                     .min_w_0()
                     .child(Label::new(display).size(LabelSize::Small).truncate()),
             )
-            .when(row.can_rerequest, |row_el| {
-                row_el.child(
-                    IconButton::new(
-                        SharedString::from(format!("rerequest-{name}")),
-                        IconName::RotateCw,
+            // Fixed slots (remove, re-request, state) so the icons line up across rows; the state, which
+            // every row has, sits flush with the right edge.
+            .child(h_flex().w(REVIEWER_SLOT).flex_none().justify_center().when(
+                row.can_remove,
+                |slot| {
+                    slot.child(
+                        IconButton::new(
+                            SharedString::from(format!("remove-{remove_name}")),
+                            IconName::Close,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .disabled(self.busy.is_some())
+                        .tooltip(Tooltip::text(format!("Remove {remove_name}")))
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
+                                this.remove_reviewer(remove_name.clone(), window, cx)
+                            },
+                        )),
                     )
-                    .icon_size(IconSize::XSmall)
-                    .disabled(blocked || self.busy.is_some())
-                    .tooltip(Tooltip::text(rerequest_tooltip))
-                    .on_click(cx.listener(
-                        move |this, _: &ClickEvent, window, cx| {
-                            this.request_reviewers(vec![name.clone()], window, cx)
-                        },
-                    )),
-                )
-            })
-            .when(row.can_remove, |row_el| {
-                row_el.child(
-                    IconButton::new(
-                        SharedString::from(format!("remove-{remove_name}")),
-                        IconName::Close,
+                },
+            ))
+            .child(h_flex().w(REVIEWER_SLOT).flex_none().justify_center().when(
+                row.can_rerequest,
+                |slot| {
+                    slot.child(
+                        IconButton::new(
+                            SharedString::from(format!("rerequest-{name}")),
+                            IconName::RotateCw,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .disabled(blocked || self.busy.is_some())
+                        .tooltip(Tooltip::text(rerequest_tooltip))
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
+                                this.request_reviewers(vec![name.clone()], window, cx)
+                            },
+                        )),
                     )
-                    .icon_size(IconSize::XSmall)
-                    .disabled(self.busy.is_some())
-                    .tooltip(Tooltip::text(format!("Remove {remove_name}")))
-                    .on_click(cx.listener(
-                        move |this, _: &ClickEvent, window, cx| {
-                            this.remove_reviewer(remove_name.clone(), window, cx)
-                        },
-                    )),
-                )
-            })
+                },
+            ))
             .child(
-                div()
+                h_flex()
                     .id(SharedString::from(format!("state-{}", row.name)))
+                    .w(REVIEWER_SLOT)
+                    .flex_none()
+                    .justify_end()
                     .tooltip(Tooltip::text(state_label))
                     .child(if dot {
                         ui::Indicator::dot().color(color).into_any_element()
@@ -1223,12 +1239,15 @@ impl ReviewSection {
                     PopoverMenu::new("icarus-review-base")
                         .full_width(true)
                         .trigger(
-                            Button::new("icarus-review-base-trigger", current)
+                            Button::new("icarus-review-base-trigger", current.clone())
                                 .full_width()
+                                .truncate(true)
                                 .style(ButtonStyle::Outlined)
                                 .label_size(LabelSize::Small)
                                 .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                                .tooltip(Tooltip::text("What the diff compares against")),
+                                .tooltip(Tooltip::text(format!(
+                                    "The diff compares against: {current}"
+                                ))),
                         )
                         .menu(move |window, cx| {
                             let options = options.clone();
@@ -1323,15 +1342,7 @@ impl Render for ReviewSection {
             .gap_1p5()
             .on_action(cx.listener(|this, _: &RequestTypedReviewers, window, cx| {
                 this.request_typed(window, cx)
-            }))
-            .child(
-                h_flex().child(
-                    Label::new("REVIEW")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .weight(gpui::FontWeight::SEMIBOLD),
-                ),
-            );
+            }));
         for row in self.rows.clone() {
             section = section.child(self.render_reviewer(&row, cx));
         }
@@ -1413,6 +1424,13 @@ impl Render for ReviewSection {
                 )
                 .child(self.summary_editor.clone()),
         );
+        let (_, summary_media) = crate::media::split_media(&self.summary_editor.read(cx).text(cx));
+        section = section.children(crate::media::render_media_strip(
+            "icarus-review-summary",
+            &summary_media,
+            &summary_media,
+            cx,
+        ));
         let drafts = view.drafts.len();
         let mut buttons = h_flex().gap_1().justify_end().flex_wrap();
         if drafts > 0 {
@@ -1572,7 +1590,12 @@ pub struct DiffReview {
     drafts: Vec<ReviewDraft>,
     notes: Vec<WorkspaceNote>,
     expanded: HashSet<String>,
-    composer: Option<(Entity<CommentComposer>, CustomBlockId)>,
+    /// The open comment box and its own block; a reply has none, it sits inside its thread's card.
+    composer: Option<(Entity<CommentComposer>, Option<CustomBlockId>)>,
+    /// The card holding an inline reply box: its block and its height without the box.
+    composer_host: Option<(CustomBlockId, u32)>,
+    /// The thread or note whose card holds the open reply box.
+    inline_reply: Option<String>,
     blocks: Vec<CustomBlockId>,
     /// The last action's failure, kept across the reload that follows it.
     error: Option<String>,
@@ -1630,6 +1653,8 @@ impl DiffReview {
             notes: Vec::new(),
             expanded: HashSet::default(),
             composer: None,
+            composer_host: None,
+            inline_reply: None,
             blocks: Vec::new(),
             error: None,
             load_error: None,
@@ -1827,6 +1852,12 @@ impl DiffReview {
         let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
         let mut markers = HashMap::default();
         let mut highlights: [Vec<std::ops::Range<editor::Anchor>>; 3] = Default::default();
+        let reply_host = self.inline_reply_host().map(str::to_owned);
+        let reply_height = self
+            .composer
+            .as_ref()
+            .map_or(0, |(composer, _)| composer.read(cx).height(cx));
+        let mut host_index = None;
         for (line, _, height, card) in cards {
             let Some(anchor) = self.anchor_for_line(line, cx) else {
                 continue;
@@ -1844,6 +1875,16 @@ impl DiffReview {
                     kinds.sort_by_key(|(kind, _)| *kind as u8);
                 }
                 highlights[slot].push(anchor..anchor);
+            }
+            let hosts_reply = reply_host.as_deref().is_some_and(|host| match &card {
+                AnyCard::Thread(thread, _) => thread.id == host,
+                AnyCard::Note(note, _) => note.id == host,
+                AnyCard::Draft(_) => false,
+            });
+            let mut height = height;
+            if hosts_reply {
+                host_index = Some((blocks.len(), height));
+                height += reply_height;
             }
             let card = cx.new(|_| ReviewCard {
                 card,
@@ -1867,8 +1908,23 @@ impl DiffReview {
             editor.highlight_gutter::<NoteGutter>(notes, |cx| cx.theme().status().created, cx);
             editor.insert_blocks(blocks, None, cx)
         });
+        self.composer_host =
+            host_index.and_then(|(index, base)| ids.get(index).map(|id| (*id, base)));
         self.blocks = ids;
         cx.notify();
+    }
+
+    /// The thread or note whose card holds the open reply box.
+    fn inline_reply_host(&self) -> Option<&str> {
+        self.composer.as_ref()?;
+        self.inline_reply.as_deref()
+    }
+
+    /// The reply box to draw at the bottom of the card for `id`, if it has one open.
+    pub fn inline_composer_for(&self, id: &str) -> Option<Entity<CommentComposer>> {
+        (self.inline_reply_host() == Some(id))
+            .then(|| self.composer.as_ref().map(|(composer, _)| composer.clone()))
+            .flatten()
     }
 
     pub fn is_expanded(&self, id: &str) -> bool {
@@ -2037,12 +2093,47 @@ impl DiffReview {
                 .find(|thread| thread.comments.iter().any(|c| &c.id == comment))
                 .and_then(|thread| thread.placement.line),
         };
-        let Some(anchor) = self.anchor_for_line(line, cx) else {
-            return;
+        let inline = match &target {
+            ComposerTarget::Reply { thread } => self
+                .threads
+                .iter()
+                .find(|candidate| &candidate.id == thread)
+                .map(|thread| {
+                    let author = thread.comments.first().and_then(|c| c.author.clone());
+                    (thread.id.clone(), author)
+                }),
+            ComposerTarget::NoteReply { note } => self
+                .notes
+                .iter()
+                .any(|candidate| &candidate.id == note)
+                .then(|| (note.clone(), None)),
+            _ => None,
         };
         let review = cx.entity().downgrade();
         let people = self.mention_source(cx);
         let notes_only = self.notes_only;
+        if let Some((host, author)) = inline {
+            let composer = cx.new(|cx| {
+                CommentComposer::new(target, text, review, people, notes_only, window, cx)
+            });
+            if let Some(author) = author {
+                composer.update(cx, |composer, cx| {
+                    composer.editor.update(cx, |editor, cx| {
+                        editor.set_placeholder_text(&format!("Reply to {author}"), window, cx)
+                    })
+                });
+            }
+            self.composer = Some((composer.clone(), None));
+            self.inline_reply = Some(host.clone());
+            self.expanded.insert(host);
+            self.rebuild_blocks(cx);
+            let focus = composer.read(cx).editor.focus_handle(cx);
+            window.focus(&focus, cx);
+            return;
+        }
+        let Some(anchor) = self.anchor_for_line(line, cx) else {
+            return;
+        };
         let composer =
             cx.new(|cx| CommentComposer::new(target, text, review, people, notes_only, window, cx));
         let height = composer.read(cx).height(cx);
@@ -2061,7 +2152,7 @@ impl DiffReview {
             )
         });
         if let Some(id) = ids.first() {
-            self.composer = Some((composer.clone(), *id));
+            self.composer = Some((composer.clone(), Some(*id)));
         }
         let focus = composer.read(cx).editor.focus_handle(cx);
         window.focus(&focus, cx);
@@ -2070,20 +2161,32 @@ impl DiffReview {
 
     /// The composer passes its own height: it is mid-update when its text changes.
     fn resize_composer(&mut self, height: u32, cx: &mut Context<Self>) {
-        let (Some((_, id)), Some(editor)) = (&self.composer, self.editor.upgrade()) else {
+        let (Some((_, block)), Some(editor)) = (&self.composer, self.editor.upgrade()) else {
             return;
         };
-        let id = *id;
+        let (id, height) = match (block, self.composer_host) {
+            (Some(id), _) => (*id, height),
+            (None, Some((host, base))) => (host, base + height),
+            (None, None) => return,
+        };
         editor.update(cx, |editor, cx| {
             editor.resize_blocks(HashMap::from_iter([(id, height)]), None, cx)
         });
     }
 
     pub fn close_composer(&mut self, cx: &mut Context<Self>) {
-        if let (Some((_, id)), Some(editor)) = (self.composer.take(), self.editor.upgrade()) {
-            editor.update(cx, |editor, cx| {
-                editor.remove_blocks(HashSet::from_iter([id]), None, cx)
-            });
+        match (self.composer.take(), self.editor.upgrade()) {
+            (Some((_, Some(id))), Some(editor)) => {
+                editor.update(cx, |editor, cx| {
+                    editor.remove_blocks(HashSet::from_iter([id]), None, cx)
+                });
+            }
+            (Some((_, None)), _) => {
+                self.inline_reply = None;
+                self.composer_host = None;
+                self.rebuild_blocks(cx);
+            }
+            _ => {}
         }
         cx.notify();
     }
@@ -2167,6 +2270,7 @@ impl DiffReview {
                 json!({ "workspace": workspace, "thread": thread, "body": body }),
             ),
         };
+        let new_note = method == "note.add";
         let Some(call) = self.call(method, params, cx) else {
             return;
         };
@@ -2178,9 +2282,13 @@ impl DiffReview {
         cx.spawn_in(window, async move |this, cx| {
             let result = call.await;
             this.update_in(cx, |this, _window, cx| match result {
-                Ok(_) => {
+                Ok(added) => {
                     this.close_composer(cx);
-                    this.reload(cx);
+                    // A new note goes into the agent's composer at once, so the prompt can follow.
+                    match added["id"].as_str().filter(|_| new_note) {
+                        Some(note) => this.add_note_to_agent(note, cx),
+                        None => this.reload(cx),
+                    }
                 }
                 Err(error) => composer.update(cx, |composer, cx| {
                     composer.busy = false;
@@ -2447,18 +2555,23 @@ fn card_frame(cx: &App) -> Div {
         .bg(cx.theme().colors().editor_background)
 }
 
-fn render_body(body: &str) -> impl IntoElement {
-    let images = markdown_images(body);
+/// A comment's text, then its images and videos; `gallery` is what the viewer steps through, by
+/// default the comment's own media.
+fn render_body(
+    id: &str,
+    body: &str,
+    gallery: Option<&[crate::media::MediaRef]>,
+    cx: &mut App,
+) -> AnyElement {
+    let (text, media) = crate::media::split_media(body);
+    let gallery = gallery.unwrap_or(&media).to_vec();
     v_flex()
         .gap_1()
-        .child(Label::new(body.to_owned()).size(LabelSize::Small))
-        .children(images.into_iter().map(|url| {
-            img(url)
-                .max_h(px(96.))
-                .max_w(px(320.))
-                .rounded_sm()
-                .into_any_element()
-        }))
+        .when(!text.is_empty(), |column| {
+            column.child(Label::new(text).size(LabelSize::Small))
+        })
+        .children(crate::media::render_media_strip(id, &media, &gallery, cx))
+        .into_any_element()
 }
 
 /// One inline card: a PR thread or a queued draft.
@@ -2504,18 +2617,37 @@ impl ReviewCard {
                 .into_any_element();
         }
         let mut card = card_frame(cx);
-        if !thread.placement.label.is_empty() {
+        if thread.placement.outdated && !thread.placement.label.is_empty() {
             card = card.child(
                 Label::new(thread.placement.label.clone())
                     .size(LabelSize::XSmall)
-                    .color(if thread.placement.outdated {
-                        Color::Warning
-                    } else {
-                        Color::Muted
-                    }),
+                    .color(Color::Warning),
             );
         }
-        for comment in &thread.comments {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let gallery: Vec<crate::media::MediaRef> = thread
+            .comments
+            .iter()
+            .flat_map(|comment| crate::media::split_media(&comment.body).1)
+            .collect();
+        for (index, comment) in thread.comments.iter().enumerate() {
+            let first = index == 0;
+            let time = comment
+                .created_at
+                .as_deref()
+                .and_then(crate::github_panel::parse_timestamp)
+                .map(|created| crate::github_panel::format_relative(now - created));
+            let meta = if first {
+                let line = thread
+                    .placement
+                    .line
+                    .filter(|_| !thread.placement.outdated && !thread.placement.file)
+                    .map(|line| format!("L{line}"));
+                let parts: Vec<String> = time.clone().into_iter().chain(line).collect();
+                (!parts.is_empty()).then(|| parts.join(" · "))
+            } else {
+                None
+            };
             let author = comment.author.clone().unwrap_or_else(|| "ghost".into());
             let comment_id = comment.id.clone();
             let reactions = comment.reactions.clone();
@@ -2528,6 +2660,12 @@ impl ReviewCard {
             card = card.child(
                 v_flex()
                     .gap_0p5()
+                    .when(!first, |column| {
+                        column
+                            .pt_1()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                    })
                     .child(
                         h_flex()
                             .gap_1()
@@ -2539,7 +2677,7 @@ impl ReviewCard {
                                 cx,
                             ))
                             .child(
-                                Label::new(format!("@{author}"))
+                                Label::new(author.clone())
                                     .size(LabelSize::Small)
                                     .weight(gpui::FontWeight::SEMIBOLD),
                             )
@@ -2549,6 +2687,15 @@ impl ReviewCard {
                                         .size(LabelSize::XSmall)
                                         .color(Color::Muted),
                                 )
+                            })
+                            .when(!first, |row| {
+                                row.when_some(time.clone(), |row, time| {
+                                    row.child(
+                                        Label::new(format!("· {time}"))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                })
                             })
                             .child(div().flex_1())
                             .when(comment.viewer_can_update, |row| {
@@ -2595,12 +2742,23 @@ impl ReviewCard {
                                         },
                                     ),
                                 )
-                            })
-                            .child(reaction_menu(comment_id.clone(), reactions, react_review)),
+                            }),
                     )
-                    .child(render_body(&comment.body))
-                    .when(!comment.reactions.is_empty(), |column| {
-                        column.child(h_flex().gap_1().children(comment.reactions.iter().map(|r| {
+                    .when_some(meta, |column, meta| {
+                        column.child(
+                            div().pl(px(20.)).child(
+                                Label::new(meta).size(LabelSize::XSmall).color(Color::Muted),
+                            ),
+                        )
+                    })
+                    .child(render_body(
+                        &format!("comment-{}", comment.id),
+                        &comment.body,
+                        Some(&gallery),
+                        cx,
+                    ))
+                    .child({
+                        let pills = comment.reactions.iter().filter(|r| r.count > 0).map(|r| {
                             let review = pill_review.clone();
                             let (subject, content, reacted) =
                                 (comment_id.clone(), r.content.clone(), r.viewer_has_reacted);
@@ -2618,10 +2776,20 @@ impl ReviewCard {
                                     })
                                     .log_err();
                             })
-                        })))
+                        });
+                        h_flex().gap_1().children(pills).child(reaction_menu(
+                            comment_id.clone(),
+                            reactions,
+                            react_review,
+                        ))
                     }),
             );
         }
+        card = card.children(
+            self.review
+                .upgrade()
+                .and_then(|review| review.read(cx).inline_composer_for(&thread.id)),
+        );
         let resolve_review = self.review.clone();
         let reply_review = self.review.clone();
         let agent_review = self.review.clone();
@@ -2638,15 +2806,18 @@ impl ReviewCard {
             h_flex()
                 .gap_1()
                 .child(
-                    Button::new(SharedString::from(format!("agent-{id}")), "Add to agent")
-                        .style(ButtonStyle::Subtle)
-                        .label_size(LabelSize::Small)
-                        .start_icon(Icon::new(IconName::ZedAgent).size(IconSize::XSmall))
-                        .on_click(move |_, _, cx| {
-                            agent_review
-                                .update(cx, |review, cx| review.add_to_agent(&agent_id, cx))
-                                .log_err();
-                        }),
+                    Button::new(
+                        SharedString::from(format!("agent-{id}")),
+                        "Send to an agent",
+                    )
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
+                    .on_click(move |_, _, cx| {
+                        agent_review
+                            .update(cx, |review, cx| review.add_to_agent(&agent_id, cx))
+                            .log_err();
+                    }),
                 )
                 .when(thread.viewer_can_reply, |row| {
                     row.child(
@@ -2773,7 +2944,12 @@ impl ReviewCard {
                         }),
                     ),
             )
-            .child(render_body(&draft.body))
+            .child(render_body(
+                &format!("draft-{}", draft.id),
+                &draft.body,
+                None,
+                cx,
+            ))
             .into_any_element()
     }
 }
@@ -2888,10 +3064,20 @@ impl ReviewCard {
                     }),
                 ),
         );
-        card = card.child(render_body(&note.body));
+        card = card.child(render_body(
+            &format!("note-{}", note.id),
+            &note.body,
+            None,
+            cx,
+        ));
         for reply in &note.replies {
-            card = card.child(self.render_note_reply(&note.id, reply));
+            card = card.child(self.render_note_reply(&note.id, reply, cx));
         }
+        card = card.children(
+            self.review
+                .upgrade()
+                .and_then(|review| review.read(cx).inline_composer_for(&note.id)),
+        );
         let (reply_review, agent_review, resolve_review, collapse_review) = (
             self.review.clone(),
             self.review.clone(),
@@ -2974,7 +3160,7 @@ impl ReviewCard {
         .into_any_element()
     }
 
-    fn render_note_reply(&self, note: &str, reply: &NoteReply) -> AnyElement {
+    fn render_note_reply(&self, note: &str, reply: &NoteReply, cx: &mut App) -> AnyElement {
         let author = match reply.author.as_str() {
             "user" => "You",
             "reply-agent" => "Answer",
@@ -3088,7 +3274,12 @@ impl ReviewCard {
                     ),
             );
         } else {
-            column = column.child(render_body(&reply.body));
+            column = column.child(render_body(
+                &format!("note-reply-{}", reply.id),
+                &reply.body,
+                None,
+                cx,
+            ));
         }
         if !reply.changed_files.is_empty() {
             let review = self.review.clone();
@@ -3169,8 +3360,9 @@ impl CommentComposer {
             ComposerTarget::NoteReply { .. } => "Ask about this note; a separate agent answers…",
             ComposerTarget::EditNote { .. } => "Edit note",
         };
+        let min_lines = if is_reply(&target) { 1 } else { 3 };
         let editor = cx.new(|cx| {
-            let mut editor = Editor::auto_height(3, 14, window, cx);
+            let mut editor = Editor::auto_height(min_lines, 14, window, cx);
             editor.set_placeholder_text(placeholder, window, cx);
             editor.set_soft_wrap();
             enable_completions(&mut editor, people, false, cx);
@@ -3192,7 +3384,12 @@ impl CommentComposer {
             target,
             editor,
             review,
-            destination: if notes_only {
+            destination: if notes_only
+                || crate::client_settings::get(
+                    Some(crate::client_settings::COMMENT_DESTINATION),
+                    cx,
+                ) == "agent"
+            {
                 Destination::Agent
             } else {
                 Destination::Review
@@ -3252,16 +3449,120 @@ impl CommentComposer {
         self.error.clone()
     }
 
+    pub fn destination(&self) -> Destination {
+        self.destination
+    }
+
+    /// Switches the box's tab, which later boxes open on too.
     pub fn set_destination(&mut self, destination: Destination, cx: &mut Context<Self>) {
         self.destination = destination;
+        let remembered = match destination {
+            Destination::Agent => Some("agent"),
+            Destination::Review => Some("review"),
+            Destination::Now => None,
+        };
+        if let Some(remembered) = remembered.filter(|_| !self.notes_only) {
+            crate::client_settings::set(
+                crate::client_settings::COMMENT_DESTINATION,
+                Some(serde_json::json!(remembered)),
+                cx,
+            )
+            .log_err();
+        }
         cx.notify();
     }
 
     fn height(&self, cx: &App) -> u32 {
         let text = self.editor.read(cx).text(cx);
+        let media = (crate::media::split_media(&text).1.len() as u32).div_ceil(3) * 10;
+        let error = u32::from(self.error.is_some());
+        if is_reply(&self.target) {
+            let lines = (text.lines().count() as u32).clamp(1, 14);
+            return 3 + lines + media + error;
+        }
         let lines = (text.lines().count() as u32).clamp(3, 14);
-        let images = markdown_images(&text).len() as u32;
-        4 + lines + images * 5 + u32::from(self.error.is_some())
+        4 + lines + media + error
+    }
+
+    /// A reply's box: one growing line inside the thread's card, with Cancel and Reply under it.
+    fn render_reply(&self, cx: &mut Context<Self>) -> AnyElement {
+        let empty = self.editor.read(cx).text(cx).trim().is_empty();
+        let (_, media) = crate::media::split_media(&self.editor.read(cx).text(cx));
+        let media_strip =
+            crate::media::render_media_strip("review-reply-media", &media, &media, cx);
+        let colors = cx.theme().colors();
+        let drop_bg = colors.drop_target_background;
+        v_flex()
+            .key_context("IcarusReply")
+            .on_action(
+                cx.listener(|this, _: &SubmitReviewComment, window, cx| this.submit(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &CancelReviewComment, window, cx| this.cancel(window, cx)),
+            )
+            .capture_action(
+                cx.listener(|this, _: &editor::actions::Paste, window, cx| this.paste(window, cx)),
+            )
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    let sources = paths
+                        .paths()
+                        .iter()
+                        .cloned()
+                        .map(UploadSource::Path)
+                        .collect();
+                    this.upload(sources, window, cx);
+                }),
+            )
+            .mt_1()
+            .p_1p5()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .child(self.editor.clone())
+            .children(media_strip)
+            .when_some(self.error.clone(), |column, error| {
+                column.child(
+                    Label::new(error)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        IconButton::new("review-reply-media", IconName::Image)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Attach an image or video"))
+                            .disabled(self.busy)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.pick_media(window, cx)),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("review-reply-cancel", "Cancel")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
+                    )
+                    .child(
+                        Button::new(
+                            "review-reply-send",
+                            if self.busy { "Posting…" } else { "Reply" },
+                        )
+                        .style(ButtonStyle::Filled)
+                        .label_size(LabelSize::Small)
+                        .disabled(self.busy || empty)
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                    ),
+            )
+            .into_any_element()
     }
 
     // Both deferred: the review updates this composer while sending, which would double-lease it.
@@ -3315,8 +3616,18 @@ impl Focusable for CommentComposer {
     }
 }
 
+fn is_reply(target: &ComposerTarget) -> bool {
+    matches!(
+        target,
+        ComposerTarget::Reply { .. } | ComposerTarget::NoteReply { .. }
+    )
+}
+
 impl Render for CommentComposer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if is_reply(&self.target) {
+            return self.render_reply(cx);
+        }
         let header = match &self.target {
             ComposerTarget::Lines { start, end } => lines_label(*start, *end).to_uppercase(),
             ComposerTarget::EditDraft { .. } | ComposerTarget::EditPublished { .. } => {
@@ -3344,9 +3655,11 @@ impl Render for CommentComposer {
         let can_post_now =
             new_comment && !self.notes_only && self.destination != Destination::Agent;
         let empty = self.editor.read(cx).text(cx).trim().is_empty();
-        let images = markdown_images(&self.editor.read(cx).text(cx));
+        let (_, media) = crate::media::split_media(&self.editor.read(cx).text(cx));
+        let media_strip =
+            crate::media::render_media_strip("review-composer-media", &media, &media, cx);
         let drop_bg = cx.theme().colors().drop_target_background;
-        card_frame(cx)
+        let composer = card_frame(cx)
             .key_context("IcarusReviewComposer")
             .on_action(
                 cx.listener(|this, _: &SubmitReviewComment, window, cx| this.submit(window, cx)),
@@ -3415,13 +3728,7 @@ impl Render for CommentComposer {
                     .border_color(cx.theme().colors().border_variant)
                     .child(self.editor.clone()),
             )
-            .children(images.into_iter().map(|url| {
-                img(url)
-                    .max_h(px(72.))
-                    .max_w(px(240.))
-                    .rounded_sm()
-                    .into_any_element()
-            }))
+            .children(media_strip)
             .when_some(self.error.clone(), |column, error| {
                 column.child(
                     Label::new(error)
@@ -3470,7 +3777,8 @@ impl Render for CommentComposer {
                             .disabled(self.busy || empty)
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
-            )
+            );
+        composer.into_any_element()
     }
 }
 
@@ -3774,7 +4082,7 @@ pub(crate) mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(thread_height(&thread, false), 3 + 1 + 2);
+        assert_eq!(thread_height(&thread, false), 3 + 1 + 2 + 2);
         thread.is_resolved = true;
         assert_eq!(thread_height(&thread, false), 2);
         let draft = ReviewDraft {
@@ -3782,6 +4090,6 @@ pub(crate) mod tests {
             ..Default::default()
         };
         assert_eq!(markdown_images(&draft.body), ["https://x/y.png"]);
-        assert_eq!(draft_height(&draft), 3 + 1 + 6);
+        assert_eq!(draft_height(&draft), 3 + 1 + 10);
     }
 }

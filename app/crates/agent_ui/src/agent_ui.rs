@@ -885,9 +885,10 @@ fn maybe_backfill_editor_layout(fs: Arc<dyn Fs>, is_new_install: bool, cx: &mut 
     }
 }
 
-fn update_command_palette_filter(cx: &mut App) {
+pub(crate) fn update_command_palette_filter(cx: &mut App) {
     let disable_ai = DisableAiSettings::get_global(cx).disable_ai;
-    let agent_enabled = AgentSettings::get_global(cx).enabled;
+    let agent_tabs = cx.has_global::<agent_tab::AgentTabsEnabled>();
+    let agent_enabled = AgentSettings::get_global(cx).enabled && !agent_tabs;
 
     let edit_prediction_provider = AllLanguageSettings::get_global(cx)
         .edit_predictions
@@ -966,10 +967,23 @@ fn update_command_palette_filter(cx: &mut App) {
         // Skills are surfaced through the settings UI now, so this command
         // should never appear in the palette.
         filter.hide_action_types(&manage_skills_action);
-        if !disable_ai {
+        if !disable_ai && !agent_tabs {
             filter.show_action_types(skill_creator_actions.iter());
         } else {
             filter.hide_action_types(&skill_creator_actions);
+        }
+
+        if agent_tabs {
+            filter.hide_namespace("agents_sidebar");
+            filter.hide_namespace("inline_assistant");
+            filter.hide_action_types(&[
+                TypeId::of::<workspace::ToggleWorkspaceSidebar>(),
+                TypeId::of::<workspace::CloseWorkspaceSidebar>(),
+                TypeId::of::<workspace::FocusWorkspaceSidebar>(),
+                TypeId::of::<workspace::NextThread>(),
+                TypeId::of::<workspace::PreviousThread>(),
+                TypeId::of::<workspace::NewThread>(),
+            ]);
         }
     });
 }

@@ -185,6 +185,30 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_new_workspace_opens_its_sidebar_on_source_control(cx: &mut gpui::TestAppContext) {
+        let (workspace, mut cx) = crate::diff_tab::tests::git_workspace(cx).await;
+        let cx = &mut cx;
+        cx.update(|_, cx| crate::enable_for_tests(cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let source_control =
+                cx.new(|cx| crate::changes_tab::SourceControlPanel::new(workspace, window, cx));
+            workspace.add_panel(source_control, window, cx);
+            let explorer = cx.new(|cx| StandInExplorer {
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.add_panel(explorer, window, cx);
+            // Zed's Explorer opens itself on startup; Source Control still comes first.
+            workspace.open_panel::<StandInExplorer>(window, cx);
+            crate::open_source_control_first(workspace, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(active_panel(&workspace, cx), Some(SOURCE_CONTROL_PANEL));
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace.right_dock().read(cx).is_open()
+        }));
+    }
+
+    #[gpui::test]
     async fn the_sidebar_follows_the_active_tab_between_explorer_and_source_control(
         cx: &mut gpui::TestAppContext,
     ) {

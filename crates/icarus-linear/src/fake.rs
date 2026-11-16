@@ -90,7 +90,8 @@ impl Transport for FakeLinear {
 }
 
 /// Answers `Issues` queries from `<dir>/<IDENTIFIER>.json` issue nodes (Linear's GraphQL shape), re-read
-/// on every call; `SearchIssues` matches their identifier and title, `MyIssues` returns them all. A `<dir>/_status.json` of `{"status": 401}` (or 429, …) answers every request with that
+/// on every call; `SearchIssues` matches their identifier and title, `MyIssues` returns them all, `Viewer`
+/// answers `<dir>/_viewer.json` or "Fixture User". A `<dir>/_status.json` of `{"status": 401}` (or 429, …) answers every request with that
 /// status instead. Each request is appended to `<dir>/requests.jsonl` without the key.
 pub struct FixtureLinear {
     dir: PathBuf,
@@ -171,10 +172,16 @@ impl Transport for FixtureLinear {
                     json!({ "data": { "issues": { "nodes": self.issue_nodes() } } }),
                 ));
             }
+            Some("Viewer") => {
+                let viewer = self
+                    .read("_viewer.json")
+                    .unwrap_or_else(|| json!({ "name": "Fixture User" }));
+                return Ok(LinearResponse::ok(json!({ "data": { "viewer": viewer } })));
+            }
             _ => {
                 return Ok(LinearResponse::json(
                     400,
-                    json!({ "errors": [{ "message": "the fixture answers Issues, SearchIssues and MyIssues" }] }),
+                    json!({ "errors": [{ "message": "the fixture answers Issues, SearchIssues, MyIssues and Viewer" }] }),
                 ));
             }
         }

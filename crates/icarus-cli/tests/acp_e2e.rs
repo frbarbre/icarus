@@ -95,6 +95,29 @@ impl Editor {
             notifications.push(message);
         }
     }
+
+    /// Waits for the next `session/update` of this kind.
+    fn update(&mut self, kind: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = self
+                .lines
+                .recv_timeout(remaining)
+                .unwrap_or_else(|_| panic!("no {kind} update"));
+            if message["params"]["update"]["sessionUpdate"] == kind {
+                return message["params"]["update"].clone();
+            }
+        }
+    }
+}
+
+fn reply_text(updates: &[Value]) -> String {
+    updates
+        .iter()
+        .filter(|u| u["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|u| u["params"]["update"]["content"]["text"].as_str())
+        .collect()
 }
 
 #[test]
@@ -235,4 +258,153 @@ fn each_new_editor_tab_gets_its_own_warm_agent() {
             "both reuse warm agents: {session}"
         );
     }
+}
+
+#[test]
+fn the_editor_gets_the_agents_commands_modes_and_models() {
+    let home = tempfile::tempdir().expect("home");
+    let work = tempfile::tempdir().expect("work");
+    let _server = start_server(home.path());
+    let fake = sibling("icarus-fake-agent");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let (client, _events) = runtime.block_on(async {
+        icarus_client::Client::connect(home.path(), "test")
+            .await
+            .expect("connect")
+    });
+    let agent_id = runtime.block_on(async {
+        let agent = client
+            .request(
+                "agent.create",
+                json!({ "cwd": work.path(), "command": [fake], "provider": "claude" }),
+            )
+            .await
+            .expect("create fake agent");
+        let id = agent["id"].as_str().expect("id").to_string();
+        // Claude Code answers `initialize` once it is up; the editor should see that answer.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client
+            .request("agent.commands", json!({ "id": id }))
+            .await
+            .expect("commands")["commands"]
+            == json!([])
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the agent never listed its commands"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        id
+    });
+
+    let mut editor = Editor::start(home.path());
+    editor.call(
+        "initialize",
+        json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+    );
+    let (new, _) = editor.call(
+        "session/new",
+        json!({ "cwd": work.path(), "mcpServers": [] }),
+    );
+    assert_eq!(new["sessionId"], agent_id.as_str());
+    let options = new["configOptions"].as_array().expect("config options");
+    let mode = options
+        .iter()
+        .find(|o| o["category"] == "mode")
+        .expect("mode picker");
+    assert_eq!(mode["currentValue"], "default", "{mode}");
+    assert!(
+        mode["options"]
+            .as_array()
+            .expect("modes")
+            .iter()
+            .any(|o| o["value"] == "plan"),
+        "{mode}"
+    );
+    let model = options
+        .iter()
+        .find(|o| o["category"] == "model")
+        .expect("model picker");
+    assert_eq!(model["currentValue"], "default");
+    assert!(
+        model["options"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .any(|o| o["value"] == "opus" && o["name"] == "Claude Opus"),
+        "{model}"
+    );
+    assert_eq!(new["modes"]["currentModeId"], "default");
+
+    let commands = editor.update("available_commands_update");
+    let names: Vec<&str> = commands["availableCommands"]
+        .as_array()
+        .expect("commands")
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(names, ["compact", "review", "remote-control"]);
+    assert_eq!(commands["availableCommands"][0]["input"]["hint"], "<focus>");
+
+    let (picked, _) = editor.call(
+        "session/set_config_option",
+        json!({ "sessionId": agent_id, "configId": "mode", "value": "plan" }),
+    );
+    assert_eq!(picked["configOptions"][0]["currentValue"], "plan");
+    let (picked, _) = editor.call(
+        "session/set_config_option",
+        json!({ "sessionId": agent_id, "configId": "model", "value": "sonnet" }),
+    );
+    assert_eq!(picked["configOptions"][1]["currentValue"], "sonnet");
+    editor.call(
+        "session/set_mode",
+        json!({ "sessionId": agent_id, "modeId": "acceptEdits" }),
+    );
+    let (_, updates) = editor.call(
+        "session/prompt",
+        json!({ "sessionId": agent_id, "prompt": [{ "type": "text", "text": "settings" }] }),
+    );
+    assert_eq!(reply_text(&updates), "echo: mode=acceptEdits model=sonnet");
+    let info = runtime
+        .block_on(client.request("agent.info", json!({ "id": agent_id })))
+        .expect("info");
+    assert_eq!(
+        info["mode"], "acceptEdits",
+        "the server keeps the editor's pick"
+    );
+    assert_eq!(info["model"], "sonnet");
+
+    let (result, updates) = editor.call(
+        "session/prompt",
+        json!({ "sessionId": agent_id, "prompt": [{ "type": "text", "text": "/compact keep the plan" }] }),
+    );
+    assert_eq!(result["stopReason"], "end_turn");
+    assert_eq!(
+        reply_text(&updates),
+        "echo: /compact keep the plan",
+        "slash commands reach the agent as typed"
+    );
+
+    let (result, updates) = editor.call(
+        "session/prompt",
+        json!({ "sessionId": agent_id, "prompt": [{ "type": "text", "text": "/remote-control on" }] }),
+    );
+    assert_eq!(result["stopReason"], "end_turn");
+    assert!(
+        reply_text(&updates).starts_with("Remote Control is on"),
+        "{updates:?}"
+    );
+    let info = runtime
+        .block_on(client.request("agent.info", json!({ "id": agent_id })))
+        .expect("info");
+    assert_eq!(info["remote_control"], true);
+    let (_, updates) = editor.call(
+        "session/prompt",
+        json!({ "sessionId": agent_id, "prompt": [{ "type": "text", "text": "args" }] }),
+    );
+    assert!(
+        reply_text(&updates).ends_with("--remote-control"),
+        "restarted with Remote Control: {updates:?}"
+    );
 }

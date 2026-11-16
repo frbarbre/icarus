@@ -13,7 +13,7 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::notifications::NotificationId;
-use workspace::{ModalView, OpenOptions, Toast, Workspace};
+use workspace::{ModalView, Toast, Workspace};
 
 use crate::routing::{self, ServerRef};
 use crate::{WorkspaceSummary, WorkspacesPanel};
@@ -709,6 +709,7 @@ pub struct NewWorkspaceModal {
     linked_issue: Option<IssueHit>,
     searching: bool,
     search_error: Option<String>,
+    linear_unconfigured: bool,
     loading: bool,
     creating: bool,
     error: Option<String>,
@@ -795,6 +796,7 @@ impl NewWorkspaceModal {
             linked_issue: None,
             searching: false,
             search_error: None,
+            linear_unconfigured: false,
             loading: true,
             creating: false,
             error: None,
@@ -847,10 +849,17 @@ impl NewWorkspaceModal {
             this.update(cx, |this, cx| {
                 this.searching = false;
                 match found {
-                    Ok(found) => this.issue_results = found,
+                    Ok(found) => {
+                        this.issue_results = found;
+                        this.linear_unconfigured = false;
+                    }
                     Err(error) => {
                         this.issue_results.clear();
-                        this.search_error = Some(error_text(&error));
+                        this.linear_unconfigured =
+                            error_code(&error).as_deref() == Some("not_configured");
+                        if !this.linear_unconfigured {
+                            this.search_error = Some(error_text(&error));
+                        }
                     }
                 }
                 cx.notify();
@@ -861,6 +870,18 @@ impl NewWorkspaceModal {
 
     pub fn issue_results(&self) -> &[IssueHit] {
         &self.issue_results
+    }
+
+    fn connect_linear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = self.workspace.clone();
+        cx.emit(DismissEvent);
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    crate::settings_view::open_linear_settings(workspace, window, cx)
+                })
+                .log_err();
+        });
     }
 
     pub fn linked_issue(&self) -> Option<&IssueHit> {
@@ -1512,6 +1533,25 @@ impl NewWorkspaceModal {
             .when_some(self.search_error.as_deref(), |column, error| {
                 column.child(render_error(error))
             })
+            .when(self.linear_unconfigured, |column| {
+                column.child(
+                    h_flex()
+                        .gap_2()
+                        .justify_between()
+                        .child(
+                            Label::new("Connect Linear to search your issues.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Button::new("icarus-connect-linear", "Connect Linear…")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.connect_linear(window, cx)
+                                })),
+                        ),
+                )
+            })
             .children(results)
     }
 
@@ -1602,7 +1642,7 @@ fn open_created_workspace(
     cx: &mut AsyncWindowContext,
 ) {
     let ServerRef::Saved(name) = server else {
-        open_workspace_path(workspace, path, cx);
+        cx.update(|_, cx| crate::show_workspace(path, cx)).log_err();
         return;
     };
     cx.update(|_, cx| {
@@ -1623,20 +1663,6 @@ fn open_created_workspace(
         crate::open_remote_workspace(name, ssh, path, panel.downgrade(), cx);
     })
     .log_err();
-}
-
-fn open_workspace_path(
-    workspace: &WeakEntity<Workspace>,
-    path: PathBuf,
-    cx: &mut AsyncWindowContext,
-) {
-    workspace
-        .update_in(cx, |workspace, window, cx| {
-            workspace
-                .open_paths(vec![path], OpenOptions::default(), None, window, cx)
-                .detach();
-        })
-        .log_err();
 }
 
 impl ModalView for NewWorkspaceModal {}
@@ -2716,8 +2742,12 @@ mod tests {
         cx.executor().advance_clock(ISSUE_SEARCH_DELAY);
         cx.run_until_parked();
         assert_eq!(
-            modal.read_with(cx, |modal, _| modal.search_error.clone()),
-            Some("Linear is not configured".into())
+            modal.read_with(cx, |modal, _| (
+                modal.search_error.clone(),
+                modal.linear_unconfigured
+            )),
+            (None, true),
+            "a missing key is a hint to connect Linear, not an error"
         );
         type_into(&issue, "XYZ-3", cx);
         assert_eq!(

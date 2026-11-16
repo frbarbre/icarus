@@ -224,6 +224,120 @@ pub fn event_to_updates(event: &Value, mode: Mode, tools: &mut ToolState) -> Vec
     }
 }
 
+const MODE_OPTION: &str = "mode";
+const MODEL_OPTION: &str = "model";
+/// Icarus's own command: Claude Code has no Remote Control in headless mode, so Icarus restarts it with it.
+const REMOTE_CONTROL_COMMAND: &str = "remote-control";
+
+fn provider_label(provider: &str) -> &str {
+    match provider {
+        "claude" => "Claude",
+        "codex" => "Codex",
+        "" => "Agent",
+        other => other,
+    }
+}
+
+/// `agent.modes` and `agent.models` as ACP session config options (mode and model categories),
+/// plus the older `modes` state for clients without config options.
+pub fn session_state(modes: &Value, models: &Value) -> Value {
+    let provider = provider_label(models["provider"].as_str().unwrap_or_default());
+    let current_mode = modes["current"].as_str().unwrap_or("default");
+    let mut mode_options: Vec<Value> = modes["modes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|mode| json!({ "value": mode["id"], "name": mode["name"], "description": mode["description"] }))
+        .collect();
+    if !mode_options
+        .iter()
+        .any(|option| option["value"] == current_mode)
+    {
+        mode_options.push(json!({ "value": current_mode, "name": current_mode }));
+    }
+    let current_model = models["current"].as_str().unwrap_or("default");
+    let mut model_options: Vec<Value> = models["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|model| {
+            json!({
+                "value": model["id"],
+                "name": format!("{provider} {}", model["name"].as_str().unwrap_or_default()),
+            })
+        })
+        .collect();
+    if !model_options
+        .iter()
+        .any(|option| option["value"] == current_model)
+    {
+        model_options
+            .push(json!({ "value": current_model, "name": format!("{provider} {current_model}") }));
+    }
+    json!({
+        "configOptions": [
+            { "id": MODE_OPTION, "name": "Mode", "category": "mode", "type": "select",
+              "currentValue": current_mode, "options": mode_options },
+            { "id": MODEL_OPTION, "name": "Model", "category": "model", "type": "select",
+              "currentValue": current_model, "options": model_options },
+        ],
+        "modes": {
+            "currentModeId": current_mode,
+            "availableModes": mode_options.iter().map(|option| json!({
+                "id": option["value"], "name": option["name"], "description": option["description"],
+            })).collect::<Vec<_>>(),
+        },
+    })
+}
+
+/// `agent.commands` as ACP available commands; Claude Code agents also get Icarus's `/remote-control`.
+pub fn available_commands(listed: &Value) -> Vec<Value> {
+    let mut commands: Vec<Value> = listed["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|command| {
+            let mut available = json!({
+                "name": command["name"],
+                "description": command["description"].as_str().unwrap_or_default(),
+            });
+            if let Some(hint) = command["hint"].as_str() {
+                available["input"] = json!({ "hint": hint });
+            }
+            available
+        })
+        .collect();
+    if listed["provider"] == "claude"
+        && !commands
+            .iter()
+            .any(|command| command["name"] == REMOTE_CONTROL_COMMAND)
+    {
+        commands.push(json!({
+            "name": REMOTE_CONTROL_COMMAND,
+            "description": "Follow this session on claude.ai or in the Claude app (restarts the agent on its session)",
+            "input": { "hint": "on | off" },
+        }));
+    }
+    commands
+}
+
+/// The `/remote-control` argument: `on`, `off`, or nothing to switch it.
+fn remote_control_request(text: &str) -> Option<Option<bool>> {
+    let rest = text
+        .trim()
+        .strip_prefix('/')?
+        .strip_prefix(REMOTE_CONTROL_COMMAND)?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    match rest.trim() {
+        "" => Some(None),
+        "on" => Some(Some(true)),
+        "off" => Some(Some(false)),
+        _ => None,
+    }
+}
+
 type Writer = mpsc::UnboundedSender<Value>;
 
 struct Bridge {
@@ -296,6 +410,116 @@ impl Bridge {
         Ok(id)
     }
 
+    /// The session's mode and model pickers; empty if the server can't say.
+    async fn session_state(&self, session_id: &str) -> Value {
+        let id = json!({ "id": session_id });
+        let (modes, models) = tokio::join!(
+            self.client.request("agent.modes", id.clone()),
+            self.client.request("agent.models", id),
+        );
+        match (modes, models) {
+            (Ok(modes), Ok(models)) => session_state(&modes, &models),
+            _ => json!({}),
+        }
+    }
+
+    async fn update_config_options(&self, session_id: &str) {
+        let state = self.session_state(session_id).await;
+        if let Some(options) = state.get("configOptions") {
+            self.notify(
+                session_id,
+                json!({ "sessionUpdate": "config_option_update", "configOptions": options }),
+            );
+        }
+    }
+
+    async fn advertise_commands(&self, session_id: &str) {
+        if let Ok(listed) = self
+            .client
+            .request("agent.commands", json!({ "id": session_id }))
+            .await
+        {
+            self.notify(
+                session_id,
+                json!({ "sessionUpdate": "available_commands_update", "availableCommands": available_commands(&listed) }),
+            );
+        }
+    }
+
+    /// Answers a session request, then tells the editor the session's commands, which it only
+    /// accepts for a session it knows.
+    async fn open_session(&self, id: Value, session_id: &str, mut result: Value) {
+        let state = self.session_state(session_id).await;
+        for (key, value) in state.as_object().into_iter().flatten() {
+            result[key] = value.clone();
+        }
+        self.respond(id, result);
+        self.advertise_commands(session_id).await;
+    }
+
+    /// Runs Icarus's `/remote-control` for a Claude Code agent; None if the agent handles the text.
+    async fn remote_control(&self, session_id: &str, text: &str) -> Result<Option<String>> {
+        let Some(wanted) = remote_control_request(text) else {
+            return Ok(None);
+        };
+        let listed = self
+            .client
+            .request("agent.commands", json!({ "id": session_id }))
+            .await?;
+        let handled_by_agent = listed["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|command| command["name"] == REMOTE_CONTROL_COMMAND);
+        if listed["provider"] != "claude" || handled_by_agent {
+            return Ok(None);
+        }
+        let info = self
+            .client
+            .request("agent.info", json!({ "id": session_id }))
+            .await?;
+        let enabled = wanted.unwrap_or(info["remote_control"] != json!(true));
+        if info["remote_control"] == json!(enabled) {
+            return Ok(Some(match (enabled, info["remote_control_url"].as_str()) {
+                (true, Some(url)) => format!("Remote Control is already on: {url}"),
+                (true, None) => "Remote Control is already on.".into(),
+                (false, _) => "Remote Control is already off.".into(),
+            }));
+        }
+        let switched = self
+            .client
+            .request(
+                "agent.remote_control",
+                json!({ "id": session_id, "enabled": enabled }),
+            )
+            .await?;
+        if !enabled {
+            return Ok(Some("Remote Control is off.".into()));
+        }
+        let restarted = switched["agents"][0]["restarted"] == json!(true);
+        let mut url = switched["agents"][0]["remote_control_url"]
+            .as_str()
+            .map(str::to_string);
+        // Claude Code registers the session a moment after it restarts.
+        for _ in 0..12 {
+            if url.is_some() || !restarted {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            url = self
+                .client
+                .request("agent.info", json!({ "id": session_id }))
+                .await?["remote_control_url"]
+                .as_str()
+                .map(str::to_string);
+        }
+        Ok(Some(match (url, restarted) {
+            (Some(url), _) => format!("Remote Control is on: {url}"),
+            (None, true) => "Remote Control is on. The claude.ai link shows in `icarus agent list` once Claude Code registers the session.".into(),
+            (None, false) => "Remote Control is on from the agent's next start.".into(),
+        }))
+    }
+
     async fn attach(&self, session_id: &str, replay: bool) -> Result<u64> {
         let since = if replay {
             0
@@ -344,6 +568,16 @@ impl Bridge {
             self.notify(&session_id, update);
         }
         let kind = agent_event["kind"].as_str().unwrap_or_default();
+        let reports_mode = agent_event["data"]["permission_mode"].is_string();
+        match kind {
+            "capabilities" => {
+                self.advertise_commands(&session_id).await;
+                self.update_config_options(&session_id).await;
+            }
+            "mode_changed" | "model_changed" => self.update_config_options(&session_id).await,
+            "status" | "session" if reports_mode => self.update_config_options(&session_id).await,
+            _ => {}
+        }
         if (kind == "turn_end" || kind == "exit")
             && let Some((id, cancelled)) = self.pending.lock().await.remove(&session_id)
         {
@@ -390,13 +624,34 @@ impl Bridge {
                     let cwd = PathBuf::from(params["cwd"].as_str().unwrap_or("."));
                     let session_id = self.new_session(cwd).await?;
                     self.attach(&session_id, false).await?;
-                    Ok(Some(json!({ "sessionId": session_id })))
+                    self.open_session(id.clone(), &session_id, json!({ "sessionId": session_id })).await;
+                    Ok(None)
                 }
                 "session/load" | "session/resume" => {
                     let session_id = params["sessionId"].as_str().unwrap_or_default().to_string();
                     self.claimed.lock().await.insert(session_id.clone());
                     self.attach(&session_id, method == "session/load").await?;
-                    Ok(Some(json!({})))
+                    self.open_session(id.clone(), &session_id, json!({})).await;
+                    Ok(None)
+                }
+                "session/set_config_option" | "session/set_mode" => {
+                    let session_id = params["sessionId"].as_str().unwrap_or_default().to_string();
+                    let (rpc, key, value) = match (method.as_str(), params["configId"].as_str()) {
+                        ("session/set_mode", _) => ("agent.set_mode", "mode", params["modeId"].as_str()),
+                        (_, Some(MODE_OPTION)) => ("agent.set_mode", "mode", params["value"].as_str()),
+                        (_, Some(MODEL_OPTION)) => ("agent.set_model", "model", params["value"].as_str()),
+                        _ => anyhow::bail!("unknown config option {}", params["configId"]),
+                    };
+                    let value = value.ok_or_else(|| anyhow::anyhow!("no {key} given"))?;
+                    self.client
+                        .request(rpc, json!({ "id": session_id, key: value }))
+                        .await?;
+                    if method == "session/set_config_option" {
+                        let state = self.session_state(&session_id).await;
+                        Ok(Some(json!({ "configOptions": state["configOptions"] })))
+                    } else {
+                        Ok(Some(json!({})))
+                    }
                 }
                 "session/list" => {
                     let agents = self.client.request("agent.list", json!({})).await?;
@@ -432,6 +687,15 @@ impl Bridge {
                             }
                             _ => {}
                         }
+                    }
+                    if let [only] = text.as_slice()
+                        && let Some(reply) = self.remote_control(&session_id, only).await?
+                    {
+                        self.notify(
+                            &session_id,
+                            json!({ "sessionUpdate": "agent_message_chunk", "content": text_block(&reply) }),
+                        );
+                        return Ok(Some(json!({ "stopReason": "end_turn" })));
                     }
                     self.pending.lock().await.insert(session_id.clone(), (id.clone(), false));
                     if let Err(error) = self
@@ -649,6 +913,61 @@ mod tests {
         assert_eq!(result[0]["content"][0]["newText"], "hi\n");
         assert_eq!(result[0]["content"][1]["type"], "content");
         parse(&result[0]);
+    }
+
+    #[test]
+    fn modes_models_and_commands_are_valid_acp() {
+        use agent_client_protocol_schema::v1::{
+            AvailableCommand, SessionConfigOption, SessionModeState,
+        };
+        let state = session_state(
+            &json!({ "current": "dontAsk", "modes": [{ "id": "plan", "name": "Plan", "description": "Plans" }] }),
+            &json!({ "provider": "claude", "current": "opus", "models": [{ "id": "opus", "name": "Opus" }] }),
+        );
+        let options: Vec<SessionConfigOption> =
+            serde_json::from_value(state["configOptions"].clone()).expect("config options");
+        assert_eq!(options.len(), 2);
+        assert_eq!(state["configOptions"][0]["category"], "mode");
+        assert_eq!(
+            state["configOptions"][0]["options"][1]["value"], "dontAsk",
+            "a mode the agent reported but Icarus doesn't list still shows"
+        );
+        assert_eq!(
+            state["configOptions"][1]["options"][0]["name"],
+            "Claude Opus"
+        );
+        let modes: SessionModeState =
+            serde_json::from_value(state["modes"].clone()).expect("modes");
+        assert_eq!(modes.available_modes.len(), 2);
+
+        let commands = available_commands(&json!({ "provider": "claude", "commands": [
+            { "name": "compact", "description": "Summarize", "hint": "<focus>" },
+        ] }));
+        let parsed: Vec<AvailableCommand> =
+            serde_json::from_value(json!(commands)).expect("commands");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(commands[0]["input"]["hint"], "<focus>");
+        assert_eq!(commands[1]["name"], REMOTE_CONTROL_COMMAND);
+        assert!(available_commands(&json!({ "provider": "codex", "commands": [] })).is_empty());
+    }
+
+    #[test]
+    fn remote_control_takes_on_off_or_nothing() {
+        assert_eq!(remote_control_request("/remote-control"), Some(None));
+        assert_eq!(
+            remote_control_request(" /remote-control on "),
+            Some(Some(true))
+        );
+        assert_eq!(
+            remote_control_request("/remote-control off"),
+            Some(Some(false))
+        );
+        assert_eq!(remote_control_request("/remote-controls"), None);
+        assert_eq!(remote_control_request("/remote-control maybe"), None);
+        assert_eq!(
+            remote_control_request("tell me about /remote-control"),
+            None
+        );
     }
 
     #[test]

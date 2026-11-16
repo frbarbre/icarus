@@ -990,6 +990,7 @@ impl Server {
             .into(),
             account: None,
             remote_control: false,
+            permission_mode: None,
         };
         if let Err(error) = self.apply_account(&mut options, None) {
             return failed(error.message);
@@ -1163,6 +1164,7 @@ mod tests {
                 pinned: false,
                 manual_order: None,
                 activity_at_ms: None,
+                discovery: Default::default(),
             })
             .expect("workspace");
         store
@@ -1355,6 +1357,7 @@ mod tests {
             pinned: false,
             manual_order: None,
             activity_at_ms: None,
+            discovery: Default::default(),
         };
         assert_eq!(
             relative_path(&workspace, "./src//a.rs").expect("rel"),

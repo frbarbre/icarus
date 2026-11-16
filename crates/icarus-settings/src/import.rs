@@ -9,7 +9,8 @@ use crate::orca::{
 };
 use crate::tooling;
 
-const SETTINGS_MAP: [(&str, &str); 13] = [
+const SETTINGS_MAP: [(&str, &str); 14] = [
+    ("sourceControlSectionLayout", "sourceControl.sections"),
     ("terminalQuickCommands", "quickCommands"),
     ("openClaudeTabsInWebView", "agents.remote_control"),
     ("terminalInactivePaneOpacity", "theme.inactivePaneOpacity"),
@@ -28,7 +29,12 @@ const SETTINGS_MAP: [(&str, &str); 13] = [
     ("terminalLineHeight", "theme.fonts.terminalLineHeight"),
 ];
 
-const TRANSLATED_SETTINGS: [&str; 3] = ["languageServers", "formatters", "linters"];
+const TRANSLATED_SETTINGS: [&str; 4] = [
+    "languageServers",
+    "formatters",
+    "linters",
+    "worktreeVisibilityDefaults",
+];
 
 const UI_MAP: [(&str, &str); 13] = [
     ("workspaceStatuses", "workspace.statuses"),
@@ -219,6 +225,109 @@ impl Importer {
             self.report.notes.push(
                 "settings.openClaudeTabsInWebView: new Claude Code sessions start with Remote Control (`agents.remote_control`), so they can be followed on claude.ai".into(),
             );
+        }
+    }
+
+    // Orca's worktreeVisibilityDefaults become `workspace.external`, `.worktreeSources` and
+    // `.sourceVisibility`; the original stays carried so export reproduces it.
+    fn worktree_visibility(&mut self, settings: &Map) {
+        const FROM: &str = "settings.worktreeVisibilityDefaults";
+        let Some(defaults) = settings
+            .get("worktreeVisibilityDefaults")
+            .and_then(Value::as_object)
+        else {
+            return;
+        };
+        fn visibility(value: Option<&Value>) -> Option<&str> {
+            value
+                .and_then(Value::as_str)
+                .filter(|v| *v == "show" || *v == "hide")
+        }
+        let valid_id = |id: &str| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        };
+        if let Some(external) = visibility(defaults.get("external")) {
+            put(&mut self.user, "workspace.external", external.into());
+            self.report.mapped.push(Mapping {
+                from: format!("{FROM}.external"),
+                to: "workspace.external".into(),
+            });
+        }
+        let mut sources = Vec::new();
+        let mut dropped = 0;
+        for source in defaults
+            .get("customSources")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let id = source
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| valid_id(id));
+            let root = source
+                .get("rootPath")
+                .and_then(Value::as_str)
+                .filter(|root| root.starts_with('/') || root.starts_with("~/"));
+            match (id, root) {
+                (Some(id), Some(root)) if sources.len() < 32 => {
+                    let mut entry = Map::new();
+                    entry.insert("id".into(), id.into());
+                    entry.insert("root".into(), root.into());
+                    sources.push(Value::Object(entry));
+                }
+                _ => dropped += 1,
+            }
+        }
+        if !sources.is_empty() {
+            put(
+                &mut self.user,
+                "workspace.worktreeSources",
+                Value::Array(sources),
+            );
+            self.report.mapped.push(Mapping {
+                from: format!("{FROM}.customSources"),
+                to: "workspace.worktreeSources".into(),
+            });
+        }
+        if dropped > 0 {
+            self.report.notes.push(format!(
+                "{FROM}.customSources: {dropped} source(s) without an id and absolute folder (Orca's export leaves the folders out) were not imported; add them to `workspace.worktreeSources`"
+            ));
+        }
+        let mut preferences = Map::new();
+        let groups = defaults.get("sourcePreferences");
+        for group in ["builtIn", "custom"] {
+            for (id, value) in groups
+                .and_then(|p| p.get(group))
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+            {
+                let known = if group == "builtIn" {
+                    id == "claude" || id == "gsd"
+                } else {
+                    valid_id(id)
+                };
+                if let (true, Some(visibility)) = (known, visibility(Some(value))) {
+                    preferences.insert(id.clone(), visibility.into());
+                }
+            }
+        }
+        if !preferences.is_empty() {
+            put(
+                &mut self.user,
+                "workspace.sourceVisibility",
+                Value::Object(preferences),
+            );
+            self.report.mapped.push(Mapping {
+                from: format!("{FROM}.sourcePreferences"),
+                to: "workspace.sourceVisibility".into(),
+            });
         }
     }
 
@@ -455,6 +564,7 @@ pub fn import_orca(export: &OrcaExport) -> OrcaImport {
             ("settings", Value::Object(settings)) => {
                 let (order, rest) = importer.map_section("settings", settings, &SETTINGS_MAP);
                 importer.language_tooling(settings);
+                importer.worktree_visibility(settings);
                 importer
                     .carry
                     .insert("settingsOrder".into(), strings(order));

@@ -3,7 +3,8 @@
 //! Each turn answers "echo: <text>". Prefixes change behaviour: `sleep:<ms> <text>` waits first
 //! (and can be interrupted), `write:<path> <text>` reports a file change and writes the file,
 //! `run:<command> <text>` reports a command execution, `plan:<a,b> <text>` updates the plan,
-//! `fail <text>` fails the turn, `exit` terminates the process.
+//! `fail <text>` fails the turn, `settings` answers with the turn's sandbox and model, `exit`
+//! terminates the process.
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -77,6 +78,15 @@ fn main() {
                 if text == "exit" {
                     break;
                 }
+                let text = if text == "settings" {
+                    format!(
+                        "sandbox={} model={}",
+                        params["sandboxPolicy"]["type"].as_str().unwrap_or("unset"),
+                        params["model"].as_str().unwrap_or("unset")
+                    )
+                } else {
+                    text
+                };
                 let n = turns.fetch_add(1, Ordering::Relaxed) + 1;
                 let turn_id = format!("turn-{n}");
                 let interrupted = Arc::new(AtomicBool::new(false));

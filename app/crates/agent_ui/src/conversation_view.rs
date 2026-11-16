@@ -3455,6 +3455,10 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Icarus notifies about agent tabs itself, from the server, only when the tab isn't in view.
+        if cx.has_global::<crate::agent_tab::AgentTabsEnabled>() {
+            return;
+        }
         #[cfg(feature = "audio")]
         self.play_notification_sound(window, cx);
         self.show_notification(caption, icon, window, cx);

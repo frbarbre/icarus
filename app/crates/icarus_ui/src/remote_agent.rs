@@ -18,18 +18,39 @@ use crate::terminals::icarus_program;
 pub(crate) const ICARUS_AGENT: &str = "Icarus";
 
 pub struct IcarusOnServer {
-    server: String,
+    /// A saved server's name; `None` is this machine's.
+    server: Option<String>,
+    /// `claude` or `codex` for new agents; `None` follows `agents.default`.
+    provider: Option<String>,
 }
 
 impl IcarusOnServer {
     pub fn new(server: String) -> Self {
-        Self { server }
+        Self {
+            server: Some(server),
+            provider: None,
+        }
+    }
+
+    pub fn with_provider(server: Option<String>, provider: String) -> Self {
+        Self {
+            server,
+            provider: Some(provider),
+        }
     }
 
     pub fn command(&self) -> AgentServerCommand {
+        let mut args = Vec::new();
+        if let Some(server) = &self.server {
+            args.extend(["--server".to_string(), server.clone()]);
+        }
+        args.push("acp".into());
+        if let Some(provider) = &self.provider {
+            args.extend(["--provider".to_string(), provider.clone()]);
+        }
         AgentServerCommand {
             path: icarus_program().into(),
-            args: vec!["--server".into(), self.server.clone(), "acp".into()],
+            args,
             env: None,
         }
     }
@@ -98,6 +119,26 @@ pub fn agent_server_for_project(
     }
 }
 
+/// The agent server for a new `provider` agent in `project`; `None` where the provider can't be
+/// chosen (projects opened over SSH, other remote kinds), which keeps the default agent.
+pub fn agent_server_with_provider(
+    project: &Entity<Project>,
+    provider: &str,
+    cx: &App,
+) -> Option<Rc<dyn AgentServer>> {
+    if !crate::enabled(cx) || project.read(cx).remote_connection_options(cx).is_some() {
+        return None;
+    }
+    let server = match routing::server_for_project(project.read(cx), cx) {
+        ServerRef::Primary => routing::primary(cx),
+        ServerRef::Saved(name) => Some(name),
+    };
+    Some(Rc::new(IcarusOnServer::with_provider(
+        server,
+        provider.to_string(),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +153,8 @@ mod tests {
         let command = server.command();
         assert_eq!(command.args, ["--server", "desk", "acp"]);
         assert!(command.path.ends_with("icarus"));
+        let codex = IcarusOnServer::with_provider(None, "codex".into());
+        assert_eq!(codex.command().args, ["acp", "--provider", "codex"]);
     }
 
     /// The test window's project is the folder `/project`.

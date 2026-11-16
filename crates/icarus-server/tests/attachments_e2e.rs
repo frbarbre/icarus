@@ -500,3 +500,65 @@ async fn pr_status_sends_check_times_updated_at_and_rich_stack_entries() {
     );
     assert_eq!(world.count("graphql StackDetails"), 2);
 }
+
+#[tokio::test]
+async fn pr_body_returns_the_description_of_the_workspace_pr() {
+    let world = World::new(json!({ "viewer": "me" })).await;
+    let (id, _) = world.workspace("feat-d").await;
+    world.set_fixtures(json!({
+        "viewer": "me",
+        "pulls": [pull(7, "feat-d", json!({}))],
+        "routes": { "GET repos/acme/widgets/pulls/7": { "body": {
+            "number": 7, "body": "## Why\n\n![shot](https://github.com/user-attachments/assets/a)",
+        } } },
+    }));
+    let reply = world.request("pr.body", json!({ "workspace": id })).await;
+    assert_eq!(reply["number"], 7);
+    assert_eq!(
+        reply["body"],
+        "## Why\n\n![shot](https://github.com/user-attachments/assets/a)"
+    );
+}
+
+#[tokio::test]
+async fn comment_media_is_fetched_through_gh_and_cached_under_the_server_home() {
+    use base64::Engine as _;
+    let url = "https://github.com/user-attachments/assets/0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0";
+    let route = format!("GET {url}");
+    let world = World::new(json!({
+        "routes": { route.clone(): { "content_type": "image/png", "text": "PNGDATA" } },
+    }))
+    .await;
+    let first = world.request("github.asset", json!({ "url": url })).await;
+    assert_eq!(first["content_type"], "image/png");
+    assert_eq!(first["cached"], false);
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(first["data"].as_str().expect("data"))
+        .expect("base64");
+    assert_eq!(data, b"PNGDATA");
+    assert_eq!(world.count(&route), 1, "fetched with the user's gh login");
+
+    let second = world.request("github.asset", json!({ "url": url })).await;
+    assert_eq!(second["cached"], true);
+    assert_eq!(second["data"], first["data"]);
+    assert_eq!(
+        world.count(&route),
+        1,
+        "the second read comes from the cache"
+    );
+    assert_eq!(
+        std::fs::read_dir(world.home.path().join("assets"))
+            .expect("cache folder")
+            .count(),
+        2
+    );
+
+    let refused = world
+        .client
+        .request(
+            "github.asset",
+            json!({ "url": "https://evil.example/user-attachments/assets/x" }),
+        )
+        .await;
+    assert!(refused.is_err(), "the login is never used for other hosts");
+}

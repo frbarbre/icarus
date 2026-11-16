@@ -1087,6 +1087,7 @@ pub(crate) mod tests {
                             "subject": "line", "body": params["body"] }));
                         Ok(json!({}))
                     }
+                    "note.add" => Ok(json!({ "id": "note-new" })),
                     _ => Ok(json!({})),
                 }
             })
@@ -1215,6 +1216,54 @@ pub(crate) mod tests {
                 json!({ "cwd": "/project", "path": "src/app.rs", "line": 1, "end_line": 2,
                 "body": "Check both lines" })
             ]
+        );
+        assert_eq!(
+            calls_to(&calls, "attach.note"),
+            [json!({ "id": "note-new" })],
+            "a new note lands in the agent's composer by itself"
+        );
+
+        // The box opens on the tab used last, also after the app restarts (client.json).
+        let destination = |review: &Entity<crate::review::DiffReview>,
+                           cx: &mut gpui::VisualTestContext| {
+            review.read_with(cx, |review, cx| {
+                review
+                    .composer()
+                    .map(|composer| composer.read(cx).destination())
+            })
+        };
+        review.update_in(cx, |review, window, cx| {
+            review.open_composer(
+                ComposerTarget::Lines { start: 3, end: 3 },
+                String::new(),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(destination(&review, cx), Some(Destination::Review));
+        review.update(cx, |review, cx| {
+            if let Some(composer) = review.composer() {
+                composer.update(cx, |composer, cx| {
+                    composer.set_destination(Destination::Agent, cx)
+                });
+            }
+            review.close_composer(cx);
+        });
+        review.update_in(cx, |review, window, cx| {
+            review.open_composer(
+                ComposerTarget::Lines { start: 4, end: 4 },
+                String::new(),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(destination(&review, cx), Some(Destination::Agent));
+        assert_eq!(
+            cx.update(|_, cx| crate::client_settings::get(
+                Some(crate::client_settings::COMMENT_DESTINATION),
+                cx
+            )),
+            json!("agent")
         );
     }
 

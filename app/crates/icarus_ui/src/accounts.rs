@@ -77,7 +77,7 @@ impl Account {
     }
 }
 
-fn provider_name(provider: &str) -> &str {
+pub(crate) fn provider_name(provider: &str) -> &str {
     match provider {
         "claude" => "Claude",
         "codex" => "Codex",

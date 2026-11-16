@@ -4,7 +4,7 @@ pub type Result<T, E = LinearError> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinearError {
-    #[error("Linear is not configured: set LINEAR_API_KEY or the `linear.api_key_command` setting")]
+    #[error("Linear is not configured: paste an API key in Settings or run `icarus linear login`")]
     NotConfigured,
     #[error("Linear rejected the API key")]
     Unauthorized,

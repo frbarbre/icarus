@@ -4,8 +4,10 @@
 //! `sleep:<ms> <text>` waits first, `write:<path> <text>` emits a Write tool call and result,
 //! `fail <text>` ends the turn as an error, `ask <question>` calls AskUserQuestion first,
 //! `env:A,B` answers with those environment variables, `args` with its command-line arguments,
-//! `exit` terminates the process. In a long prompt, the last line starting with `@fake ` is the
-//! message instead (so tests can steer note reply sessions through the thread).
+//! `settings` with its permission mode and model, `exit` terminates the process. In a long prompt,
+//! the last line starting with `@fake ` is the message instead (so tests can steer note reply
+//! sessions through the thread). Control requests (`initialize`, `set_permission_mode`,
+//! `set_model`, `interrupt`) are answered as Claude Code does.
 
 use std::io::{BufRead, Write};
 use std::time::Duration;
@@ -30,12 +32,78 @@ fn main() {
     if !lazy_init {
         emit(&mut out, init.clone());
     }
+    let args: Vec<String> = std::env::args().collect();
+    let mut mode = if let Some(at) = args.iter().position(|a| a == "--permission-mode") {
+        args.get(at + 1).cloned().unwrap_or_default()
+    } else if args.iter().any(|a| a == "--dangerously-skip-permissions") {
+        "bypassPermissions".to_string()
+    } else {
+        "default".to_string()
+    };
+    let mut model = args
+        .iter()
+        .position(|a| a == "--model")
+        .and_then(|at| args.get(at + 1).cloned())
+        .unwrap_or_else(|| "default".to_string());
     let mut turn = 0u64;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if message["type"] == "control_request" {
+            let request = &message["request"];
+            let answer = match request["subtype"].as_str().unwrap_or_default() {
+                "initialize" => Ok(json!({
+                    "commands": [
+                        { "name": "compact", "description": "Summarize the conversation", "argumentHint": "<focus>" },
+                        { "name": "review", "description": "Review a pull request", "argumentHint": "" },
+                        { "name": "__internal", "description": "", "argumentHint": "" },
+                    ],
+                    "models": [
+                        { "value": "default", "displayName": "Default (recommended)" },
+                        { "value": "opus", "displayName": "Opus" },
+                        { "value": "sonnet", "displayName": "Sonnet" },
+                    ],
+                    "current_permission_mode": mode,
+                })),
+                "set_permission_mode" => match request["mode"].as_str() {
+                    Some(
+                        next @ ("default" | "acceptEdits" | "plan" | "auto" | "dontAsk"
+                        | "bypassPermissions"),
+                    ) => {
+                        mode = next.to_string();
+                        Ok(json!({ "mode": mode }))
+                    }
+                    _ => Err("Cannot set permission mode".to_string()),
+                },
+                "set_model" => {
+                    model = request["model"].as_str().unwrap_or("default").to_string();
+                    Ok(json!({ "model": model }))
+                }
+                "interrupt" => Ok(json!({})),
+                other => Err(format!("unknown control request {other}")),
+            };
+            let response = match answer {
+                Ok(response) => {
+                    json!({ "subtype": "success", "request_id": message["request_id"], "response": response })
+                }
+                Err(error) => {
+                    json!({ "subtype": "error", "request_id": message["request_id"], "error": error })
+                }
+            };
+            emit(
+                &mut out,
+                json!({ "type": "control_response", "response": response }),
+            );
+            if request["subtype"] == "set_permission_mode" {
+                emit(
+                    &mut out,
+                    json!({ "type": "system", "subtype": "status", "status": null, "permissionMode": mode, "session_id": session_id }),
+                );
+            }
+            continue;
+        }
         if message["type"] != "user" {
             continue;
         }
@@ -100,6 +168,9 @@ fn main() {
         }
         if text == "args" {
             text = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+        }
+        if text == "settings" {
+            text = format!("mode={mode} model={model}");
         }
         if let Some(names) = text.strip_prefix("env:") {
             text = names

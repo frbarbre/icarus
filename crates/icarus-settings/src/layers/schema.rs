@@ -268,6 +268,24 @@ pub fn document_schema() -> Schema {
                     "Folder new workspaces are created in; `~` is the home folder. Read when the server starts.",
                     Str,
                 ),
+                field(
+                    "external",
+                    "Whether worktrees Icarus finds outside its folder and every source show in the sidebar (Orca's worktreeVisibilityDefaults.external). A project's `project.externalWorktreeVisibility` wins.",
+                    Schema::Enum(&["show", "hide"]),
+                ),
+                field(
+                    "worktreeSources",
+                    "Folders whose worktrees form their own source, shown or hidden apart from other external ones (Orca's customSources; at most 32).",
+                    array(closed(vec![
+                        field("id", "Letters, digits, `-` and `_`.", Str),
+                        field("root", "Absolute folder, or starting with `~/`.", Str),
+                    ])),
+                ),
+                field(
+                    "sourceVisibility",
+                    "show | hide per source: `claude` (.claude/worktrees), `gsd` (.gsd-workspaces) or a worktreeSources id. Sources are hidden unless set to show.",
+                    map_of(Schema::Enum(&["show", "hide"])),
+                ),
             ]),
         ),
         field(
@@ -436,10 +454,18 @@ pub fn document_schema() -> Schema {
                 ),
                 field(
                     "sections",
-                    "Section order and hidden sections (ids: agent-turns, changes, commits), as Orca's sourceControlSectionLayout.",
+                    "Section order and hidden sections (ids: agent-turns, changes, commits), as Orca's sourceControlSectionLayout; `pr` is the PR panel's (pr-attention, pr-previews, pr-checks, pr-review, pr-pending-review, pr-comments, pr-resolved).",
                     open(vec![
                         field("order", "", array(Str)),
                         field("hidden", "", array(Str)),
+                        field(
+                            "pr",
+                            "",
+                            open(vec![
+                                field("order", "", array(Str)),
+                                field("hidden", "", array(Str)),
+                            ]),
+                        ),
                     ]),
                 ),
             ]),
@@ -551,7 +577,7 @@ pub fn document_schema() -> Schema {
         ),
         field(
             "linear",
-            "Linear issue titles and details on workspace cards. `LINEAR_API_KEY` in the server's environment wins over these.",
+            "Linear issue titles and details on workspace cards. Paste the API key in Settings or run `icarus linear login`; `LINEAR_API_KEY` in the server's environment, then `api_key_command`, win over that saved key.",
             closed(vec![
                 field(
                     "api_key_command",

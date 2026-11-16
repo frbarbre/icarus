@@ -89,7 +89,7 @@ pub async fn run(cli: &super::Cli, client: &Client, command: &IssueCommand) -> R
                     format!("Linear configured ({})", v["key"].as_str().unwrap_or("?"))
                 } else {
                     format!(
-                        "Linear not configured ({}): set LINEAR_API_KEY or `linear.api_key_command`",
+                        "Linear not configured ({}): run `icarus linear login`",
                         v["key"].as_str().unwrap_or("?")
                     )
                 }

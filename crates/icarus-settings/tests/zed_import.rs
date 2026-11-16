@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use icarus_settings::json::{self, Value};
 use icarus_settings::layers::{self, KeyPath};
 use icarus_settings::zed::ApplyError;
-use icarus_settings::zed_import::{FileStatus, ZedImport, import};
+use icarus_settings::zed_import::{self, FileStatus, ZedImport, import};
 
 const ZED_SETTINGS: &str = r#"// Zed settings
 {
@@ -121,6 +121,31 @@ fn commented_settings_are_imported_without_the_keys_icarus_owns() {
     assert!(result.kept.is_empty());
     assert!(result.headline().contains("settings"));
     assert!(result.headline().contains("theme"));
+}
+
+#[test]
+fn a_real_import_is_remembered_and_a_dry_run_is_not() {
+    let dirs = Dirs::new();
+    dirs.write(dirs.source.join("settings.json"), ZED_SETTINGS);
+    dirs.run(true);
+    assert!(!zed_import::already_imported(&dirs.target));
+    dirs.run(false);
+    assert!(zed_import::already_imported(&dirs.target));
+}
+
+#[test]
+fn the_explorer_dock_is_not_imported() {
+    let dirs = Dirs::new();
+    dirs.write(
+        dirs.source.join("settings.json"),
+        r#"{"project_panel":{"dock":"left","indent_size":12}}"#,
+    );
+    let result = dirs.run(false);
+    assert_eq!(result.protected, ["project_panel.dock"]);
+    assert_eq!(
+        dirs.target_settings(),
+        doc(r#"{"project_panel":{"indent_size":12}}"#)
+    );
 }
 
 #[test]

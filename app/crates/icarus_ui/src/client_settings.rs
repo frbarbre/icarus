@@ -11,9 +11,22 @@ use serde_json::{Map, Value, json};
 use util::ResultExt as _;
 
 pub const CARD_FIELDS: &str = "workspace.cardFields";
+/// Per grouping (`sidebar.groupBy` value), the titles of the sections folded shut.
+pub const COLLAPSED_GROUPS: &str = "sidebar.collapsedGroups";
+
+/// The line comment box's tab used last: `agent` (a note) or `review` (a review draft).
+pub const COMMENT_DESTINATION: &str = "review.commentDestination";
+
+/// How Source Control lists changed files: `list` or `tree`.
+pub const CHANGES_VIEW: &str = "sourceControl.changesView";
 
 /// The keys this layer may hold.
-pub const KEYS: &[&str] = &[CARD_FIELDS];
+pub const KEYS: &[&str] = &[
+    CARD_FIELDS,
+    COLLAPSED_GROUPS,
+    COMMENT_DESTINATION,
+    CHANGES_VIEW,
+];
 
 #[derive(Default)]
 pub struct ClientSettings {
@@ -71,6 +84,29 @@ pub fn card_fields(cx: &App) -> Option<Vec<String>> {
     })
 }
 
+pub fn group_collapsed(group_by: &str, title: &str, cx: &App) -> bool {
+    get(Some(COLLAPSED_GROUPS), cx)[group_by]
+        .as_array()
+        .is_some_and(|titles| titles.iter().any(|item| item.as_str() == Some(title)))
+}
+
+/// Folds the section `title` of grouping `group_by` shut, or opens it again.
+pub fn toggle_group_collapsed(group_by: &str, title: &str, cx: &mut App) -> Result<()> {
+    let mut groups = get(Some(COLLAPSED_GROUPS), cx);
+    if !groups.is_object() {
+        groups = json!({});
+    }
+    let mut titles: Vec<Value> = groups[group_by].as_array().cloned().unwrap_or_default();
+    match titles.iter().position(|item| item.as_str() == Some(title)) {
+        Some(index) => {
+            titles.remove(index);
+        }
+        None => titles.push(json!(title)),
+    }
+    groups[group_by] = Value::Array(titles);
+    set(COLLAPSED_GROUPS, Some(groups), cx)
+}
+
 fn validate(key: &str, value: &Value) -> Result<()> {
     if !KEYS.contains(&key) {
         bail!(
@@ -84,6 +120,23 @@ fn validate(key: &str, value: &Value) -> Result<()> {
             .is_some_and(|items| items.iter().all(Value::is_string))
     {
         bail!("{key} takes a list of field ids, e.g. [\"pr\", \"unread\"]");
+    }
+    if key == CHANGES_VIEW && !matches!(value.as_str(), Some("list" | "tree")) {
+        bail!("{key} is \"list\" or \"tree\"");
+    }
+    if key == COMMENT_DESTINATION && !matches!(value.as_str(), Some("agent" | "review")) {
+        bail!("{key} is \"agent\" or \"review\"");
+    }
+    if key == COLLAPSED_GROUPS
+        && !value.as_object().is_some_and(|groups| {
+            groups.values().all(|titles| {
+                titles
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(Value::is_string))
+            })
+        })
+    {
+        bail!("{key} maps a grouping to section titles, e.g. {{\"stack\": [\"Stack #7\"]}}");
     }
     Ok(())
 }

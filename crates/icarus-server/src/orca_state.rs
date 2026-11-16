@@ -579,6 +579,7 @@ mod tests {
             pinned: false,
             manual_order: None,
             activity_at_ms: None,
+            discovery: Default::default(),
         }
     }
 

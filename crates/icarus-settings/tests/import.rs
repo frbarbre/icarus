@@ -84,6 +84,11 @@ fn statuses_rules_and_prompts_map_verbatim() {
         get(user, "quickCommands"),
         original.setting("terminalQuickCommands")
     );
+    assert_eq!(
+        get(user, "sourceControl.sections"),
+        original.setting("sourceControlSectionLayout"),
+        "the panels' section order and hidden sections, PR panel included"
+    );
     assert_eq!(get(user, "presets"), None);
     assert_eq!(get(user, "languages"), None);
     assert_eq!(
@@ -419,5 +424,85 @@ fn a_fresh_icarus_document_exports_a_valid_orca_file() {
             .expect("valid")
             .to_text(),
         export.to_text()
+    );
+}
+
+#[test]
+fn worktree_visibility_defaults_become_discovery_settings() {
+    let text = r#"{
+  "format": "orca-settings",
+  "version": 1,
+  "settings": {
+    "worktreeVisibilityDefaults": {
+      "external": "hide",
+      "customSources": [
+        { "id": "conductor", "rootPath": "~/conductor/workspaces" },
+        { "id": "scrubbed" },
+        { "id": "bad id", "rootPath": "/x" }
+      ],
+      "sourcePreferences": {
+        "builtIn": { "claude": "show", "other": "show" },
+        "custom": { "conductor": "show", "scrubbed": "maybe" }
+      }
+    }
+  },
+  "projects": [
+    {
+      "remote": "github.com/acme/widgets",
+      "settings": {
+        "externalWorktreeVisibility": "show",
+        "worktreeVisibilitySourcePreferences": { "builtIn": { "gsd": "hide" } }
+      }
+    }
+  ]
+}
+"#;
+    let import = import_orca_text(text).expect("valid");
+    let user = &import.user;
+    assert_eq!(
+        get(user, "workspace.external").and_then(Value::as_str),
+        Some("hide")
+    );
+    assert_eq!(
+        get(user, "workspace.worktreeSources"),
+        Some(
+            &json::parse(r#"[{"id":"conductor","root":"~/conductor/workspaces"}]"#).expect("json")
+        )
+    );
+    assert_eq!(
+        get(user, "workspace.sourceVisibility"),
+        Some(&json::parse(r#"{"claude":"show","conductor":"show"}"#).expect("json"))
+    );
+    assert!(
+        import
+            .report
+            .notes
+            .iter()
+            .any(|n| n.contains("2 source(s)")),
+        "{:?}",
+        import.report.notes
+    );
+    assert!(
+        !import
+            .report
+            .unmapped
+            .contains(&"settings.worktreeVisibilityDefaults".to_owned())
+    );
+    let project = &import.projects["github.com/acme/widgets"];
+    assert_eq!(
+        get(project, "project.externalWorktreeVisibility").and_then(Value::as_str),
+        Some("show"),
+        "a repo that showed external worktrees in Orca keeps showing them"
+    );
+    assert!(
+        import.report.validation.is_empty(),
+        "{:?}",
+        import.report.validation
+    );
+    let export = export_orca(&import.user, &import.projects).expect("valid");
+    assert_eq!(
+        json::parse(&export.to_text()).expect("json"),
+        json::parse(text).expect("json"),
+        "the original comes back on export"
     );
 }

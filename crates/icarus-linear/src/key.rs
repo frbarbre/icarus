@@ -104,6 +104,17 @@ impl KeyCommand {
 pub enum KeySource {
     Env,
     Command,
+    Stored,
+}
+
+impl KeySource {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Command => "command",
+            Self::Stored => "stored",
+        }
+    }
 }
 
 /// Where the key stands. Never carries the key or any command output.
@@ -114,13 +125,29 @@ pub enum KeyStatus {
     /// Configured but not tried yet.
     CommandPending,
     CommandFailed(String),
-    Rejected,
+    Stored,
+    Rejected(KeySource),
     NotConfigured,
 }
 
 impl KeyStatus {
     pub fn configured(&self) -> bool {
-        matches!(self, Self::Env | Self::Command | Self::CommandPending)
+        matches!(
+            self,
+            Self::Env | Self::Command | Self::CommandPending | Self::Stored
+        )
+    }
+
+    pub fn source(&self) -> Option<KeySource> {
+        match self {
+            Self::Env => Some(KeySource::Env),
+            Self::Command | Self::CommandPending | Self::CommandFailed(_) => {
+                Some(KeySource::Command)
+            }
+            Self::Stored => Some(KeySource::Stored),
+            Self::Rejected(source) => Some(*source),
+            Self::NotConfigured => None,
+        }
     }
 }
 
@@ -132,11 +159,19 @@ struct State {
     rejected: bool,
 }
 
-/// Resolves the key: `LINEAR_API_KEY`, else `linear.api_key_command` (run once, kept in memory), else nothing.
+#[derive(Default)]
+struct Stored {
+    key: Option<ApiKey>,
+    rejected: bool,
+}
+
+/// Resolves the key: `LINEAR_API_KEY`, else `linear.api_key_command` (run once, kept in memory), else
+/// the key stored with `set_stored`, else nothing.
 pub struct KeyResolver {
     env_key: Option<ApiKey>,
     env_rejected: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
+    stored: std::sync::Mutex<Stored>,
 }
 
 impl KeyResolver {
@@ -148,11 +183,38 @@ impl KeyResolver {
                 .map(ApiKey::new),
             env_rejected: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(State::default()),
+            stored: std::sync::Mutex::new(Stored::default()),
         }
     }
 
     pub fn from_env() -> Self {
         Self::new(std::env::var(ENV_VAR).ok())
+    }
+
+    fn stored(&self) -> std::sync::MutexGuard<'_, Stored> {
+        self.stored
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn has_env(&self) -> bool {
+        self.env_key.is_some()
+    }
+
+    pub async fn has_command(&self) -> bool {
+        self.state.lock().await.command.is_some()
+    }
+
+    /// The key saved by the user (Keychain or file), last in line after env and command.
+    pub fn set_stored(&self, key: Option<ApiKey>) {
+        *self.stored() = Stored {
+            key,
+            rejected: false,
+        };
+    }
+
+    pub fn has_stored(&self) -> bool {
+        self.stored().key.is_some()
     }
 
     /// Follows the setting; a different command drops the cached key and any backoff.
@@ -173,6 +235,7 @@ impl KeyResolver {
         state.rejected = false;
         self.env_rejected
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.stored().rejected = false;
     }
 
     pub async fn key(&self) -> Result<(ApiKey, KeySource)> {
@@ -187,7 +250,12 @@ impl KeyResolver {
             return Ok((key.clone(), KeySource::Command));
         }
         let Some(command) = state.command.clone() else {
-            return Err(LinearError::NotConfigured);
+            let stored = self.stored();
+            return match &stored.key {
+                Some(_) if stored.rejected => Err(LinearError::Unauthorized),
+                Some(key) => Ok((key.clone(), KeySource::Stored)),
+                None => Err(LinearError::NotConfigured),
+            };
         };
         if let Some((at, _)) = &state.failed
             && at.elapsed() < COMMAND_RETRY
@@ -229,13 +297,17 @@ impl KeyResolver {
                 }
                 !retried
             }
+            KeySource::Stored => {
+                self.stored().rejected = true;
+                false
+            }
         }
     }
 
     pub async fn status(&self) -> KeyStatus {
         if self.env_key.is_some() {
             return if self.env_rejected.load(std::sync::atomic::Ordering::Relaxed) {
-                KeyStatus::Rejected
+                KeyStatus::Rejected(KeySource::Env)
             } else {
                 KeyStatus::Env
             };
@@ -245,8 +317,15 @@ impl KeyResolver {
             return KeyStatus::Command;
         }
         match (&state.command, &state.failed) {
-            (None, _) => KeyStatus::NotConfigured,
-            (Some(_), Some(_)) if state.rejected => KeyStatus::Rejected,
+            (None, _) => {
+                let stored = self.stored();
+                match stored.key {
+                    Some(_) if stored.rejected => KeyStatus::Rejected(KeySource::Stored),
+                    Some(_) => KeyStatus::Stored,
+                    None => KeyStatus::NotConfigured,
+                }
+            }
+            (Some(_), Some(_)) if state.rejected => KeyStatus::Rejected(KeySource::Command),
             (Some(_), Some((_, reason))) => KeyStatus::CommandFailed(reason.clone()),
             (Some(_), None) => KeyStatus::CommandPending,
         }
@@ -404,6 +483,28 @@ mod tests {
             resolver.key().await,
             Err(LinearError::NotConfigured)
         ));
+        assert_eq!(resolver.status().await, KeyStatus::NotConfigured);
+    }
+
+    #[tokio::test]
+    async fn the_stored_key_comes_after_env_and_command() {
+        let resolver = KeyResolver::new(None);
+        resolver.set_stored(Some(ApiKey::new("lin_stored")));
+        let (key, source) = resolver.key().await.expect("key");
+        assert_eq!((key.expose(), source), ("lin_stored", KeySource::Stored));
+        assert_eq!(resolver.status().await, KeyStatus::Stored);
+
+        resolver
+            .set_command(Some(KeyCommand::Shell("echo lin_cmd".into())))
+            .await;
+        assert_eq!(resolver.key().await.expect("key").0.expose(), "lin_cmd");
+
+        let env = KeyResolver::new(Some("lin_env".into()));
+        env.set_stored(Some(ApiKey::new("lin_stored")));
+        assert_eq!(env.key().await.expect("key").1, KeySource::Env);
+
+        resolver.set_command(None).await;
+        resolver.set_stored(None);
         assert_eq!(resolver.status().await, KeyStatus::NotConfigured);
     }
 

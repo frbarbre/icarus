@@ -3,6 +3,7 @@ mod attach;
 mod extras;
 mod git_ops;
 mod issue;
+mod linear;
 mod notes;
 mod orca_state;
 mod ports;
@@ -165,6 +166,11 @@ enum Command {
     Issue {
         #[command(subcommand)]
         command: issue::IssueCommand,
+    },
+    /// Connect Linear: save, remove or check the API key the server uses.
+    Linear {
+        #[command(subcommand)]
+        command: linear::LinearCommand,
     },
     /// Notes on lines of a workspace's files: how agents point the user at code in the diff, with
     /// threads answered by throwaway agent sessions.
@@ -408,8 +414,8 @@ enum AppCommand {
         #[arg(long)]
         args: Option<String>,
     },
-    /// The app's own settings (its `client.json`), which override the server's for this app only.
-    /// Today that is `workspace.cardFields`.
+    /// The app's own settings (its `client.json`): view state kept per app, such as card fields,
+    /// folded groups or the changes view. A key the server also has is overridden for this app only.
     Config {
         #[command(subcommand)]
         command: AppConfigCommand,
@@ -695,9 +701,35 @@ enum WorkspaceCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// List workspaces, with the worktrees found by discovery; origin is shown unless native.
     List {
         #[arg(long)]
         project: Option<String>,
+        /// Include hidden workspaces, marked `hidden`.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Hide a workspace from the sidebar; its worktree stays where it is.
+    Hide {
+        id: String,
+    },
+    /// Show a hidden workspace again (`--follow-settings` drops the choice instead).
+    Unhide {
+        id: String,
+        /// Forget the explicit show/hide and follow the visibility settings again.
+        #[arg(long)]
+        follow_settings: bool,
+    },
+    /// Newly found worktrees waiting for a show/hide decision.
+    Inbox {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Show every worktree from one source in a project: external, claude, gsd or custom:<id>.
+    ShowSource {
+        #[arg(long)]
+        project: String,
+        source: String,
     },
     /// Run the project's setup script again, in a new Setup terminal.
     Setup {
@@ -753,14 +785,21 @@ enum WorkspaceCommand {
     Turns {
         id: String,
     },
-    /// Remove the worktree; the project's archive script runs first and a failure keeps it.
+    /// Remove the workspace. A worktree Icarus created is deleted (archive script first, a failure
+    /// keeps it); any other worktree is only hidden unless --delete-worktree.
     Remove {
         id: String,
         /// Remove even with local changes or a failed archive script.
         #[arg(long)]
         force: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "delete_branch")]
         keep_branch: bool,
+        /// Delete a worktree Icarus didn't create (discovered or adopted) instead of hiding it.
+        #[arg(long)]
+        delete_worktree: bool,
+        /// Also delete the branch of a worktree Icarus didn't create (its branch is kept by default).
+        #[arg(long)]
+        delete_branch: bool,
         /// Don't run the project's archive script.
         #[arg(long)]
         skip_archive: bool,
@@ -804,6 +843,9 @@ enum AgentCommand {
         /// Ask for permissions instead of bypassing them.
         #[arg(long)]
         ask_permissions: bool,
+        /// Permission mode to start in (see `icarus agent mode`); wins over --ask-permissions.
+        #[arg(long)]
+        mode: Option<String>,
         /// Resume an earlier provider session.
         #[arg(long)]
         resume: Option<String>,
@@ -823,6 +865,13 @@ enum AgentCommand {
         #[arg(long, conflicts_with = "id")]
         workspace: Option<String>,
     },
+    /// Show the agent's permission mode and the modes it offers, or switch to MODE; the agent keeps
+    /// it across restarts.
+    Mode { id: String, mode: Option<String> },
+    /// Show the agent's model and the models it offers, or switch to MODEL for the following turns.
+    Model { id: String, model: Option<String> },
+    /// List the slash commands the agent offers.
+    Commands { id: String },
     /// List agent sessions.
     List,
     /// Past sessions (sleeping, exited or killed), newest first; --search looks through prompts and answers.
@@ -1183,6 +1232,25 @@ impl Switch {
     fn enabled(self) -> bool {
         matches!(self, Switch::On)
     }
+}
+
+/// `agent.modes` / `agent.models`: one choice per line, the current one marked.
+fn choices_summary(v: &Value, key: &str) -> String {
+    let current = v["current"].as_str().unwrap_or_default();
+    v[key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|choice| {
+            let id = choice["id"].as_str().unwrap_or_default();
+            let mark = if id == current { "*" } else { " " };
+            format!(
+                "{mark} {id}  {}",
+                choice["name"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn remote_control_summary(v: &Value) -> String {
@@ -2038,8 +2106,13 @@ async fn main() -> Result<()> {
                     Some(_) => "  unread",
                     None => "",
                 };
+                let origin = match w["origin"].as_str() {
+                    Some("native") | None => String::new(),
+                    Some(origin) => format!("  [{origin}]"),
+                };
+                let hidden = if w["hidden"] == true { "  hidden" } else { "" };
                 format!(
-                    "{}  {}  {}  {}{setup}{pinned}{unread}",
+                    "{}  {}  {}  {}{origin}{hidden}{setup}{pinned}{unread}",
                     w["id"].as_str().unwrap_or_default(),
                     w["name"].as_str().unwrap_or_default(),
                     w["status"].as_str().unwrap_or("-"),
@@ -2175,14 +2248,83 @@ async fn main() -> Result<()> {
                         .await?;
                     print(&cli, &value, summary);
                 }
-                WorkspaceCommand::List { project } => {
+                WorkspaceCommand::List { project, all } => {
                     let value = client
-                        .request("workspace.list", json!({ "project": project }))
+                        .request(
+                            "workspace.list",
+                            json!({ "project": project, "refresh": true, "include_hidden": all }),
+                        )
                         .await?;
                     print(&cli, &value, |v| {
                         v.as_array()
                             .map(|i| i.iter().map(summary).collect::<Vec<_>>().join("\n"))
                             .unwrap_or_default()
+                    });
+                }
+                WorkspaceCommand::Hide { id } | WorkspaceCommand::Unhide { id, .. } => {
+                    let visibility = match command {
+                        WorkspaceCommand::Hide { .. } => json!("hide"),
+                        WorkspaceCommand::Unhide {
+                            follow_settings: true,
+                            ..
+                        } => Value::Null,
+                        _ => json!("show"),
+                    };
+                    let value = client
+                        .request(
+                            "workspace.visibility",
+                            json!({ "id": id, "visibility": visibility }),
+                        )
+                        .await?;
+                    print(&cli, &value, |v| {
+                        if v["hidden"] == true {
+                            "hidden".into()
+                        } else {
+                            "shown".into()
+                        }
+                    });
+                }
+                WorkspaceCommand::Inbox { project } => {
+                    let value = client
+                        .request("workspace.inbox", json!({ "project": project }))
+                        .await?;
+                    print(&cli, &value, |v| {
+                        let lines: Vec<String> =
+                            v.as_array()
+                                .into_iter()
+                                .flatten()
+                                .flat_map(|entry| {
+                                    let project =
+                                        entry["project_name"].as_str().unwrap_or_default();
+                                    entry["workspaces"].as_array().into_iter().flatten().map(
+                                        move |w| {
+                                            format!(
+                                                "{project}  {}  {}  {}  [{}]",
+                                                w["id"].as_str().unwrap_or_default(),
+                                                w["name"].as_str().unwrap_or_default(),
+                                                w["path"].as_str().unwrap_or_default(),
+                                                w["origin"].as_str().unwrap_or_default(),
+                                            )
+                                        },
+                                    )
+                                })
+                                .collect();
+                        if lines.is_empty() {
+                            "no new worktrees".into()
+                        } else {
+                            lines.join("\n")
+                        }
+                    });
+                }
+                WorkspaceCommand::ShowSource { project, source } => {
+                    let value = client
+                        .request(
+                            "workspace.show_source",
+                            json!({ "project": project, "source": source }),
+                        )
+                        .await?;
+                    print(&cli, &value, |v| {
+                        format!("set {} to show", v["key"].as_str().unwrap_or_default())
                     });
                 }
                 WorkspaceCommand::Show { id } => {
@@ -2307,14 +2449,22 @@ async fn main() -> Result<()> {
                     id,
                     force,
                     keep_branch,
+                    delete_worktree,
+                    delete_branch,
                     skip_archive,
                     allow_failed_archive,
                 } => {
+                    let delete_branch = if *keep_branch {
+                        Some(false)
+                    } else {
+                        delete_branch.then_some(true)
+                    };
                     let value = client
                         .request_timeout(
                             "workspace.remove",
                             json!({
-                                "id": id, "force": force, "delete_branch": !keep_branch,
+                                "id": id, "force": force, "delete_branch": delete_branch,
+                                "delete_worktree": delete_worktree.then_some(true),
                                 "skip_archive": skip_archive,
                                 "allow_failed_archive": allow_failed_archive,
                             }),
@@ -2322,7 +2472,9 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     print(&cli, &value, |v| {
-                        if v["archive"]["success"] == false {
+                        if v["hidden"] == true {
+                            "hidden (the worktree was not created by Icarus, so it stays; pass --delete-worktree to delete it)".into()
+                        } else if v["archive"]["success"] == false {
                             format!(
                                 "removed (the archive script failed)\n{}",
                                 v["archive"]["output"].as_str().unwrap_or_default()
@@ -2594,6 +2746,10 @@ async fn main() -> Result<()> {
             let client = connect(&cli).await?;
             issue::run(&cli, &client, command).await?;
         }
+        Command::Linear { command } => {
+            let client = connect(&cli).await?;
+            linear::run(&cli, &client, command).await?;
+        }
         Command::Review { at, command } => {
             let client = connect(&cli).await?;
             review::run(&cli, &client, at, command).await?;
@@ -2659,6 +2815,7 @@ async fn main() -> Result<()> {
                     model,
                     prompt,
                     ask_permissions,
+                    mode,
                     resume,
                     account,
                     remote_control,
@@ -2673,7 +2830,7 @@ async fn main() -> Result<()> {
                             json!({
                                 "cwd": cwd, "provider": provider, "title": title, "workspace": workspace,
                                 "model": model, "prompt": prompt, "bypass_permissions": !ask_permissions,
-                                "resume": resume, "account": account,
+                                "mode": mode, "resume": resume, "account": account,
                                 "remote_control": remote_control.map(Switch::enabled),
                             }),
                         )
@@ -2695,6 +2852,54 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     print(&cli, &value, remote_control_summary);
+                }
+                AgentCommand::Mode { id, mode } => {
+                    if let Some(mode) = mode {
+                        client
+                            .request_timeout(
+                                "agent.set_mode",
+                                json!({ "id": id, "mode": mode }),
+                                Duration::from_secs(60),
+                            )
+                            .await?;
+                    }
+                    let value = client.request("agent.modes", json!({ "id": id })).await?;
+                    print(&cli, &value, |v| choices_summary(v, "modes"));
+                }
+                AgentCommand::Model { id, model } => {
+                    if let Some(model) = model {
+                        client
+                            .request_timeout(
+                                "agent.set_model",
+                                json!({ "id": id, "model": model }),
+                                Duration::from_secs(60),
+                            )
+                            .await?;
+                    }
+                    let value = client.request("agent.models", json!({ "id": id })).await?;
+                    print(&cli, &value, |v| choices_summary(v, "models"));
+                }
+                AgentCommand::Commands { id } => {
+                    let value = client
+                        .request("agent.commands", json!({ "id": id }))
+                        .await?;
+                    print(&cli, &value, |v| {
+                        v["commands"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|c| {
+                                let name = c["name"].as_str().unwrap_or_default();
+                                let hint = c["hint"]
+                                    .as_str()
+                                    .map(|h| format!(" {h}"))
+                                    .unwrap_or_default();
+                                let description = c["description"].as_str().unwrap_or_default();
+                                format!("/{name}{hint}  {description}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    });
                 }
                 AgentCommand::List => {
                     let value = client.request("agent.list", json!({})).await?;

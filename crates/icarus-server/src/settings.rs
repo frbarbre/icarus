@@ -48,7 +48,7 @@ struct KeyWrite {
 
 impl Server {
     /// Sets (or with `None` unsets) a key in one writable layer.
-    fn write_key(
+    pub(crate) fn write_key(
         &self,
         key: &str,
         value: Option<Json>,

@@ -47,7 +47,9 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
         MenuItem::action("Debugger Panel", debug_panel::ToggleFocus),
     ];
 
-    if !DisableAiSettings::get_global(cx).disable_ai {
+    if !DisableAiSettings::get_global(cx).disable_ai
+        && !cx.has_global::<agent_settings::AgentTabsEnabled>()
+    {
         view_items.push(MenuItem::action("Agent Panel", assistant::ToggleFocus));
     }
 

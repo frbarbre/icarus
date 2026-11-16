@@ -248,8 +248,41 @@ fn app_in_front(cx: &mut App) -> bool {
     })
 }
 
-/// A toast while someone is looking at the app; otherwise a system banner they can click.
+/// Whether `agent_id`'s tab is showing in a pane of the focused window's workspace.
+pub(crate) fn agent_in_view(agent_id: &str, cx: &mut App) -> bool {
+    let Some(window) = cx
+        .active_window()
+        .and_then(|window| window.downcast::<workspace::MultiWorkspace>())
+    else {
+        return false;
+    };
+    window
+        .update(cx, |multi_workspace, window, cx| {
+            window.is_window_active()
+                && multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .panes()
+                    .iter()
+                    .filter_map(|pane| pane.read(cx).active_item())
+                    .any(|item| {
+                        crate::remote_control::agent_of_item(item.as_ref(), cx).as_deref()
+                            == Some(agent_id)
+                    })
+        })
+        .unwrap_or(false)
+}
+
+/// A toast while someone is looking at the app; otherwise a system banner they can click. Nothing
+/// when the notice is about the agent tab they are looking at.
 fn present(notice: &Notice, sound: bool, cx: &mut App) {
+    if notice
+        .agent_id()
+        .is_some_and(|agent_id| agent_in_view(&agent_id, cx))
+    {
+        mark_read(Some(notice.id.clone()), cx);
+        return;
+    }
     if app_in_front(cx) {
         show_toast(notice, cx);
         return;
@@ -775,6 +808,61 @@ mod tests {
             assert_eq!(store.badge(), None, "no unread, no badge");
             assert!(store.items().iter().all(|notice| notice.read));
         });
+    }
+
+    #[gpui::test]
+    async fn an_agent_tab_in_view_gets_no_notification(cx: &mut gpui::TestAppContext) {
+        let (workspace, _, mut cx) = panel_window(Vec::new(), cx).await;
+        with_identity(&mut cx);
+        let agent_tab = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let item = cx.new(workspace::item::test::TestItem::new);
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
+        });
+        let agent_item = agent_tab.entity_id();
+        cx.cx.update(|cx| {
+            crate::remote_control::set_agent_resolver(cx, move |item, _| {
+                (item.item_id() == agent_item).then(|| "agent-1".to_owned())
+            })
+        });
+        let toasts = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids().len())
+        };
+        let before = toasts(&mut cx);
+
+        cx.cx
+            .update(|cx| handle_event("notification", payload("seen", "agent_turn_done"), cx));
+        cx.run_until_parked();
+        assert_eq!(toasts(&mut cx), before, "the agent's tab is in front");
+        let store = cx.cx.update(|cx| store(cx));
+        store.read_with(&cx, |store, _| assert_eq!(store.unread(), 0));
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let other = cx.new(workspace::item::test::TestItem::new);
+            workspace.add_item_to_active_pane(Box::new(other), None, true, window, cx);
+        });
+        cx.cx
+            .update(|cx| handle_event("notification", payload("away", "agent_turn_done"), cx));
+        cx.run_until_parked();
+        assert_eq!(toasts(&mut cx), before + 1, "another tab is in front");
+
+        cx.deactivate_window();
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let pane = workspace.active_pane().clone();
+            pane.update(cx, |pane, cx| {
+                let index = pane.index_for_item(&agent_tab).expect("agent tab");
+                pane.activate_item(index, true, true, window, cx);
+            });
+        });
+        cx.cx
+            .update(|cx| handle_event("notification", payload("behind", "agent_turn_done"), cx));
+        cx.run_until_parked();
+        assert!(
+            cx.shown_system_notifications()
+                .iter()
+                .any(|banner| banner.tag.as_ref() == "behind"),
+            "the window isn't focused, so the banner shows"
+        );
     }
 
     #[gpui::test]

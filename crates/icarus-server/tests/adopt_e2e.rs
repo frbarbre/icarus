@@ -22,6 +22,7 @@ fn start_server(home: &Path) -> ServerProcess {
     let child = Command::new(env!("CARGO_BIN_EXE_icarus-server"))
         .args(["--home", home.to_str().expect("utf8 home"), "serve"])
         .env("ICARUS_WORKSPACE_ROOT", home.join("workspaces"))
+        .env("ICARUS_CONFIG_DIR", home.join("config"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -205,17 +206,95 @@ async fn an_existing_worktree_is_adopted_in_place_and_refusals_are_clear() {
         "{headless:#}"
     );
 
-    client
+    let hidden = client
         .request(
             "workspace.remove",
             json!({ "id": adopted["id"], "force": true }),
         )
         .await
         .expect("remove the adopted workspace");
-    assert!(!outside.exists(), "its worktree is removed like any other");
+    assert_eq!(hidden["worktree_deleted"], false);
+    assert!(
+        outside.join("work.txt").exists(),
+        "a worktree Icarus didn't create is only hidden"
+    );
+    client
+        .request(
+            "workspace.remove",
+            json!({ "id": adopted["id"], "force": true, "delete_worktree": true, "delete_branch": true }),
+        )
+        .await
+        .expect("delete the adopted worktree when asked");
+    assert!(!outside.exists(), "deleted when asked");
     assert_eq!(
         git(&repo, &["branch", "--list", "fix/login"]),
         "",
-        "and its branch deleted"
+        "and its branch, when asked"
     );
+}
+
+#[tokio::test]
+async fn adopting_a_discovered_worktree_keeps_its_record_and_shows_it() {
+    let home = tempfile::tempdir().expect("home");
+    let dirs = tempfile::tempdir().expect("dirs");
+    let dirs = std::fs::canonicalize(dirs.path()).expect("canonical");
+    let repo = dirs.join("widgets");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("readme.md"), "hello\n").expect("write");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let outside = dirs.join("elsewhere").join("spike");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "spike",
+            outside.to_str().expect("utf8"),
+        ],
+    );
+    let config = home.path().join("config");
+    std::fs::create_dir_all(&config).expect("config");
+    std::fs::write(
+        config.join("icarus.json"),
+        r#"{"workspace":{"external":"hide"}}"#,
+    )
+    .expect("settings");
+
+    let _server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let project = client
+        .request("project.add", json!({ "path": repo }))
+        .await
+        .expect("add project");
+    let hidden = client
+        .request(
+            "workspace.list",
+            json!({ "project": project["id"], "refresh": true, "include_hidden": true }),
+        )
+        .await
+        .expect("list");
+    let found = hidden[0].clone();
+    assert_eq!(found["hidden"], true);
+    let adopted = client
+        .request("workspace.adopt", json!({ "path": outside }))
+        .await
+        .expect("adopt");
+    assert_eq!(adopted["id"], found["id"]);
+    assert_eq!(adopted["origin"], "adopted");
+    assert_eq!(adopted["hidden"], false);
+    let listed = client
+        .request(
+            "workspace.list",
+            json!({ "project": project["id"], "refresh": true }),
+        )
+        .await
+        .expect("list");
+    assert_eq!(listed.as_array().map(Vec::len), Some(1));
 }

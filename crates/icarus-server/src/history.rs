@@ -501,6 +501,7 @@ mod tests {
             state,
             provider_session: None,
             model: None,
+            mode: "default".into(),
             turns: 2,
             created_at_ms: 1,
             last_activity_ms: 9_999,

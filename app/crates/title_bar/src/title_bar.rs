@@ -1310,7 +1310,8 @@ impl TitleBar {
                 let user_store = user_store.clone();
                 let workspace = workspace.clone();
 
-                let ai_enabled = !project::DisableAiSettings::get_global(cx).disable_ai;
+                let ai_enabled = !project::DisableAiSettings::get_global(cx).disable_ai
+                    && !cx.has_global::<agent_settings::AgentTabsEnabled>();
                 let current_layout = AgentSettings::get_layout(cx);
                 let is_editor = matches!(current_layout, WindowLayout::Editor(_));
                 let is_agent = matches!(current_layout, WindowLayout::Agent(_));

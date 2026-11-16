@@ -536,6 +536,10 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         .detach();
 
         cx.defer(move |cx| {
+            // Icarus: its Workspaces panel replaces the threads sidebar.
+            if icarus_ui::enabled(cx) {
+                return;
+            }
             window_handle
                 .update(cx, |_, window, cx| {
                     let sidebar =
@@ -837,7 +841,10 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
-        workspace_handle.update(cx, |workspace, cx| {
+        workspace_handle.update_in(cx, |workspace, window, cx| {
+            if icarus_ui::enabled(cx) {
+                icarus_ui::open_source_control_first(workspace, window, cx);
+            }
             workspace.finish_dock_restoration(cx);
         })?;
 

@@ -194,6 +194,7 @@ impl Server {
             env: Default::default(),
             account: None,
             remote_control: choice.remote_control,
+            permission_mode: None,
         };
         self.apply_account(&mut options, None)
             .map_err(|e| anyhow::anyhow!(e.message))?;

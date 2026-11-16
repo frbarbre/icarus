@@ -40,8 +40,10 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `project scripts <id>` | Show the repository's committed scripts and whether they're trusted. |
 | `project trust <id> [--always]` / `untrust <id>` | Trust or untrust them. |
 | `workspace create --project <p> [name] …` | Create a workspace. See [Workspaces](workspaces.md#from-the-shell). |
-| `workspace adopt <path> [--project <p>] [--name <n>]` | Register an existing worktree as a workspace. See [Workspaces](workspaces.md#adopt-an-existing-worktree). |
-| `workspace list [--project]` / `show <ws>` | List or show workspaces. |
+| `workspace adopt <path> [--project <p>] [--name <n>]` | Register a worktree of another clone as a workspace. See [Workspaces](workspaces.md#adopt-a-worktree-from-another-clone). |
+| `workspace list [--project] [--all]` / `show <ws>` | List workspaces, rescanning worktrees first (`--all` adds hidden ones), or show one. |
+| `workspace hide <ws>` / `unhide <ws> [--follow-settings]` | Hide or show a workspace in the sidebar. See [Worktrees made elsewhere](workspaces.md#worktrees-made-elsewhere). |
+| `workspace inbox [--project]` / `show-source <source> --project <p>` | Newly found worktrees, and showing every worktree from a source. |
 | `workspace set <ws> [--status] [--title] [--base] [--pin\|--unpin]` | Change a workspace. |
 | `workspace reorder <ws>...` | Put workspaces at the top of the Manual sort. |
 | `workspace mark-read` / `mark-unread <ws>` | Clear or set the unread mark. |
@@ -51,14 +53,17 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `workspace turns <ws>` | Recorded agent turns. |
 | `workspace next-action <ws> [--run]` | Show or run the next step. |
 | `workspace sleep` / `wake <ws>` | Park and restart a workspace. |
-| `workspace remove <ws> [--force] [--keep-branch] [--skip-archive] [--allow-failed-archive]` | Remove a workspace. |
+| `workspace remove <ws> [--force] [--keep-branch] [--delete-worktree] [--delete-branch] [--skip-archive] [--allow-failed-archive]` | Remove a workspace. A worktree Icarus didn't create is only hidden unless `--delete-worktree`. |
 | `layout list [--project]` / `show <name>` | Tab layouts. |
 
 ### Agents
 
 | Command | What it does |
 |---|---|
-| `agent create [--workspace] [--cwd] [--provider] [--prompt] [--model] [--account] [--title] [--ask-permissions] [--resume] [--remote-control on\|off]` | Start an agent. |
+| `agent create [--workspace] [--cwd] [--provider] [--prompt] [--model] [--mode] [--account] [--title] [--ask-permissions] [--resume] [--remote-control on\|off]` | Start an agent. |
+| `agent mode <id> [<mode>]` | List the agent's permission modes, or switch to one; it survives restarts. |
+| `agent model <id> [<model>]` | List the agent's models, or switch to one for the following turns. |
+| `agent commands <id>` | The agent's slash commands. |
 | `agent list` | List agents. |
 | `agent send <id> <text>` | Send a message. |
 | `agent read <id>` | Print the transcript. |
@@ -111,6 +116,7 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `pr status <ws> [--refresh]` | The workspace's pull request. |
 | `pr previews <ws>` / `preview <ws> [--app] [--browser]` | Preview deployments. |
 | `issue show` / `open` / `search` / `refresh` / `status` | Linear issues. |
+| `linear login` / `logout` / `status` | Save (from a hidden prompt or stdin), remove or check the Linear API key. See [Linear](github-and-linear.md#set-up-the-api-key). |
 | `rules status` / `tick [--dry-run]` | Automations. |
 | `notifications [--unread] [--limit]` / `read <id>\|--all` / `clear` | Notifications. |
 

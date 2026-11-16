@@ -63,6 +63,8 @@ impl Section {
 pub struct SectionLayout {
     pub order: Vec<String>,
     pub hidden: Vec<String>,
+    /// The PR panel's own layout, which lives in the same setting and is written back untouched.
+    pub pr: Option<Value>,
 }
 
 fn strings(value: &Value) -> Vec<String> {
@@ -79,11 +81,16 @@ impl SectionLayout {
         Self {
             order: strings(&value["order"]),
             hidden: strings(&value["hidden"]),
+            pr: value.get("pr").filter(|pr| pr.is_object()).cloned(),
         }
     }
 
     pub fn to_value(&self) -> Value {
-        json!({ "order": self.order, "hidden": self.hidden })
+        let mut value = json!({ "order": self.order, "hidden": self.hidden });
+        if let Some(pr) = &self.pr {
+            value["pr"] = pr.clone();
+        }
+        value
     }
 
     /// Saved ids first, then the sections the save doesn't name, in the default order.
@@ -142,6 +149,7 @@ impl SectionLayout {
         Self {
             order,
             hidden: self.hidden.clone(),
+            pr: self.pr.clone(),
         }
     }
 
@@ -315,6 +323,16 @@ mod tests {
             shown
                 .toggled_hidden(Section::Changes)
                 .is_hidden(Section::Changes)
+        );
+
+        let with_pr = SectionLayout::from_settings(&json!({ "pr": { "order": ["pr-checks"] } }));
+        assert_eq!(
+            with_pr
+                .moved(Section::Commits, None)
+                .toggled_hidden(Section::Changes)
+                .to_value()["pr"],
+            json!({ "order": ["pr-checks"] }),
+            "saving the Source Control layout keeps the PR panel's"
         );
 
         let default = SectionLayout::default();

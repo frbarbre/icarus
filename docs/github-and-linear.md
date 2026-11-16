@@ -14,15 +14,26 @@ Settings → Integrations shows whether `gh` is signed in.
 
 A workspace's pull request is the open PR for its branch. Cards show it when the `pr` card field is on: the number, state, and a dot for its checks. The `pr-author`, `pr-diff` and `stack` fields add the author's avatar, +N −M and the stack position.
 
-The GitHub panel (right dock; the action is `icarus::ToggleGitHubPanel`) shows the workspace's PR in full:
+The GitHub panel (right dock, ⌘⇧H; the action is `icarus::ToggleGitHubPanel`) shows the workspace's PR in full. At the top:
 
 - The state (Draft, Open, Queued, Merged, Closed), refresh, and a link to GitHub.
 - **Stack**: when the PR is part of a GitHub stack, every PR in it, with the current one highlighted, and a warning when the stack is out of date.
 - **Merge queue**: the PR's position and estimated time when it's queued.
-- **Needs attention**: conflicts, failing checks and other blockers.
-- **Checks**: failing first, with durations.
-- **Reviewers** and the **Review** section. See [Review a pull request](review.md#review-a-pull-request).
+- **Description**: the PR's description in Markdown, folded with its header.
+
+Images and videos in the description, comments, review threads and your comment boxes show as thumbnails. Click one to see it large; ← and → step through the others in the same thread, Escape closes. Videos open in your default player. Attachments from private repositories load through the Icarus server with your `gh` login, and the server keeps a copy in `~/.icarus/assets`.
+
+Then the sections, which work like Source Control's: click a header to collapse it, drag a header onto another to move it, right-click it to move or hide it, and drag a section's bottom edge to give it a fixed height (double-click the edge to undo). The order and hidden sections are saved in `sourceControl.sections.pr` (Orca's `sourceControlSectionLayout.pr` imports there); collapsed sections and heights are kept per workspace while the app runs.
+
+- **Needs attention**: conflicts, failing checks, requested changes, a branch behind its base.
 - **Previews**: the PR's preview deployments.
+- **Checks**: a summary such as "1 failed · 24 passed · 18 skipped" in the header, failing and running checks listed, and the passed and skipped ones behind a toggle. The section starts collapsed while everything is green.
+- **Review**: reviewers and the review form. See [Review a pull request](review.md#review-a-pull-request).
+- **Pending review**: your queued draft comments; click one to open its line.
+- **Comments**: the open review threads, filtered by All, Humans, Bots or Unresolved. Each card shows the comments in Markdown with their reactions; `file:L42` opens the line in the diff tab. Reply, resolve, react and send the thread to an agent from the card.
+- **Resolved**: resolved threads, collapsed at first.
+
+Files with open review threads show a comment count in the Changes list, and the diff marks their lines in the gutter.
 
 To open the PR: `icarus: open pull request`, or copy its URL with `icarus: copy pull request url`.
 
@@ -73,20 +84,32 @@ Icarus reads Linear issues to name workspaces and show issue details on cards. I
 
 ### Set up the API key
 
-Create a personal API key in Linear's settings. Then give it to the server in one of two ways:
+Create a personal API key in Linear (Settings → Security & access → Personal API keys). Then paste it in one of two places:
 
-- Set `LINEAR_API_KEY` in the server's environment.
-- Or set a command that prints the key, so it never sits in a file. This is the better choice when the server starts at login, since it doesn't see your shell's environment:
-
-```sh
-icarus config set linear.api_key_command '["security", "find-generic-password", "-s", "linear-api-key", "-w"]'
-```
-
-The command can be an argument list or a string run with `sh -c`. Its output is kept in memory only, and it runs again if Linear rejects the key. Set it in your user settings (it isn't read from project files). Settings → Integrations has the same field and a refresh button.
+- Icarus Settings → Integrations → **Linear API key**, then **Save**.
+- Or the terminal:
 
 ```sh
-icarus issue status    # is Linear configured?
+icarus linear login            # asks for the key without echoing it
+pbpaste | icarus linear login  # or reads it from stdin
+icarus linear status           # "Signed in to Linear as …"
+icarus linear logout           # removes the saved key
 ```
+
+The server checks the key with Linear before saving it and refuses one Linear rejects. On macOS it goes into your login Keychain (service `dev.icarus.linear`); elsewhere into a file only you can read, `linear-api-key` in the server's home (`~/.icarus`). The key is never written to a settings file and never shown again.
+
+#### Headless servers
+
+On a server without a desktop session, give the key through the environment or a command instead. Either wins over a saved key, in this order:
+
+1. `LINEAR_API_KEY` in the server's environment.
+2. A command that prints the key, e.g. from a password manager:
+
+```sh
+icarus config set linear.api_key_command '["bw", "get", "password", "Linear API key"]'
+```
+
+The command can be an argument list or a string run with `sh -c`. Its output is kept in memory only, and it runs again if Linear rejects the key. Set it in your user settings (it isn't read from project files). Settings → Integrations has the same field.
 
 ### Use issues
 

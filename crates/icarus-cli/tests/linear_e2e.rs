@@ -257,6 +257,116 @@ async fn issue_search_matches_text_and_identifiers_without_leaking_the_key() {
     assert!(!log.contains("lin_test_fixture_key"));
 }
 
+impl Env {
+    fn icarus_with_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write as _;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_icarus"))
+            .arg("--home")
+            .arg(self.home.path())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("icarus");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input.as_bytes())
+            .expect("write key");
+        child.wait_with_output().expect("icarus")
+    }
+}
+
+#[tokio::test]
+async fn a_key_pasted_with_login_is_checked_saved_used_and_removed_with_logout() {
+    let env = start(None);
+    std::fs::write(
+        env.fixtures.join("_viewer.json"),
+        json!({ "name": "Ada Lovelace" }).to_string(),
+    )
+    .expect("viewer");
+    let status = env.json(&["linear", "status"]);
+    assert_eq!(status["configured"], false);
+    assert_eq!(status["source"], Value::Null);
+
+    let (_app, mut events) = icarus_client::Client::connect(env.home.path(), "icarus-app")
+        .await
+        .expect("app");
+    std::fs::write(env.fixtures.join("_status.json"), r#"{"status": 401}"#).expect("401");
+    let refused = env.icarus_with_stdin(&["linear", "login"], "lin_api_wrongkey\n");
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("rejected"), "{stderr}");
+    assert!(!stderr.contains("lin_api_wrongkey"), "{stderr}");
+    assert!(!env.home.path().join("linear-api-key").exists());
+    let garbage = env.icarus_with_stdin(&["linear", "login"], "not a key\n");
+    assert!(!garbage.status.success());
+    std::fs::remove_file(env.fixtures.join("_status.json")).expect("unset 401");
+
+    let login = env.icarus_with_stdin(&["linear", "login"], "  lin_api_fixturekey\n");
+    assert!(
+        login.status.success(),
+        "{}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&login.stdout).trim(),
+        "Signed in to Linear as Ada Lovelace"
+    );
+    let stored = env.home.path().join("linear-api-key");
+    assert_eq!(
+        std::fs::read_to_string(&stored).expect("stored"),
+        "lin_api_fixturekey"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&stored)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let event = tokio::time::timeout(left, events.recv())
+            .await
+            .expect("config.changed in time")
+            .expect("open stream");
+        if event.topic == "config.changed" {
+            break;
+        }
+    }
+
+    let status = env.json(&["linear", "status"]);
+    assert_eq!(status["configured"], true);
+    assert_eq!(status["source"], "stored");
+    assert_eq!(status["store"], "file");
+    assert_eq!(status["viewer"], "Ada Lovelace");
+    assert!(!status.to_string().contains("lin_api_fixturekey"));
+    assert!(
+        env.ok(&["linear", "status"])
+            .contains("Signed in to Linear as Ada Lovelace via saved key (file)")
+    );
+    let shown = env.ok(&["issue", "show", "ABC-12"]);
+    assert!(shown.contains("Fix login redirect"), "{shown}");
+
+    let logout = env.ok(&["linear", "logout"]);
+    assert!(logout.contains("Removed the saved Linear key"), "{logout}");
+    assert!(!stored.exists());
+    assert_eq!(env.json(&["linear", "status"])["configured"], false);
+    assert!(
+        env.ok(&["linear", "status"])
+            .contains("run `icarus linear login`")
+    );
+
+    let log = std::fs::read_to_string(env.fixtures.join("requests.jsonl")).expect("log");
+    assert!(log.contains("\"Viewer\""));
+    assert!(!log.contains("lin_api_"));
+}
+
 #[tokio::test]
 async fn without_a_key_linear_degrades_quietly() {
     let env = start(None);

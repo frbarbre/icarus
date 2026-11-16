@@ -260,9 +260,19 @@ pub struct ThreadsSidebarSettings {
     pub default_width: Pixels,
 }
 
+/// Icarus: present once agents live in centre tabs, which replace Zed's agent panel, threads sidebar
+/// and inline assistant.
+pub struct AgentTabsEnabled;
+
+impl gpui::Global for AgentTabsEnabled {}
+
 impl AgentSettings {
+    /// Whether Zed's own agent surfaces show (panel, inline assist, AI buttons); Icarus's agent tabs
+    /// turn them off.
     pub fn enabled(&self, cx: &App) -> bool {
-        self.enabled && !DisableAiSettings::get_global(cx).disable_ai
+        self.enabled
+            && !DisableAiSettings::get_global(cx).disable_ai
+            && !cx.has_global::<AgentTabsEnabled>()
     }
 
     pub fn temperature_for_model(model: &LanguageModel, cx: &App) -> Option<f32> {

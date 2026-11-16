@@ -98,6 +98,10 @@ fn prompt_if_needed(cx: &mut Context<Workspace>) {
     let Some(sources) = sources(cx) else {
         return;
     };
+    // `icarus settings import-zed` leaves the same mark the app's own import does.
+    if zed_import::already_imported(&sources.target) {
+        return;
+    }
     let plan = run_import(sources, true, cx);
     cx.spawn(async move |workspace, cx| {
         let plan = plan.await?;
@@ -328,6 +332,23 @@ mod tests {
         assert!(workspace.read_with(&cx, |workspace, _| {
             workspace.has_notification(&NotificationId::unique::<ImportResult>())
         }));
+    }
+
+    #[gpui::test]
+    async fn no_prompt_after_the_cli_imported(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sources = zed_install(root.path());
+        zed_import::import(
+            &sources.config,
+            sources.data.as_deref(),
+            &sources.target,
+            false,
+        )
+        .expect("cli import");
+        // Something the import doesn't own changed afterwards, so a dry run alone would still offer it.
+        std::fs::remove_dir_all(sources.target.join("themes")).ok();
+        let (workspace, mut cx) = open_workspace(sources, cx).await;
+        assert!(!prompted(&workspace, &mut cx));
     }
 
     #[gpui::test]

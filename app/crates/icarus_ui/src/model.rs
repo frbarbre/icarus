@@ -5,12 +5,27 @@ use serde::Deserialize;
 
 use crate::cards::SortBy;
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct AgentSummary {
     pub id: String,
     pub title: Option<String>,
     pub state: String,
     pub provider: String,
+    #[serde(default)]
+    pub turns: u64,
+    #[serde(default)]
+    pub last_activity_ms: u64,
+}
+
+impl AgentSummary {
+    /// The agent's title, when it finished a turn and said something worth a line on the card.
+    pub fn finished_summary(&self) -> Option<&str> {
+        (self.state == "idle" && self.turns > 0)
+            .then_some(self.title.as_deref())
+            .flatten()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -561,6 +576,7 @@ mod tests {
             title: None,
             state: "working".into(),
             provider: "claude".into(),
+            ..AgentSummary::default()
         });
         let listed = vec![beta, alpha, gamma];
         let projects = |id: &str| if id == "a" { "zeta" } else { "api" }.to_string();
@@ -632,6 +648,7 @@ mod tests {
             title: None,
             state: "working".into(),
             provider: "claude".into(),
+            ..AgentSummary::default()
         });
         let mut items = vec![quiet, done_old, working, done_new, asking];
         sort_workspaces(&mut items, SortBy::Smart, |_| String::new());

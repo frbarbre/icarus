@@ -541,6 +541,82 @@ impl Facet {
     }
 }
 
+/// One line of the Changes tree: a folder, or a file by its index in the listing's rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeEntry {
+    Folder {
+        path: String,
+        name: String,
+        depth: usize,
+        files: usize,
+        collapsed: bool,
+    },
+    File {
+        index: usize,
+        depth: usize,
+    },
+}
+
+/// The rows as a folder tree, folders before files at each level, skipping what folded folders hide.
+pub fn tree_entries(paths: &[&str], collapsed: &collections::HashSet<String>) -> Vec<TreeEntry> {
+    #[derive(Default)]
+    struct Folder {
+        folders: std::collections::BTreeMap<String, Folder>,
+        files: Vec<(String, usize)>,
+        count: usize,
+    }
+    let mut root = Folder::default();
+    for (index, path) in paths.iter().enumerate() {
+        let mut parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        let Some(name) = parts.pop() else {
+            continue;
+        };
+        let mut folder = &mut root;
+        folder.count += 1;
+        for part in parts {
+            folder = folder.folders.entry(part.to_owned()).or_default();
+            folder.count += 1;
+        }
+        folder.files.push((name.to_owned(), index));
+    }
+    fn walk(
+        folder: &Folder,
+        prefix: &str,
+        depth: usize,
+        collapsed: &collections::HashSet<String>,
+        out: &mut Vec<TreeEntry>,
+    ) {
+        for (name, child) in &folder.folders {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let folded = collapsed.contains(&path);
+            out.push(TreeEntry::Folder {
+                path: path.clone(),
+                name: name.clone(),
+                depth,
+                files: child.count,
+                collapsed: folded,
+            });
+            if !folded {
+                walk(child, &path, depth + 1, collapsed, out);
+            }
+        }
+        let mut files = folder.files.clone();
+        files.sort();
+        out.extend(
+            files
+                .into_iter()
+                .map(|(_, index)| TreeEntry::File { index, depth }),
+        );
+    }
+    let mut out = Vec::new();
+    walk(&root, "", 0, collapsed, &mut out);
+    out
+}
+
 /// The trigger's label while any facet is active, e.g. `Implementation · Frontend`.
 fn filter_label(facets: &[Facet]) -> Option<String> {
     let parts: Vec<String> = facets.iter().filter_map(Facet::shown_label).collect();
@@ -621,8 +697,12 @@ pub struct SourceControlPanel {
     selected: Option<usize>,
     /// The last file step's direction and time, to tell a held key's repeats from single presses.
     last_step: Option<(bool, Instant)>,
+    /// Folders folded shut in the tree view, by path.
+    collapsed_dirs: collections::HashSet<String>,
     /// Open notes per changed file, shown as a badge on its row.
     note_counts: HashMap<String, usize>,
+    /// Unresolved PR review threads per changed file.
+    pr_thread_counts: HashMap<String, usize>,
     /// The workspace's agent turns, newest first.
     turns: Vec<TurnRow>,
     turns_collapsed: bool,
@@ -697,7 +777,9 @@ impl SourceControlPanel {
             error: None,
             selected: None,
             last_step: None,
+            collapsed_dirs: Default::default(),
             note_counts: HashMap::default(),
+            pr_thread_counts: HashMap::default(),
             turns: Vec::new(),
             turns_collapsed: false,
             commits: Vec::new(),
@@ -735,7 +817,9 @@ impl SourceControlPanel {
             error: None,
             selected,
             last_step: None,
+            collapsed_dirs: Default::default(),
             note_counts: HashMap::default(),
+            pr_thread_counts: HashMap::default(),
             turns: Vec::new(),
             turns_collapsed: false,
             commits: Vec::new(),
@@ -905,64 +989,34 @@ impl SourceControlPanel {
         let root = self.root.clone();
         let known = self.icarus_workspace.clone();
         let scope = self.scope.clone();
-        let fetch = Tokio::spawn_result(cx, async move {
-            let id = match known {
-                Some(id) => id,
-                None => workspace_id_for_root(client.clone(), &root)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("{} isn't an Icarus workspace", root.display())
-                    })?,
-            };
-            let value = client
-                .request(
-                    "workspace.changes",
-                    serde_json::json!({ "id": id, "scope": scope.wire() }),
-                )
-                .await?;
-            let listing = serde_json::from_value::<Listing>(value)?;
-            // A server without notes, or a failed lookup, just shows no badges.
-            let note_counts = client
-                .request("note.list", serde_json::json!({ "workspace": id }))
-                .await
-                .ok()
-                .map(|value| note_counts(&value))
-                .unwrap_or_default();
-            // Turns and the branch state are extras: a failure leaves those sections empty.
-            let turns = client
-                .request("workspace.turns", serde_json::json!({ "id": id }))
-                .await
-                .ok()
-                .and_then(|value| serde_json::from_value::<Vec<TurnRow>>(value).ok())
-                .unwrap_or_default();
-            let sync = client
-                .request("git.status", serde_json::json!({ "workspace": id }))
-                .await
-                .ok()
-                .and_then(|value| serde_json::from_value::<SyncInfo>(value).ok());
-            let commits = client
-                .request("git.commits", serde_json::json!({ "workspace": id }))
-                .await
-                .ok()
-                .and_then(|value| serde_json::from_value::<BranchCommits>(value).ok())
-                .unwrap_or_default();
-            anyhow::Ok((id, listing, note_counts, turns, sync, commits))
+        let fetch = Tokio::spawn_result(cx, {
+            let client = client.clone();
+            async move {
+                let id = match known {
+                    Some(id) => id,
+                    None => workspace_id_for_root(client.clone(), &root)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("{} isn't an Icarus workspace", root.display())
+                        })?,
+                };
+                let value = client
+                    .request(
+                        "workspace.changes",
+                        serde_json::json!({ "id": id, "scope": scope.wire() }),
+                    )
+                    .await?;
+                anyhow::Ok((id, serde_json::from_value::<Listing>(value)?))
+            }
         });
-        self.refreshing = Some(cx.spawn(async move |this, cx| {
+        let refresh = cx.spawn(async move |this, cx| {
             let result = fetch.await;
-            this.update(cx, |this, cx| {
-                this.refreshing = None;
+            // The list shows as soon as it arrives; notes, turns, branch state and commits follow.
+            let id = this.update(cx, |this, cx| {
+                cx.notify();
                 match result {
-                    Ok((id, listing, note_counts, turns, sync, commits)) => {
-                        this.note_counts = note_counts;
-                        this.turns = turns;
-                        this.sync = sync;
-                        this.commits = commits.commits;
-                        this.commits_truncated = commits.truncated;
-                        let commits = &this.commits;
-                        this.expanded_commits
-                            .retain(|oid, _| commits.iter().any(|commit| &commit.oid == oid));
-                        this.icarus_workspace = Some(id);
+                    Ok((id, listing)) => {
+                        this.icarus_workspace = Some(id.clone());
                         this.error = None;
                         if let Some(selected) = this.selected
                             && selected >= listing.rows.len()
@@ -972,12 +1026,67 @@ impl SourceControlPanel {
                         if this.listing.as_ref() != Some(&listing) {
                             this.listing = Some(listing);
                         }
+                        Some(id)
                     }
-                    Err(error) => this.error = Some(format!("{error:#}").into()),
+                    Err(error) => {
+                        this.refreshing = None;
+                        this.error = Some(format!("{error:#}").into());
+                        None
+                    }
                 }
+            })?;
+            let Some(id) = id else {
+                return anyhow::Ok(());
+            };
+            let extras = this.update(cx, |_, cx| {
+                Tokio::spawn_result(cx, async move {
+                    // Asked together, so one slow extra (a long branch's commits) holds back none of the others.
+                    let (notes, turns, sync, commits, threads) = futures::join!(
+                        client.request("note.list", serde_json::json!({ "workspace": id })),
+                        client.request("workspace.turns", serde_json::json!({ "id": id })),
+                        client.request("git.status", serde_json::json!({ "workspace": id })),
+                        client.request("git.commits", serde_json::json!({ "workspace": id })),
+                        client.request(
+                            "review.threads",
+                            serde_json::json!({ "workspace": id, "unresolved": true })
+                        ),
+                    );
+                    anyhow::Ok((notes, turns, sync, commits, threads))
+                })
+            })?;
+            let (notes, turns, sync, commits, threads) = extras.await?;
+            this.update(cx, |this, cx| {
+                this.refreshing = None;
+                // A failed extra just leaves its part empty.
+                this.note_counts = notes
+                    .ok()
+                    .map(|value| note_counts(&value))
+                    .unwrap_or_default();
+                this.pr_thread_counts = threads
+                    .ok()
+                    .map(|value| crate::pr_comments::open_thread_counts(&value))
+                    .unwrap_or_default();
+                this.turns = turns
+                    .ok()
+                    .and_then(|value| serde_json::from_value::<Vec<TurnRow>>(value).ok())
+                    .unwrap_or_default();
+                this.sync = sync
+                    .ok()
+                    .and_then(|value| serde_json::from_value::<SyncInfo>(value).ok());
+                let commits = commits
+                    .ok()
+                    .and_then(|value| serde_json::from_value::<BranchCommits>(value).ok())
+                    .unwrap_or_default();
+                this.commits = commits.commits;
+                this.commits_truncated = commits.truncated;
+                let commits = &this.commits;
+                this.expanded_commits
+                    .retain(|oid, _| commits.iter().any(|commit| &commit.oid == oid));
                 cx.notify();
             })
-            .log_err();
+        });
+        self.refreshing = Some(cx.spawn(async move |_, _| {
+            refresh.await.log_err();
         }));
     }
 
@@ -1033,7 +1142,54 @@ impl SourceControlPanel {
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
         self.selected = Some(index);
-        self.scroll.scroll_to_item(index, ScrollStrategy::Center);
+        let line = if self.tree_view(cx) {
+            // A file inside a folded folder shows once its folders open.
+            if let Some(path) = self.rows().get(index).map(|row| row.path.clone()) {
+                let mut folder = Path::new(&path).parent();
+                while let Some(parent) = folder.filter(|parent| !parent.as_os_str().is_empty()) {
+                    self.collapsed_dirs
+                        .remove(parent.to_string_lossy().as_ref());
+                    folder = parent.parent();
+                }
+            }
+            self.tree()
+                .iter()
+                .position(
+                    |entry| matches!(entry, TreeEntry::File { index: file, .. } if *file == index),
+                )
+                .unwrap_or(index)
+        } else {
+            index
+        };
+        self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    /// Whether the Changes list shows a folder tree; this app remembers the choice.
+    pub fn tree_view(&self, cx: &App) -> bool {
+        crate::client_settings::get(Some(crate::client_settings::CHANGES_VIEW), cx) == "tree"
+    }
+
+    pub fn toggle_tree_view(&mut self, cx: &mut Context<Self>) {
+        let next = if self.tree_view(cx) { "list" } else { "tree" };
+        crate::client_settings::set(
+            crate::client_settings::CHANGES_VIEW,
+            Some(serde_json::json!(next)),
+            cx,
+        )
+        .log_err();
+        cx.notify();
+    }
+
+    pub fn tree(&self) -> Vec<TreeEntry> {
+        let paths: Vec<&str> = self.rows().iter().map(|row| row.path.as_str()).collect();
+        tree_entries(&paths, &self.collapsed_dirs)
+    }
+
+    pub fn toggle_folder(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_dirs.remove(path) {
+            self.collapsed_dirs.insert(path.to_owned());
+        }
         cx.notify();
     }
 
@@ -1490,7 +1646,6 @@ impl SourceControlPanel {
             .count();
         let label = filter_label(&facets);
         let weak = cx.entity().downgrade();
-        let any_stageable = self.rows().iter().any(|row| can_stage(row, &self.scope));
         let any_unstageable = self.rows().iter().any(|row| can_unstage(row, &self.scope));
         let idle = self.git_busy.is_none();
 
@@ -1552,17 +1707,24 @@ impl SourceControlPanel {
                         ),
                 )
             })
-            .when(any_stageable, |this| {
-                this.child(
-                    IconButton::new("changes-stage-all", IconName::Plus)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .disabled(!idle)
-                        .tooltip(Tooltip::text("Stage all"))
-                        .on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| this.stage_all(true, cx)),
-                        ),
+            .child({
+                let tree = self.tree_view(cx);
+                IconButton::new(
+                    "changes-tree-view",
+                    if tree {
+                        IconName::ListTree
+                    } else {
+                        IconName::FileTree
+                    },
                 )
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text(if tree {
+                    "Show as list"
+                } else {
+                    "Show as tree"
+                }))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_tree_view(cx)))
             })
             .when_some(badge, |this, (text, tooltip)| {
                 this.child(
@@ -1640,7 +1802,7 @@ impl SourceControlPanel {
         let directory = path
             .parent()
             .map(|parent| parent.to_string_lossy().into_owned())
-            .filter(|parent| !parent.is_empty());
+            .filter(|parent| !parent.is_empty() && !self.tree_view(cx));
         let icon = FileIcons::get_icon(path, cx);
         let selected = self.selected == Some(index);
         let color = status_color(&row.status);
@@ -1715,6 +1877,10 @@ impl SourceControlPanel {
                     )
                 },
             )
+            .children(crate::pr_comments::open_thread_badge(
+                index,
+                self.pr_thread_counts.get(&row.path).copied(),
+            ))
             .when_some(
                 self.note_counts
                     .get(&row.path)
@@ -1942,59 +2108,35 @@ impl SourceControlPanel {
         collapsed: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let header = h_flex()
-            .id(SharedString::from(format!(
-                "changes-{}-header",
-                section.id()
-            )))
-            .h(px(28.))
-            .px_2()
-            .gap_1()
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.toggle_collapsed(section, cx);
-            }))
-            .on_drag(DraggedSection(section), |dragged, _, _, cx| {
-                cx.new(|_| dragged.clone())
-            })
-            .drag_over::<DraggedSection>(|style, _, _, cx| {
-                style.bg(cx.theme().colors().drop_target_background)
-            })
-            .on_drop(cx.listener(move |this, dragged: &DraggedSection, _, cx| {
-                let layout = this.settings.sections.dropped(dragged.0, section);
-                this.set_section_layout(layout, cx);
-            }))
-            .child(
-                Icon::new(if collapsed {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                })
-                .size(IconSize::XSmall)
-                .color(Color::Muted),
-            )
-            .child(
-                Label::new(section.label().to_uppercase())
-                    .size(LabelSize::XSmall)
-                    .weight(FontWeight::SEMIBOLD)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(count)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
-        let weak = cx.entity().downgrade();
+        let toggle = cx.entity().downgrade();
+        let target = toggle.clone();
+        let weak = toggle.clone();
         let layout = self.settings.sections.clone();
-        right_click_menu(SharedString::from(format!(
-            "changes-{}-section-menu",
-            section.id()
-        )))
-        .trigger(move |_, _, _| header)
-        .menu(move |window, cx| {
-            sections_menu(weak.clone(), Some(section), layout.clone(), window, cx)
-        })
-        .into_any_element()
+        crate::sections::SectionHeader::new(
+            format!("changes-{}-header", section.id()),
+            section.label(),
+            collapsed,
+        )
+        .count(count)
+        .render(
+            DraggedSection(section),
+            move |_, cx| {
+                toggle
+                    .update(cx, |this, cx| this.toggle_collapsed(section, cx))
+                    .log_err();
+            },
+            move |dragged: &DraggedSection, _, cx| {
+                target
+                    .update(cx, |this, cx| {
+                        let layout = this.settings.sections.dropped(dragged.0, section);
+                        this.set_section_layout(layout, cx);
+                    })
+                    .log_err();
+            },
+            move |window, cx| {
+                sections_menu(weak.clone(), Some(section), layout.clone(), window, cx)
+            },
+        )
     }
 
     /// The Changes section: its header, then the file list (or why it's empty).
@@ -2013,10 +2155,15 @@ impl SourceControlPanel {
                 if count == 0 {
                     this.child(self.render_empty(cx))
                 } else {
+                    let lines = if self.tree_view(cx) {
+                        self.tree().len()
+                    } else {
+                        count
+                    };
                     this.child(
                         uniform_list(
                             "changes-rows",
-                            count,
+                            lines,
                             cx.processor(Self::render_rows_processor),
                         )
                         .track_scroll(&self.scroll)
@@ -2781,7 +2928,7 @@ pub fn register(cx: &mut App) {
             workspace.focus_panel::<SourceControlPanel>(window, cx);
         });
         workspace.register_action(|workspace, _: &ToggleSourceControlPanel, window, cx| {
-            workspace.toggle_panel_focus::<SourceControlPanel>(window, cx);
+            crate::github_panel::toggle_panel::<SourceControlPanel>(workspace, window, cx);
         });
         workspace.register_action(|workspace, action: &ToggleSourceControlSection, _, cx| {
             let Some(section) = Section::parse(&action.section) else {
@@ -3063,7 +3210,64 @@ impl SourceControlPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        self.render_rows(range, cx)
+        if !self.tree_view(cx) {
+            return self.render_rows(range, cx);
+        }
+        let rows = self.rows().to_vec();
+        let tree = self.tree();
+        range
+            .filter_map(|line| tree.get(line).cloned())
+            .map(|entry| match entry {
+                TreeEntry::Folder {
+                    path,
+                    name,
+                    depth,
+                    files,
+                    collapsed,
+                } => {
+                    h_flex()
+                        .id(SharedString::from(format!("changes-folder-{path}")))
+                        .h(px(26.))
+                        .pl(px(8. + depth as f32 * 12.))
+                        .pr_2()
+                        .gap_1()
+                        .w_full()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .child(
+                            Icon::new(if collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            Icon::new(IconName::Folder)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(name).size(LabelSize::Small).truncate())
+                        .child(
+                            Label::new(files.to_string())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.toggle_folder(&path, cx)
+                        }))
+                        .into_any_element()
+                }
+                TreeEntry::File { index, depth } => match rows.get(index) {
+                    Some(row) => div()
+                        .pl(px(depth as f32 * 12. + 12.))
+                        .child(self.render_row(index, row, cx))
+                        .into_any_element(),
+                    None => div().into_any_element(),
+                },
+            })
+            .collect()
     }
 }
 
@@ -4004,6 +4208,69 @@ mod tests {
             Some(0),
             "a fresh press wraps to the first file"
         );
+    }
+
+    #[test]
+    fn the_tree_nests_files_under_counted_folders_and_folds() {
+        let paths = ["src/ui/app.rs", "src/new.rs", "README.md", "src/ui/view.rs"];
+        let open = tree_entries(&paths, &Default::default());
+        assert_eq!(
+            open,
+            [
+                TreeEntry::Folder {
+                    path: "src".into(),
+                    name: "src".into(),
+                    depth: 0,
+                    files: 3,
+                    collapsed: false
+                },
+                TreeEntry::Folder {
+                    path: "src/ui".into(),
+                    name: "ui".into(),
+                    depth: 1,
+                    files: 2,
+                    collapsed: false
+                },
+                TreeEntry::File { index: 0, depth: 2 },
+                TreeEntry::File { index: 3, depth: 2 },
+                TreeEntry::File { index: 1, depth: 1 },
+                TreeEntry::File { index: 2, depth: 0 },
+            ]
+        );
+        let folded = tree_entries(&paths, &["src/ui".to_owned()].into_iter().collect());
+        assert_eq!(folded.len(), 4, "a folded folder hides its files");
+    }
+
+    #[gpui::test]
+    async fn the_tree_view_is_remembered_and_selecting_opens_folders(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let window = cx.add_empty_window();
+        let changes = window.update(|_, cx| {
+            cx.new(|cx| SourceControlPanel::preview(sample_listing(), ChangesScope::Base, None, cx))
+        });
+        changes.update(window, |changes, cx| {
+            assert!(!changes.tree_view(cx));
+            changes.toggle_tree_view(cx);
+            assert!(changes.tree_view(cx));
+            assert_eq!(
+                crate::client_settings::get(Some(crate::client_settings::CHANGES_VIEW), cx),
+                serde_json::json!("tree")
+            );
+            changes.toggle_folder("src", cx);
+            assert_eq!(
+                changes.tree().len(),
+                2,
+                "src folded: the folder and README.md"
+            );
+            changes.select(0, cx);
+            assert_eq!(changes.selected, Some(0));
+            assert_eq!(
+                changes.tree().len(),
+                4,
+                "selecting a file in a folded folder opens it"
+            );
+        });
     }
 
     #[gpui::test]

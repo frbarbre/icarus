@@ -9,6 +9,8 @@ Icarus runs your own `claude` (Claude Code) and `codex` binaries with your own l
 Each agent is a tab in the centre panes, showing its conversation. Tabs can be split, dragged and moved between panes like any other tab.
 
 - To open a new agent tab, press ⌘⌥T (`icarus: new agent`; no default key on Linux). It starts an agent with the default provider in the current workspace.
+- To pick the provider, use the **+** above the composer (**New Claude Agent** or **New Codex Agent**), or `icarus: new claude agent` / `icarus: new codex agent`.
+- Clicking an agent tab, switching to it with the keyboard, or opening it from a notification puts the cursor in its draft.
 - Closing the last agent tab of a workspace opens a fresh one.
 - Every new workspace starts with an agent.
 
@@ -16,7 +18,9 @@ To find and reopen an earlier session, run `icarus: open agent history` from the
 
 ## The composer
 
-One composer sits at the bottom of the centre area. It types into the active agent tab, or into the last agent tab you used when another kind of tab is active. Each agent keeps its own draft and attachments, so switching tabs never mixes them up.
+One composer sits at the bottom of the centre area. It types into the active agent tab, or into the last agent tab you used when another kind of tab is active. Each agent keeps its own draft and attachments, so switching tabs never mixes them up. The line above it says which agent it types to; with several agent tabs open, that agent's tab title and the top edge of its conversation are drawn in the accent colour, even while the cursor is in the composer.
+
+Agent notifications only appear when you aren't looking at that agent's tab: it is in another tab or workspace, or the window isn't in front.
 
 `icarus: focus composer` moves the cursor into it.
 
@@ -68,6 +72,36 @@ icarus config set agents.commands.codex '["/opt/codex/bin/codex"]'
 ```
 
 Agents run with permission prompts bypassed (Codex's "full access"); the app has no permission prompts. `icarus agent create --ask-permissions` starts an agent that asks instead; for Codex that is read-only mode with approval requests declined.
+
+### Modes and models
+
+The composer of an agent tab has a mode picker and a model picker. A change applies to the running session (Claude Code switches at once; Codex from its next turn), and the server keeps it, so the agent restarts in the same mode and model after a sleep or an app restart.
+
+| Claude Code mode | What it does |
+|---|---|
+| Default | Asks before edits and commands. Nobody answers those questions, so they are denied. |
+| Accept Edits | Edits files without asking; other prompts are denied. |
+| Plan | Explores and plans without changing anything. |
+| Auto | Claude Code decides which actions are safe to run. |
+| Don't Ask | Runs only what your Claude Code settings already allow. |
+| Bypass Permissions | Runs everything without asking (the default for new agents). |
+
+Codex has three: **Read Only**, **Auto** (edits and commands inside the workspace) and **Full Access** (the default). Approval requests are declined except in Full Access.
+
+The model list is the one Claude Code or Codex reports for your login; until the agent has started once, Claude agents offer the `opus`, `sonnet` and `haiku` aliases.
+
+```sh
+icarus agent mode <agent>               # list the modes, * marks the current one
+icarus agent mode <agent> plan
+icarus agent model <agent> sonnet
+icarus agent create --mode acceptEdits --prompt "Tidy the README"
+```
+
+### Slash commands
+
+Type `/` in the composer for the agent's slash commands: Claude Code's own (`/compact`, `/context`, `/review`, …), your custom commands and your skills, as Claude Code lists them for its headless mode. A command is sent to the agent as typed. Codex agents have none.
+
+`/remote-control [on|off]` is Icarus's own: Claude Code has no Remote Control in headless mode, so it switches [Remote Control](#remote-control) for that agent and prints the session link. `icarus agent commands <agent>` lists the commands from the shell.
 
 ## Working with agents from the shell
 
@@ -137,7 +171,7 @@ To run one agent or workspace on a specific account, pass `--account <id or labe
 
 Claude Code's Remote Control lets you follow and drive a session from claude.ai or the Claude app. Icarus starts Claude Code with its own `--remote-control` flag; it's off by default.
 
-- To turn it on for one agent, open its tab and use the Remote Control item in the status bar (`icarus: toggle remote control`). Once Claude Code reports the session link, the same menu opens or copies it.
+- To turn it on for one agent, open its tab and use the Remote Control item in the status bar (`icarus: toggle remote control`), or type `/remote-control` in its composer. Once Claude Code reports the session link, the same menu opens or copies it.
 - To turn it on for every new Claude agent, set Settings → Agents → Remote Control for new agents, or `icarus config set agents.remote_control true`.
 
 ```sh

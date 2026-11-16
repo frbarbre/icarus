@@ -8541,6 +8541,7 @@ dependencies = [
  "image",
  "language",
  "log",
+ "markdown",
  "menu",
  "multi_buffer",
  "objc2 0.6.5",

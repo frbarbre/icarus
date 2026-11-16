@@ -122,6 +122,16 @@ impl FixtureGh {
             "body": request.json_body(),
         });
         self.log(&line);
+        let raw = &fixtures["routes"][&route];
+        if let Some(content_type) = raw["content_type"].as_str() {
+            let response = FakeResponse::status(raw["status"].as_u64().unwrap_or(200) as u16)
+                .header("Content-Type", content_type);
+            let response = FakeResponse {
+                body: raw["text"].as_str().unwrap_or_default().to_owned(),
+                ..response
+            };
+            return FakeGh::new().on(route, response).execute(request).await;
+        }
         let (status, body) = fixture_response(&fixtures, request);
         FakeGh::new()
             .on(route, FakeResponse::json(status, body.to_string()))
@@ -523,15 +533,88 @@ impl GitHubService {
                     "deletions": details.deletions,
                     "checks": pr.checks_rollup,
                     "in_merge_queue": pr.is_in_merge_queue,
-                    "stack": pr.stack.as_ref().map(|stack| json!({
-                        "number": stack.number,
-                        "position": stack.position,
-                        "size": stack.size,
-                    })),
+                    "stack": match &pr.stack {
+                        Some(stack) => json!({
+                            "number": stack.number,
+                            "position": stack.position,
+                            "size": stack.size,
+                        }),
+                        None => branch_stack(&cached_pulls(&prs, project_id), pr)
+                            .map(|(number, position, size)| json!({
+                                "number": number,
+                                "position": position,
+                                "size": size,
+                            }))
+                            .unwrap_or(Value::Null),
+                    },
                 })
             })
             .unwrap_or(Value::Null)
     }
+}
+
+fn cached_pulls<'a>(
+    prs: &'a HashMap<String, ProjectPrs>,
+    project_id: &str,
+) -> Vec<&'a PullRequest> {
+    prs.get(project_id)
+        .map(|cached| {
+            cached
+                .by_branch
+                .values()
+                .flatten()
+                .map(|details| &details.pr)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A stack made of plain branches, without GitHub's stacks feature: open PRs each based on the one
+/// below's head branch. Returns (bottom PR number, 1-based position from the bottom, size) when
+/// `pr` sits in a chain of two or more.
+pub(crate) fn branch_stack(pulls: &[&PullRequest], pr: &PullRequest) -> Option<(u64, u32, u32)> {
+    let open: Vec<&PullRequest> = pulls
+        .iter()
+        .copied()
+        .filter(|pull| pull.state == icarus_rules::facts::PrState::Open)
+        .collect();
+    let based_on = |pull: &PullRequest| {
+        let base = strip_remote(&pull.base_ref_name);
+        open.iter()
+            .copied()
+            .find(|below| below.number != pull.number && below.head_ref_name == base)
+    };
+    let mut chain = vec![pr];
+    let mut lowest = pr;
+    while let Some(below) = based_on(lowest) {
+        if chain.iter().any(|seen| seen.number == below.number) {
+            break;
+        }
+        chain.push(below);
+        lowest = below;
+    }
+    chain.reverse();
+    let position = chain.len() as u32;
+    let mut top = pr;
+    loop {
+        let above = open
+            .iter()
+            .copied()
+            .filter(|pull| {
+                pull.number != top.number
+                    && strip_remote(&pull.base_ref_name) == top.head_ref_name
+                    && !chain.iter().any(|seen| seen.number == pull.number)
+            })
+            .min_by_key(|pull| pull.number);
+        match above {
+            Some(above) => {
+                chain.push(above);
+                top = above;
+            }
+            None => break,
+        }
+    }
+    (chain.len() >= 2).then_some((lowest.number, position, chain.len() as u32))
 }
 
 /// `github.com/owner/name` → the repository on GitHub; other hosts have no GitHub repository.
@@ -641,6 +724,40 @@ impl Server {
         p: Value,
     ) -> Result<Value, RpcError> {
         match method {
+            "github.asset" => {
+                #[derive(Deserialize)]
+                struct AssetParams {
+                    url: String,
+                }
+                let asset: AssetParams = params(p)?;
+                self.github_asset(&asset.url).await
+            }
+            "pr.body" => {
+                let key: WorkspaceKey = params(p)?;
+                let workspace = self
+                    .store
+                    .workspace(&key.workspace)
+                    .map_err(|e| rpc("internal", e))?
+                    .ok_or_else(|| rpc("not_found", format!("workspace {}", key.workspace)))?;
+                let branch = local_branch(&workspace).await;
+                let view = self.pr_view(&workspace, branch.as_deref(), false).await;
+                let Some(pr) = view.pr else {
+                    return Err(rpc("no_pr", "this workspace has no pull request"));
+                };
+                let pull: Value = self
+                    .github
+                    .client
+                    .rest_json(icarus_github::GhRequest::get(format!(
+                        "repos/{}/{}/pulls/{}",
+                        pr.repo.owner, pr.repo.name, pr.number
+                    )))
+                    .await
+                    .map_err(|e| rpc("github_failed", e))?;
+                Ok(json!({
+                    "number": pr.number,
+                    "body": pull["body"].as_str().unwrap_or_default(),
+                }))
+            }
             "pr.status" => {
                 let key: WorkspaceKey = params(p)?;
                 let workspace = self
@@ -1044,6 +1161,93 @@ impl Server {
     }
 }
 
+/// Total size of fetched comment media kept on disk; the oldest files go first past it.
+const ASSET_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn asset_cache_key(url: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(url.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Deletes the least recently written cache files until the folder fits `limit`.
+fn prune_asset_cache(dir: &std::path::Path, limit: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let metadata = entry
+                .metadata()
+                .ok()
+                .filter(|metadata| metadata.is_file())?;
+            Some((metadata.modified().ok()?, metadata.len(), entry.path()))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
+    files.sort();
+    for (_, size, path) in files {
+        if total <= limit {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
+impl Server {
+    /// A comment's image or video, fetched with the user's `gh` login and cached under the server home.
+    pub(crate) async fn github_asset(&self, url: &str) -> Result<Value, RpcError> {
+        use base64::Engine as _;
+        if !icarus_github::attachment::is_github_asset_url(url) {
+            return Err(rpc(
+                "invalid",
+                "only media GitHub hosts for comments can be fetched",
+            ));
+        }
+        let dir = self.paths.home.join("assets");
+        let key = asset_cache_key(url);
+        let (body_path, type_path) = (dir.join(&key), dir.join(format!("{key}.type")));
+        let cached = match (
+            std::fs::read(&body_path),
+            std::fs::read_to_string(&type_path),
+        ) {
+            (Ok(bytes), Ok(content_type)) => Some((content_type, bytes)),
+            _ => None,
+        };
+        let (content_type, bytes, hit) = match cached {
+            Some((content_type, bytes)) => (content_type, bytes, true),
+            None => {
+                let asset = self
+                    .github
+                    .client
+                    .fetch_asset(url)
+                    .await
+                    .map_err(|error| rpc("github_failed", error))?;
+                let written = std::fs::create_dir_all(&dir)
+                    .and_then(|()| std::fs::write(&body_path, &asset.bytes))
+                    .and_then(|()| std::fs::write(&type_path, &asset.content_type));
+                if let Err(error) = written {
+                    tracing::warn!("caching {url} failed: {error}");
+                }
+                prune_asset_cache(&dir, ASSET_CACHE_BYTES);
+                (asset.content_type, asset.bytes, false)
+            }
+        };
+        Ok(json!({
+            "url": url,
+            "content_type": content_type,
+            "size": bytes.len(),
+            "cached": hit,
+            "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        }))
+    }
+}
+
 /// The branch checked out in the worktree, falling back to the recorded one.
 pub(crate) async fn local_branch(workspace: &Workspace) -> Option<String> {
     let path = workspace.path.clone();
@@ -1059,6 +1263,89 @@ pub(crate) async fn local_branch(workspace: &Workspace) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pull(number: u64, head: &str, base: &str) -> PullRequest {
+        PullRequest {
+            number,
+            head_ref_name: head.into(),
+            base_ref_name: base.into(),
+            ..PullRequest::default()
+        }
+    }
+
+    #[test]
+    fn prs_based_on_each_others_branches_form_a_stack() {
+        let bottom = pull(
+            4147,
+            "feature/e-7225-player-reports-impressions-from-one-playback",
+            "main",
+        );
+        let top = pull(
+            4148,
+            "feature/e-6052-playlist-stats-tab",
+            "feature/e-7225-player-reports-impressions-from-one-playback",
+        );
+        let loose = pull(4100, "fix/typo", "main");
+        let pulls = [&top, &loose, &bottom];
+        assert_eq!(branch_stack(&pulls, &bottom), Some((4147, 1, 2)));
+        assert_eq!(branch_stack(&pulls, &top), Some((4147, 2, 2)));
+        assert_eq!(branch_stack(&pulls, &loose), None);
+
+        let a = pull(1, "a", "main");
+        let b = pull(2, "b", "origin/a");
+        let c = pull(3, "c", "refs/heads/b");
+        let three = [&c, &a, &b];
+        assert_eq!(branch_stack(&three, &a), Some((1, 1, 3)));
+        assert_eq!(branch_stack(&three, &b), Some((1, 2, 3)));
+        assert_eq!(branch_stack(&three, &c), Some((1, 3, 3)));
+
+        let merged = PullRequest {
+            state: icarus_rules::facts::PrState::Merged,
+            ..a.clone()
+        };
+        assert_eq!(
+            branch_stack(&[&merged, &b, &c], &b),
+            Some((2, 1, 2)),
+            "a merged bottom leaves the stack"
+        );
+    }
+
+    #[test]
+    fn a_card_summary_shows_a_branch_stack() {
+        let service = GitHubService::new(ServerGh::Fixture(FixtureGh::new(PathBuf::from(
+            "/nonexistent",
+        ))));
+        let details = |pr: PullRequest| {
+            Some(PrDetails {
+                node_id: String::new(),
+                pr,
+                updated_at: None,
+                additions: 0,
+                deletions: 0,
+                changed_files: 0,
+                is_cross_repository: false,
+                head_ref_deleted: false,
+                base_ref_deleted: false,
+                code_owner_requests: Vec::new(),
+            })
+        };
+        let by_branch = HashMap::from([
+            ("bottom".to_owned(), details(pull(10, "bottom", "main"))),
+            ("top".to_owned(), details(pull(11, "top", "bottom"))),
+        ]);
+        lock(&service.prs).insert(
+            "project".into(),
+            ProjectPrs {
+                at: Instant::now(),
+                viewer: None,
+                by_branch,
+            },
+        );
+        assert_eq!(
+            service.cached_pr_summary("project", "top")["stack"],
+            json!({ "number": 10, "position": 2, "size": 2 })
+        );
+    }
 
     fn project(remote: Option<&str>) -> Project {
         Project {

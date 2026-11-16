@@ -37,6 +37,77 @@ pub fn git_env(repo: &Path, args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Like [`git`], but kills git once `timeout` passes (a folder macOS hasn't let us into blocks it forever).
+pub fn git_timeout(repo: &Path, args: &[&str], timeout: std::time::Duration) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "core.quotePath=false"])
+        .args(args)
+        // Its own process group, so a timeout also ends whatever git started.
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{}", child.id())])
+                .status();
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "git {} in {} did not finish within {}s",
+                args.join(" "),
+                repo.display(),
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if !status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
 fn git_ok(repo: &Path, args: &[&str]) -> Option<String> {
     git(repo, args).ok().map(|s| s.trim().to_string())
 }
@@ -157,10 +228,32 @@ pub struct Worktree {
     pub branch: Option<String>,
     pub detached: bool,
     pub main: bool,
+    #[serde(default)]
+    pub bare: bool,
+    /// The lock reason (empty when locked without one).
+    #[serde(default)]
+    pub locked: Option<String>,
+    /// Git would prune it: its folder is gone.
+    #[serde(default)]
+    pub prunable: bool,
 }
 
 pub fn list_worktrees(repo: &Path) -> Result<Vec<Worktree>> {
-    let output = git(repo, &["worktree", "list", "--porcelain"])?;
+    Ok(parse_worktree_list(&git(
+        repo,
+        &["worktree", "list", "--porcelain"],
+    )?))
+}
+
+pub fn list_worktrees_timeout(repo: &Path, timeout: std::time::Duration) -> Result<Vec<Worktree>> {
+    Ok(parse_worktree_list(&git_timeout(
+        repo,
+        &["worktree", "list", "--porcelain"],
+        timeout,
+    )?))
+}
+
+fn parse_worktree_list(output: &str) -> Vec<Worktree> {
     let mut worktrees = Vec::new();
     let mut current: Option<Worktree> = None;
     for line in output.lines().chain(std::iter::once("")) {
@@ -179,7 +272,25 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<Worktree>> {
                     branch: None,
                     detached: false,
                     main: worktrees.is_empty(),
+                    bare: false,
+                    locked: None,
+                    prunable: false,
                 });
+            }
+            "bare" => {
+                if let Some(w) = current.as_mut() {
+                    w.bare = true;
+                }
+            }
+            "locked" => {
+                if let Some(w) = current.as_mut() {
+                    w.locked = Some(value.to_string());
+                }
+            }
+            "prunable" => {
+                if let Some(w) = current.as_mut() {
+                    w.prunable = true;
+                }
             }
             "HEAD" => {
                 if let Some(w) = current.as_mut() {
@@ -199,7 +310,7 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<Worktree>> {
             _ => {}
         }
     }
-    Ok(worktrees)
+    worktrees
 }
 
 #[derive(Debug, Clone)]

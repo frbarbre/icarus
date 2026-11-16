@@ -20,6 +20,21 @@ The Linux column applies to the app built from source; releases ship a macOS app
 
 The card field chords, in order: 1 unread, 2 status chip, 3 agents, 4 pull request, 5 PR author, 6 PR diff, 7 stack, 8 Linear title, 9 ports, 0 project.
 
+## Panels
+
+Each key focuses its panel, opening the dock; pressed again while the panel has focus, it hides the panel.
+
+| Action | macOS | Linux | Action name |
+|---|---|---|---|
+| Source Control panel | ⌘⇧G | Ctrl+Shift+G | `icarus::ToggleSourceControlPanel` |
+| PR panel | ⌘⇧H | Ctrl+Shift+H | `icarus::ToggleGitHubPanel` |
+| Explorer | ⌘⇧E | Ctrl+Shift+E | `project_panel::ToggleFocus` |
+| Search | ⌘⇧F | Ctrl+Shift+F | `pane::DeploySearch` |
+| Left dock | ⌘B | Ctrl+B | `workspace::ToggleLeftDock` |
+| Right dock | ⌘L (outside text editors), ⌘R, ⌥⌘B | Ctrl+Alt+B | `workspace::ToggleRightDock` |
+
+Orca puts its PR panel on Mod+Shift+K, which Zed's editors use to delete a line, so Icarus uses Mod+Shift+H; search-and-replace stays in the command palette. Inside a text editor ⌘L still selects the line.
+
 ## Diffs, review and Source Control
 
 | Action | macOS | Linux | Action name |
@@ -30,6 +45,7 @@ The card field chords, in order: 1 unread, 2 status chip, 3 agents, 4 pull reque
 | Next / previous changed file | ⌥F7 / ⌥⇧F7 | Alt+F7 / Alt+Shift+F7 | `icarus::NextChangedFile` / `PreviousChangedFile` |
 | Comment or note on the selected lines | ⌘⇧A | Ctrl+Shift+A | `icarus::AddReviewComment` |
 | Send the comment box | ⌘Enter | Ctrl+Enter | `icarus::SubmitReviewComment` |
+| Send a reply (Shift+Enter for a new line) | Enter | Enter | `icarus::SubmitReviewComment` |
 | Close the comment box | Escape | Escape | `icarus::CancelReviewComment` |
 | Uncommitted changes only, and back | ⌥⌘U | none | `icarus::ToggleUncommittedChanges` |
 | Latest agent turn, and back | ⌥⇧⌘T | none | `icarus::OpenLatestAgentTurn` |
@@ -61,7 +77,7 @@ With one tab group, ⌥⌘← / ⌥⌘→ go back and forward in history. Zed's 
 | `icarus::ShowNotifications` / `MarkAllNotificationsRead` / `ClearNotifications` | Notifications. |
 | `icarus::OpenPullRequest` / `CopyPullRequestUrl` | The workspace's PR. |
 | `icarus::AddProject` | Add a project. |
-| `icarus::ToggleWorkspacesPanel` / `ToggleSourceControlPanel` / `ToggleGitHubPanel` | Show or hide a panel. |
+| `icarus::ToggleWorkspacesPanel` | Show or hide the Workspaces panel. |
 | `icarus::CommitChanges`, `PushBranch`, `PullBranch`, `SyncBranch`, `ForcePushWithLease` | Git actions on the workspace. |
 | `icarus::ActivateNextItemOfSameType` / `ActivatePreviousItemOfSameType` | Cycle through tabs of the active tab's kind (agents, terminals, files, diffs). |
 | `icarus::FocusReviewSummary` | Jump to the review summary. |

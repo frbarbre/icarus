@@ -25,21 +25,58 @@ pub fn command(options: &AgentOptions) -> Vec<String> {
     command
 }
 
-/// Orca's Full access for bypass, else its Ask; every field is set so `config.toml` cannot widen it.
-pub fn thread_policy(bypass: bool) -> Value {
-    if bypass {
-        json!({ "approvalPolicy": "never", "sandbox": "danger-full-access", "approvalsReviewer": "user" })
-    } else {
-        json!({ "approvalPolicy": "on-request", "sandbox": "read-only", "approvalsReviewer": "user" })
-    }
+pub const FULL_ACCESS: &str = "full-access";
+pub const AUTO: &str = "auto";
+pub const READ_ONLY: &str = "read-only";
+
+/// Codex's approval presets as `(id, name, description)`. Nobody answers approvals, so only Full
+/// Access approves; the others decline whatever their sandbox doesn't allow.
+pub const MODES: &[(&str, &str, &str)] = &[
+    (
+        READ_ONLY,
+        "Read Only",
+        "Reads files; edits and commands that need access are declined",
+    ),
+    (
+        AUTO,
+        "Auto",
+        "Edits and runs commands inside the workspace; anything beyond it is declined",
+    ),
+    (
+        FULL_ACCESS,
+        "Full Access",
+        "Edits and runs anything without asking",
+    ),
+];
+
+pub fn default_mode(bypass: bool) -> &'static str {
+    if bypass { FULL_ACCESS } else { READ_ONLY }
 }
 
-pub fn turn_policy(bypass: bool) -> Value {
-    if bypass {
-        json!({ "approvalPolicy": "never", "approvalsReviewer": "user", "sandboxPolicy": { "type": "dangerFullAccess" } })
-    } else {
-        json!({ "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandboxPolicy": { "type": "readOnly" } })
-    }
+/// Every field is set so `config.toml` cannot widen the mode.
+pub fn thread_policy(mode: &str) -> Value {
+    let (approval, sandbox) = match mode {
+        FULL_ACCESS => ("never", "danger-full-access"),
+        AUTO => ("on-request", "workspace-write"),
+        _ => ("on-request", "read-only"),
+    };
+    json!({ "approvalPolicy": approval, "sandbox": sandbox, "approvalsReviewer": "user" })
+}
+
+pub fn turn_policy(mode: &str) -> Value {
+    let (approval, sandbox) = match mode {
+        FULL_ACCESS => ("never", "dangerFullAccess"),
+        AUTO => ("on-request", "workspaceWrite"),
+        _ => ("on-request", "readOnly"),
+    };
+    json!({ "approvalPolicy": approval, "approvalsReviewer": "user", "sandboxPolicy": { "type": sandbox } })
+}
+
+fn options_mode(options: &AgentOptions) -> &str {
+    options
+        .permission_mode
+        .as_deref()
+        .unwrap_or_else(|| default_mode(options.bypass_permissions))
 }
 
 pub fn initialize_params() -> Value {
@@ -55,7 +92,7 @@ pub fn initialize_params() -> Value {
 }
 
 pub fn start_params(options: &AgentOptions) -> Value {
-    let mut params = thread_policy(options.bypass_permissions);
+    let mut params = thread_policy(options_mode(options));
     params["cwd"] = json!(options.cwd);
     if let Some(model) = &options.model {
         params["model"] = json!(model);
@@ -65,25 +102,20 @@ pub fn start_params(options: &AgentOptions) -> Value {
 
 /// Omits the model so the resumed thread keeps its own model and effort.
 pub fn resume_params(options: &AgentOptions, thread_id: &str) -> Value {
-    let mut params = thread_policy(options.bypass_permissions);
+    let mut params = thread_policy(options_mode(options));
     params["cwd"] = json!(options.cwd);
     params["threadId"] = json!(thread_id);
     params["excludeTurns"] = json!(true);
     params
 }
 
-pub fn turn_params(
-    thread_id: &str,
-    text: &str,
-    images: &[(String, String)],
-    bypass: bool,
-) -> Value {
+pub fn turn_params(thread_id: &str, text: &str, images: &[(String, String)], mode: &str) -> Value {
     let mut input: Vec<Value> = images
         .iter()
         .map(|(media_type, data)| json!({ "type": "image", "url": format!("data:{media_type};base64,{data}") }))
         .collect();
     input.push(json!({ "type": "text", "text": text, "text_elements": [] }));
-    let mut params = turn_policy(bypass);
+    let mut params = turn_policy(mode);
     params["threadId"] = json!(thread_id);
     params["input"] = json!(input);
     params
@@ -424,6 +456,7 @@ mod tests {
             env: BTreeMap::new(),
             account: None,
             remote_control: true,
+            permission_mode: None,
         }
     }
 
@@ -433,7 +466,8 @@ mod tests {
         assert_eq!(start["approvalPolicy"], "never");
         assert_eq!(start["sandbox"], "danger-full-access");
         assert_eq!(start["model"], "gpt-5");
-        let ask = turn_params("t", "hi", &[], false);
+        assert_eq!(start_params(&options(false))["sandbox"], "read-only");
+        let ask = turn_params("t", "hi", &[], READ_ONLY);
         assert_eq!(ask["approvalPolicy"], "on-request");
         assert_eq!(ask["sandboxPolicy"]["type"], "readOnly");
         let resume = resume_params(&options(true), "thread-1");
@@ -442,6 +476,23 @@ mod tests {
             "a resumed thread keeps its model"
         );
         assert_eq!(resume["threadId"], "thread-1");
+    }
+
+    #[test]
+    fn a_picked_mode_wins_over_the_bypass_default() {
+        let auto = AgentOptions {
+            permission_mode: Some(AUTO.into()),
+            ..options(true)
+        };
+        assert_eq!(start_params(&auto)["sandbox"], "workspace-write");
+        assert_eq!(
+            turn_params("t", "hi", &[], AUTO)["sandboxPolicy"]["type"],
+            "workspaceWrite"
+        );
+        assert_eq!(
+            turn_params("t", "hi", &[], FULL_ACCESS)["approvalPolicy"],
+            "never"
+        );
     }
 
     #[test]

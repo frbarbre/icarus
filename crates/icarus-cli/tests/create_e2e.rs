@@ -333,11 +333,33 @@ fn a_worktree_of_another_clone_is_adopted_by_its_remote_and_removed_from_that_cl
     assert_eq!(adopted["project_id"], project.as_str());
     assert_eq!(adopted["name"], "feature-x");
     assert_eq!(adopted["branch"], "feature/x");
-    assert!(env.ok(&["workspace", "list"]).contains("feature-x"));
+    assert!(
+        env.ok(&["workspace", "list"])
+            .contains("feature-x  [adopted]")
+    );
 
-    env.ok(&["workspace", "remove", "feature-x", "--force"]);
-    assert!(!worktree.exists());
-    assert_eq!(git(&clone, &["branch", "--list", "feature/x"]), "");
+    assert!(
+        env.ok(&["workspace", "remove", "feature-x", "--force"])
+            .contains("hidden"),
+        "Icarus didn't create it, so it is only hidden"
+    );
+    assert!(worktree.exists());
+    assert!(!env.ok(&["workspace", "list"]).contains("feature-x"));
+    assert!(env.ok(&["workspace", "list", "--all"]).contains("hidden"));
+
+    env.ok(&[
+        "workspace",
+        "remove",
+        "feature-x",
+        "--force",
+        "--delete-worktree",
+    ]);
+    assert!(!worktree.exists(), "deleted from that clone when asked");
+    assert_eq!(
+        git(&clone, &["branch", "--list", "feature/x"]),
+        "feature/x",
+        "its branch is kept unless --delete-branch"
+    );
 }
 
 /// Stands in for the app: answers `client.config` by writing what it would hold.

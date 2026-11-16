@@ -130,9 +130,24 @@ fn trust_icarus_worktrees(
     .detach_and_log_err(cx);
 }
 
+/// Marks `path` as an Icarus workspace before it opens, so its worktree is trusted the moment it is added,
+/// also under the canonical path Zed's worktree reports when the folder is reached through a symlink.
+pub(crate) fn add_icarus_workspace_path(path: &Path, cx: &mut App) {
+    let canonical = std::fs::canonicalize(path).ok();
+    let paths = &mut cx.default_global::<AppConnection>().workspace_paths;
+    for path in std::iter::once(path.to_path_buf()).chain(canonical) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+}
+
 /// Re-checks every open window after the list of Icarus workspaces changed.
 pub(crate) fn set_icarus_workspace_paths(paths: Vec<PathBuf>, cx: &mut App) {
-    cx.default_global::<AppConnection>().workspace_paths = paths;
+    cx.default_global::<AppConnection>().workspace_paths = Vec::new();
+    for path in paths {
+        add_icarus_workspace_path(&path, cx);
+    }
     recheck_open_windows(cx);
 }
 

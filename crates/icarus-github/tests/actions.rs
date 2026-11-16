@@ -806,6 +806,44 @@ async fn upload_attachment_posts_raw_bytes_to_uploads_host() {
 }
 
 #[tokio::test]
+async fn attachments_are_fetched_through_the_signed_in_gh_and_only_from_github() {
+    let url = "https://github.com/user-attachments/assets/0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0";
+    let github = client(
+        FakeGh::new().on(
+            format!("GET {url}"),
+            FakeResponse::status(200)
+                .header("Content-Type", "image/png; charset=binary")
+                .header("Content-Length", "4"),
+        ),
+    );
+    let asset = github.fetch_asset(url).await.expect("fetched");
+    assert_eq!(asset.content_type, "image/png");
+    let request = only_request(&github);
+    assert_eq!(
+        request.endpoint, url,
+        "gh signs the github.com request itself"
+    );
+    assert!(request.args().contains(&"Accept: */*".to_owned()));
+
+    for refused in [
+        "http://github.com/user-attachments/assets/x",
+        "https://evil.example/user-attachments/assets/x",
+        "https://github.com/acme/widgets/settings",
+        "https://github.com@evil.example/user-attachments/assets/x",
+    ] {
+        assert!(github.fetch_asset(refused).await.is_err(), "{refused}");
+    }
+    assert_eq!(
+        github.runner().requests().len(),
+        1,
+        "no request leaves for a host that isn't GitHub's"
+    );
+    assert!(icarus_github::attachment::is_github_asset_url(
+        "https://private-user-images.githubusercontent.com/1/2.png?jwt=abc"
+    ));
+}
+
+#[tokio::test]
 async fn upload_attachment_refusals() {
     let github = client(FakeGh::new().on(
         "GET repos/acme/widgets",

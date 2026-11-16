@@ -819,6 +819,9 @@ fn main() {
         cx.set_global(agent_ui::agent_tab::TabAgentServer(std::rc::Rc::new(
             icarus_ui::remote_agent::agent_server_for_project,
         )));
+        cx.set_global(agent_ui::agent_tab::TabAgentProviderServer(
+            std::rc::Rc::new(icarus_ui::remote_agent::agent_server_with_provider),
+        ));
         icarus_ui::remote_control::set_agent_resolver(cx, |item, cx| {
             item.act_as::<agent_ui::agent_tab::AgentTab>(cx)?
                 .read(cx)

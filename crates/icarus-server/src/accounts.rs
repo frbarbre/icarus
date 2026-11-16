@@ -400,6 +400,7 @@ mod tests {
             state: AgentState::Idle,
             provider_session: None,
             model: None,
+            mode: "default".into(),
             turns: 0,
             created_at_ms: 0,
             last_activity_ms: 0,

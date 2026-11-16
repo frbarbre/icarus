@@ -682,6 +682,15 @@
     },
   },
   {
+    "context": "IcarusReply > Editor",
+    "bindings": {
+      "enter": "icarus::SubmitReviewComment",
+      "ctrl-enter": "icarus::SubmitReviewComment",
+      "shift-enter": "editor::Newline",
+      "escape": "icarus::CancelReviewComment",
+    },
+  },
+  {
     "context": "Workspace",
     "bindings": {
       "ctrl-alt-enter": "icarus::RunNextAction",
@@ -748,8 +757,6 @@
       "ctrl-b": "workspace::ToggleLeftDock",
       // Icarus: Orca's Mod+J workspace switcher; the bottom dock stays in the View menu and palette.
       "ctrl-j": "icarus::OpenWorkspaceSwitcher",
-      "ctrl-alt-j": "multi_workspace::ToggleWorkspaceSidebar",
-      "ctrl-alt-;": "multi_workspace::FocusWorkspaceSidebar",
       "ctrl-alt-y": "workspace::ToggleAllDocks",
       "ctrl-alt-0": "workspace::ResetActiveDockSize",
       // For 0px parameter, uses UI font size value.
@@ -760,7 +767,8 @@
       "ctrl-alt-+": ["workspace::IncreaseOpenDocksSize", { "px": 0 }],
       "shift-find": "pane::DeploySearch",
       "ctrl-shift-f": "pane::DeploySearch",
-      "ctrl-shift-h": ["pane::DeploySearch", { "replace_enabled": true }],
+      // Icarus: Orca's sidebar key for the PR panel; search-and-replace stays in the palette.
+      "ctrl-shift-h": "icarus::ToggleGitHubPanel",
       "ctrl-shift-t": "pane::ReopenClosedItem",
       "ctrl-k ctrl-p": "workspace::ReopenLastPicker",
       "ctrl-k ctrl-s": "zed::OpenKeymap",
@@ -776,9 +784,8 @@
       "ctrl-shift-p": "command_palette::Toggle",
       "ctrl-shift-m": "diagnostics::Deploy",
       "ctrl-shift-e": "project_panel::ToggleFocus",
-      "ctrl-shift-g": "git_panel::ToggleFocus",
+      "ctrl-shift-g": "icarus::ToggleSourceControlPanel",
       "ctrl-shift-d": "debug_panel::ToggleFocus",
-      "ctrl-?": "agent::ToggleFocus",
       "alt-save": "workspace::SaveAll",
       "ctrl-alt-s": "workspace::SaveAll",
       "ctrl-k n": "encoding_selector::Toggle",
@@ -1024,7 +1031,6 @@
       "ctrl-shift-e": "pane::RevealInProjectPanel",
       "ctrl-f8": "editor::GoToHunk",
       "ctrl-shift-f8": "editor::GoToPreviousHunk",
-      "ctrl-enter": "assistant::InlineAssist",
       "ctrl-:": "editor::ToggleInlayHints",
     },
   },
@@ -1392,7 +1398,6 @@
       "paste": "terminal::Paste",
       "shift-insert": "terminal::Paste",
       "ctrl-shift-v": "terminal::Paste",
-      "ctrl-enter": "assistant::InlineAssist",
       "alt-b": ["terminal::SendText", "\u001bb"],
       "alt-f": ["terminal::SendText", "\u001bf"],
       "alt-.": ["terminal::SendText", "\u001b."],

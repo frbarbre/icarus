@@ -6,17 +6,19 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use icarus_linear::{
-    ApiKey, FixtureLinear, HttpTransport, Issue, KeyCommand, KeyResolver, Linear, LinearError,
-    LinearRequest, LinearResponse, Transport, normalize_identifier,
+    ApiKey, FixtureLinear, HttpTransport, Issue, KeyCommand, KeyResolver, KeySource, Linear,
+    LinearError, LinearRequest, LinearResponse, Transport, normalize_identifier,
 };
 use icarus_protocol::RpcError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::linear_key::{KeyStore, valid_key};
 use crate::server::{Server, params, rpc, to_value};
 
 const ISSUE_TTL: Duration = Duration::from_secs(60);
 const CREATE_TIMEOUT: Duration = Duration::from_secs(15);
+const VIEWER_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_POLL_MS: u64 = 300_000;
 const MIN_POLL_MS: u64 = 1_000;
 const SEARCH_LIMIT: usize = 20;
@@ -44,6 +46,10 @@ struct Cached {
 pub struct LinearService {
     client: Linear<ServerLinear>,
     cache: Mutex<HashMap<String, Cached>>,
+    store: Arc<dyn KeyStore>,
+    /// Whether the stored key has been read; set and clear keep it current afterwards.
+    stored_loaded: tokio::sync::Mutex<bool>,
+    viewer: Mutex<Option<(KeySource, String)>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -53,15 +59,54 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl LinearService {
-    pub fn from_env() -> Self {
+    pub fn from_env(store: Box<dyn KeyStore>) -> Self {
         let transport = match std::env::var_os("ICARUS_LINEAR_FIXTURES") {
             Some(dir) => ServerLinear::Fixture(FixtureLinear::new(PathBuf::from(dir))),
             None => ServerLinear::Http(HttpTransport::new()),
         };
+        Self::new(transport, KeyResolver::from_env(), store)
+    }
+
+    pub fn new(transport: ServerLinear, keys: KeyResolver, store: Box<dyn KeyStore>) -> Self {
         Self {
-            client: Linear::new(transport, KeyResolver::from_env()),
+            client: Linear::new(transport, keys),
             cache: Mutex::new(HashMap::new()),
+            store: Arc::from(store),
+            stored_loaded: tokio::sync::Mutex::new(false),
+            viewer: Mutex::new(None),
         }
+    }
+
+    /// Reads the stored key once, and only when neither env nor a command would win over it.
+    async fn load_stored(&self) {
+        let keys = self.client.keys();
+        if keys.has_env() || keys.has_command().await {
+            return;
+        }
+        let mut loaded = self.stored_loaded.lock().await;
+        if *loaded {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        match tokio::task::spawn_blocking(move || store.load()).await {
+            Ok(Ok(key)) => {
+                keys.set_stored(key.map(ApiKey::new));
+                *loaded = true;
+            }
+            Ok(Err(error)) => tracing::warn!("could not read the stored Linear key: {error}"),
+            Err(error) => tracing::warn!("could not read the stored Linear key: {error}"),
+        }
+    }
+
+    async fn store_op(
+        &self,
+        op: impl FnOnce(&dyn KeyStore) -> std::io::Result<()> + Send + 'static,
+    ) -> Result<(), RpcError> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || op(store.as_ref()))
+            .await
+            .map_err(|e| rpc("internal", e))?
+            .map_err(|e| rpc("key_store_failed", e))
     }
 
     pub(crate) fn cached(&self, identifier: &str) -> Option<Issue> {
@@ -148,6 +193,7 @@ impl Server {
         let settings = self.resolved_settings(None);
         let command = KeyCommand::from_setting(&settings["linear"]["api_key_command"]);
         self.linear.client.keys().set_command(command).await;
+        self.linear.load_stored().await;
     }
 
     /// Adds the cached Linear details to a workspace's `issue`; never touches the network.
@@ -192,7 +238,6 @@ impl Server {
 
     /// Refreshes every linked issue; tells clients which workspaces' cards changed.
     pub(crate) async fn linear_poll(&self) -> Result<Value, LinearError> {
-        self.linear_sync_settings().await;
         let workspaces = self
             .store
             .workspaces(None)
@@ -204,6 +249,7 @@ impl Server {
         if linked.is_empty() {
             return Ok(json!({ "refreshed": 0, "changed": [] }));
         }
+        self.linear_sync_settings().await;
         let ids: Vec<String> = linked.iter().map(|(_, id)| id.clone()).collect();
         let (found, changed) = self.linear.fetch(&ids).await?;
         let changed_workspaces: Vec<&String> = linked
@@ -221,8 +267,12 @@ impl Server {
     }
 
     pub(crate) async fn linear_dispatch(&self, method: &str, p: Value) -> Result<Value, RpcError> {
-        if method == "issue.search" {
-            return self.issue_search(p).await;
+        match method {
+            "issue.search" => return self.issue_search(p).await,
+            "linear.status" => return self.linear_status().await,
+            "linear.set_api_key" => return self.linear_set_key(p).await,
+            "linear.clear_api_key" => return self.linear_clear_key().await,
+            _ => {}
         }
         #[derive(Deserialize)]
         struct P {
@@ -253,11 +303,101 @@ impl Server {
                 Ok(json!({
                     "configured": status.configured(),
                     "key": format!("{status:?}"),
+                    "source": status.source().map(KeySource::name),
                     "cached": lock(&self.linear.cache).len(),
                 }))
             }
             (other, _) => Err(rpc("unknown_method", other)),
         }
+    }
+
+    /// Whether Linear has a key, where it comes from and whose it is; never the key itself.
+    async fn linear_status(&self) -> Result<Value, RpcError> {
+        self.linear_sync_settings().await;
+        let keys = self.linear.client.keys();
+        let mut status = keys.status().await;
+        let mut viewer = None;
+        if let Some(source) = status.source().filter(|_| status.configured()) {
+            let cached = lock(&self.linear.viewer)
+                .clone()
+                .filter(|(from, _)| *from == source);
+            viewer = match cached {
+                Some((_, name)) => Some(name),
+                None => {
+                    match tokio::time::timeout(VIEWER_TIMEOUT, self.linear.client.viewer()).await {
+                        Ok(Ok(name)) => {
+                            *lock(&self.linear.viewer) = Some((source, name.clone()));
+                            Some(name)
+                        }
+                        Ok(Err(error)) => {
+                            tracing::debug!("linear viewer lookup failed: {error}");
+                            None
+                        }
+                        Err(_) => None,
+                    }
+                }
+            };
+            status = keys.status().await;
+        }
+        Ok(json!({
+            "configured": status.configured(),
+            "source": status.source().map(KeySource::name),
+            "rejected": matches!(status, icarus_linear::KeyStatus::Rejected(_)),
+            "stored": keys.has_stored(),
+            "store": self.linear.store.kind(),
+            "viewer": viewer,
+        }))
+    }
+
+    async fn linear_set_key(&self, p: Value) -> Result<Value, RpcError> {
+        #[derive(Deserialize)]
+        struct P {
+            key: String,
+        }
+        let p: P = params(p)?;
+        let key = p.key.trim().to_owned();
+        if !valid_key(&key) {
+            return Err(rpc(
+                "invalid_params",
+                "that doesn't look like a Linear API key (Linear → Settings → Security & access → Personal API keys)",
+            ));
+        }
+        let key = ApiKey::new(key);
+        let name = match tokio::time::timeout(VIEWER_TIMEOUT, self.linear.client.viewer_with(&key))
+            .await
+        {
+            Ok(Ok(name)) => name,
+            Ok(Err(LinearError::Unauthorized)) => {
+                return Err(rpc(
+                    "unauthorized",
+                    "Linear rejected this API key; nothing was saved",
+                ));
+            }
+            Ok(Err(error)) => return Err(linear_rpc(error)),
+            Err(_) => return Err(rpc("linear_failed", "Linear did not answer in time")),
+        };
+        let saved = key.clone();
+        self.linear
+            .store_op(move |store| store.save(saved.expose()))
+            .await?;
+        *self.linear.stored_loaded.lock().await = true;
+        let keys = self.linear.client.keys();
+        keys.set_stored(Some(key));
+        keys.reset_backoff().await;
+        *lock(&self.linear.viewer) = Some((KeySource::Stored, name.clone()));
+        self.broadcast("config.changed", json!({ "source": "linear" }));
+        let mut status = self.linear_status().await?;
+        status["name"] = json!(name);
+        Ok(status)
+    }
+
+    async fn linear_clear_key(&self) -> Result<Value, RpcError> {
+        self.linear.store_op(|store| store.clear()).await?;
+        *self.linear.stored_loaded.lock().await = true;
+        self.linear.client.keys().set_stored(None);
+        lock(&self.linear.viewer).take_if(|(source, _)| *source == KeySource::Stored);
+        self.broadcast("config.changed", json!({ "source": "linear" }));
+        self.linear_status().await
     }
 
     async fn issue_search(&self, p: Value) -> Result<Value, RpcError> {

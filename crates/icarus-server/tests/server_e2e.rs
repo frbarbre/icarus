@@ -764,6 +764,164 @@ async fn agents_survive_a_server_restart_and_resume_their_session() {
     );
 }
 
+/// Sends `text` and returns the agent's answer to it.
+async fn say(client: &Client, id: &str, text: &str) -> String {
+    client
+        .request("agent.send", json!({ "id": id, "text": text }))
+        .await
+        .expect("send");
+    client
+        .request("agent.wait", json!({ "id": id, "timeout_ms": 10000 }))
+        .await
+        .expect("wait");
+    let transcript = client
+        .request("agent.read", json!({ "id": id }))
+        .await
+        .expect("read");
+    transcript["text"]
+        .as_str()
+        .expect("text")
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("echo: "))
+        .expect("an answer")
+        .to_string()
+}
+
+#[tokio::test]
+async fn an_agents_mode_and_model_reach_claude_code_and_survive_a_restart() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let work = tempfile::tempdir().expect("workdir");
+    let fake = env!("CARGO_BIN_EXE_icarus-fake-agent");
+    let server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let info = client
+        .request(
+            "agent.create",
+            json!({ "cwd": work.path(), "command": [fake], "provider": "claude", "mode": "acceptEdits" }),
+        )
+        .await
+        .expect("create");
+    let id = info["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        say(&client, &id, "settings").await,
+        "mode=acceptEdits model=default"
+    );
+
+    let commands = client
+        .request("agent.commands", json!({ "id": id }))
+        .await
+        .expect("commands");
+    let names: Vec<&str> = commands["commands"]
+        .as_array()
+        .expect("commands")
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["compact", "review"],
+        "internal commands stay hidden"
+    );
+    assert_eq!(commands["commands"][0]["hint"], "<focus>");
+    let models = client
+        .request("agent.models", json!({ "id": id }))
+        .await
+        .expect("models");
+    assert_eq!(models["current"], "default");
+    assert!(
+        models["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .any(|m| m["id"] == "opus" && m["name"] == "Opus"),
+        "the models Claude Code reported: {models}"
+    );
+    let modes = client
+        .request("agent.modes", json!({ "id": id }))
+        .await
+        .expect("modes");
+    assert_eq!(modes["current"], "acceptEdits");
+    assert!(
+        modes["modes"]
+            .as_array()
+            .expect("modes")
+            .iter()
+            .any(|m| m["id"] == "bypassPermissions")
+    );
+
+    let set = client
+        .request("agent.set_mode", json!({ "id": id, "mode": "plan" }))
+        .await
+        .expect("set mode");
+    assert_eq!(set["mode"], "plan");
+    client
+        .request("agent.set_model", json!({ "id": id, "model": "sonnet" }))
+        .await
+        .expect("set model");
+    assert_eq!(
+        say(&client, &id, "settings").await,
+        "mode=plan model=sonnet"
+    );
+    assert!(
+        client
+            .request("agent.set_mode", json!({ "id": id, "mode": "yolo" }))
+            .await
+            .is_err(),
+        "unknown modes are refused"
+    );
+    drop(client);
+    drop(server);
+
+    let _server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test")
+        .await
+        .expect("reconnect");
+    let restored = client
+        .request("agent.info", json!({ "id": id }))
+        .await
+        .expect("restored");
+    assert_eq!(restored["state"], "sleeping");
+    assert_eq!(restored["mode"], "plan");
+    assert_eq!(restored["model"], "sonnet");
+    let commands = client
+        .request("agent.commands", json!({ "id": id }))
+        .await
+        .expect("commands while asleep");
+    assert_eq!(commands["commands"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        say(&client, &id, "settings").await,
+        "mode=plan model=sonnet",
+        "the woken process starts in the picked mode and model"
+    );
+
+    client
+        .request("agent.sleep", json!({ "id": id }))
+        .await
+        .expect("sleep");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client
+        .request("agent.info", json!({ "id": id }))
+        .await
+        .expect("info")["state"]
+        != "sleeping"
+    {
+        assert!(Instant::now() < deadline, "never slept");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client
+        .request(
+            "agent.set_mode",
+            json!({ "id": id, "mode": "bypassPermissions" }),
+        )
+        .await
+        .expect("set mode while asleep");
+    assert_eq!(
+        say(&client, &id, "settings").await,
+        "mode=bypassPermissions model=sonnet"
+    );
+}
+
 #[tokio::test]
 async fn proxy_starts_the_server_and_bridges_a_tokenless_client() {
     let home = tempfile::tempdir().expect("tempdir");

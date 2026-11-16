@@ -334,7 +334,7 @@ impl MultiWorkspace {
 
     pub fn sidebar_render_state(&self, cx: &App) -> SidebarRenderState {
         SidebarRenderState {
-            open: self.sidebar_open() && self.multi_workspace_enabled(cx),
+            open: self.sidebar_open() && self.multi_workspace_enabled(cx) && self.sidebar.is_some(),
             side: self.sidebar_side(cx),
         }
     }
@@ -2179,21 +2179,24 @@ impl Render for MultiWorkspace {
                 .text_color(text_color)
                 .on_action(cx.listener(Self::close_window))
                 .when(self.multi_workspace_enabled(cx), |this| {
-                    this.on_action(cx.listener(
-                        |this: &mut Self, _: &ToggleWorkspaceSidebar, window, cx| {
-                            this.toggle_sidebar(window, cx);
-                        },
-                    ))
-                    .on_action(cx.listener(
-                        |this: &mut Self, _: &CloseWorkspaceSidebar, window, cx| {
-                            this.close_sidebar_action(window, cx);
-                        },
-                    ))
-                    .on_action(cx.listener(
-                        |this: &mut Self, _: &FocusWorkspaceSidebar, window, cx| {
-                            this.focus_sidebar(window, cx);
-                        },
-                    ))
+                    // Icarus registers no sidebar; its toggles must not open an empty one.
+                    this.when(self.sidebar.is_some(), |this| {
+                        this.on_action(cx.listener(
+                            |this: &mut Self, _: &ToggleWorkspaceSidebar, window, cx| {
+                                this.toggle_sidebar(window, cx);
+                            },
+                        ))
+                        .on_action(cx.listener(
+                            |this: &mut Self, _: &CloseWorkspaceSidebar, window, cx| {
+                                this.close_sidebar_action(window, cx);
+                            },
+                        ))
+                        .on_action(cx.listener(
+                            |this: &mut Self, _: &FocusWorkspaceSidebar, window, cx| {
+                                this.focus_sidebar(window, cx);
+                            },
+                        ))
+                    })
                     .on_action(cx.listener(
                         |this: &mut Self, action: &ToggleThreadSwitcher, window, cx| {
                             if let Some(sidebar) = &this.sidebar {

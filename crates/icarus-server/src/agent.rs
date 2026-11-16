@@ -16,12 +16,160 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::codex;
 
 /// Bounds Codex handshakes and requests so a stuck app-server cannot hang a client.
 const CODEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bounds Claude Code control requests; `initialize` waits for the session's hooks to start.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The provider's own default model; no `--model` / per-turn model is sent for it.
+pub const DEFAULT_MODEL: &str = "default";
+
+const BYPASS_PERMISSIONS: &str = "bypassPermissions";
+
+/// Claude Code's permission modes (`set_permission_mode`) as `(id, name, description)`. Nobody
+/// answers its permission prompts, so in the asking modes a tool that needs approval is denied.
+pub const CLAUDE_MODES: &[(&str, &str, &str)] = &[
+    (
+        "default",
+        "Default",
+        "Asks before edits and commands; with nobody to ask they are denied",
+    ),
+    (
+        "acceptEdits",
+        "Accept Edits",
+        "Edits files without asking; other prompts are denied",
+    ),
+    (
+        "plan",
+        "Plan",
+        "Explores and plans without changing anything",
+    ),
+    (
+        "auto",
+        "Auto",
+        "Claude Code decides which actions are safe to run",
+    ),
+    (
+        "dontAsk",
+        "Don't Ask",
+        "Runs only what is allowed already; denies the rest",
+    ),
+    (
+        BYPASS_PERMISSIONS,
+        "Bypass Permissions",
+        "Runs everything without asking",
+    ),
+];
+
+pub fn provider_modes(provider: &str) -> &'static [(&'static str, &'static str, &'static str)] {
+    match provider {
+        "codex" => codex::MODES,
+        _ => CLAUDE_MODES,
+    }
+}
+
+/// The mode an agent starts in when none was picked: its bypass setting, in the provider's terms.
+pub fn default_mode(options: &AgentOptions) -> &'static str {
+    match (options.provider.as_str(), options.bypass_permissions) {
+        ("codex", bypass) => codex::default_mode(bypass),
+        (_, true) => BYPASS_PERMISSIONS,
+        (_, false) => "default",
+    }
+}
+
+/// Models a provider offers before it has said: Claude Code's aliases, Codex's default.
+fn fallback_models(provider: &str) -> Vec<(String, String)> {
+    let models: &[(&str, &str)] = match provider {
+        "claude" => &[
+            (DEFAULT_MODEL, "Default"),
+            ("opus", "Opus"),
+            ("sonnet", "Sonnet"),
+            ("haiku", "Haiku"),
+        ],
+        _ => &[(DEFAULT_MODEL, "Default")],
+    };
+    models
+        .iter()
+        .map(|(id, name)| (id.to_string(), name.to_string()))
+        .collect()
+}
+
+/// Codex app-server's `model/list` answer as `{ id, name }`, the provider default first.
+fn codex_models(listed: &Value) -> Vec<Value> {
+    let items: Vec<&Value> = listed["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["hidden"] != json!(true))
+        .collect();
+    let id = |item: &Value| {
+        item["model"]
+            .as_str()
+            .or_else(|| item["id"].as_str())
+            .map(str::to_string)
+    };
+    // A per-turn model sticks, so going back to the default has to name it.
+    let default = items
+        .iter()
+        .find(|item| item["isDefault"] == json!(true))
+        .and_then(|item| id(item));
+    let mut models = vec![json!({ "id": DEFAULT_MODEL, "name": "Default", "resolves": default })];
+    for item in items {
+        let Some(id) = id(item) else { continue };
+        let name = item["displayName"].as_str().unwrap_or(&id).to_string();
+        models.push(json!({ "id": id, "name": name }));
+    }
+    models
+}
+
+/// Claude Code's `initialize` answer: its slash commands, models and permission mode.
+fn claude_capabilities(response: &Value) -> Value {
+    let commands: Vec<Value> = response["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|command| {
+            let name = command["name"].as_str()?;
+            // Claude Code's own `__` commands are internal and never typed.
+            (!name.is_empty() && !name.starts_with("__")).then(|| {
+                json!({
+                    "name": name,
+                    "description": command["description"].as_str().unwrap_or_default(),
+                    "hint": command["argumentHint"].as_str().filter(|hint| !hint.is_empty()),
+                })
+            })
+        })
+        .collect();
+    let models: Vec<Value> = response["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model["value"].as_str()?;
+            Some(json!({ "id": id, "name": model["displayName"].as_str().unwrap_or(id) }))
+        })
+        .collect();
+    json!({
+        "commands": commands,
+        "models": models,
+        "permission_mode": response["current_permission_mode"],
+    })
+}
+
+type Reply = std::result::Result<Value, String>;
+
+async fn settle(what: &str, reply: oneshot::Receiver<Reply>) -> Result<Value> {
+    match tokio::time::timeout(CONTROL_TIMEOUT, reply).await {
+        Err(_) => Err(anyhow!("{what} timed out")),
+        Ok(Err(_)) => Err(anyhow!("the agent exited during {what}")),
+        Ok(Ok(Err(message))) => Err(anyhow!("{what}: {message}")),
+        Ok(Ok(Ok(result))) => Ok(result),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +211,9 @@ pub struct AgentOptions {
     /// Start Claude Code with its own Remote Control (plan D21); switchable later per agent.
     #[serde(default)]
     pub remote_control: bool,
+    /// The mode to start in (see `provider_modes`); unset follows `bypass_permissions`.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 /// Agent events the server reacts to (notifications), forwarded with the agent's id.
@@ -80,6 +231,8 @@ pub struct AgentInfo {
     pub state: AgentState,
     pub provider_session: Option<String>,
     pub model: Option<String>,
+    /// The permission mode (Claude Code) or approval preset (Codex) the agent works in.
+    pub mode: String,
     pub turns: u64,
     pub created_at_ms: u64,
     pub last_activity_ms: u64,
@@ -111,6 +264,32 @@ struct State {
     /// Set by `sleep`, so the process ending is not mistaken for a crash.
     parking: bool,
     remote_control: bool,
+    /// Picked with `set_mode` or reported by the agent; restarts start in it.
+    mode: Option<String>,
+    /// Picked with `set_model`; wins over the creation-time model for later turns and restarts.
+    chosen_model: Option<String>,
+    /// What the provider said it offers: `{ commands, models }`.
+    capabilities: Value,
+}
+
+/// Applies the events that carry the agent's mode, model choice and capabilities.
+fn track_choices(state: &mut State, kind: &str, data: &Value) {
+    match kind {
+        "mode_changed" | "session" | "status" | "capabilities" => {
+            if let Some(mode) = data["permission_mode"].as_str() {
+                state.mode = Some(mode.to_string());
+            }
+        }
+        "model_changed" => state.chosen_model = data["model"].as_str().map(str::to_string),
+        _ => {}
+    }
+    if kind == "capabilities" {
+        for key in ["commands", "models"] {
+            if data[key].is_array() {
+                state.capabilities[key] = data[key].clone();
+            }
+        }
+    }
 }
 
 pub struct AgentThread {
@@ -125,6 +304,8 @@ pub struct AgentThread {
     turn_hook: std::sync::OnceLock<Arc<dyn TurnHook>>,
     signals: std::sync::OnceLock<mpsc::UnboundedSender<AgentSignal>>,
     codex: codex::Rpc,
+    /// Claude Code control requests waiting for their response, by request id.
+    control: Mutex<HashMap<String, oneshot::Sender<Reply>>>,
 }
 
 fn now_ms() -> u64 {
@@ -184,6 +365,18 @@ pub fn remote_control_url(config_dir: &Path, session_id: &str) -> Option<String>
     best.map(|(_, url)| url)
 }
 
+fn permission_flags(options: &AgentOptions) -> Vec<String> {
+    // Lets the mode switch to bypassPermissions later, whatever it starts in.
+    let mut flags = vec!["--allow-dangerously-skip-permissions".to_string()];
+    match options.permission_mode.as_deref() {
+        Some(BYPASS_PERMISSIONS) => flags.push("--dangerously-skip-permissions".into()),
+        Some(mode) => flags.extend(["--permission-mode".to_string(), mode.to_string()]),
+        None if options.bypass_permissions => flags.push("--dangerously-skip-permissions".into()),
+        None => {}
+    }
+    flags
+}
+
 /// The command line for a provider, built from the user's installed agent binary.
 pub fn provider_command(options: &AgentOptions) -> Result<Vec<String>> {
     if options.command.as_ref().is_some_and(Vec::is_empty) {
@@ -200,6 +393,12 @@ pub fn provider_command(options: &AgentOptions) -> Result<Vec<String>> {
         if let Some(session) = &options.resume {
             command.extend(["--resume".to_string(), session.clone()]);
         }
+        if options.permission_mode.is_some() {
+            command.extend(permission_flags(options));
+        }
+        if let Some(model) = &options.model {
+            command.extend(["--model".to_string(), model.clone()]);
+        }
         command.extend(remote_control);
         return Ok(command);
     }
@@ -215,9 +414,7 @@ pub fn provider_command(options: &AgentOptions) -> Result<Vec<String>> {
                 "--verbose".into(),
                 "--include-partial-messages".into(),
             ];
-            if options.bypass_permissions {
-                command.push("--dangerously-skip-permissions".into());
-            }
+            command.extend(permission_flags(options));
             if let Some(model) = &options.model {
                 command.extend(["--model".to_string(), model.clone()]);
             }
@@ -238,9 +435,13 @@ pub fn normalize(line: &Value) -> Vec<(String, Value)> {
         "system" => match line["subtype"].as_str().unwrap_or_default() {
             "init" => vec![(
                 "session".into(),
-                json!({ "session_id": line["session_id"], "model": line["model"], "cwd": line["cwd"] }),
+                json!({ "session_id": line["session_id"], "model": line["model"], "cwd": line["cwd"],
+                    "permission_mode": line["permissionMode"] }),
             )],
-            "status" => vec![("status".into(), json!({ "status": line["status"] }))],
+            "status" => vec![(
+                "status".into(),
+                json!({ "status": line["status"], "permission_mode": line["permissionMode"] }),
+            )],
             "api_retry" | "permission_denied" => vec![("notice".into(), line.clone())],
             _ => Vec::new(),
         },
@@ -349,8 +550,12 @@ impl AgentThread {
             killed: false,
             parking: false,
             remote_control: options.remote_control,
+            mode: None,
+            chosen_model: None,
+            capabilities: json!({}),
         };
         for event in events {
+            track_choices(&mut state, &event.kind, &event.data);
             match event.kind.as_str() {
                 "remote_control" => {
                     state.remote_control = event.data["enabled"].as_bool().unwrap_or_default();
@@ -386,6 +591,7 @@ impl AgentThread {
             turn_hook: std::sync::OnceLock::new(),
             signals: std::sync::OnceLock::new(),
             codex: codex::Rpc::default(),
+            control: Mutex::default(),
         })
     }
 
@@ -478,7 +684,16 @@ impl AgentThread {
     async fn start_process(self: &Arc<Self>, resume: Option<String>) -> Result<()> {
         let mut options = self.options.clone();
         options.resume = resume;
-        options.remote_control = lock(&self.state).remote_control;
+        {
+            let state = lock(&self.state);
+            options.remote_control = state.remote_control;
+            if let Some(mode) = &state.mode {
+                options.permission_mode = Some(mode.clone());
+            }
+            if let Some(model) = &state.chosen_model {
+                options.model = (model != DEFAULT_MODEL).then(|| model.clone());
+            }
+        }
         let command = provider_command(&options)?;
         let mut process = Command::new(&command[0]);
         process
@@ -540,16 +755,78 @@ impl AgentThread {
                 }
             }
         });
-        if self.is_codex()
-            && let Err(error) = self.open_codex_thread(options.resume.as_deref()).await
-        {
+        if !self.is_codex() {
+            // Written before any message, so the answer describes the session from its start.
+            let reply = self
+                .control_request(json!({ "subtype": "initialize" }))
+                .await?;
+            let asking = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Ok(response) = settle("initialize", reply).await {
+                    asking.record_capabilities(claude_capabilities(&response));
+                }
+            });
+            return Ok(());
+        }
+        if let Err(error) = self.open_codex_thread(&options).await {
             self.stdin.lock().await.take();
             if let Some(child) = self.child.lock().await.as_mut() {
                 let _ = child.start_kill();
             }
             return Err(error);
         }
+        let asking = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Ok(listed) = asking.codex_request("model/list", json!({})).await {
+                asking.record_capabilities(json!({ "models": codex_models(&listed) }));
+            }
+        });
         Ok(())
+    }
+
+    /// Records what the provider offers, unless it said the same before.
+    fn record_capabilities(&self, capabilities: Value) {
+        {
+            let state = lock(&self.state);
+            let unchanged = ["commands", "models"].iter().all(|key| {
+                capabilities[key].is_null() || capabilities[key] == state.capabilities[key]
+            });
+            let mode = capabilities["permission_mode"].as_str();
+            if unchanged && (mode.is_none() || mode == state.mode.as_deref()) {
+                return;
+            }
+        }
+        self.record("capabilities", capabilities);
+    }
+
+    /// Writes a Claude Code control request; the receiver gets its response.
+    async fn control_request(&self, request: Value) -> Result<oneshot::Receiver<Reply>> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (sender, reply) = oneshot::channel();
+        lock(&self.control).insert(id.clone(), sender);
+        let line = json!({ "type": "control_request", "request_id": id, "request": request });
+        if let Err(error) = self.write_line(&line).await {
+            lock(&self.control).remove(&id);
+            return Err(error);
+        }
+        Ok(reply)
+    }
+
+    fn control_response(&self, response: &Value) {
+        let Some(sender) = response["request_id"]
+            .as_str()
+            .and_then(|id| lock(&self.control).remove(id))
+        else {
+            return;
+        };
+        let reply = if response["subtype"] == "error" {
+            Err(response["error"]
+                .as_str()
+                .map_or_else(|| response["error"].to_string(), str::to_string))
+        } else {
+            Ok(response["response"].clone())
+        };
+        let _ = sender.send(reply);
     }
 
     async fn write_line(&self, message: &Value) -> Result<()> {
@@ -571,16 +848,13 @@ impl AgentThread {
         }
     }
 
-    async fn open_codex_thread(&self, resume: Option<&str>) -> Result<()> {
+    async fn open_codex_thread(&self, options: &AgentOptions) -> Result<()> {
         self.codex_request("initialize", codex::initialize_params())
             .await?;
         self.write_line(&json!({ "method": "initialized" })).await?;
-        let opened = match resume {
+        let opened = match options.resume.as_deref() {
             Some(thread_id) => match self
-                .codex_request(
-                    "thread/resume",
-                    codex::resume_params(&self.options, thread_id),
-                )
+                .codex_request("thread/resume", codex::resume_params(options, thread_id))
                 .await
             {
                 Err(error) if codex::is_no_rollout(&format!("{error}"), thread_id) => {
@@ -588,13 +862,13 @@ impl AgentThread {
                         "notice",
                         json!({ "message": format!("codex thread {thread_id} was never saved; started a new one") }),
                     );
-                    self.codex_request("thread/start", codex::start_params(&self.options))
+                    self.codex_request("thread/start", codex::start_params(options))
                         .await?
                 }
                 other => other?,
             },
             None => {
-                self.codex_request("thread/start", codex::start_params(&self.options))
+                self.codex_request("thread/start", codex::start_params(options))
                     .await?
             }
         };
@@ -614,13 +888,17 @@ impl AgentThread {
             return vec![("stdout".into(), json!({ "line": line }))];
         };
         if !self.is_codex() {
+            if value["type"] == "control_response" {
+                self.control_response(&value["response"]);
+                return Vec::new();
+            }
             return normalize(&value);
         }
         match self.codex.incoming(value) {
             codex::Incoming::Notification { method, params } => codex::normalize(&method, &params),
             codex::Incoming::Request { id, method } => {
-                let bypass = self.options.bypass_permissions;
-                let reply = match codex::reply_to_request(&method, bypass) {
+                let approve = self.current_mode() == codex::FULL_ACCESS;
+                let reply = match codex::reply_to_request(&method, approve) {
                     Ok(result) => json!({ "id": id, "result": result }),
                     Err((code, message)) => {
                         json!({ "id": id, "error": { "code": code, "message": message } })
@@ -655,6 +933,7 @@ impl AgentThread {
             data,
         };
         state.last_activity_ms = event.at_ms;
+        track_choices(&mut state, kind, &event.data);
         match kind {
             "remote_control" => {
                 state.remote_control = event.data["enabled"].as_bool().unwrap_or_default();
@@ -718,6 +997,7 @@ impl AgentThread {
 
     async fn finish(&self) {
         self.codex.reset();
+        lock(&self.control).clear();
         let code = match self.child.lock().await.as_mut() {
             Some(child) => child.wait().await.ok().and_then(|status| status.code()),
             None => None,
@@ -792,7 +1072,13 @@ impl AgentThread {
             cwd: self.options.cwd.clone(),
             state: state.state,
             provider_session: state.provider_session.clone(),
-            model: state.model.clone().or_else(|| self.options.model.clone()),
+            model: state
+                .chosen_model
+                .clone()
+                .filter(|model| model != DEFAULT_MODEL)
+                .or_else(|| state.model.clone())
+                .or_else(|| self.options.model.clone()),
+            mode: self.mode_of(&state),
             turns: state.turns,
             created_at_ms: self.created_at_ms,
             last_activity_ms: state.last_activity_ms,
@@ -872,10 +1158,11 @@ impl AgentThread {
             .clone()
             .context("codex thread is not open")?;
         self.run_turn_hook(Some(text)).await;
-        let (request, reply) = self.codex.request(
-            "turn/start",
-            codex::turn_params(&thread_id, text, images, self.options.bypass_permissions),
-        );
+        let mut params = codex::turn_params(&thread_id, text, images, &self.current_mode());
+        if let Some(model) = self.codex_turn_model() {
+            params["model"] = json!(model);
+        }
+        let (request, reply) = self.codex.request("turn/start", params);
         self.record(
             "user_message",
             json!({ "text": text, "images": images.len() }),
@@ -895,6 +1182,113 @@ impl AgentThread {
             );
         }
         Err(error)
+    }
+
+    fn codex_turn_model(&self) -> Option<String> {
+        let state = lock(&self.state);
+        let chosen = state.chosen_model.clone()?;
+        if chosen != DEFAULT_MODEL {
+            return Some(chosen);
+        }
+        state.capabilities["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|model| model["id"] == DEFAULT_MODEL)
+            .and_then(|model| model["resolves"].as_str().map(str::to_string))
+    }
+
+    /// The models the provider offers as `(id, name)`, the provider default first.
+    pub fn models(&self) -> Vec<(String, String)> {
+        let state = lock(&self.state);
+        let reported: Vec<(String, String)> = state.capabilities["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|model| {
+                Some((
+                    model["id"].as_str()?.to_string(),
+                    model["name"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        if reported.is_empty() {
+            fallback_models(&self.options.provider)
+        } else {
+            reported
+        }
+    }
+
+    /// The model the next turn uses: the picked one, else the one it was started with.
+    pub fn current_model(&self) -> String {
+        lock(&self.state)
+            .chosen_model
+            .clone()
+            .or_else(|| self.options.model.clone())
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    }
+
+    /// Whether a process is up to take control requests now; otherwise the next start applies the choice.
+    async fn running(&self) -> bool {
+        self.stdin.lock().await.is_some()
+    }
+
+    /// Switches the model: Claude Code switches its running session, Codex takes it with the next
+    /// turn, and restarts keep it.
+    pub async fn set_model(&self, model: &str) -> Result<()> {
+        if model.trim().is_empty() {
+            return Err(anyhow!("no model given"));
+        }
+        if !self.is_codex() && self.running().await {
+            let reply = self
+                .control_request(json!({ "subtype": "set_model", "model": model }))
+                .await?;
+            settle("set_model", reply).await?;
+        }
+        self.record("model_changed", json!({ "model": model }));
+        Ok(())
+    }
+
+    fn mode_of(&self, state: &State) -> String {
+        state
+            .mode
+            .clone()
+            .or_else(|| self.options.permission_mode.clone())
+            .unwrap_or_else(|| default_mode(&self.options).to_string())
+    }
+
+    pub fn current_mode(&self) -> String {
+        self.mode_of(&lock(&self.state))
+    }
+
+    /// Switches the permission mode: Claude Code switches its running session, Codex applies it
+    /// from the next turn, and restarts keep it.
+    pub async fn set_mode(&self, mode: &str) -> Result<()> {
+        let modes = provider_modes(&self.options.provider);
+        if !modes.iter().any(|(id, _, _)| *id == mode) {
+            let known: Vec<&str> = modes.iter().map(|(id, _, _)| *id).collect();
+            return Err(anyhow!(
+                "{} has no mode {mode}; pick one of {}",
+                self.options.provider,
+                known.join(", ")
+            ));
+        }
+        if !self.is_codex() && self.running().await {
+            let reply = self
+                .control_request(json!({ "subtype": "set_permission_mode", "mode": mode }))
+                .await?;
+            settle("set_permission_mode", reply).await?;
+        }
+        self.record("mode_changed", json!({ "permission_mode": mode }));
+        Ok(())
+    }
+
+    /// The provider's slash commands as `{ name, description, hint }`; empty until it has said.
+    pub fn commands(&self) -> Vec<Value> {
+        lock(&self.state).capabilities["commands"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Asks the agent to stop the current turn.
@@ -1146,6 +1540,7 @@ mod tests {
             env: BTreeMap::new(),
             account: None,
             remote_control: false,
+            permission_mode: None,
         };
         let command = provider_command(&options).expect("command");
         assert_eq!(command[0], "claude");
@@ -1175,8 +1570,87 @@ mod tests {
         };
         assert_eq!(
             provider_command(&custom).expect("command"),
-            ["my-claude", "--resume", "abc", REMOTE_CONTROL_FLAG]
+            [
+                "my-claude",
+                "--resume",
+                "abc",
+                "--model",
+                "opus",
+                REMOTE_CONTROL_FLAG
+            ]
         );
+    }
+
+    #[test]
+    fn a_picked_permission_mode_starts_claude_in_it_and_bypass_stays_reachable() {
+        let options = AgentOptions {
+            provider: "claude".into(),
+            cwd: PathBuf::from("/tmp"),
+            workspace: None,
+            title: None,
+            model: None,
+            bypass_permissions: true,
+            resume: None,
+            command: None,
+            env: BTreeMap::new(),
+            account: None,
+            remote_control: false,
+            permission_mode: Some("plan".into()),
+        };
+        let command = provider_command(&options).expect("command");
+        assert!(
+            command
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "plan"])
+        );
+        assert!(!command.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(command.contains(&"--allow-dangerously-skip-permissions".to_string()));
+        let ask = AgentOptions {
+            permission_mode: None,
+            bypass_permissions: false,
+            ..options
+        };
+        assert_eq!(default_mode(&ask), "default");
+        assert!(
+            !provider_command(&ask)
+                .expect("command")
+                .iter()
+                .any(|arg| arg == "--permission-mode" || arg == "--dangerously-skip-permissions")
+        );
+    }
+
+    #[test]
+    fn claude_initialize_answers_become_commands_models_and_a_mode() {
+        let capabilities = claude_capabilities(&json!({
+            "commands": [
+                { "name": "compact", "description": "Summarize", "argumentHint": "<focus>" },
+                { "name": "__internal", "description": "", "argumentHint": "" },
+                { "name": "review", "description": "Review a PR", "argumentHint": "" },
+            ],
+            "models": [{ "value": "default", "displayName": "Default (recommended)" }, { "value": "opus", "displayName": "Opus" }],
+            "current_permission_mode": "acceptEdits",
+        }));
+        let names: Vec<&str> = capabilities["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert_eq!(names, ["compact", "review"]);
+        assert_eq!(capabilities["commands"][0]["hint"], "<focus>");
+        assert!(capabilities["commands"][1]["hint"].is_null());
+        assert_eq!(
+            capabilities["models"][1],
+            json!({ "id": "opus", "name": "Opus" })
+        );
+        assert_eq!(capabilities["permission_mode"], "acceptEdits");
+
+        let codex = codex_models(&json!({ "data": [
+            { "model": "gpt-a", "displayName": "A", "isDefault": true },
+            { "model": "gpt-hidden", "hidden": true },
+        ] }));
+        assert_eq!(codex.len(), 2);
+        assert_eq!(codex[0]["resolves"], "gpt-a");
     }
 
     #[test]

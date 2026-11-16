@@ -314,3 +314,89 @@ async fn codex_without_bypass_runs_read_only_and_declines_writes() {
         .expect("file change result");
     assert_eq!(result["data"]["is_error"], true);
 }
+
+async fn say(client: &Client, id: &str, text: &str) -> String {
+    client
+        .request("agent.send", json!({ "id": id, "text": text }))
+        .await
+        .expect("send");
+    wait_idle(client, id).await;
+    let transcript = client
+        .request("agent.read", json!({ "id": id }))
+        .await
+        .expect("read");
+    transcript["text"]
+        .as_str()
+        .expect("text")
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("echo: "))
+        .expect("an answer")
+        .to_string()
+}
+
+#[tokio::test]
+async fn codex_modes_and_models_apply_per_turn_and_survive_a_restart() {
+    let home = tempfile::tempdir().expect("home");
+    let work = tempfile::tempdir().expect("work");
+    let server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let id = create(&client, work.path(), json!({})).await;
+    let modes = client
+        .request("agent.modes", json!({ "id": id }))
+        .await
+        .expect("modes");
+    assert_eq!(modes["current"], "full-access");
+    let ids: Vec<&str> = modes["modes"]
+        .as_array()
+        .expect("modes")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["read-only", "auto", "full-access"]);
+    let commands = client
+        .request("agent.commands", json!({ "id": id }))
+        .await
+        .expect("commands");
+    assert_eq!(commands["commands"], json!([]));
+    assert_eq!(
+        say(&client, &id, "settings").await,
+        "sandbox=dangerFullAccess model=unset"
+    );
+
+    client
+        .request("agent.set_mode", json!({ "id": id, "mode": "auto" }))
+        .await
+        .expect("set mode");
+    client
+        .request("agent.set_model", json!({ "id": id, "model": "gpt-fake" }))
+        .await
+        .expect("set model");
+    assert_eq!(
+        say(&client, &id, "settings").await,
+        "sandbox=workspaceWrite model=gpt-fake"
+    );
+    assert!(
+        client
+            .request("agent.set_mode", json!({ "id": id, "mode": "plan" }))
+            .await
+            .is_err(),
+        "Claude Code's modes are not Codex's"
+    );
+    drop(client);
+    drop(server);
+
+    let _server = start_server(home.path());
+    let (client, _events) = Client::connect(home.path(), "test")
+        .await
+        .expect("reconnect");
+    let restored = client
+        .request("agent.info", json!({ "id": id }))
+        .await
+        .expect("restored");
+    assert_eq!(restored["mode"], "auto");
+    assert_eq!(
+        say(&client, &id, "settings").await,
+        "sandbox=workspaceWrite model=gpt-fake"
+    );
+}

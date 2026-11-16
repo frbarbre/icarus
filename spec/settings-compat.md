@@ -875,7 +875,7 @@ and `isPortableSettingKey`.
 | `windowBackgroundBlur` | `?boolean` | false | exported |  |  |
 | `workspaceDir` | `string` | "~/orca/workspaces" | excluded: pattern /dir$/i |  |  |
 | `workspaceDirHistory` | `?OrcaWorkspaceLayout[]` | [] | excluded: pattern /dirhistory/i |  |  |
-| `worktreeVisibilityDefaults` | `?WorktreeVisibilityDefaults` | {"external":"hide"} | exported |  | `customSources[].rootPath` is scrubbed. |
+| `worktreeVisibilityDefaults` | `?WorktreeVisibilityDefaults` | {"external":"hide"} | exported |  | `customSources[].rootPath` is scrubbed. Icarus maps it to `workspace.external`, `workspace.worktreeSources` (only sources still carrying a folder) and `workspace.sourceVisibility`. |
 | `zcodePlanSite` | `?ZcodePlanSite` | "zai" | exported |  |  |
 
 ---

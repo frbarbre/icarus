@@ -18,9 +18,10 @@ use crate::create::{
 use crate::hooks::{ScriptKind, SetupDecision, setup_key, should_run_setup, untrusted_message};
 use crate::next_action;
 use crate::server::{Server, params, rpc, to_value};
-use crate::state::{Workspace, workspace_slug};
+use crate::state::{Discovery, ORIGIN_ADOPTED, ORIGIN_NATIVE, Workspace, workspace_slug};
 
 const SLUG_MAX: usize = 63;
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -189,6 +190,7 @@ impl Server {
             .map(|t| json!({ "id": t.id, "label": t.label, "running": t.running }))
             .collect();
         let mut value = serde_json::to_value(workspace).unwrap_or_default();
+        value["source_label"] = json!(crate::discovery::source_label(workspace));
         value["agents"] = json!(agents);
         value["terminals"] = json!(terminals);
         value["setup"] = json!(self.setup_status(&workspace.id));
@@ -287,6 +289,11 @@ impl Server {
                 let p: AdoptParams = params(p)?;
                 self.adopt_workspace(p).await
             }
+            "workspace.discover"
+            | "workspace.inbox"
+            | "workspace.visibility"
+            | "workspace.show_source"
+            | "workspace.inbox_dismiss" => self.discovery_dispatch(method, p).await,
             "workspace.create_cancel" => {
                 #[derive(Deserialize)]
                 struct P {
@@ -344,6 +351,12 @@ impl Server {
                 #[derive(Deserialize)]
                 struct P {
                     project: Option<String>,
+                    /// Rescan the worktrees now rather than at most every few seconds.
+                    #[serde(default)]
+                    refresh: bool,
+                    /// Hidden discovered workspaces too, marked `hidden`.
+                    #[serde(default)]
+                    include_hidden: bool,
                 }
                 let p: P = params(p)?;
                 let project_id = match p.project {
@@ -356,10 +369,22 @@ impl Server {
                     ),
                     None => None,
                 };
-                let workspaces = self
-                    .store
-                    .workspaces(project_id.as_deref())
-                    .map_err(internal)?;
+                if p.refresh {
+                    self.discover(project_id.as_deref(), true).await;
+                } else {
+                    // Never wait on git here: a repository macOS hasn't let the server into blocks it.
+                    let server = Arc::clone(self);
+                    let project_id = project_id.clone();
+                    tokio::spawn(async move {
+                        server.discover(project_id.as_deref(), false).await;
+                    });
+                }
+                let workspaces = if p.include_hidden {
+                    self.store.known_workspaces(project_id.as_deref())
+                } else {
+                    self.store.workspaces(project_id.as_deref())
+                }
+                .map_err(internal)?;
                 Ok(json!(
                     workspaces
                         .iter()
@@ -451,8 +476,10 @@ impl Server {
                     id: String,
                     #[serde(default)]
                     force: bool,
-                    #[serde(default = "yes")]
-                    delete_branch: bool,
+                    /// Defaults to deleting it only with a worktree Icarus created.
+                    delete_branch: Option<bool>,
+                    /// Defaults to true only for worktrees Icarus created; others are hidden instead.
+                    delete_worktree: Option<bool>,
                     /// Remove without running the project's archive script.
                     #[serde(default)]
                     skip_archive: bool,
@@ -462,6 +489,20 @@ impl Server {
                 }
                 let p: P = params(p)?;
                 let workspace = self.workspace_by_key(&p.id)?;
+                let created = self.created_by_icarus(&workspace);
+                if !p.delete_worktree.unwrap_or(created) {
+                    self.stop_workspace_processes(&workspace.id).await;
+                    self.store
+                        .set_visibility(&workspace.id, Some("hide"), true)
+                        .map_err(internal)?;
+                    self.broadcast(
+                        "workspace.changed",
+                        json!({ "workspaces": [workspace.id], "source": "hide" }),
+                    );
+                    return Ok(
+                        json!({ "removed": true, "hidden": true, "worktree_deleted": false }),
+                    );
+                }
                 let unsent = self.unsent_drafts(&workspace.id);
                 if unsent > 0 && !p.force {
                     return Err(rpc(
@@ -512,7 +553,7 @@ impl Server {
                     project.root.clone(),
                     workspace.path.clone(),
                     p.force,
-                    p.delete_branch,
+                    p.delete_branch.unwrap_or(created),
                 );
                 let result = tokio::task::spawn_blocking(move || {
                     if path.exists() {
@@ -535,19 +576,7 @@ impl Server {
                     Err(error) => return Err(rpc("git_failed", format!("{error:#}"))),
                     Ok(()) => {}
                 }
-                for agent in self.agents.all() {
-                    if agent.info().workspace.as_deref() == Some(workspace.id.as_str()) {
-                        let _ = agent.kill().await;
-                        self.agents.remove(agent.id());
-                    }
-                }
-                for terminal in self.terminals.list() {
-                    if terminal.workspace.as_deref() == Some(workspace.id.as_str())
-                        && let Some(session) = self.terminals.remove(&terminal.id)
-                    {
-                        let _ = session.kill();
-                    }
-                }
+                self.stop_workspace_processes(&workspace.id).await;
                 self.store
                     .remove_workspace(&workspace.id)
                     .map_err(internal)?;
@@ -563,7 +592,7 @@ impl Server {
                 {
                     tracing::warn!("removing {}: {error}", runner.display());
                 }
-                Ok(json!({ "removed": true, "archive": archive }))
+                Ok(json!({ "removed": true, "archive": archive, "worktree_deleted": true }))
             }
             "workspace.setup" => {
                 #[derive(Deserialize)]
@@ -971,8 +1000,11 @@ impl Server {
             // Orca stamps a new workspace at the top of the Manual order.
             manual_order: Some(now_ms() as i64),
             activity_at_ms: None,
+            discovery: Discovery::default(),
         };
-        self.store.insert_workspace(&workspace).map_err(internal)?;
+        self.store
+            .insert_owned_workspace(&workspace)
+            .map_err(internal)?;
         if let Err(error) = self.start_setup(&workspace, &project.root, setup_decision) {
             tracing::warn!("setup for {}: {}", workspace.name, error.message);
             self.record_setup_failure(&workspace.id, error.message);
@@ -999,6 +1031,7 @@ impl Server {
                 remote_control: p
                     .remote_control
                     .unwrap_or_else(|| next_action::remote_control_default(&settings)),
+                permission_mode: None,
             };
             self.apply_account(&mut options, p.account.as_deref())?;
             let agent = self
@@ -1066,8 +1099,15 @@ impl Server {
     }
 
     async fn adopt_workspace(&self, p: AdoptParams) -> Result<Value, RpcError> {
-        let found = tokio::task::spawn_blocking(move || inspect_worktree(&p.path))
+        let inspecting = tokio::task::spawn_blocking(move || inspect_worktree(&p.path));
+        let found = tokio::time::timeout(Duration::from_secs(20), inspecting)
             .await
+            .map_err(|_| {
+                rpc(
+                    "timeout",
+                    "git did not answer for the worktree in time; if it is in a protected folder, allow the server in macOS Privacy & Security settings",
+                )
+            })?
             .map_err(internal)??;
         let project = match &p.project {
             Some(key) => self
@@ -1086,11 +1126,37 @@ impl Server {
                 )
             })?,
         };
-        let existing = self.store.workspaces(None).map_err(internal)?;
-        if let Some(workspace) = existing
+        let existing = self.store.all_workspaces(None).map_err(internal)?;
+        let same = existing
             .iter()
-            .find(|workspace| icarus_git::same_path(&workspace.path, &found.path))
-        {
+            .find(|workspace| icarus_git::same_path(&workspace.path, &found.path));
+        if let Some(workspace) = same.filter(|w| w.discovery.discovered) {
+            // Discovery got there first: adopting keeps its record and shows it whatever the settings.
+            let name = match p.name.filter(|name| !name.trim().is_empty()) {
+                Some(name) => workspace_slug(&name, SLUG_MAX),
+                None => workspace.name.clone(),
+            };
+            if existing.iter().any(|other| {
+                other.id != workspace.id
+                    && other.project_id == workspace.project_id
+                    && other.name == name
+            }) {
+                return Err(rpc(
+                    "exists",
+                    format!("the project already has a workspace named {name}; pass --name"),
+                ));
+            }
+            self.store
+                .adopt_discovered(&workspace.id, &name)
+                .map_err(internal)?;
+            let adopted = self.workspace_by_key(&workspace.id)?;
+            self.broadcast(
+                "workspace.changed",
+                json!({ "workspaces": [adopted.id], "source": "adopt" }),
+            );
+            return Ok(self.workspace_json(&adopted));
+        }
+        if let Some(workspace) = same.filter(|w| w.discovery.missing_at_ms.is_none()) {
             return Err(rpc(
                 "exists",
                 format!(
@@ -1111,10 +1177,11 @@ impl Server {
             })
             .unwrap_or_default();
         let slug = workspace_slug(&name, SLUG_MAX);
-        if existing
-            .iter()
-            .any(|workspace| workspace.project_id == project.id && workspace.name == slug)
-        {
+        if existing.iter().any(|workspace| {
+            workspace.project_id == project.id
+                && workspace.name == slug
+                && workspace.discovery.missing_at_ms.is_none()
+        }) {
             return Err(rpc(
                 "exists",
                 format!(
@@ -1138,13 +1205,45 @@ impl Server {
             pinned: false,
             manual_order: Some(now_ms() as i64),
             activity_at_ms: None,
+            discovery: Discovery {
+                origin: ORIGIN_ADOPTED.into(),
+                ..Discovery::default()
+            },
         };
-        self.store.insert_workspace(&workspace).map_err(internal)?;
+        self.store
+            .insert_owned_workspace(&workspace)
+            .map_err(internal)?;
         self.broadcast(
             "workspace.changed",
             json!({ "workspaces": [workspace.id], "source": "adopt" }),
         );
         Ok(self.workspace_json(&workspace))
+    }
+
+    /// Only worktrees Icarus made itself, in its own folder, may be deleted without being asked to.
+    fn created_by_icarus(&self, workspace: &Workspace) -> bool {
+        let canonical = |path: &std::path::Path| {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        };
+        workspace.discovery.origin == ORIGIN_NATIVE
+            && !workspace.discovery.discovered
+            && canonical(&workspace.path).starts_with(canonical(&self.workspace_root))
+    }
+
+    async fn stop_workspace_processes(&self, workspace_id: &str) {
+        for agent in self.agents.all() {
+            if agent.info().workspace.as_deref() == Some(workspace_id) {
+                let _ = agent.kill().await;
+                self.agents.remove(agent.id());
+            }
+        }
+        for terminal in self.terminals.list() {
+            if terminal.workspace.as_deref() == Some(workspace_id)
+                && let Some(session) = self.terminals.remove(&terminal.id)
+            {
+                let _ = session.kill();
+            }
+        }
     }
 
     /// The project registered for this repository's main checkout, else for its canonical remote.
@@ -1185,7 +1284,7 @@ struct FoundWorktree {
 
 fn inspect_worktree(path: &std::path::Path) -> Result<FoundWorktree, RpcError> {
     let shown = path.display();
-    let output = icarus_git::git(
+    let output = icarus_git::git_timeout(
         path,
         &[
             "rev-parse",
@@ -1194,6 +1293,7 @@ fn inspect_worktree(path: &std::path::Path) -> Result<FoundWorktree, RpcError> {
             "--git-dir",
             "--git-common-dir",
         ],
+        GIT_TIMEOUT,
     )
     .map_err(|e| {
         rpc(
@@ -1218,19 +1318,23 @@ fn inspect_worktree(path: &std::path::Path) -> Result<FoundWorktree, RpcError> {
             ),
         ));
     }
-    let branch = icarus_git::git(&top, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|branch| branch.trim().to_owned())
-        .ok()
-        .filter(|branch| !branch.is_empty())
-        .ok_or_else(|| {
-            rpc(
-                "detached_head",
-                format!(
-                    "{} has a detached HEAD; check out a branch in it first",
-                    top.display()
-                ),
-            )
-        })?;
+    let branch = icarus_git::git_timeout(
+        &top,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        GIT_TIMEOUT,
+    )
+    .map(|branch| branch.trim().to_owned())
+    .ok()
+    .filter(|branch| !branch.is_empty())
+    .ok_or_else(|| {
+        rpc(
+            "detached_head",
+            format!(
+                "{} has a detached HEAD; check out a branch in it first",
+                top.display()
+            ),
+        )
+    })?;
     let repo = icarus_git::repo_info(&top).map_err(|e| rpc("not_a_repo", format!("{e:#}")))?;
     Ok(FoundWorktree {
         path: top,

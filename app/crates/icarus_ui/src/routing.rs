@@ -240,6 +240,7 @@ mod tests {
             title: None,
             state: "idle".into(),
             provider: "claude".into(),
+            ..AgentSummary::default()
         }];
         let mut shared = summary("shared", "/w/main", None);
         shared.id = "ws-shared".into();

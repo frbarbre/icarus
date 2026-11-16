@@ -11,6 +11,7 @@ use gpui::{
 };
 use project::Project;
 use ui::{Color, Icon, IconName, Label, LabelSize, prelude::*};
+use util::ResultExt as _;
 use workspace::item::{Item, ItemEvent, SerializableItem};
 use workspace::{ItemId, Pane, SaveIntent, Workspace, WorkspaceId};
 
@@ -23,10 +24,40 @@ actions!(
     [
         /// Opens a new agent tab and points the composer at it.
         NewAgent,
+        /// Opens a new Claude Code agent tab.
+        NewClaudeAgent,
+        /// Opens a new Codex agent tab.
+        NewCodexAgent,
         /// Moves focus to the composer at the bottom of the workspace.
         FocusComposer,
     ]
 );
+
+/// The agent providers a new tab can start, as (`agents.default` value, name).
+pub const PROVIDERS: [(&str, &str); 2] = [("claude", "Claude"), ("codex", "Codex")];
+
+/// Picks the agent server that starts a new `provider` agent in a project; Icarus sets it.
+pub struct TabAgentProviderServer(
+    pub  std::rc::Rc<
+        dyn Fn(&Entity<Project>, &str, &App) -> Option<std::rc::Rc<dyn agent_servers::AgentServer>>,
+    >,
+);
+
+impl gpui::Global for TabAgentProviderServer {}
+
+/// Opens a new agent tab running `provider` (`claude` or `codex`) and focuses the composer on it.
+pub fn open_provider_agent_tab(
+    workspace: &mut Workspace,
+    provider: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<AgentTab>> {
+    let server = cx
+        .try_global::<TabAgentProviderServer>()
+        .map(|picker| picker.0.clone())
+        .and_then(|picker| picker(workspace.project(), provider, cx));
+    open_tab(workspace, server, None, None, true, window, cx)
+}
 
 /// An agent conversation shown as a center tab; its composer lives in the workspace's [`AgentComposer`].
 pub struct AgentTab {
@@ -35,6 +66,11 @@ pub struct AgentTab {
     observed_thread: Option<EntityId>,
     /// What the last save said about messages, kept while a restored conversation hasn't loaded.
     saved_had_messages: bool,
+    focus_handle: FocusHandle,
+    workspace: WeakEntity<Workspace>,
+    /// Set by the composer while it types into this agent and other agent tabs are open.
+    marked_as_target: bool,
+    _focus_subscription: Subscription,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -42,6 +78,8 @@ impl AgentTab {
     pub fn new(
         conversation_view: Entity<ConversationView>,
         requested_agent_id: Option<String>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let subscription = cx.observe(&conversation_view, |tab, _, cx| {
@@ -49,15 +87,48 @@ impl AgentTab {
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
         });
+        let focus_handle = cx.focus_handle();
+        // Activating the tab (click, keys, a notification) means "talk to this agent".
+        let focus_subscription = cx.on_focus(&focus_handle, window, |tab, window, cx| {
+            tab.focus_composer(window, cx)
+        });
         let mut tab = Self {
             conversation_view,
             requested_agent_id,
             observed_thread: None,
             saved_had_messages: false,
+            focus_handle,
+            workspace,
+            marked_as_target: false,
+            _focus_subscription: focus_subscription,
             _subscriptions: vec![subscription],
         };
         tab.observe_root_thread(cx);
         tab
+    }
+
+    /// Points the workspace's composer at this agent and moves focus into it.
+    fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(composer) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| AgentComposer::for_workspace(workspace.read(cx)))
+        else {
+            return;
+        };
+        let tab = cx.entity();
+        window.defer(cx, move |window, cx| {
+            composer.update(cx, |composer, cx| composer.set_target(tab, cx));
+            AgentComposer::focus(&composer, window, cx);
+        });
+    }
+
+    fn set_marked_as_target(&mut self, marked: bool, cx: &mut Context<Self>) {
+        if self.marked_as_target != marked {
+            self.marked_as_target = marked;
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
+        }
     }
 
     pub fn conversation_view(&self) -> &Entity<ConversationView> {
@@ -124,13 +195,30 @@ impl AgentTab {
 impl EventEmitter<ItemEvent> for AgentTab {}
 
 impl Focusable for AgentTab {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.conversation_view.read(cx).focus_handle(cx)
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
 impl Item for AgentTab {
     type Event = ItemEvent;
+
+    fn tab_content(
+        &self,
+        params: workspace::item::TabContentParams,
+        _window: &Window,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let color = if self.marked_as_target {
+            Color::Accent
+        } else {
+            params.text_color()
+        };
+        Label::new(self.tab_content_text(params.detail.unwrap_or_default(), cx))
+            .single_line()
+            .color(color)
+            .into_any_element()
+    }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         self.conversation_view.read(cx).title(cx)
@@ -162,8 +250,23 @@ impl Item for AgentTab {
 }
 
 impl Render for AgentTab {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.conversation_view.clone())
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .track_focus(&self.focus_handle)
+            .relative()
+            .size_full()
+            .child(self.conversation_view.clone())
+            .when(self.marked_as_target, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(gpui::px(2.))
+                        .bg(cx.theme().colors().text_accent),
+                )
+            })
     }
 }
 
@@ -293,7 +396,13 @@ impl SerializableItem for AgentTab {
                             )
                         });
                         let tab = cx.new(|cx| {
-                            let mut tab = AgentTab::new(conversation_view, Some(agent_id), cx);
+                            let mut tab = AgentTab::new(
+                                conversation_view,
+                                Some(agent_id),
+                                workspace.clone(),
+                                window,
+                                cx,
+                            );
                             tab.saved_had_messages = had_messages;
                             tab
                         });
@@ -375,6 +484,9 @@ pub struct AgentComposer {
     recent: Vec<EntityId>,
     observed_target: Option<EntityId>,
     ensure_scheduled: bool,
+    /// Focus asked for before the target's conversation loaded; given once it has.
+    pending_focus: bool,
+    agent_tab_count: usize,
     _target_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -399,6 +511,8 @@ impl AgentComposer {
             recent: Vec::new(),
             observed_target: None,
             ensure_scheduled: false,
+            pending_focus: false,
+            agent_tab_count: 0,
             _target_subscriptions: Vec::new(),
             _subscriptions: vec![subscription],
         }
@@ -469,11 +583,28 @@ impl AgentComposer {
         }
     }
 
+    /// Marks the target's tab while several agents could be typed into.
+    fn mark_target(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let tabs: Vec<Entity<AgentTab>> =
+            workspace.read(cx).items_of_type::<AgentTab>(cx).collect();
+        self.agent_tab_count = tabs.len();
+        let target = self.observed_target;
+        let several = tabs.len() > 1;
+        for tab in tabs {
+            let marked = several && Some(tab.entity_id()) == target;
+            tab.update(cx, |tab, cx| tab.set_marked_as_target(marked, cx));
+        }
+    }
+
     fn set_target(&mut self, tab: Entity<AgentTab>, cx: &mut Context<Self>) {
         let id = tab.entity_id();
         self.recent.retain(|recent| *recent != id);
         self.recent.push(id);
         if self.observed_target != Some(id) {
+            self.pending_focus = false;
             self.observed_target = Some(id);
             let conversation_view = tab.read(cx).conversation_view.clone();
             self._target_subscriptions = vec![
@@ -486,6 +617,7 @@ impl AgentComposer {
             self.target = Some(tab.downgrade());
             self.observe_target_thread(cx);
         }
+        self.mark_target(cx);
         cx.notify();
     }
 
@@ -501,15 +633,57 @@ impl AgentComposer {
         self.target()?.read(cx).thread_view(cx)
     }
 
-    /// Focuses the target agent's draft.
+    /// Focuses the target agent's draft, or does once its conversation has loaded.
     pub fn focus(composer: &Entity<Self>, window: &mut Window, cx: &mut App) {
         let focus_handle = composer
             .read(cx)
             .target_thread_view(cx)
             .map(|thread_view| thread_view.read(cx).message_editor.focus_handle(cx));
-        if let Some(focus_handle) = focus_handle {
-            focus_handle.focus(window, cx);
+        match focus_handle {
+            Some(focus_handle) => focus_handle.focus(window, cx),
+            None => composer.update(cx, |composer, cx| {
+                composer.pending_focus = true;
+                cx.notify();
+            }),
         }
+    }
+
+    /// Whether typing now goes into this composer's target agent.
+    pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.target_thread_view(cx).is_some_and(|thread_view| {
+            thread_view
+                .read(cx)
+                .message_editor
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        })
+    }
+
+    /// "+" above the composer: a new agent tab, choosing Claude or Codex.
+    fn render_new_agent_menu(&self) -> impl IntoElement {
+        let workspace = self.workspace.clone();
+        ui::PopoverMenu::new("icarus-new-agent-menu")
+            .trigger_with_tooltip(
+                IconButton::new("icarus-new-agent", IconName::Plus).icon_size(IconSize::XSmall),
+                ui::Tooltip::text("New Agent"),
+            )
+            .anchor(gpui::Anchor::BottomRight)
+            .menu(move |window, cx| {
+                let workspace = workspace.clone();
+                Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for (provider, name) in PROVIDERS {
+                        let workspace = workspace.clone();
+                        menu = menu.entry(format!("New {name} Agent"), None, move |window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    open_provider_agent_tab(workspace, provider, window, cx);
+                                })
+                                .log_err();
+                        });
+                    }
+                    menu
+                }))
+            })
     }
 
     /// Swaps a tab whose agent no longer exists for a fresh agent in the same pane.
@@ -551,10 +725,48 @@ impl AgentComposer {
 
 impl Render for AgentComposer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus
+            && let Some(thread_view) = self.target_thread_view(cx)
+        {
+            self.pending_focus = false;
+            let focus_handle = thread_view.read(cx).message_editor.focus_handle(cx);
+            window.defer(cx, move |window, cx| focus_handle.focus(window, cx));
+        }
+        let several = self.agent_tab_count > 1;
+        let target_title = self
+            .target()
+            .map(|tab| tab.read(cx).conversation_view.read(cx).title(cx));
+        let header_color = if several { Color::Accent } else { Color::Muted };
         let composer = self.target_thread_view(cx).map(|thread_view| {
-            thread_view.update(cx, |thread_view, cx| {
+            let composer = thread_view.update(cx, |thread_view, cx| {
                 thread_view.render_hosted_composer(window, cx)
-            })
+            });
+            v_flex()
+                .w_full()
+                .child(
+                    h_flex()
+                        .px_3()
+                        .pt_1()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().editor_background)
+                        .child(
+                            Icon::new(IconName::ZedAgent)
+                                .size(IconSize::XSmall)
+                                .color(header_color),
+                        )
+                        .child(
+                            Label::new(format!("To {}", target_title.unwrap_or_default()))
+                                .size(LabelSize::XSmall)
+                                .color(header_color)
+                                .truncate(),
+                        )
+                        .child(div().flex_1())
+                        .child(self.render_new_agent_menu()),
+                )
+                .child(composer)
+                .into_any_element()
         });
         let failed = self
             .target()
@@ -670,7 +882,9 @@ fn open_tab(
             let conversation_view = panel.update(cx, |panel, cx| {
                 panel.new_tab_conversation(server, resume_session_id, None, window, cx)
             });
-            let tab = cx.new(|cx| AgentTab::new(conversation_view, agent_id, cx));
+            let workspace_handle = cx.entity().downgrade();
+            let tab = cx
+                .new(|cx| AgentTab::new(conversation_view, agent_id, workspace_handle, window, cx));
             workspace.add_item(pane, Box::new(tab.clone()), None, true, focus, window, cx);
             tab
         }
@@ -698,14 +912,64 @@ pub struct TabAgentServer(
 
 impl gpui::Global for TabAgentServer {}
 
-/// Present once agent tabs are on; the agent panel then leaves sessions to the tabs.
-pub struct AgentTabsEnabled;
+pub use agent_settings::AgentTabsEnabled;
 
-impl gpui::Global for AgentTabsEnabled {}
+/// Adds the focused editor's or terminal's selection to the composer's target agent.
+pub(crate) fn add_selection_to_composer(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    use crate::completion_provider::AgentContextSource;
+    let source = AgentContextSource::from_focused(workspace, window, cx)
+        .or_else(|| AgentContextSource::from_active(workspace, cx));
+    let Some(selection) = source.and_then(|source| source.read_selection(workspace, true, cx))
+    else {
+        return;
+    };
+    let Some(composer) = AgentComposer::for_workspace(workspace) else {
+        return;
+    };
+    let Some(tab) = composer.read(cx).target() else {
+        return;
+    };
+    let conversation_view = tab.read(cx).conversation_view.clone();
+    conversation_view.update(cx, |conversation_view, cx| {
+        conversation_view.insert_selection(selection, window, cx)
+    });
+    AgentComposer::focus(&composer, window, cx);
+}
+
+/// Swaps an agent panel that something opened for its dock's next panel (or closes the dock) and
+/// focuses the composer, since agents live in tabs.
+pub(crate) fn hide_agent_panel(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    for dock in workspace.all_docks() {
+        let Some(index) = dock.read(cx).panel_index_for_type::<AgentPanel>() else {
+            continue;
+        };
+        dock.update(cx, |dock, cx| {
+            if dock.active_panel_index() != Some(index) {
+                return;
+            }
+            match dock.first_enabled_panel_idx(cx) {
+                Ok(other) if other != index => dock.activate_panel(other, window, cx),
+                _ => dock.set_open(false, window, cx),
+            }
+        });
+    }
+    if let Some(composer) = AgentComposer::for_workspace(workspace) {
+        AgentComposer::focus(&composer, window, cx);
+    }
+}
 
 /// Gives every workspace window agent tabs and one shared composer; Icarus calls this, upstream Zed does not.
 pub fn init(cx: &mut App) {
     cx.set_global(AgentTabsEnabled);
+    crate::update_command_palette_filter(cx);
     workspace::register_serializable_item::<AgentTab>(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if let Some(window) = window {
@@ -723,6 +987,12 @@ pub fn install(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
     composer.update(cx, |composer, cx| composer.schedule_ensure(window, cx));
     workspace.register_action(|workspace, _: &NewAgent, window, cx| {
         open_agent_tab(workspace, None, None, true, window, cx);
+    });
+    workspace.register_action(|workspace, _: &NewClaudeAgent, window, cx| {
+        open_provider_agent_tab(workspace, "claude", window, cx);
+    });
+    workspace.register_action(|workspace, _: &NewCodexAgent, window, cx| {
+        open_provider_agent_tab(workspace, "codex", window, cx);
     });
     workspace.register_action(|workspace, _: &FocusComposer, window, cx| {
         if let Some(composer) = AgentComposer::for_workspace(workspace) {
@@ -843,6 +1113,105 @@ mod tests {
                 .detach_and_log_err(cx);
         });
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn activating_an_agent_tab_focuses_its_draft_and_marks_it_while_typing(
+        cx: &mut TestAppContext,
+    ) {
+        crate::test_support::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            crate::thread_metadata_store::init(cx);
+            init(cx);
+        });
+        let _connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        fs.insert_tree("/project", serde_json::json!({ "a.txt": "" }))
+            .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            panel.update(cx, |panel, cx| {
+                panel.select_agent(crate::Agent::Stub, window, cx)
+            });
+            workspace.add_panel(panel, window, cx);
+        });
+        cx.run_until_parked();
+        let first = agent_tabs(&workspace, cx)[0].clone();
+        let marked = |tab: &Entity<AgentTab>, cx: &mut VisualTestContext| {
+            tab.read_with(cx, |tab, _| tab.marked_as_target)
+        };
+        assert!(!marked(&first, cx), "one agent needs no marker");
+
+        let second = workspace
+            .update_in(cx, |workspace, window, cx| {
+                open_agent_tab(workspace, None, None, false, window, cx)
+            })
+            .expect("second agent");
+        cx.run_until_parked();
+        assert!(marked(&second, cx) && !marked(&first, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&first, true, true, window, cx);
+        });
+        cx.run_until_parked();
+        let first_draft = draft(&first, cx);
+        assert!(
+            cx.update(|window, cx| first_draft
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)),
+            "activating the tab puts the cursor in its draft"
+        );
+        assert!(marked(&first, cx) && !marked(&second, cx));
+        let composer = workspace
+            .read_with(cx, |workspace, _| AgentComposer::for_workspace(workspace))
+            .expect("composer");
+        assert!(
+            cx.update(|window, cx| composer.read(cx).is_focused(window, cx)),
+            "typing goes to the marked agent"
+        );
+
+        cx.simulate_input("hi");
+        assert_eq!(
+            first_draft.read_with(cx, |editor, cx| editor.text(cx)),
+            "hi"
+        );
+        assert!(
+            marked(&first, cx),
+            "the marker stays while focus is in the composer"
+        );
+
+        cx.dispatch_action(zed_actions::assistant::ToggleFocus);
+        cx.run_until_parked();
+        let (in_a_dock, has_button) = cx.update(|window, cx| {
+            let workspace = workspace.read(cx);
+            let panel = workspace.panel::<AgentPanel>(cx).expect("panel");
+            let in_a_dock = workspace.all_docks().iter().any(|dock| {
+                dock.read(cx)
+                    .visible_panel()
+                    .is_some_and(|visible| visible.panel_id() == panel.entity_id())
+            });
+            (
+                in_a_dock,
+                workspace::Panel::icon(panel.read(cx), window, cx).is_some(),
+            )
+        });
+        assert!(
+            !in_a_dock,
+            "agents live in tabs; Zed's agent panel never shows"
+        );
+        assert!(!has_button, "and has no status bar button");
     }
 
     #[gpui::test]

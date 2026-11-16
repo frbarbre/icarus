@@ -46,6 +46,12 @@ pub fn set_agent_resolver(
     cx.set_global(GlobalAgentResolver(Arc::new(resolver)));
 }
 
+/// The server agent `item` shows, when it is an agent tab.
+pub(crate) fn agent_of_item(item: &dyn ItemHandle, cx: &App) -> Option<String> {
+    cx.try_global::<GlobalAgentResolver>()
+        .and_then(|resolver| (resolver.0)(item, cx))
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct RemoteControlState {
     #[serde(default)]
@@ -267,10 +273,7 @@ impl StatusItemView for RemoteControlButton {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let agent = active_pane_item.and_then(|item| {
-            cx.try_global::<GlobalAgentResolver>()
-                .and_then(|resolver| (resolver.0)(item, cx))
-        });
+        let agent = active_pane_item.and_then(|item| agent_of_item(item, cx));
         self.set_agent(agent, cx);
     }
 

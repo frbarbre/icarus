@@ -17,6 +17,8 @@ pub const PROTECTED_KEYS: &[&str] = &[
     "agent.enabled",
     "disable_ai",
     "agent_servers.Icarus",
+    // The Explorer sits in the right sidebar with Source Control and GitHub, as in Orca.
+    "project_panel.dock",
 ];
 
 /// The look reported back so the user sees what carried over.
@@ -30,6 +32,15 @@ pub const APPEARANCE_KEYS: &[&str] = &[
 ];
 
 const AUTO_INSTALL: &str = "auto_install_extensions";
+
+/// Written into the app's config directory by every real import, from the CLI or the app, so the app
+/// stops offering one.
+const IMPORTED_MARKER: &str = ".zed-imported";
+
+/// Whether an import into the app's config directory `target` has run.
+pub fn already_imported(target: &Path) -> bool {
+    target.join(IMPORTED_MARKER).exists()
+}
 
 fn env_dir(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
@@ -622,6 +633,14 @@ pub fn import(
         |name, _| name == IMPORTED_THEME_FILE,
         dry_run,
     )?);
+
+    let found_anything =
+        settings_found || !extensions.is_empty() || !dev_extensions.is_empty() || !files.is_empty();
+    if !dry_run && found_anything {
+        fs::create_dir_all(target).map_err(io_error(target))?;
+        let marker = target.join(IMPORTED_MARKER);
+        fs::write(&marker, source.to_string_lossy().as_bytes()).map_err(io_error(&marker))?;
+    }
 
     Ok(ZedImport {
         source: source.to_owned(),

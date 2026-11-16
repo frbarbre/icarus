@@ -754,6 +754,15 @@
     },
   },
   {
+    "context": "IcarusReply > Editor",
+    "bindings": {
+      "enter": "icarus::SubmitReviewComment",
+      "cmd-enter": "icarus::SubmitReviewComment",
+      "shift-enter": "editor::Newline",
+      "escape": "icarus::CancelReviewComment",
+    },
+  },
+  {
     "context": "Workspace",
     "use_key_equivalents": true,
     "bindings": {
@@ -824,8 +833,6 @@
       "cmd-r": "workspace::ToggleRightDock",
       // Icarus: Orca's Mod+J workspace switcher; the bottom dock stays in the View menu and palette.
       "cmd-j": "icarus::OpenWorkspaceSwitcher",
-      "cmd-alt-j": "multi_workspace::ToggleWorkspaceSidebar",
-      "cmd-alt-;": "multi_workspace::FocusWorkspaceSidebar",
       "alt-cmd-y": "workspace::ToggleAllDocks",
       // For 0px parameter, uses UI font size value.
       "ctrl-alt-0": "workspace::ResetActiveDockSize",
@@ -835,7 +842,11 @@
       "ctrl-alt-_": ["workspace::DecreaseOpenDocksSize", { "px": 0 }],
       "ctrl-alt-+": ["workspace::IncreaseOpenDocksSize", { "px": 0 }],
       "cmd-shift-f": "pane::DeploySearch",
-      "cmd-shift-h": ["pane::DeploySearch", { "replace_enabled": true }],
+      // Icarus: Orca's sidebar keys: ⌘⇧G Source Control, ⌘⇧H the PR panel, ⌘L the right dock.
+      // Search-and-replace stays in the palette; ⌘L selects a line inside text editors.
+      "cmd-shift-g": "icarus::ToggleSourceControlPanel",
+      "cmd-shift-h": "icarus::ToggleGitHubPanel",
+      "cmd-l": "workspace::ToggleRightDock",
       "cmd-shift-t": "pane::ReopenClosedItem",
       "cmd-k cmd-p": "workspace::ReopenLastPicker",
       "cmd-k cmd-s": "zed::OpenKeymap",
@@ -850,7 +861,6 @@
       "cmd-shift-e": "project_panel::ToggleFocus",
       "ctrl-shift-g": "git_panel::ToggleFocus",
       "cmd-shift-d": "debug_panel::ToggleFocus",
-      "cmd-?": "agent::ToggleFocus",
       "cmd-alt-s": "workspace::SaveAll",
       "cmd-k n": "encoding_selector::Toggle",
       "cmd-k m": "language_selector::Toggle",
@@ -1095,7 +1105,6 @@
       "cmd-shift-e": "pane::RevealInProjectPanel",
       "cmd-f8": "editor::GoToHunk",
       "cmd-shift-f8": "editor::GoToPreviousHunk",
-      "ctrl-enter": "assistant::InlineAssist",
       "ctrl-:": "editor::ToggleInlayHints",
     },
   },
@@ -1471,7 +1480,6 @@
       "cmd-a": "editor::SelectAll",
       "cmd-k": "terminal::Clear",
       "cmd-n": "workspace::NewTerminal",
-      "ctrl-enter": "assistant::InlineAssist",
       "ctrl-_": null, // emacs undo
       // Some nice conveniences
       "cmd-backspace": ["terminal::SendKeystroke", "ctrl-u"], // clear line

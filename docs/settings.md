@@ -61,6 +61,9 @@ icarus config explain --project my-repo project.hooks.scripts.setup
 | `agents.commands.<provider>` | | Command line for a provider, e.g. `["/opt/bin/codex"]`. |
 | `agents.remote_control` | `false` | Start Claude Code agents with Remote Control. |
 | `workspace.root` | `~/icarus/workspaces` | Where worktrees are created. Read when the server starts. |
+| `workspace.external` | `hide` | Whether worktrees found outside Icarus's folder show. See [Worktrees made elsewhere](workspaces.md#worktrees-made-elsewhere). |
+| `workspace.worktreeSources` | `[]` | Your own worktree sources, `[{"id", "root"}]`. |
+| `workspace.sourceVisibility` | | `show`/`hide` per source: `claude`, `gsd` or a source id. |
 | `workspace.statuses` | Todo, In progress, In review, Done | Status columns. |
 | `workspace.cardFields` | | Fields on cards. See [Card fields](workspaces.md#card-fields). |
 | `sidebar.groupBy` | `repo` | `workspace-status`, `pr-status`, `stack`, `repo`, `none`. |
@@ -85,7 +88,7 @@ icarus config explain --project my-repo project.hooks.scripts.setup
 
 ## Per-app settings
 
-The app keeps a `client.json` in its config folder that overrides server settings for that app only. Today it holds only `workspace.cardFields`, so a laptop and a desktop sharing a server can show different card fields. Toggling a card field in the app writes it; **Use Shared Card Fields** removes it.
+The app keeps a `client.json` in its config folder that overrides server settings for that app only. It holds `workspace.cardFields`, so a laptop and a desktop sharing a server can show different card fields (toggling a card field in the app writes it; **Use Shared Card Fields** removes it), `sidebar.collapsedGroups`, the Workspaces panel's folded sections per grouping, `review.commentDestination`, the line comment box's last tab (`agent` or `review`), and `sourceControl.changesView`, Source Control's `list` or `tree` view.
 
 ```sh
 icarus app config get

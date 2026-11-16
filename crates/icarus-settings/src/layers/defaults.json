@@ -6,9 +6,10 @@
       { "id": "in-review", "label": "In review", "color": "conductor-review", "icon": "conductor-review" },
       { "id": "completed", "label": "Done", "color": "conductor-done", "icon": "conductor-done" }
     ],
-    "cardFields": ["status", "unread", "issue", "linear-issue", "jira-issue", "pr", "automation", "cli", "comment", "ports", "inline-agents", "host", "project"],
+    "cardFields": ["workspace-status", "unread", "issue", "linear-issue", "jira-issue", "pr", "automation", "cli", "comment", "ports", "inline-agents", "host", "project"],
     "boardOpacity": 1,
-    "boardColumnWidth": 308
+    "boardColumnWidth": 308,
+    "external": "hide"
   },
   "sidebar": {
     "groupBy": "repo",

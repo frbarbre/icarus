@@ -43,7 +43,42 @@ pub struct Workspace {
     /// The last agent turn, terminal output or git change (ms), for Recent and Agent Activity sorting.
     #[serde(default)]
     pub activity_at_ms: Option<u64>,
+    #[serde(flatten, default)]
+    pub discovery: Discovery,
 }
+
+/// Where a workspace's worktree came from and whether the sidebar shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Discovery {
+    /// `native` (under `workspace.root`), `adopted`, `claude`, `gsd`, `custom:<id>` or `external`.
+    pub origin: String,
+    /// Found by listing the project's worktrees rather than created or adopted by Icarus.
+    pub discovered: bool,
+    /// The user's explicit `show` or `hide`, which beats every setting.
+    pub visibility: Option<String>,
+    /// Hidden by `visibility` or the visibility settings, as of the last discovery.
+    pub hidden: bool,
+    /// The user decided on it in the new-worktrees inbox.
+    pub inbox_seen: bool,
+    /// Git stopped listing the worktree; the row stays so a re-added worktree gets it back.
+    pub missing_at_ms: Option<u64>,
+}
+
+impl Default for Discovery {
+    fn default() -> Self {
+        Self {
+            origin: ORIGIN_NATIVE.into(),
+            discovered: false,
+            visibility: None,
+            hidden: false,
+            inbox_seen: false,
+            missing_at_ms: None,
+        }
+    }
+}
+
+pub const ORIGIN_NATIVE: &str = "native";
+pub const ORIGIN_ADOPTED: &str = "adopted";
 
 /// Activity stamps closer together than this don't rewrite the row (Orca's recent-stamp throttle).
 pub const ACTIVITY_THROTTLE_MS: u64 = 10_000;
@@ -230,6 +265,32 @@ impl Store {
         )?;
         add_missing_column(&connection, "workspaces", "manual_order", "INTEGER")?;
         add_missing_column(&connection, "workspaces", "activity_at_ms", "INTEGER")?;
+        add_missing_column(
+            &connection,
+            "workspaces",
+            "origin",
+            "TEXT NOT NULL DEFAULT 'native'",
+        )?;
+        add_missing_column(
+            &connection,
+            "workspaces",
+            "discovered",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_missing_column(&connection, "workspaces", "visibility", "TEXT")?;
+        add_missing_column(
+            &connection,
+            "workspaces",
+            "hidden",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_missing_column(
+            &connection,
+            "workspaces",
+            "inbox_seen",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_missing_column(&connection, "workspaces", "missing_at_ms", "INTEGER")?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -323,9 +384,87 @@ impl Store {
     }
 
     pub fn insert_workspace(&self, workspace: &Workspace) -> Result<()> {
+        Self::insert_with(&self.db(), "INSERT", workspace)?;
+        Ok(())
+    }
+
+    /// Inserts a workspace Icarus made or adopted, replacing a discovered or missing row for its path.
+    pub fn insert_owned_workspace(&self, workspace: &Workspace) -> Result<()> {
+        let mut db = self.db();
+        let transaction = db.transaction()?;
+        transaction.execute(
+            "DELETE FROM workspaces WHERE path = ?1 AND (discovered = 1 OR missing_at_ms IS NOT NULL)",
+            params![workspace.path.to_string_lossy()],
+        )?;
+        Self::insert_with(&transaction, "INSERT", workspace)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Inserts a discovered workspace; false when a row for its path appeared meanwhile.
+    pub fn insert_discovered_workspace(&self, workspace: &Workspace) -> Result<bool> {
+        Ok(Self::insert_with(&self.db(), "INSERT OR IGNORE", workspace)? > 0)
+    }
+
+    /// Records what discovery found for a workspace, leaving the user's own edits alone.
+    pub fn update_discovery(
+        &self,
+        id: &str,
+        branch: Option<&str>,
+        discovery: &Discovery,
+    ) -> Result<()> {
         self.db().execute(
-            "INSERT INTO workspaces (id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms, pinned, manual_order, activity_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "UPDATE workspaces SET branch = ?2, origin = ?3, hidden = ?4, missing_at_ms = ?5 WHERE id = ?1",
+            params![
+                id,
+                branch,
+                discovery.origin,
+                discovery.hidden,
+                discovery.missing_at_ms.map(|at| at as i64)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The user's show/hide choice (None follows the settings again); it also answers the inbox.
+    pub fn set_visibility(&self, id: &str, visibility: Option<&str>, hidden: bool) -> Result<()> {
+        self.db().execute(
+            "UPDATE workspaces SET visibility = ?2, hidden = ?3, inbox_seen = 1 WHERE id = ?1",
+            params![id, visibility, hidden],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_inbox_seen(&self, ids: &[String]) -> Result<usize> {
+        let mut db = self.db();
+        let transaction = db.transaction()?;
+        let mut changed = 0;
+        for id in ids {
+            changed += transaction.execute(
+                "UPDATE workspaces SET inbox_seen = 1 WHERE id = ?1",
+                params![id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// Turns a discovered workspace into an adopted one, shown whatever the settings say.
+    pub fn adopt_discovered(&self, id: &str, name: &str) -> Result<()> {
+        self.db().execute(
+            "UPDATE workspaces SET name = ?2, origin = ?3, discovered = 0, visibility = NULL, hidden = 0, inbox_seen = 1, missing_at_ms = NULL WHERE id = ?1",
+            params![id, name, ORIGIN_ADOPTED],
+        )?;
+        Ok(())
+    }
+
+    fn insert_with(db: &Connection, verb: &str, workspace: &Workspace) -> Result<usize> {
+        let discovery = &workspace.discovery;
+        Ok(db.execute(
+            &format!(
+                "{verb} INTO workspaces (id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms, pinned, manual_order, activity_at_ms, origin, discovered, visibility, hidden, inbox_seen, missing_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
+            ),
             params![
                 workspace.id,
                 workspace.project_id,
@@ -340,10 +479,15 @@ impl Store {
                 workspace.created_at_ms as i64,
                 workspace.pinned,
                 workspace.manual_order,
-                workspace.activity_at_ms.map(|at| at as i64)
+                workspace.activity_at_ms.map(|at| at as i64),
+                discovery.origin,
+                discovery.discovered,
+                discovery.visibility,
+                discovery.hidden,
+                discovery.inbox_seen,
+                discovery.missing_at_ms.map(|at| at as i64)
             ],
-        )?;
-        Ok(())
+        )?)
     }
 
     /// Ranks `ids` for the Manual sort, first highest, all above every earlier rank; others keep theirs.
@@ -406,15 +550,25 @@ impl Store {
             pinned: row.get(11)?,
             manual_order: row.get(12)?,
             activity_at_ms: row.get::<_, Option<i64>>(13)?.map(|at| at as u64),
+            discovery: Discovery {
+                origin: row.get(14)?,
+                discovered: row.get(15)?,
+                visibility: row.get(16)?,
+                hidden: row.get(17)?,
+                inbox_seen: row.get(18)?,
+                missing_at_ms: row.get::<_, Option<i64>>(19)?.map(|at| at as u64),
+            },
         })
     }
 
-    const WORKSPACE_COLUMNS: &str = "id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms, pinned, manual_order, activity_at_ms";
+    const WORKSPACE_COLUMNS: &str = "id, project_id, name, path, branch, base_ref, status, title, issue, pull_request, created_at_ms, pinned, manual_order, activity_at_ms, origin, discovered, visibility, hidden, inbox_seen, missing_at_ms";
 
-    /// Finds a workspace by id, name or path.
+    /// Finds a workspace by id, name or path; a worktree git no longer lists only by id.
     pub fn workspace(&self, key: &str) -> Result<Option<Workspace>> {
         let sql = format!(
-            "SELECT {} FROM workspaces WHERE id = ?1 OR name = ?1 OR path = ?1 ORDER BY created_at_ms DESC LIMIT 1",
+            "SELECT {} FROM workspaces
+             WHERE id = ?1 OR ((name = ?1 OR path = ?1) AND missing_at_ms IS NULL)
+             ORDER BY id = ?1 DESC, hidden, created_at_ms DESC LIMIT 1",
             Self::WORKSPACE_COLUMNS
         );
         Ok(self
@@ -423,10 +577,25 @@ impl Store {
             .optional()?)
     }
 
+    /// The workspaces the sidebar shows: hidden ones and worktrees git no longer lists are left out.
     pub fn workspaces(&self, project_id: Option<&str>) -> Result<Vec<Workspace>> {
+        self.query_workspaces(project_id, "AND hidden = 0 AND missing_at_ms IS NULL")
+    }
+
+    /// Shown and hidden workspaces whose worktrees git still lists.
+    pub fn known_workspaces(&self, project_id: Option<&str>) -> Result<Vec<Workspace>> {
+        self.query_workspaces(project_id, "AND missing_at_ms IS NULL")
+    }
+
+    /// Every row, missing worktrees included, for discovery.
+    pub fn all_workspaces(&self, project_id: Option<&str>) -> Result<Vec<Workspace>> {
+        self.query_workspaces(project_id, "")
+    }
+
+    fn query_workspaces(&self, project_id: Option<&str>, filter: &str) -> Result<Vec<Workspace>> {
         let db = self.db();
         let sql = format!(
-            "SELECT {} FROM workspaces WHERE ?1 IS NULL OR project_id = ?1 ORDER BY created_at_ms",
+            "SELECT {} FROM workspaces WHERE (?1 IS NULL OR project_id = ?1) {filter} ORDER BY created_at_ms",
             Self::WORKSPACE_COLUMNS
         );
         let mut statement = db.prepare(&sql)?;
@@ -972,6 +1141,7 @@ mod tests {
             pinned: false,
             manual_order: Some(5),
             activity_at_ms: None,
+            discovery: Discovery::default(),
         };
         store.insert_workspace(&workspace).expect("insert");
         workspace.status = Some("in-review".into());
@@ -1007,6 +1177,7 @@ mod tests {
             pinned: false,
             manual_order: None,
             activity_at_ms: None,
+            discovery: Discovery::default(),
         };
         store.insert_workspace(&workspace).expect("insert");
         let first = store
@@ -1063,6 +1234,7 @@ mod tests {
                     pinned: false,
                     manual_order: Some(index as i64),
                     activity_at_ms: None,
+                    discovery: Discovery::default(),
                 })
                 .expect("insert");
         }

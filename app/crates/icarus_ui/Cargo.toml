@@ -36,6 +36,7 @@ extension_host.workspace = true
 git_ui.workspace = true
 language.workspace = true
 log.workspace = true
+markdown.workspace = true
 multi_buffer.workspace = true
 paths.workspace = true
 picker.workspace = true
