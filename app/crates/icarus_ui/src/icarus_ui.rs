@@ -12,6 +12,7 @@ mod model;
 mod next_action;
 pub mod notifications;
 pub mod palettes;
+pub mod pane_nav;
 pub mod quick_commands;
 pub mod remote_agent;
 pub mod remote_control;
@@ -767,6 +768,7 @@ pub fn init(cx: &mut App) {
     accounts::register(cx);
     remote_control::register(cx);
     settings_view::register(cx);
+    pane_nav::register(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_some() {
             // A workspace opened after its layout was stored (e.g. the app was closed) applies it now.

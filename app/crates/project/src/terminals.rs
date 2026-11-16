@@ -556,6 +556,11 @@ impl Project {
         if terminal.read(cx).task().is_some() {
             return self.create_terminal_shell(cwd, cx);
         }
+        // A routed shell's program attaches to that one shell, so a clone would mirror it instead of starting a new one.
+        if terminal.read(cx).external_id().is_some() {
+            let cwd = terminal.read(cx).working_directory().or(cwd);
+            return self.create_terminal_shell(cwd, cx);
+        }
         let local_path = if self.is_via_remote_server() {
             None
         } else {

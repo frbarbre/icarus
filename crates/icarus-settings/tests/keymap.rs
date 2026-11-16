@@ -174,6 +174,30 @@ fn quick_commands_and_the_switcher_map_to_their_icarus_actions() {
 }
 
 #[test]
+fn terminal_panes_and_group_focus_map_to_their_actions() {
+    let orca = json!({ "version": 1, "platforms": { "darwin": {
+        "terminal.splitRight": ["Mod+Alt+D"],
+        "terminal.focusNextPane": ["Ctrl+N"],
+        "terminal.expandPane": ["Mod+Alt+Enter"],
+        "tabGroup.focusLeft": ["Ctrl+H"],
+    } } });
+    let translation = translate(&orca, Platform::Mac);
+    let terminal = section(&translation, "Terminal").expect("terminal section");
+    assert_eq!(terminal["alt-cmd-d"], "pane::SplitRight");
+    assert_eq!(terminal["ctrl-n"], "icarus::FocusNextTerminalPane");
+    assert_eq!(terminal["alt-cmd-enter"], "workspace::ToggleZoom");
+    assert_eq!(
+        section(&translation, "Workspace").expect("global section")["ctrl-h"],
+        "icarus::FocusGroupLeft"
+    );
+    let unbind = &translation.sections[0]["unbind"];
+    assert_eq!(unbind["cmd-d"], "pane::SplitRight", "Orca's ⌘D gives way");
+    assert_eq!(unbind["cmd-]"], "icarus::FocusNextTerminalPane");
+    assert_eq!(unbind["alt-cmd-left"], "icarus::FocusGroupLeft");
+    assert!(translation.skipped.is_empty(), "{:?}", translation.skipped);
+}
+
+#[test]
 fn an_empty_list_unbinds_the_default_without_a_new_key() {
     let orca = json!({ "version": 1, "platforms": { "darwin": { "editor.showEdit": [] } } });
     let translation = translate(&orca, Platform::Mac);

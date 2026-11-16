@@ -1410,6 +1410,16 @@
       "ctrl-alt-r": "terminal::RerunTask",
       "alt-t": "terminal::RerunTask",
       "ctrl-shift-5": "pane::SplitRight",
+      // Icarus: Orca's Linux terminal splits, pane cycling and expand; each split starts its own server shell.
+      "ctrl-shift-d": "pane::SplitRight",
+      "alt-shift-d": "pane::SplitDown",
+      "ctrl-]": "icarus::FocusNextTerminalPane",
+      "ctrl-[": "icarus::FocusPreviousTerminalPane",
+      "ctrl-shift-enter": "workspace::ToggleZoom",
+      // Icarus: like Orca, readline word moves and ESC DEL instead of xterm's sequences readline ignores.
+      "ctrl-left": ["terminal::SendText", "\u001bb"],
+      "ctrl-right": ["terminal::SendText", "\u001bf"],
+      "alt-backspace": ["terminal::SendText", "\u001b\u007f"],
       "ctrl->": "agent::AddSelectionToThread",
     },
   },

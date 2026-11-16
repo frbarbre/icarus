@@ -2827,6 +2827,180 @@ mod tests {
         );
     }
 
+    fn sent(
+        terminal: &Entity<Terminal>,
+        keystrokes: &str,
+        cx: &mut VisualTestContext,
+    ) -> Vec<Vec<u8>> {
+        cx.simulate_keystrokes(keystrokes);
+        terminal.update(cx, |terminal, _| terminal.take_input_log())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn macos_line_editing_keys_send_orcas_readline_sequences(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, _terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(sent(&terminal, "cmd-left", &mut cx), vec![b"\x01".to_vec()]);
+        assert_eq!(
+            sent(&terminal, "cmd-right", &mut cx),
+            vec![b"\x05".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "cmd-backspace", &mut cx),
+            vec![b"\x15".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "cmd-delete", &mut cx),
+            vec![b"\x0b".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "alt-left", &mut cx),
+            vec![b"\x1bb".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "alt-right", &mut cx),
+            vec![b"\x1bf".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "alt-backspace", &mut cx),
+            vec![b"\x1b\x7f".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "alt-delete", &mut cx),
+            vec![b"\x1bd".to_vec()]
+        );
+
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(ENTER_ALT_SCREEN, cx);
+                terminal.sync(window, cx);
+            });
+        });
+        assert_eq!(
+            sent(&terminal, "alt-delete", &mut cx),
+            vec![b"\x1b[3;3~".to_vec()],
+            "full-screen apps keep xterm's own alt-delete, since ESC d reads as Escape then d",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn cmd_up_and_down_jump_to_the_ends_of_the_scrollback(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, _terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        let output = (0..300)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(output.as_bytes(), cx);
+                terminal.sync(window, cx);
+            });
+        });
+
+        cx.simulate_keystrokes("cmd-up");
+        cx.update(|window, cx| terminal.update(cx, |terminal, cx| terminal.sync(window, cx)));
+        let at_top = terminal.read_with(&cx, |terminal, _| terminal.last_content.display_offset);
+        assert!(
+            at_top > 200,
+            "cmd-up shows the start of the scrollback, got {at_top}"
+        );
+
+        cx.simulate_keystrokes("cmd-down");
+        cx.update(|window, cx| terminal.update(cx, |terminal, cx| terminal.sync(window, cx)));
+        assert_eq!(
+            terminal.read_with(&cx, |terminal, _| terminal.last_content.display_offset),
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    async fn linux_word_keys_send_readline_sequences(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, _terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            sent(&terminal, "ctrl-left", &mut cx),
+            vec![b"\x1bb".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "ctrl-right", &mut cx),
+            vec![b"\x1bf".to_vec()]
+        );
+        assert_eq!(
+            sent(&terminal, "alt-backspace", &mut cx),
+            vec![b"\x1b\x7f".to_vec()]
+        );
+    }
+
+    #[gpui::test]
+    async fn splitting_a_routed_terminal_starts_a_new_routed_shell(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        cx.update(|cx| {
+            load_default_keymap(cx);
+            let requests = requests.clone();
+            cx.set_global(project::terminals::ShellRouter(std::sync::Arc::new(
+                move |request, _| {
+                    requests.lock().expect("requests").push(request.reattach);
+                    Some(Task::ready(Err(anyhow::anyhow!("no server in tests"))))
+                },
+            )));
+        });
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        terminal.update(cx, |terminal, _| {
+            terminal.set_external_id(Some("term-1".into()))
+        });
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        cx.dispatch_action(workspace::pane::SplitRight::default());
+        cx.run_until_parked();
+        // The stubbed shell fails, leaving focus in the new empty pane; split from the terminal again.
+        cx.update(|window, cx| terminal_view.focus_handle(cx).focus(window, cx));
+        cx.run_until_parked();
+        cx.dispatch_action(workspace::pane::SplitDown::default());
+        cx.run_until_parked();
+        assert_eq!(
+            *requests.lock().expect("requests"),
+            vec![None, None],
+            "each split asks for a fresh shell rather than re-attaching the source's"
+        );
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_input_log())
+                .is_empty()
+        );
+    }
+
     #[gpui::test]
     async fn altgr_character_input_is_not_swallowed_as_meta_sequence(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;

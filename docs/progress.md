@@ -295,6 +295,12 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 
 **Themes (D10):** `icarus theme import vscode|warp <file> [--name] [--select] [--dry-run]` converts a VS Code colour theme (JSON with comments, through the Orca importer's converter) or a Warp theme (YAML; gradients become their first colour) into a Zed theme family in the app's `themes/` folder (`imported-<name>.json`, so re-importing replaces it). `--select` makes it the theme for its appearance, keeping the mode and the other slot, and backs up a commented settings file first.
 
+**Keyboard details (Orca's pane and terminal keys):**
+- ⌥⌘←/→/↑/↓ (`icarus::FocusGroupLeft/Right/Up/Down`, macOS) move focus to the nearest tab group sharing that edge, Orca's rule exactly (2 px tolerance, larger shared edge breaks ties), with no wrap and nothing at the edge; they work from editors and terminals too. Zed's own ⌥⌘←/→ (previous/next tab, still on ⌘{ / ⌘}) and the editor's ⌥⌘↑/↓ (insert cursor above/below, still on ⌘⌃P / ⌘⌃N) give way.
+- Terminal splits use Zed panes rather than Orca's panes-inside-a-tab, so a split terminal can be dragged, resized, zoomed and restored like any tab: ⌘D / ⌘⇧D split right/down (Linux Ctrl+Shift+D / Alt+Shift+D, as in Orca), ⌘] / ⌘[ cycle the terminal panes in creation order and wrap (`icarus::FocusNextTerminalPane` / `FocusPreviousTerminalPane`), ⌘⇧Enter expands one (`workspace::ToggleZoom`), ⌘K clears. A split of a server terminal starts its own server shell in the source's folder (before, Zed's clone re-ran `icarus terminal attach` and mirrored the same shell); split layouts reattach to the same shells after a restart. ⌘⇧D displaces Zed's debug-panel focus only inside a terminal.
+- Line editing follows Orca's `terminal-shortcut-policy.ts`: ⌘←/→ ^A/^E, ⌘⌫ ^U, ⌘⌦ ^K, ⌥←/→ ESC b / ESC f, ⌥⌫ ESC DEL, ⌥⌦ ESC d except in full-screen apps (vim keeps xterm's own `CSI 3;3~`), ⌘↑/↓ jump to the top/bottom of the scrollback; on Linux Ctrl+←/→ send ESC b / ESC f.
+- The Orca keybindings importer also maps `tabGroup.focus*` and `terminal.splitRight/splitDown/focusNextPane/focusPreviousPane/expandPane`.
+
 **Visual tests pin their theme:** the runner sets the theme mode to dark at start, so dark baselines no longer follow the machine's appearance; `ICARUS_VISUAL_ASSUME_APPEARANCE=light` proves it (all baselines pass assuming a light system). CI no longer forces dark mode.
 
 ## CI
@@ -311,18 +317,18 @@ Parked until you're back; work continues on other items.
 
 ## In progress
 
-- App: the browser, explorer and diff tab types.
+Nothing right now; see Next.
 
 ## Next
 
 Gaps against the [MUST] list in features.md, in the order they're being built:
-1. **Terminal details:** splits inside a terminal tab (Mod+D / Mod+Shift+D), macOS line-editing keys translated to readline sequences, task terminals on the server.
+1. **Terminal details, leftovers:** task terminals on the server; Orca's pane-only extras (equalize, pane titles, the single-group ⌥⌘←/→ fallback to worktree history); kitty-keyboard-aware line editing (Orca lets a TUI that negotiated the kitty protocol keep ⌥⌫ / ⌥←→; Zed's terminal has no such signal, so those keys always translate).
 2. **Review mode UI** (mostly done, see above): left are "Comment now", paste/drop media, @-mention and `:emoji:` autocomplete, gutter "+" and drag-select, the assignable-users picker, editing/deleting published comments.
 3. **Notes in the app, leftovers:** a gutter marker and gutter "+" (notes add through ⌘⇧A's "Agent" side today), a link to a reply session's transcript, and notes in plain file editors (they show in diff tabs only).
 4. **Source Control leftovers:** the right-click row menu (open, reveal, copy path, Discard), stage/unstage in the app (RPCs and CLI exist; the single Changes list has no staging UI, as in Orca), the Commits section, and turn rows opening their first file in a diff tab rather than the commit view.
 5. **Sidebar and cards, leftovers:** grouping by repo and by PR status (they fall back to status grouping), sort orders, the text filter, pin and multi-select (features.md §2.2), a per-client override of the card fields, hotkeys bound per card field by default, and quick commands naming their terminal tab (the server label is set; tab titles don't use it yet).
 6. **Server features in the app, leftovers:** an SSH-opened workspace checked end to end on a real second machine (and Icarus's own remote-server binary in releases if Zed's official one doesn't match the fork); terminals in SSH-opened projects are Zed's remote shells, not server terminals (Zed's terminal routing hook only covers local shells); notifications, open-file requests and layouts from saved servers other than the app's own; "this machine" listed alongside the saved servers when the app's own connection points elsewhere; per-kind notification toggles in the app (they're settings today); Remote Control's link checked against a real account.
 7. **Settings, leftovers:** the settings tab doesn't refresh on its own when settings change elsewhere (CLI or agent) — reopen or switch scope; Orca's pending PR-review drafts (a separate `pending-review-drafts.json`) aren't imported; the other rule options (on merge/close, on reviewed, conflict agent, review inbox) are edited in JSON.
-8. **Keyboard details:** ⌥⌘arrows between panes, splits inside a terminal tab, macOS line-editing keys in terminals.
+7c. **SSH remote projects in releases:** build and ship the fork's own `remote_server` with each release (Zed's SSH remoting would otherwise download Zed's official 1.30.0 remote server, which may not speak this fork's protocol), and test opening a workspace over SSH against a real host.
 
 Dropped on purpose: the Claude web view (plan §5 open question; the composer replaces it).

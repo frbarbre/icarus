@@ -539,9 +539,12 @@
     "context": "Pane",
     "use_key_equivalents": true,
     "bindings": {
-      "alt-cmd-left": "pane::ActivatePreviousItem",
+      // Icarus: ⌥⌘arrows are Orca's tab-group focus; previous/next tab stays on cmd-{ / cmd-}.
+      "alt-cmd-left": "icarus::FocusGroupLeft",
       "cmd-{": "pane::ActivatePreviousItem",
-      "alt-cmd-right": "pane::ActivateNextItem",
+      "alt-cmd-right": "icarus::FocusGroupRight",
+      "alt-cmd-up": "icarus::FocusGroupUp",
+      "alt-cmd-down": "icarus::FocusGroupDown",
       "cmd-}": "pane::ActivateNextItem",
       "ctrl-shift-pageup": "pane::SwapItemLeft",
       "ctrl-shift-pagedown": "pane::SwapItemRight",
@@ -574,9 +577,10 @@
       "cmd-[": "editor::Outdent",
       "cmd-]": "editor::Indent",
       "cmd-ctrl-p": ["editor::AddSelectionAbove", { "skip_soft_wrap": false }], // Insert cursor above
-      "cmd-alt-up": ["editor::AddSelectionAbove", { "skip_soft_wrap": true }],
+      // Icarus: ⌥⌘↑/↓ are Orca's tab-group focus; insert cursor above/below stays on cmd-ctrl-p/n.
+      "cmd-alt-up": "icarus::FocusGroupUp",
       "cmd-ctrl-n": ["editor::AddSelectionBelow", { "skip_soft_wrap": false }], // Insert cursor below
-      "cmd-alt-down": ["editor::AddSelectionBelow", { "skip_soft_wrap": true }],
+      "cmd-alt-down": "icarus::FocusGroupDown",
       "cmd-shift-k": "editor::DeleteLine",
       "alt-up": "editor::MoveLineUp",
       "alt-down": "editor::MoveLineDown",
@@ -750,6 +754,10 @@
       "cmd-alt-d": "icarus::ShowDiff",
       "cmd-alt-enter": "icarus::RunNextAction",
       "cmd-alt-t": "icarus::NewAgent",
+      "cmd-alt-left": "icarus::FocusGroupLeft",
+      "cmd-alt-right": "icarus::FocusGroupRight",
+      "cmd-alt-up": "icarus::FocusGroupUp",
+      "cmd-alt-down": "icarus::FocusGroupDown",
       "cmd-shift-b": "icarus::OpenFrontend",
       "cmd-alt-p": "icarus::OpenPreview",
       "cmd-alt-l": "icarus::OpenLinearIssue",
@@ -1456,6 +1464,8 @@
       // Terminal.app compatibility
       "alt-left": ["terminal::SendText", "\u001bb"],
       "alt-right": ["terminal::SendText", "\u001bf"],
+      // Icarus: Orca's ⌥⌫ deletes the previous word as readline's ESC DEL.
+      "alt-backspace": ["terminal::SendText", "\u001b\u007f"],
       "alt-b": ["terminal::SendText", "\u001bb"],
       "alt-f": ["terminal::SendText", "\u001bf"],
       "ctrl-delete": ["terminal::SendText", "\u001b[3;5~"],
@@ -1471,9 +1481,10 @@
       "ctrl-r": ["terminal::SendKeystroke", "ctrl-r"],
       "ctrl-backspace": ["terminal::SendKeystroke", "ctrl-w"],
       "shift-pageup": "terminal::ScrollPageUp",
-      "cmd-up": "terminal::ScrollPageUp",
+      // Icarus: like Orca, ⌘↑/↓ jump to the top/bottom of the scrollback.
+      "cmd-up": "terminal::ScrollToTop",
       "shift-pagedown": "terminal::ScrollPageDown",
-      "cmd-down": "terminal::ScrollPageDown",
+      "cmd-down": "terminal::ScrollToBottom",
       "shift-up": "terminal::ScrollLineUp",
       "shift-down": "terminal::ScrollLineDown",
       "shift-home": "terminal::ScrollToTop",
@@ -1488,8 +1499,21 @@
       "ctrl-alt-left": "pane::SplitLeft",
       "ctrl-alt-right": "pane::SplitRight",
       "cmd-d": "pane::SplitRight",
+      // Icarus: Orca's terminal splits, pane cycling and expand; each split starts its own server shell.
+      "cmd-shift-d": "pane::SplitDown",
+      "cmd-]": "icarus::FocusNextTerminalPane",
+      "cmd-[": "icarus::FocusPreviousTerminalPane",
+      "cmd-shift-enter": "workspace::ToggleZoom",
       "cmd-alt-r": "terminal::RerunTask",
       "cmd->": "agent::AddSelectionToThread",
+    },
+  },
+  {
+    // Icarus: full-screen apps like vim read ESC d as Escape then d, so they keep xterm's own ⌥⌦.
+    "context": "Terminal && screen == alt",
+    "use_key_equivalents": true,
+    "bindings": {
+      "alt-delete": ["terminal::SendText", "\u001b[3;3~"],
     },
   },
   {
