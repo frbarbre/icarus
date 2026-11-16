@@ -6,20 +6,13 @@ on:
     paths: [app/**, crates/icarus-client/**, crates/icarus-protocol/**, crates/icarus-settings/**, Cargo.toml, .github/workflows/app.yml]
   pull_request:
     paths: [app/**, crates/icarus-client/**, crates/icarus-protocol/**, crates/icarus-settings/**, Cargo.toml, .github/workflows/app.yml]
-  schedule:
-    - cron: '17 3 * * *'
   workflow_dispatch:
-    inputs:
-      zed-suite:
-        description: Also run the full zed crate test suite
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: app-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  group: app-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -33,17 +26,14 @@ defaults:
   run:
     working-directory: app
 
+# No disk cleanup: hosted runners start with ~88 GB (Linux) and ~45 GB (macOS) free and these builds peak
+# under 20 GB, while the cleanup steps cost 1-4 minutes per job.
 jobs:
   test:
     name: tests (linux)
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 60
     steps:
-      - uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
-        with:
-          tool-cache: true
-          swap-storage: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: ./script/linux
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -56,74 +46,11 @@ jobs:
       - run: df -h /
         if: always()
 
-  clippy:
-    name: clippy (macos)
-    if: github.event_name != 'schedule'
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Free disk space
-        run: |
-          df -h /
-          xcrun simctl delete all || true
-          sudo rm -rf ~/Library/Android /Library/Developer/CoreSimulator/Profiles/Runtimes "$RUNNER_TOOL_CACHE" /usr/local/share/dotnet ~/.dotnet || true
-          df -h /
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: app -> target
-          shared-key: app-clippy-macos
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy -p icarus_ui -p agent_ui -p workspace -p title_bar -p zed --all-targets -- -D warnings
-      - run: df -h /
-        if: always()
-
-  visual:
-    name: visual tests (macos)
-    if: github.event_name != 'schedule'
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Free disk space
-        run: |
-          df -h /
-          xcrun simctl delete all || true
-          sudo rm -rf ~/Library/Android /Library/Developer/CoreSimulator/Profiles/Runtimes "$RUNNER_TOOL_CACHE" /usr/local/share/dotnet ~/.dotnet || true
-          df -h /
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: app -> target
-          shared-key: app-visual-macos
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: xcrun -sdk macosx metal --version
-      # The dark baselines follow the system appearance once One Light is registered; runners default to light.
-      - run: defaults write -g AppleInterfaceStyle Dark
-      - run: cargo build -p zed --bin zed-visual-test-runner --features visual-tests
-      - run: cargo run -p zed --bin zed-visual-test-runner --features visual-tests
-        env:
-          ICARUS_VISUAL_ONLY: '1'
-          VISUAL_TEST_OUTPUT_DIR: ${{ github.workspace }}/app/target/visual_tests
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: failure()
-        with:
-          name: visual-tests
-          path: app/target/visual_tests
-          retention-days: 7
-          if-no-files-found: ignore
-      - run: df -h /
-        if: always()
-
   zed:
     name: zed crate tests (linux)
-    if: github.event_name == 'schedule' || inputs.zed-suite
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
-      - uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
-        with:
-          tool-cache: true
-          swap-storage: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: ./script/linux
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
@@ -136,5 +63,50 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Upstream's session-restore tests are timing-sensitive; retries absorb their flakes.
       - run: cargo nextest run -p zed --no-fail-fast --retries 2
+      - run: df -h /
+        if: always()
+
+  clippy:
+    name: clippy (macos)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: app -> target
+          shared-key: app-clippy-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy -p icarus_ui -p agent_ui -p workspace -p title_bar -p zed --all-targets -- -D warnings
+      - run: df -h /
+        if: always()
+
+  visual:
+    name: visual tests (macos)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: app -> target
+          shared-key: app-visual-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # A baseline mismatch fails the job after a complete build; keep that build.
+          cache-on-failure: true
+      # The dark baselines follow the system appearance once One Light is registered; runners default to light.
+      - run: osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to true' || true
+      - run: cargo build -p zed --bin zed-visual-test-runner --features visual-tests
+      - run: cargo run -p zed --bin zed-visual-test-runner --features visual-tests -- -AppleInterfaceStyle Dark
+        env:
+          ICARUS_VISUAL_ONLY: '1'
+          VISUAL_TEST_OUTPUT_DIR: ${{ github.workspace }}/app/target/visual_tests
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: visual-tests
+          path: app/target/visual_tests
+          retention-days: 7
+          if-no-files-found: ignore
       - run: df -h /
         if: always()
