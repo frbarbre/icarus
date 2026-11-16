@@ -2,6 +2,7 @@ pub mod accounts;
 pub mod browser;
 pub mod cards;
 pub mod changes_tab;
+pub mod comment_input;
 pub mod commit_modal;
 pub mod diff_tab;
 pub mod github_panel;
@@ -747,6 +748,11 @@ pub fn enabled(cx: &App) -> bool {
     cx.has_global::<IcarusEnabled>()
 }
 
+#[cfg(test)]
+pub(crate) fn enable_for_tests(cx: &mut App) {
+    cx.set_global(IcarusEnabled);
+}
+
 pub fn init(cx: &mut App) {
     cx.set_global(IcarusEnabled);
     routing::load_primary(cx);
@@ -759,6 +765,7 @@ pub fn init(cx: &mut App) {
     browser::register(cx);
     changes_tab::register(cx);
     diff_tab::register(cx);
+    review::attach_notes_to_file_editors(cx);
     sidebar::register(cx);
     zed_import::register(cx);
     quick_commands::register(cx);

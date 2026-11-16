@@ -1,7 +1,9 @@
 //! GitHub review mode (github-review.md): the Review section in the GitHub panel, and draft comments,
 //! inline PR threads and the comment composer inside diff tabs. Everything goes through `review.*` RPCs.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +27,9 @@ use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 
 use crate::AppConnection;
+use crate::comment_input::{
+    MentionSource, Mentionable, UploadSource, clipboard_images, enable_completions, upload_into,
+};
 use crate::github_panel::{
     AvatarKind, PullRequest, RequestedReviewer, Review, ReviewState, render_avatar,
 };
@@ -143,6 +148,8 @@ pub struct ThreadComment {
     pub body: String,
     pub url: Option<String>,
     pub reactions: Vec<ReactionSummary>,
+    pub viewer_can_update: bool,
+    pub viewer_can_delete: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -180,6 +187,8 @@ pub struct NoteReply {
     pub status: Option<String>,
     pub error: Option<String>,
     pub changed_files: Vec<String>,
+    /// For `reply-agent` entries: the throwaway session, whose transcript stays in history.
+    pub agent_id: Option<String>,
 }
 
 impl NoteReply {
@@ -462,6 +471,53 @@ fn reaction_emoji(content: &str) -> &'static str {
     }
 }
 
+/// GitHub's eight reactions, in the order GitHub's own picker shows them.
+pub const REACTIONS: [&str; 8] = [
+    "+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes",
+];
+
+/// The smiley button that offers all eight reactions, checked when you already gave one.
+fn reaction_menu(
+    comment: String,
+    reactions: Vec<ReactionSummary>,
+    review: WeakEntity<DiffReview>,
+) -> impl IntoElement {
+    PopoverMenu::new(SharedString::from(format!("react-{comment}")))
+        .trigger_with_tooltip(
+            IconButton::new(
+                SharedString::from(format!("react-button-{comment}")),
+                IconName::ThumbsUp,
+            )
+            .icon_size(IconSize::XSmall),
+            Tooltip::text("Add a reaction"),
+        )
+        .menu(move |window, cx| {
+            let (comment, reactions, review) = (comment.clone(), reactions.clone(), review.clone());
+            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for reaction in REACTIONS {
+                    let reacted = reactions
+                        .iter()
+                        .any(|r| r.content == reaction && r.viewer_has_reacted);
+                    let (comment, review) = (comment.clone(), review.clone());
+                    menu = menu.toggleable_entry(
+                        format!("{} {reaction}", reaction_emoji(reaction)),
+                        reacted,
+                        IconPosition::End,
+                        None,
+                        move |_, cx| {
+                            review
+                                .update(cx, |review, cx| {
+                                    review.toggle_reaction(&comment, reaction, reacted, cx)
+                                })
+                                .log_err();
+                        },
+                    );
+                }
+                menu
+            }))
+        })
+}
+
 pub(crate) fn app_client(cx: &App) -> Option<Arc<Client>> {
     cx.try_global::<AppConnection>()
         .and_then(|connection| connection.client.clone())
@@ -505,6 +561,87 @@ pub(crate) struct RpcStub(pub Arc<dyn Fn(&str, &Value) -> Result<Value> + Send +
 
 #[cfg(test)]
 impl gpui::Global for RpcStub {}
+
+/// Marks an editor that already has a review layer (a diff tab's), and keeps a file editor's notes alive.
+#[derive(Default)]
+pub struct ReviewAttached(pub Option<Entity<DiffReview>>);
+
+impl editor::Addon for ReviewAttached {
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Shows notes in plain file editors of Icarus workspaces too, not only in diff tabs.
+pub fn attach_notes_to_file_editors(cx: &mut App) {
+    cx.observe_new(|editor: &mut Editor, window, cx| {
+        let Some(window) = window else {
+            return;
+        };
+        if !editor.mode().is_full() || !crate::enabled(cx) {
+            return;
+        }
+        // Deferred: a diff tab marks its editor right after creating it.
+        cx.defer_in(window, |editor, _window, cx| attach_notes(editor, cx));
+    })
+    .detach();
+}
+
+fn attach_notes(editor: &mut Editor, cx: &mut Context<Editor>) {
+    if editor.addon::<ReviewAttached>().is_some() {
+        return;
+    }
+    let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
+        return;
+    };
+    let Some(project) = editor.project().cloned() else {
+        return;
+    };
+    let Some(file) = buffer
+        .read(cx)
+        .file()
+        .and_then(|file| project::File::from_dyn(Some(file)).cloned())
+    else {
+        return;
+    };
+    let Some(root) = project
+        .read(cx)
+        .worktree_for_id(file.worktree_id(cx), cx)
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+    else {
+        return;
+    };
+    if crate::routing::server_for_path(&root, cx).is_none() {
+        return;
+    }
+    let relative = file.path.as_unix_str().to_owned();
+    let client = crate::routing::client_for_project(project.read(cx), cx);
+    let weak = cx.entity().downgrade();
+    let workspace_key = root.to_string_lossy().into_owned();
+    let review =
+        cx.new(|cx| DiffReview::notes_only(weak, buffer, workspace_key, relative, client, cx));
+    editor.register_addon(ReviewAttached(Some(review)));
+}
+
+/// `review.mentionables`' answer as a list: the PR's author first, then the assignable users.
+pub fn mentionables_from(value: &Value) -> Vec<Mentionable> {
+    let mut people: Vec<Mentionable> = value["author"]
+        .as_str()
+        .map(|login| Mentionable {
+            login: login.to_owned(),
+            name: None,
+        })
+        .into_iter()
+        .collect();
+    let users: Vec<Mentionable> =
+        serde_json::from_value(value["users"].clone()).unwrap_or_default();
+    for user in users {
+        if !people.iter().any(|known| known.login == user.login) {
+            people.push(user);
+        }
+    }
+    people
+}
 
 pub(crate) fn request(
     client: Option<Arc<Client>>,
@@ -562,17 +699,34 @@ impl ReviewSection {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let people = MentionSource::default();
         let summary_editor = cx.new(|cx| {
             let mut editor = Editor::auto_height(2, 10, window, cx);
             editor.set_placeholder_text("Add review summary…", window, cx);
             editor.set_soft_wrap();
+            enable_completions(&mut editor, people.clone(), false, cx);
             editor
         });
         let reviewer_input = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Request a review: login or org/team", window, cx);
+            // The assignable users, offered as you type a login.
+            enable_completions(&mut editor, people.clone(), true, cx);
             editor
         });
+        if let Some(call) = request(
+            client.clone(),
+            "review.mentionables",
+            json!({ "workspace": workspace }),
+            cx,
+        ) {
+            let people = people.clone();
+            cx.spawn(async move |_, _| match call.await {
+                Ok(value) => people.set(mentionables_from(&value)),
+                Err(error) => log::warn!("loading assignable users failed: {error:#}"),
+            })
+            .detach();
+        }
         let subscriptions =
             vec![
                 cx.subscribe(&summary_editor, |this, _, event: &EditorEvent, cx| {
@@ -621,6 +775,36 @@ impl ReviewSection {
 
     pub fn workspace(&self) -> &str {
         &self.workspace
+    }
+
+    /// Uploads pasted or dropped files into the summary at its cursor.
+    pub fn upload_to_summary(
+        &mut self,
+        sources: Vec<UploadSource>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.error = None;
+        let weak = cx.entity().downgrade();
+        let on_error: Rc<dyn Fn(String, &mut Window, &mut App)> =
+            Rc::new(move |error, _window, cx| {
+                weak.update(cx, |section, cx| {
+                    section.error = Some(error);
+                    cx.notify();
+                })
+                .log_err();
+            });
+        for source in sources {
+            upload_into(
+                self.summary_editor.clone(),
+                source,
+                self.workspace.clone(),
+                self.client.clone(),
+                on_error.clone(),
+                window,
+                cx,
+            );
+        }
     }
 
     pub fn view(&self) -> Option<&ReviewView> {
@@ -1054,12 +1238,33 @@ impl Render for ReviewSection {
                     .child(Label::new(label).size(LabelSize::XSmall).color(color)),
             );
         }
+        let drop_bg = cx.theme().colors().drop_target_background;
         section = section.child(
             div()
                 .p_1()
                 .border_1()
                 .rounded_sm()
                 .border_color(cx.theme().colors().border_variant)
+                .capture_action(cx.listener(|this, _: &editor::actions::Paste, window, cx| {
+                    let images = clipboard_images(cx);
+                    if images.is_empty() {
+                        cx.propagate();
+                        return;
+                    }
+                    this.upload_to_summary(images, window, cx);
+                }))
+                .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
+                .on_drop(
+                    cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                        let sources = paths
+                            .paths()
+                            .iter()
+                            .cloned()
+                            .map(UploadSource::Path)
+                            .collect();
+                        this.upload_to_summary(sources, window, cx);
+                    }),
+                )
                 .child(self.summary_editor.clone()),
         );
         let drafts = view.drafts.len();
@@ -1139,6 +1344,10 @@ pub enum ComposerTarget {
         note: String,
         reply: Option<String>,
     },
+    /// One of your comments already on GitHub, by node id.
+    EditPublished {
+        comment: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1147,7 +1356,47 @@ pub enum Destination {
     Review,
     /// A note on these lines (`note.add`), which the agent side of Icarus reads and answers.
     Agent,
+    /// Posted to GitHub straight away, outside the pending review ("Comment now").
+    Now,
 }
+
+/// What a gutter marker stands for; each kind has its own icon and colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerKind {
+    Thread,
+    Draft,
+    Note,
+}
+
+impl MarkerKind {
+    fn icon(self) -> IconName {
+        match self {
+            Self::Thread => IconName::Chat,
+            Self::Draft => IconName::Pencil,
+            Self::Note => IconName::ZedAgent,
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Thread => Color::Accent,
+            Self::Draft => Color::Warning,
+            Self::Note => Color::Created,
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Thread => "Show the PR thread",
+            Self::Draft => "Show your pending comment",
+            Self::Note => "Show the note",
+        }
+    }
+}
+
+struct ThreadGutter;
+struct DraftGutter;
+struct NoteGutter;
 
 /// Asks the diff tab to open another file's diff, e.g. one a note's answer changed.
 #[derive(Debug, Clone, PartialEq)]
@@ -1171,6 +1420,12 @@ pub struct DiffReview {
     /// The last action's failure, kept across the reload that follows it.
     error: Option<String>,
     load_error: Option<String>,
+    /// A plain file editor: only notes, no PR threads or review drafts.
+    notes_only: bool,
+    people: MentionSource,
+    people_requested: bool,
+    /// Multibuffer row → what its gutter marker opens, rebuilt with the blocks.
+    markers: Rc<RefCell<HashMap<u32, (MarkerKind, String)>>>,
     _poll: Task<()>,
 }
 
@@ -1181,6 +1436,30 @@ impl DiffReview {
         workspace_key: String,
         path: String,
         client: Option<Arc<Client>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(editor, buffer, workspace_key, path, client, false, cx)
+    }
+
+    /// Notes on a plain file editor of an Icarus workspace (no review threads or drafts there).
+    pub fn notes_only(
+        editor: WeakEntity<Editor>,
+        buffer: Entity<Buffer>,
+        workspace_key: String,
+        path: String,
+        client: Option<Arc<Client>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(editor, buffer, workspace_key, path, client, true, cx)
+    }
+
+    fn build(
+        editor: WeakEntity<Editor>,
+        buffer: Entity<Buffer>,
+        workspace_key: String,
+        path: String,
+        client: Option<Arc<Client>>,
+        notes_only: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut review = Self {
@@ -1197,8 +1476,13 @@ impl DiffReview {
             blocks: Vec::new(),
             error: None,
             load_error: None,
+            notes_only,
+            people: MentionSource::default(),
+            people_requested: false,
+            markers: Rc::default(),
             _poll: Task::ready(()),
         };
+        review.install_gutter_hook(cx);
         let this = cx.entity().downgrade();
         cx.default_global::<ReviewListeners>().diffs.push(this);
         if review.client.is_some() {
@@ -1263,6 +1547,22 @@ impl DiffReview {
             json!({ "cwd": self.workspace_key, "path": self.path, "include_resolved": true }),
             cx,
         );
+        if self.notes_only {
+            let Some(notes) = notes else {
+                return Task::ready(());
+            };
+            return cx.spawn(async move |this, cx| {
+                let notes = notes.await;
+                this.update(cx, |this, cx| {
+                    match notes {
+                        Ok(notes) => this.notes = serde_json::from_value(notes).unwrap_or_default(),
+                        Err(error) => log::warn!("loading notes failed: {error:#}"),
+                    }
+                    this.rebuild_blocks(cx);
+                })
+                .log_err();
+            });
+        }
         let (Some(threads), Some(drafts)) = (
             request(
                 self.client.clone(),
@@ -1383,10 +1683,24 @@ impl DiffReview {
         }
         cards.sort_by_key(|(line, order, _, _)| (line.is_none(), *line, *order));
         let mut blocks = Vec::new();
+        let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+        let mut markers = HashMap::default();
+        let mut highlights: [Vec<std::ops::Range<editor::Anchor>>; 3] = Default::default();
         for (line, _, height, card) in cards {
             let Some(anchor) = self.anchor_for_line(line, cx) else {
                 continue;
             };
+            if line.is_some() {
+                let (kind, id, slot) = match &card {
+                    AnyCard::Thread(thread, _) => (MarkerKind::Thread, thread.id.clone(), 0),
+                    AnyCard::Draft(draft) => (MarkerKind::Draft, draft.id.clone(), 1),
+                    AnyCard::Note(note, _) => (MarkerKind::Note, note.id.clone(), 2),
+                };
+                let row = multi_buffer::ToPoint::to_point(&anchor, &snapshot).row;
+                // A row with several kinds shows the first: threads, then drafts, then notes.
+                markers.entry(row).or_insert((kind, id));
+                highlights[slot].push(anchor..anchor);
+            }
             let card = cx.new(|_| ReviewCard {
                 card,
                 review: this.clone(),
@@ -1399,13 +1713,106 @@ impl DiffReview {
                 priority: 1,
             });
         }
+        *self.markers.borrow_mut() = markers;
+        let [threads, drafts, notes] = highlights;
         let old: HashSet<CustomBlockId> = self.blocks.drain(..).collect();
         let ids = editor.update(cx, |editor, cx| {
             editor.remove_blocks(old, None, cx);
+            editor.highlight_gutter::<ThreadGutter>(threads, |cx| cx.theme().status().info, cx);
+            editor.highlight_gutter::<DraftGutter>(drafts, |cx| cx.theme().status().warning, cx);
+            editor.highlight_gutter::<NoteGutter>(notes, |cx| cx.theme().status().created, cx);
             editor.insert_blocks(blocks, None, cx)
         });
         self.blocks = ids;
         cx.notify();
+    }
+
+    pub fn is_expanded(&self, id: &str) -> bool {
+        self.expanded.contains(id)
+    }
+
+    /// The marker shown on a multibuffer row instead of "+".
+    pub fn marker_at(&self, row: u32) -> Option<(MarkerKind, String)> {
+        self.markers.borrow().get(&row).cloned()
+    }
+
+    /// Gives the editor's gutter "+" (click or drag over rows) and the markers to this review.
+    fn install_gutter_hook(&self, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.upgrade() else {
+            return;
+        };
+        let review = cx.entity().downgrade();
+        let markers = self.markers.clone();
+        let on_rows_review = review.clone();
+        let hook = editor::GutterCommentHook {
+            on_rows: Rc::new(move |window, cx| {
+                on_rows_review
+                    .update(cx, |review, cx| review.open_on_selection(window, cx))
+                    .log_err();
+            }),
+            marker: Rc::new(move |row, _cx| {
+                let (kind, _) = markers.borrow().get(&row.0).cloned()?;
+                Some((kind.icon(), kind.color(), kind.tooltip().into()))
+            }),
+            on_marker: Rc::new(move |row, window, cx| {
+                review
+                    .update(cx, |review, cx| review.reveal_marker(row.0, window, cx))
+                    .log_err();
+            }),
+        };
+        // Deferred: file editors create their review while they're mid-update themselves.
+        cx.defer(move |cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_gutter_comment_hook(Some(hook), cx)
+            });
+        });
+    }
+
+    /// Expands the marked card if it is collapsed and scrolls the editor to its line.
+    pub fn reveal_marker(&mut self, row: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, id)) = self.marker_at(row) else {
+            return;
+        };
+        let collapsed = self
+            .threads
+            .iter()
+            .any(|thread| thread.id == id && thread.is_resolved)
+            || self.notes.iter().any(|note| note.id == id && note.resolved);
+        if collapsed && !self.expanded.contains(&id) {
+            self.expanded.insert(id);
+            self.rebuild_blocks(cx);
+        }
+        if let Some(editor) = self.editor.upgrade() {
+            editor.update(cx, |editor, cx| {
+                let point = Point::new(row, 0);
+                editor.change_selections(
+                    editor::SelectionEffects::scroll(editor::scroll::Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([point..point]),
+                );
+            });
+        }
+    }
+
+    /// The people @-mentions offer; asked for once per tab, when a comment box first opens.
+    fn mention_source(&mut self, cx: &mut Context<Self>) -> MentionSource {
+        if !self.people_requested && !self.notes_only {
+            self.people_requested = true;
+            let people = self.people.clone();
+            if let Some(call) = self.call(
+                "review.mentionables",
+                json!({ "workspace": self.workspace_key }),
+                cx,
+            ) {
+                cx.spawn(async move |_, _| match call.await {
+                    Ok(value) => people.set(mentionables_from(&value)),
+                    Err(error) => log::warn!("loading people to mention failed: {error:#}"),
+                })
+                .detach();
+            }
+        }
+        self.people.clone()
     }
 
     /// Opens the composer on the editor's selection (§2.1).
@@ -1463,12 +1870,20 @@ impl DiffReview {
                 .iter()
                 .find(|candidate| &candidate.id == note)
                 .map(|note| note.end_line.max(note.line)),
+            ComposerTarget::EditPublished { comment } => self
+                .threads
+                .iter()
+                .find(|thread| thread.comments.iter().any(|c| &c.id == comment))
+                .and_then(|thread| thread.placement.line),
         };
         let Some(anchor) = self.anchor_for_line(line, cx) else {
             return;
         };
         let review = cx.entity().downgrade();
-        let composer = cx.new(|cx| CommentComposer::new(target, text, review, window, cx));
+        let people = self.mention_source(cx);
+        let notes_only = self.notes_only;
+        let composer =
+            cx.new(|cx| CommentComposer::new(target, text, review, people, notes_only, window, cx));
         let height = composer.read(cx).height(cx);
         let ids = editor.update(cx, |editor, cx| {
             editor.insert_blocks(
@@ -1568,6 +1983,20 @@ impl DiffReview {
                     "start_line": (start != end).then_some(*start), "body": body,
                 }),
             ),
+            (ComposerTarget::Lines { start, end }, Destination::Now) => (
+                "review.comment.post",
+                json!({
+                    "workspace": workspace, "path": self.path, "line": end,
+                    "start_line": (start != end).then_some(*start), "body": body,
+                }),
+            ),
+            (ComposerTarget::EditPublished { comment }, _) => (
+                "review.comment.edit_published",
+                json!({
+                    "workspace": workspace, "kind": "review_comment", "node_id": comment,
+                    "body": body,
+                }),
+            ),
             (ComposerTarget::EditDraft { id }, _) => (
                 "review.comment.edit",
                 json!({ "workspace": workspace, "id": id, "body": body }),
@@ -1636,11 +2065,65 @@ impl DiffReview {
         self.mutate(method, params, cx);
     }
 
-    pub fn toggle_reaction(&mut self, comment: &str, reacted: bool, cx: &mut Context<Self>) {
+    /// Adds or removes one of GitHub's eight reactions (`+1`, `heart`, …) on a comment.
+    pub fn toggle_reaction(
+        &mut self,
+        comment: &str,
+        reaction: &str,
+        reacted: bool,
+        cx: &mut Context<Self>,
+    ) {
         let params = json!({
-            "workspace": self.workspace_key, "subject": comment, "reaction": "+1", "remove": reacted,
+            "workspace": self.workspace_key, "subject": comment, "reaction": reaction,
+            "remove": reacted,
         });
         self.mutate("review.react", params, cx);
+    }
+
+    /// Deletes one of your published review comments, after asking.
+    pub fn delete_published(&mut self, comment: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            "Delete this comment on GitHub?",
+            Some("It's removed from the pull request for everyone."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        let comment = comment.to_owned();
+        cx.spawn(async move |this, cx| {
+            if answer.await.ok() != Some(0) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                let params = json!({
+                    "workspace": this.workspace_key, "kind": "review_comment", "node_id": comment,
+                });
+                this.mutate("review.comment.delete_published", params, cx);
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    /// Opens a reply session's transcript: wakes it from history and shows it as an agent tab.
+    pub fn open_transcript(&mut self, agent_id: &str, cx: &mut Context<Self>) {
+        let Some(call) = self.call("agent.resume", json!({ "id": agent_id }), cx) else {
+            return;
+        };
+        let agent_id = agent_id.to_owned();
+        let path = PathBuf::from(&self.workspace_key);
+        cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |this, cx| match result {
+                Ok(_) => crate::history::open_resumed(agent_id, Some(path), cx),
+                Err(error) => {
+                    this.error = Some(format!("{error:#}"));
+                    cx.notify();
+                }
+            })
+            .log_err();
+        })
+        .detach();
     }
 
     /// Drops the thread into this workspace's composer as an attachment chip (§10).
@@ -1723,37 +2206,38 @@ impl DiffReview {
 
     /// Uploads an image or video to GitHub and puts its markdown into the composer (§11.5).
     pub fn attach_media(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.upload_to_composer(UploadSource::Path(path), window, cx);
+    }
+
+    /// Uploads a picked, pasted or dropped file into the open composer at its cursor.
+    pub fn upload_to_composer(
+        &mut self,
+        source: UploadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((composer, _)) = self.composer.clone() else {
             return;
         };
-        let params = json!({ "workspace": self.workspace_key, "path": path });
-        let Some(call) = self.call("review.upload", params, cx) else {
-            return;
-        };
-        composer.update(cx, |composer, cx| {
-            composer.busy = true;
-            cx.notify();
-        });
-        cx.spawn_in(window, async move |_, cx| {
-            let result = call.await;
-            composer
-                .update_in(cx, |composer, window, cx| {
-                    composer.busy = false;
-                    match result {
-                        // The composer's own edit hook resizes its block.
-                        Ok(value) => {
-                            let markdown = value["markdown"].as_str().unwrap_or_default();
-                            composer.editor.update(cx, |editor, cx| {
-                                editor.insert(&format!("{markdown}\n"), window, cx)
-                            });
-                        }
-                        Err(error) => composer.error = Some(format!("{error:#}")),
-                    }
+        let editor = composer.read(cx).editor.clone();
+        let weak = composer.downgrade();
+        let on_error: Rc<dyn Fn(String, &mut Window, &mut App)> =
+            Rc::new(move |error, _window, cx| {
+                weak.update(cx, |composer, cx| {
+                    composer.error = Some(error);
                     cx.notify();
                 })
                 .log_err();
-        })
-        .detach();
+            });
+        upload_into(
+            editor,
+            source,
+            self.workspace_key.clone(),
+            self.client.clone(),
+            on_error,
+            window,
+            cx,
+        );
     }
 }
 
@@ -1872,12 +2356,14 @@ impl ReviewCard {
         }
         for comment in &thread.comments {
             let author = comment.author.clone().unwrap_or_else(|| "ghost".into());
-            let liked = comment
-                .reactions
-                .iter()
-                .any(|r| r.content == "+1" && r.viewer_has_reacted);
             let comment_id = comment.id.clone();
-            let review_for_like = self.review.clone();
+            let reactions = comment.reactions.clone();
+            let react_review = self.review.clone();
+            let edit_review = self.review.clone();
+            let delete_review = self.review.clone();
+            let (edit_id, delete_id, edit_body) =
+                (comment.id.clone(), comment.id.clone(), comment.body.clone());
+            let pill_review = self.review.clone();
             card = card.child(
                 v_flex()
                     .gap_0p5()
@@ -1904,33 +2390,73 @@ impl ReviewCard {
                                 )
                             })
                             .child(div().flex_1())
-                            .child(
-                                IconButton::new(
-                                    SharedString::from(format!("like-{}", comment.id)),
-                                    IconName::ThumbsUp,
+                            .when(comment.viewer_can_update, |row| {
+                                row.child(
+                                    IconButton::new(
+                                        SharedString::from(format!("edit-{}", comment.id)),
+                                        IconName::Pencil,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("Edit comment"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            edit_review
+                                                .update(cx, |review, cx| {
+                                                    review.open_composer(
+                                                        ComposerTarget::EditPublished {
+                                                            comment: edit_id.clone(),
+                                                        },
+                                                        edit_body.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })
+                                                .log_err();
+                                        },
+                                    ),
                                 )
-                                .icon_size(IconSize::XSmall)
-                                .toggle_state(liked)
-                                .tooltip(Tooltip::text(if liked { "Remove 👍" } else { "👍" }))
-                                .on_click(move |_, _, cx| {
-                                    review_for_like
-                                        .update(cx, |review, cx| {
-                                            review.toggle_reaction(&comment_id, liked, cx)
-                                        })
-                                        .log_err();
-                                }),
-                            ),
+                            })
+                            .when(comment.viewer_can_delete, |row| {
+                                row.child(
+                                    IconButton::new(
+                                        SharedString::from(format!("delete-{}", comment.id)),
+                                        IconName::Trash,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("Delete comment"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            delete_review
+                                                .update(cx, |review, cx| {
+                                                    review.delete_published(&delete_id, window, cx)
+                                                })
+                                                .log_err();
+                                        },
+                                    ),
+                                )
+                            })
+                            .child(reaction_menu(comment_id.clone(), reactions, react_review)),
                     )
                     .child(render_body(&comment.body))
                     .when(!comment.reactions.is_empty(), |column| {
                         column.child(h_flex().gap_1().children(comment.reactions.iter().map(|r| {
-                            Label::new(format!("{} {}", reaction_emoji(&r.content), r.count))
-                                .size(LabelSize::XSmall)
-                                .color(if r.viewer_has_reacted {
-                                    Color::Accent
-                                } else {
-                                    Color::Muted
-                                })
+                            let review = pill_review.clone();
+                            let (subject, content, reacted) =
+                                (comment_id.clone(), r.content.clone(), r.viewer_has_reacted);
+                            Button::new(
+                                SharedString::from(format!("pill-{comment_id}-{}", r.content)),
+                                format!("{} {}", reaction_emoji(&r.content), r.count),
+                            )
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::XSmall)
+                            .toggle_state(r.viewer_has_reacted)
+                            .on_click(move |_, _, cx| {
+                                review
+                                    .update(cx, |review, cx| {
+                                        review.toggle_reaction(&subject, &content, reacted, cx)
+                                    })
+                                    .log_err();
+                            })
                         })))
                     }),
             );
@@ -2326,7 +2852,32 @@ impl ReviewCard {
                                 .log_err();
                         }),
                     )
-                }),
+                })
+                .when_some(
+                    reply
+                        .agent_id
+                        .clone()
+                        .filter(|_| reply.author == "reply-agent"),
+                    |row, agent_id| {
+                        let review = self.review.clone();
+                        row.child(div().flex_1()).child(
+                            Button::new(
+                                SharedString::from(format!("note-transcript-{}", reply.id)),
+                                "Transcript",
+                            )
+                            .style(ButtonStyle::Transparent)
+                            .label_size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .end_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::XSmall))
+                            .tooltip(Tooltip::text("Open the session that wrote this answer"))
+                            .on_click(move |_, _, cx| {
+                                review
+                                    .update(cx, |review, cx| review.open_transcript(&agent_id, cx))
+                                    .log_err();
+                            }),
+                        )
+                    },
+                ),
         );
         if reply.is_thinking() {
             column = column.child(
@@ -2430,6 +2981,8 @@ pub struct CommentComposer {
     editor: Entity<Editor>,
     review: WeakEntity<DiffReview>,
     destination: Destination,
+    /// A plain file editor's box: notes only, no review toggle or "Comment now".
+    notes_only: bool,
     busy: bool,
     error: Option<String>,
     _subscription: Subscription,
@@ -2440,12 +2993,17 @@ impl CommentComposer {
         target: ComposerTarget,
         text: String,
         review: WeakEntity<DiffReview>,
+        people: MentionSource,
+        notes_only: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let placeholder = match &target {
             ComposerTarget::Reply { .. } => "Reply…",
-            ComposerTarget::EditDraft { .. } => "Edit comment",
+            ComposerTarget::EditDraft { .. } | ComposerTarget::EditPublished { .. } => {
+                "Edit comment"
+            }
+            ComposerTarget::Lines { .. } if notes_only => "Leave a note on this line",
             ComposerTarget::Lines { .. } => "Leave a review comment on this line",
             ComposerTarget::NoteReply { .. } => "Ask about this note; a separate agent answers…",
             ComposerTarget::EditNote { .. } => "Edit note",
@@ -2454,6 +3012,7 @@ impl CommentComposer {
             let mut editor = Editor::auto_height(3, 14, window, cx);
             editor.set_placeholder_text(placeholder, window, cx);
             editor.set_soft_wrap();
+            enable_completions(&mut editor, people, false, cx);
             if !text.is_empty() {
                 editor.set_text(text, window, cx);
             }
@@ -2472,11 +3031,52 @@ impl CommentComposer {
             target,
             editor,
             review,
-            destination: Destination::Review,
+            destination: if notes_only {
+                Destination::Agent
+            } else {
+                Destination::Review
+            },
+            notes_only,
             busy: false,
             error: None,
             _subscription: subscription,
         }
+    }
+
+    /// Pastes images from the clipboard as uploads; text pastes go on to the editor.
+    fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let images = clipboard_images(cx);
+        if images.is_empty() {
+            cx.propagate();
+            return;
+        }
+        self.upload(images, window, cx);
+    }
+
+    fn upload(&mut self, sources: Vec<UploadSource>, window: &mut Window, cx: &mut Context<Self>) {
+        self.error = None;
+        let review = self.review.clone();
+        // Deferred: uploading reads this composer, which is mid-update here.
+        window.defer(cx, move |window, cx| {
+            review
+                .update(cx, |review, cx| {
+                    for source in sources {
+                        review.upload_to_composer(source, window, cx);
+                    }
+                })
+                .log_err();
+        });
+    }
+
+    fn send_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let review = self.review.clone();
+        window.defer(cx, move |window, cx| {
+            review
+                .update(cx, |review, cx| {
+                    review.submit_composer(Destination::Now, window, cx)
+                })
+                .log_err();
+        });
     }
 
     pub fn target(&self) -> &ComposerTarget {
@@ -2558,7 +3158,9 @@ impl Render for CommentComposer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = match &self.target {
             ComposerTarget::Lines { start, end } => lines_label(*start, *end).to_uppercase(),
-            ComposerTarget::EditDraft { .. } => "EDIT COMMENT".to_owned(),
+            ComposerTarget::EditDraft { .. } | ComposerTarget::EditPublished { .. } => {
+                "EDIT COMMENT".to_owned()
+            }
             ComposerTarget::Reply { .. } => "REPLY".to_owned(),
             ComposerTarget::NoteReply { .. } => "REPLY TO NOTE".to_owned(),
             ComposerTarget::EditNote { .. } => "EDIT NOTE".to_owned(),
@@ -2566,13 +3168,23 @@ impl Render for CommentComposer {
         let new_comment = matches!(self.target, ComposerTarget::Lines { .. });
         let submit_label = match (&self.target, self.destination) {
             (_, _) if self.busy => "Posting…",
-            (ComposerTarget::Lines { .. }, Destination::Review) => "Add to review",
+            (ComposerTarget::Lines { .. }, Destination::Review | Destination::Now) => {
+                "Add to review"
+            }
             (ComposerTarget::Lines { .. }, Destination::Agent) => "Add note",
-            (ComposerTarget::EditDraft { .. } | ComposerTarget::EditNote { .. }, _) => "Save",
+            (
+                ComposerTarget::EditDraft { .. }
+                | ComposerTarget::EditNote { .. }
+                | ComposerTarget::EditPublished { .. },
+                _,
+            ) => "Save",
             (ComposerTarget::Reply { .. } | ComposerTarget::NoteReply { .. }, _) => "Reply",
         };
+        let can_post_now =
+            new_comment && !self.notes_only && self.destination != Destination::Agent;
         let empty = self.editor.read(cx).text(cx).trim().is_empty();
         let images = markdown_images(&self.editor.read(cx).text(cx));
+        let drop_bg = cx.theme().colors().drop_target_background;
         card_frame(cx)
             .key_context("IcarusReviewComposer")
             .on_action(
@@ -2580,6 +3192,21 @@ impl Render for CommentComposer {
             )
             .on_action(
                 cx.listener(|this, _: &CancelReviewComment, window, cx| this.cancel(window, cx)),
+            )
+            .capture_action(
+                cx.listener(|this, _: &editor::actions::Paste, window, cx| this.paste(window, cx)),
+            )
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    let sources = paths
+                        .paths()
+                        .iter()
+                        .cloned()
+                        .map(UploadSource::Path)
+                        .collect();
+                    this.upload(sources, window, cx);
+                }),
             )
             .child(
                 h_flex()
@@ -2591,7 +3218,7 @@ impl Render for CommentComposer {
                             .weight(gpui::FontWeight::SEMIBOLD),
                     )
                     .child(div().flex_1())
-                    .when(new_comment, |row| {
+                    .when(new_comment && !self.notes_only, |row| {
                         row.child(
                             ui::ToggleButtonGroup::single_row(
                                 "review-destination",
@@ -2612,7 +3239,7 @@ impl Render for CommentComposer {
                             )
                             .selected_index(match self.destination {
                                 Destination::Agent => 0,
-                                Destination::Review => 1,
+                                Destination::Review | Destination::Now => 1,
                             })
                             .style(ui::ToggleButtonGroupStyle::Outlined)
                             .label_size(LabelSize::XSmall),
@@ -2661,6 +3288,20 @@ impl Render for CommentComposer {
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
                     )
+                    .when(can_post_now, |row| {
+                        row.child(
+                            Button::new("review-comment-now", "Comment now")
+                                .style(ButtonStyle::Outlined)
+                                .label_size(LabelSize::Small)
+                                .disabled(self.busy || empty)
+                                .tooltip(Tooltip::text(
+                                    "Post this one comment now, outside your pending review",
+                                ))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.send_now(window, cx)),
+                                ),
+                        )
+                    })
                     .child(
                         Button::new("review-submit", submit_label)
                             .style(ButtonStyle::Filled)

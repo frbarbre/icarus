@@ -111,6 +111,7 @@ pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
     file_status_label_color, render_breadcrumb_text,
 };
+pub use git::GutterCommentHook;
 pub use git::blame::{BlameRenderer, GitBlame, MAX_RELATIVE_TIMESTAMP};
 pub use git::{
     DefaultDiffHunkRenderer, DiffHunkRenderer, HiddenDiffHunkRenderer,
@@ -1173,6 +1174,7 @@ pub struct Editor {
     gutter_hover_button: (Option<GutterHoverButton>, Option<Task<()>>),
     pub(crate) gutter_diff_review_indicator: (Option<PhantomDiffReviewIndicator>, Option<Task<()>>),
     pub(crate) diff_review_drag_state: Option<DiffReviewDragState>,
+    pub(crate) gutter_comment_hook: Option<GutterCommentHook>,
     /// Active diff review overlays. Multiple overlays can be open simultaneously
     /// when hunks have comments stored.
     pub(crate) diff_review_overlays: Vec<DiffReviewOverlay>,
@@ -2550,6 +2552,7 @@ impl Editor {
             gutter_hover_button: (None, None),
             gutter_diff_review_indicator: (None, None),
             diff_review_drag_state: None,
+            gutter_comment_hook: None,
             diff_review_overlays: Vec::new(),
             stored_review_comments: Vec::new(),
             next_review_comment_id: 0,

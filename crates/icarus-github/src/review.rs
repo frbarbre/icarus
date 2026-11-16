@@ -3,8 +3,32 @@ use crate::error::{GitHubError, Result};
 use crate::runner::{Gh, GhRequest, Method};
 use crate::stack::is_git_oid;
 use icarus_rules::facts::{RepoRef, RequestedReviewer};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+
+/// Someone who can be @-mentioned or asked for a review in a repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubUser {
+    pub login: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+}
+
+const ASSIGNABLE_USERS: &str =
+    "query AssignableUsers($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    assignableUsers(first: 100, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes { login name avatarUrl(size: 64) }
+    }
+  }
+}";
+
+/// Bounds the pages fetched for very large organisations; the first few hundred cover any picker.
+const MAX_ASSIGNABLE_PAGES: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -549,6 +573,55 @@ impl<G: Gh> GitHub<G> {
                 .await
                 .map(drop),
         }
+    }
+
+    /// Users who can be assigned in the repository: GitHub's own candidates for review requests and mentions.
+    pub async fn assignable_users(&self, repo: &RepoRef) -> Result<Vec<GitHubUser>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PageInfo {
+            has_next_page: bool,
+            end_cursor: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Users {
+            page_info: PageInfo,
+            #[serde(default)]
+            nodes: Vec<Option<GitHubUser>>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Repository {
+            assignable_users: Users,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            repository: Option<Repository>,
+        }
+        let mut users = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..MAX_ASSIGNABLE_PAGES {
+            let data: Data = self
+                .graphql_data(
+                    ASSIGNABLE_USERS,
+                    json!({ "owner": repo.owner, "name": repo.name, "after": after }),
+                )
+                .await?;
+            let Some(repository) = data.repository else {
+                return Err(GitHubError::NotFound(format!(
+                    "Could not find {}/{}.",
+                    repo.owner, repo.name
+                )));
+            };
+            let page = repository.assignable_users;
+            users.extend(page.nodes.into_iter().flatten());
+            match page.page_info.end_cursor {
+                Some(cursor) if page.page_info.has_next_page => after = Some(cursor),
+                _ => break,
+            }
+        }
+        Ok(users)
     }
 
     pub async fn set_reaction(

@@ -8519,6 +8519,7 @@ dependencies = [
  "acp_thread",
  "agent_servers",
  "anyhow",
+ "base64 0.22.1",
  "block2 0.6.2",
  "buffer_diff",
  "collections",

@@ -430,6 +430,118 @@ async fn reviewers_are_requested_and_removed_with_teams_split_out() {
 }
 
 #[tokio::test]
+async fn comments_post_now_get_edited_and_deleted_and_mentionables_are_cached() {
+    let world = World::new(json!({ "viewer": "me" })).await;
+    let (ws, _path, head) = world.workspace("rev").await;
+    let mut gh = fixtures(&head, "someone");
+    gh["assignable_users"] = json!([
+        { "login": "alice", "name": "Alice A", "avatarUrl": "https://avatars.example/alice" },
+        { "login": "bob", "name": null, "avatarUrl": null },
+    ]);
+    world.set_fixtures(&gh);
+
+    let posted = world
+        .request(
+            "review.comment.post",
+            json!({ "workspace": ws, "path": "src/a.rs", "line": 3, "body": "Now, not later." }),
+        )
+        .await;
+    assert_eq!(posted["comment"]["node_id"], "PRRC_now");
+    assert_eq!(posted["file_comment"], false);
+    let drafts = world
+        .request("review.comment.list", json!({ "workspace": ws }))
+        .await;
+    assert_eq!(
+        drafts["drafts"].as_array().map(Vec::len),
+        Some(0),
+        "comment now never queues"
+    );
+    let log = std::fs::read_to_string(format!("{}.requests.jsonl", world.fixtures.display()))
+        .unwrap_or_default();
+    let post = log
+        .lines()
+        .find(|line| line.contains("pulls/5/comments") && line.contains("POST"))
+        .expect("posted through the PR comments endpoint");
+    assert!(
+        post.contains(&format!("\"commit_id\":\"{head}\"")) && post.contains("\"line\":3"),
+        "posted on the PR head at the line: {post}"
+    );
+
+    let outside = world
+        .request(
+            "review.comment.post",
+            json!({ "workspace": ws, "path": "src/a.rs", "line": 15, "body": "Outside the diff." }),
+        )
+        .await;
+    assert_eq!(
+        outside["file_comment"], true,
+        "lines outside the diff post as a file comment, like queued drafts"
+    );
+
+    let edited = world
+        .request(
+            "review.comment.edit_published",
+            json!({ "workspace": ws, "kind": "review_comment", "node_id": "PRRC_now", "body": "Edited." }),
+        )
+        .await;
+    assert_eq!(edited["edited"], true);
+    world
+        .request(
+            "review.comment.delete_published",
+            json!({ "workspace": ws, "kind": "issue_comment", "id": 42 }),
+        )
+        .await;
+    let summary = world
+        .error(
+            "review.comment.delete_published",
+            json!({ "workspace": ws, "kind": "review_summary", "node_id": "PRR_1" }),
+        )
+        .await;
+    assert!(
+        summary.contains("cannot delete a submitted review"),
+        "{summary}"
+    );
+    let missing = world
+        .error(
+            "review.comment.edit_published",
+            json!({ "workspace": ws, "kind": "review_comment", "body": "x" }),
+        )
+        .await;
+    assert!(missing.contains("node_id is required"), "{missing}");
+    let log = std::fs::read_to_string(format!("{}.requests.jsonl", world.fixtures.display()))
+        .unwrap_or_default();
+    assert!(log.contains("UpdateReviewComment"), "{log}");
+    assert!(
+        log.lines()
+            .any(|line| line.contains("DELETE") && line.contains("issues/comments/42")),
+        "{log}"
+    );
+
+    let mentionables = world
+        .request("review.mentionables", json!({ "workspace": ws }))
+        .await;
+    let logins: Vec<&str> = mentionables["users"]
+        .as_array()
+        .expect("users")
+        .iter()
+        .filter_map(|u| u["login"].as_str())
+        .collect();
+    assert_eq!(logins, ["alice", "bob"]);
+    assert_eq!(mentionables["author"], "someone");
+    world
+        .request("review.mentionables", json!({ "workspace": ws }))
+        .await;
+    assert_eq!(
+        world.requests("graphql AssignableUsers").len(),
+        1,
+        "the second lookup comes from the cache"
+    );
+    world
+        .request("workspace.remove", json!({ "id": ws, "force": true }))
+        .await;
+}
+
+#[tokio::test]
 async fn own_pull_request_is_comment_only_and_a_refused_submit_keeps_drafts() {
     let world = World::new(json!({ "viewer": "me" })).await;
     let (ws, _path, head) = world.workspace("rev").await;

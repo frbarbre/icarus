@@ -14,7 +14,7 @@ use icarus_github::attachment::{
     is_video,
 };
 use icarus_github::diff_lines::{Placement, file_comment_body};
-use icarus_github::review::{CommentTarget, DraftComment, Reaction, Side, Verdict};
+use icarus_github::review::{CommentRef, CommentTarget, DraftComment, Reaction, Side, Verdict};
 use icarus_github::review_context::ReviewContext;
 use icarus_github::review_threads::PrThread;
 use icarus_protocol::RpcError;
@@ -422,6 +422,44 @@ struct AddComment {
     body: String,
 }
 
+/// A comment already on GitHub: a review comment or review summary by node id, or a PR conversation comment by id.
+#[derive(Deserialize)]
+struct Published {
+    kind: String,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+impl Published {
+    fn comment_ref(&self) -> Result<CommentRef, RpcError> {
+        let node_id = || {
+            self.node_id
+                .clone()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| rpc("invalid", "node_id is required"))
+        };
+        match self.kind.as_str() {
+            "review_comment" => Ok(CommentRef::ReviewComment {
+                node_id: node_id()?,
+            }),
+            "review_summary" => Ok(CommentRef::ReviewSummary {
+                node_id: node_id()?,
+            }),
+            "issue_comment" => Ok(CommentRef::IssueComment {
+                id: self.id.ok_or_else(|| rpc("invalid", "id is required"))?,
+            }),
+            _ => Err(rpc(
+                "invalid",
+                "kind must be review_comment, review_summary or issue_comment",
+            )),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct EditComment {
     id: String,
@@ -578,6 +616,52 @@ impl Server {
                 let add: AddComment = params(p)?;
                 let (workspace, target) = self.review_target(&at).await?;
                 self.add_draft(&workspace, &target, add).await
+            }
+            "review.comment.post" => {
+                let at: At = params(p.clone())?;
+                let add: AddComment = params(p)?;
+                let (workspace, target) = self.review_target(&at).await?;
+                self.post_comment_now(&workspace, &target, add).await
+            }
+            "review.comment.edit_published" | "review.comment.delete_published" => {
+                let at: At = params(p.clone())?;
+                let published: Published = params(p)?;
+                let comment = published.comment_ref()?;
+                let (workspace, target) = self.review_target(&at).await?;
+                let client = &self.github.client;
+                if method == "review.comment.edit_published" {
+                    let body = published
+                        .body
+                        .as_deref()
+                        .ok_or_else(|| rpc("invalid", "body is required"))?;
+                    check_body(body, false)?;
+                    client.edit_comment(&target.repo, &comment, body).await
+                } else {
+                    client.delete_comment(&target.repo, &comment).await
+                }
+                .map_err(github_error)?;
+                self.review_changed(Some(&workspace.id), None);
+                Ok(json!({
+                    "edited": method == "review.comment.edit_published",
+                    "deleted": method == "review.comment.delete_published",
+                }))
+            }
+            "review.mentionables" => {
+                let at: At = params(p)?;
+                let (_workspace, target) = self.review_target(&at).await?;
+                let users = self
+                    .github
+                    .assignable_users(&target.repo, at.refresh)
+                    .await
+                    .map_err(github_error)?;
+                let author = self
+                    .github
+                    .client
+                    .review_context(&target.repo, target.number)
+                    .await
+                    .ok()
+                    .and_then(|context| context.author_login);
+                Ok(json!({ "users": users, "author": author }))
             }
             "review.comment.edit" => {
                 let at: At = params(p.clone())?;
@@ -979,6 +1063,64 @@ impl Server {
         target: &Target,
         add: AddComment,
     ) -> Result<Value, RpcError> {
+        let (draft, note) = self.build_draft(workspace, target, add).await?;
+        let count = self.update_session(workspace, target, |session| {
+            session.drafts.push(draft.clone());
+            if session.drafts.len() > MAX_DRAFTS {
+                let excess = session.drafts.len() - MAX_DRAFTS;
+                session.drafts.drain(..excess);
+            }
+            Ok(session.drafts.len())
+        })?;
+        Ok(json!({
+            "draft": draft,
+            "drafts": count,
+            "file_comment": draft.subject == "file" && note.is_some(),
+            "note": note,
+        }))
+    }
+
+    /// Posts one comment straight away ("Comment now"), outside the pending review.
+    async fn post_comment_now(
+        &self,
+        workspace: &Workspace,
+        target: &Target,
+        add: AddComment,
+    ) -> Result<Value, RpcError> {
+        let (draft, note) = self.build_draft(workspace, target, add).await?;
+        let context = self
+            .github
+            .client
+            .review_context(&target.repo, target.number)
+            .await
+            .map_err(github_error)?;
+        let posted = self
+            .github
+            .client
+            .post_review_comment(
+                &target.repo,
+                target.number,
+                &context.head_ref_oid,
+                &draft.to_github(),
+            )
+            .await
+            .map_err(github_error)?;
+        self.review_changed(Some(&workspace.id), None);
+        Ok(json!({
+            "comment": { "id": posted.id, "node_id": posted.node_id, "url": posted.html_url },
+            "path": draft.path,
+            "line": draft.line,
+            "file_comment": draft.subject == "file" && note.is_some(),
+            "note": note,
+        }))
+    }
+
+    async fn build_draft(
+        &self,
+        workspace: &Workspace,
+        target: &Target,
+        add: AddComment,
+    ) -> Result<(Draft, Option<String>), RpcError> {
         check_body(&add.body, false)?;
         let path = add.path.trim().trim_start_matches("./").to_owned();
         if path.is_empty() || path.starts_with('/') || path.split('/').any(|p| p == "..") {
@@ -1079,20 +1221,7 @@ impl Server {
             created_at: now_ms(),
             updated_at: None,
         };
-        let count = self.update_session(workspace, target, |session| {
-            session.drafts.push(draft.clone());
-            if session.drafts.len() > MAX_DRAFTS {
-                let excess = session.drafts.len() - MAX_DRAFTS;
-                session.drafts.drain(..excess);
-            }
-            Ok(session.drafts.len())
-        })?;
-        Ok(json!({
-            "draft": draft,
-            "drafts": count,
-            "file_comment": subject == "file" && line.is_some(),
-            "note": note,
-        }))
+        Ok((draft, note))
     }
 
     async fn submit_review(

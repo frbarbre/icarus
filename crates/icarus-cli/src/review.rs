@@ -110,6 +110,19 @@ pub enum ReviewCommand {
     },
     /// Upload an image or video as a GitHub attachment and print the markdown to put in a comment.
     Upload { file: String },
+    /// People who can be @-mentioned or asked for a review (the repository's assignable users).
+    People {
+        #[arg(long)]
+        refresh: bool,
+    },
+}
+
+/// A published comment's reference: node id, or the numeric id of a PR conversation comment.
+fn published(kind: &str, node_id: &str) -> Value {
+    match (kind, node_id.parse::<u64>()) {
+        ("issue_comment", Ok(id)) => json!({ "kind": kind, "id": id }),
+        _ => json!({ "kind": kind, "node_id": node_id }),
+    }
 }
 
 #[derive(Subcommand)]
@@ -127,11 +140,29 @@ pub enum CommentCommand {
         /// right (the new file, default) or left (the old file).
         #[arg(long)]
         side: Option<String>,
+        /// Post it on GitHub right away instead of queueing it for the review ("Comment now").
+        #[arg(long)]
+        now: bool,
         #[command(flatten)]
         body: Body,
     },
     /// List the queued drafts.
     List,
+    /// Edit one of your comments already on GitHub (review comment node id, `PRRC_…`).
+    EditPublished {
+        node_id: String,
+        /// review_comment (default), review_summary, or issue_comment (pass the numeric id).
+        #[arg(long, default_value = "review_comment")]
+        kind: String,
+        #[command(flatten)]
+        body: Body,
+    },
+    /// Delete one of your comments already on GitHub.
+    DeletePublished {
+        node_id: String,
+        #[arg(long, default_value = "review_comment")]
+        kind: String,
+    },
     /// Replace a draft's body.
     Edit {
         id: String,
@@ -206,6 +237,7 @@ pub async fn run(
                 line,
                 end_line,
                 side,
+                now,
                 body,
             } => {
                 let (start_line, line) = match (line, end_line) {
@@ -219,6 +251,21 @@ pub async fn run(
                     json!({ "path": file, "line": line, "start_line": start_line, "side": side,
                         "file": line.is_none(), "body": body.required()? }),
                 );
+                if *now {
+                    let value = call("review.comment.post", params).await?;
+                    super::print(cli, &value, |v| {
+                        let mut text = format!(
+                            "posted {}",
+                            v["comment"]["url"].as_str().unwrap_or("the comment")
+                        );
+                        if let Some(note) = v["note"].as_str() {
+                            text.push('\n');
+                            text.push_str(note);
+                        }
+                        text
+                    });
+                    return Ok(());
+                }
                 let value = call("review.comment.add", params).await?;
                 super::print(cli, &value, |v| {
                     let mut text = format!(
@@ -259,7 +306,44 @@ pub async fn run(
                     format!("cleared {} draft(s)", v["cleared"])
                 });
             }
+            CommentCommand::EditPublished {
+                node_id,
+                kind,
+                body,
+            } => {
+                let mut params = with(base, published(kind, node_id));
+                params["body"] = json!(body.required()?);
+                let value = call("review.comment.edit_published", params).await?;
+                super::print(cli, &value, |_| format!("edited {node_id}"));
+            }
+            CommentCommand::DeletePublished { node_id, kind } => {
+                let value = call(
+                    "review.comment.delete_published",
+                    with(base, published(kind, node_id)),
+                )
+                .await?;
+                super::print(cli, &value, |_| format!("deleted {node_id}"));
+            }
         },
+        ReviewCommand::People { refresh } => {
+            let value = call(
+                "review.mentionables",
+                with(base, json!({ "refresh": refresh })),
+            )
+            .await?;
+            super::print(cli, &value, |v| {
+                v["users"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|user| match user["name"].as_str() {
+                        Some(name) => format!("{}  {name}", user["login"].as_str().unwrap_or("")),
+                        None => user["login"].as_str().unwrap_or("").to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        }
         ReviewCommand::Summary {
             body,
             clear,

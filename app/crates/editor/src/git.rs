@@ -179,6 +179,18 @@ pub(super) struct StoredReviewComment {
     pub(super) is_editing: bool,
 }
 
+/// Lets an embedder own the gutter's "+" comment button (and its drag-to-select) instead of the
+/// built-in diff review overlay, and show its own markers on rows that already carry comments.
+#[derive(Clone)]
+pub struct GutterCommentHook {
+    /// Runs after a click or drag on "+"; the chosen rows are the editor's newest selection.
+    pub on_rows: Rc<dyn Fn(&mut Window, &mut App)>,
+    /// The marker for a multibuffer row that already has a comment, in place of "+".
+    pub marker: Rc<dyn Fn(MultiBufferRow, &App) -> Option<(IconName, Color, SharedString)>>,
+    /// Runs when a marker is clicked.
+    pub on_marker: Rc<dyn Fn(MultiBufferRow, &mut Window, &mut App)>,
+}
+
 /// Represents an active diff review overlay that appears when clicking the "Add Review" button.
 pub(super) struct DiffReviewOverlay {
     pub(super) anchor_range: Range<Anchor>,
@@ -1031,6 +1043,35 @@ impl Editor {
         let text_color = cx.theme().colors().text;
         let icon_color = cx.theme().colors().icon_accent;
 
+        let marker = self.gutter_comment_hook.clone().and_then(|hook| {
+            let point = self
+                .display_snapshot(cx)
+                .display_point_to_point(DisplayPoint::new(display_row, 0), Bias::Left);
+            let row = MultiBufferRow(point.row);
+            (hook.marker)(row, cx).map(|marker| (hook, row, marker))
+        });
+        if let Some((hook, row, (icon, color, tooltip))) = marker {
+            return h_flex()
+                .id("diff_review_button")
+                .cursor_pointer()
+                .w(width - px(1.))
+                .h(relative(0.9))
+                .justify_center()
+                .rounded_sm()
+                .hover(|s| s.bg(icon_color.opacity(0.2)))
+                .child(Icon::new(icon).size(IconSize::Small).color(color))
+                .tooltip(Tooltip::text(tooltip))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |_, _: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        let on_marker = hook.on_marker.clone();
+                        // Deferred: the handler updates blocks of this editor.
+                        window.defer(cx, move |window, cx| on_marker(row, window, cx));
+                    }),
+                );
+        }
+
         h_flex()
             .id("diff_review_button")
             .cursor_pointer()
@@ -1097,7 +1138,26 @@ impl Editor {
         if let Some(drag_state) = self.diff_review_drag_state.take() {
             let snapshot = self.snapshot(window, cx);
             let range = drag_state.row_range(&snapshot.display_snapshot);
-            self.show_diff_review_overlay(*range.start()..*range.end(), window, cx);
+            if let Some(hook) = self.gutter_comment_hook.clone() {
+                let start = snapshot
+                    .display_snapshot
+                    .display_point_to_point(range.start().as_display_point(), Bias::Left);
+                let end_row = snapshot
+                    .display_snapshot
+                    .display_point_to_point(range.end().as_display_point(), Bias::Left)
+                    .row;
+                let end = Point::new(
+                    end_row,
+                    snapshot.buffer_snapshot().line_len(MultiBufferRow(end_row)),
+                );
+                self.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([Point::new(start.row, 0)..end])
+                });
+                // Deferred: the handler inserts blocks into this editor.
+                window.defer(cx, move |window, cx| (hook.on_rows)(window, cx));
+            } else {
+                self.show_diff_review_overlay(*range.start()..*range.end(), window, cx);
+            }
         }
         cx.notify();
     }

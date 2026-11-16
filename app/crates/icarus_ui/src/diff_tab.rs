@@ -200,6 +200,7 @@ impl DiffTab {
                 Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx);
             // Any renderer stops the editor from replacing this base diff with its own HEAD diff.
             editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
+            editor.register_addon(crate::review::ReviewAttached::default());
             editor
         });
         let editor_events = cx.subscribe(&editor, |_, _, event: &EditorEvent, cx| {
@@ -1177,7 +1178,7 @@ pub(crate) mod tests {
             );
             review.submit_composer(Destination::Review, window, cx);
             review.set_resolved("T1", true, cx);
-            review.toggle_reaction("T1-c1", false, cx);
+            review.toggle_reaction("T1-c1", "+1", false, cx);
             review.add_to_agent("T2", cx);
             review.remove_draft("d1", cx);
         });
@@ -1557,6 +1558,315 @@ pub(crate) mod tests {
         assert!(
             cx.update(|window, cx| tab.read(cx).editor.focus_handle(cx).is_focused(window)),
             "the diff takes focus, as Orca's outside-editor keys do"
+        );
+    }
+
+    fn editable_thread(id: &str, line: u32, resolved: bool) -> serde_json::Value {
+        let mut thread = thread_json(id, line, resolved);
+        thread["comments"][0]["viewer_can_update"] = json!(true);
+        thread["comments"][0]["viewer_can_delete"] = json!(true);
+        thread
+    }
+
+    async fn review_tab(
+        cx: &mut gpui::TestAppContext,
+        answer: impl Fn(&str, &serde_json::Value) -> Result<serde_json::Value> + Send + Sync + 'static,
+    ) -> (
+        Entity<DiffTab>,
+        Entity<crate::review::DiffReview>,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        gpui::VisualTestContext,
+    ) {
+        let (workspace, mut cx) = git_workspace(cx).await;
+        let calls = cx.update(|_, cx| crate::review::tests::stub_rpc(cx, answer));
+        let tab = open(
+            &workspace,
+            "/project/src/app.rs",
+            DiffBase::Uncommitted,
+            &mut cx,
+        );
+        cx.run_until_parked();
+        let tab = tab.await.expect("diff tab");
+        let review = tab.update(&mut cx, |tab, cx| {
+            tab.enable_review("/project".into(), "src/app.rs".into(), cx);
+            tab.review().cloned().expect("review")
+        });
+        review.update(&mut cx, |review, cx| review.reload(cx));
+        cx.run_until_parked();
+        (tab, review, calls, cx)
+    }
+
+    #[gpui::test]
+    async fn gutter_plus_markers_comment_now_and_published_comment_actions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::review::tests::calls_to;
+        use crate::review::{ComposerTarget, Destination, MarkerKind};
+
+        let (tab, review, calls, mut cx) = review_tab(cx, |method, _| match method {
+            "review.threads" => Ok(json!({ "threads": [
+                editable_thread("T1", 1, false), editable_thread("T2", 2, true),
+            ] })),
+            "review.comment.list" => Ok(json!({ "drafts": [] })),
+            "review.mentionables" => Ok(json!({ "users": [{ "login": "alice" }] })),
+            "review.comment.post" => Ok(json!({ "comment": { "id": 9 } })),
+            _ => Ok(json!({})),
+        })
+        .await;
+        let cx = &mut cx;
+
+        // Rows with a thread show its marker instead of "+"; clicking a resolved one expands it.
+        let editor = tab.read_with(cx, |tab, _| tab.editor().clone());
+        let marked: Vec<(u32, MarkerKind, String)> = review.read_with(cx, |review, _| {
+            (0..12)
+                .filter_map(|row| review.marker_at(row).map(|(kind, id)| (row, kind, id)))
+                .collect()
+        });
+        assert_eq!(
+            marked
+                .iter()
+                .map(|(_, kind, id)| (*kind, id.as_str()))
+                .collect::<Vec<_>>(),
+            [(MarkerKind::Thread, "T1"), (MarkerKind::Thread, "T2")]
+        );
+        assert!(editor.read_with(cx, |editor, _| editor.gutter_comment_hook().is_some()));
+        let resolved_row = marked[1].0;
+        review.read_with(cx, |review, _| assert!(!review.is_expanded("T2")));
+        let hook = editor.read_with(cx, |editor, _| editor.gutter_comment_hook().cloned());
+        let hook = hook.expect("the review owns the gutter button");
+        cx.update(|window, cx| {
+            (hook.on_marker)(multi_buffer::MultiBufferRow(resolved_row), window, cx)
+        });
+        cx.run_until_parked();
+        review.read_with(cx, |review, _| assert!(review.is_expanded("T2")));
+
+        // "+" (click or drag) opens the box on the selected rows, the same as ⌘⇧A.
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 0)..Point::new(1, 3)])
+            });
+        });
+        cx.update(|window, cx| (hook.on_rows)(window, cx));
+        cx.run_until_parked();
+        let composer = review.read_with(cx, |review, _| review.composer().cloned().expect("box"));
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.target().clone()),
+            ComposerTarget::Lines { start: 1, end: 2 }
+        );
+        assert_eq!(
+            calls_to(&calls, "review.mentionables"),
+            [json!({ "workspace": "/project" })],
+            "the people to mention load when the first box opens"
+        );
+
+        // "Comment now" posts straight away instead of queueing.
+        composer
+            .read_with(cx, |composer, _| composer.editor().clone())
+            .update_in(cx, |editor, window, cx| {
+                editor.set_text("Ship it", window, cx)
+            });
+        review.update_in(cx, |review, window, cx| {
+            review.submit_composer(Destination::Now, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "review.comment.post"),
+            [
+                json!({ "workspace": "/project", "path": "src/app.rs", "line": 2,
+                "start_line": 1, "body": "Ship it" })
+            ]
+        );
+        assert!(calls_to(&calls, "review.comment.add").is_empty());
+
+        // Your published comments can be edited, deleted (after asking) and reacted to.
+        review.update_in(cx, |review, window, cx| {
+            review.open_composer(
+                ComposerTarget::EditPublished {
+                    comment: "T1-c1".into(),
+                },
+                "Why this, exactly?".into(),
+                window,
+                cx,
+            );
+            review.submit_composer(Destination::Review, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "review.comment.edit_published"),
+            [
+                json!({ "workspace": "/project", "kind": "review_comment", "node_id": "T1-c1",
+                "body": "Why this, exactly?" })
+            ]
+        );
+        review.update_in(cx, |review, window, cx| {
+            review.delete_published("T1-c1", window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            calls_to(&calls, "review.comment.delete_published").is_empty(),
+            "nothing is deleted before the answer"
+        );
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "review.comment.delete_published"),
+            [json!({ "workspace": "/project", "kind": "review_comment", "node_id": "T1-c1" })]
+        );
+        review.update(cx, |review, cx| {
+            review.toggle_reaction("T1-c1", "heart", false, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "review.react")[0],
+            json!({ "workspace": "/project", "subject": "T1-c1", "reaction": "heart",
+                "remove": false })
+        );
+    }
+
+    #[gpui::test]
+    async fn pasted_images_upload_in_place_and_mentions_complete(cx: &mut gpui::TestAppContext) {
+        use crate::review::ComposerTarget;
+        use crate::review::tests::calls_to;
+
+        let (_tab, review, calls, mut cx) = review_tab(cx, |method, params| match method {
+            "review.threads" => Ok(json!({ "threads": [] })),
+            "review.comment.list" => Ok(json!({ "drafts": [] })),
+            "review.mentionables" => Ok(json!({ "author": "bob",
+                "users": [{ "login": "alice", "name": "Alice A" }] })),
+            "review.upload" if params["name"] == "pasted-image.png" => Ok(json!({
+                "markdown": "![pasted-image.png](https://example.com/a.png)" })),
+            "review.upload" => Err(anyhow::anyhow!("Only images and videos can be attached.")),
+            _ => Ok(json!({})),
+        })
+        .await;
+        let cx = &mut cx;
+        review.update_in(cx, |review, window, cx| {
+            review.open_composer(
+                ComposerTarget::Lines { start: 1, end: 1 },
+                String::new(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let composer = review.read_with(cx, |review, _| review.composer().cloned().expect("box"));
+        let editor = composer.read_with(cx, |composer, _| composer.editor().clone());
+        let focus = editor.read_with(cx, |editor, cx| editor.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+
+        // A pasted image uploads from memory and its markdown replaces the placeholder.
+        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            vec![1, 2, 3],
+        )));
+        cx.dispatch_action(editor::actions::Paste);
+        let uploaded = calls_to(&calls, "review.upload");
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(uploaded[0]["name"], "pasted-image.png");
+        assert_eq!(uploaded[0]["data_base64"], "AQID");
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "![pasted-image.png](https://example.com/a.png)"
+        );
+
+        // A failed upload takes its placeholder back out and shows GitHub's words.
+        review.update_in(cx, |review, window, cx| {
+            review.upload_to_composer(
+                crate::comment_input::UploadSource::Path("/tmp/notes.txt".into()),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "![pasted-image.png](https://example.com/a.png)"
+        );
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.error_text()),
+            Some("Only images and videos can be attached.".to_owned())
+        );
+
+        // Typing "@al" offers the repository's people; confirming inserts the login.
+        editor.update_in(cx, |editor, window, cx| editor.set_text("", window, cx));
+        cx.simulate_input("cc @al");
+        cx.run_until_parked();
+        cx.dispatch_action(editor::actions::ConfirmCompletion::default());
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "cc @alice "
+        );
+        cx.simulate_input(":tad");
+        cx.run_until_parked();
+        cx.dispatch_action(editor::actions::ConfirmCompletion::default());
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "cc @alice 🎉"
+        );
+    }
+
+    #[gpui::test]
+    async fn notes_show_in_plain_file_editors_and_answers_link_their_transcript(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::review::tests::{calls_to, stub_rpc};
+
+        let (workspace, mut cx) = git_workspace(cx).await;
+        let cx = &mut cx;
+        let calls = cx.update(|_, cx| {
+            crate::enable_for_tests(cx);
+            crate::worktree_trust::set_icarus_workspace_paths(vec!["/project".into()], cx);
+            crate::review::attach_notes_to_file_editors(cx);
+            stub_rpc(cx, |method, _| match method {
+                "note.list" => Ok(json!([{
+                    "id": "n1", "path": "src/new.rs", "line": 1, "end_line": 1,
+                    "author": "user", "body": "Why added?",
+                    "replies": [{ "id": "r1", "author": "reply-agent", "body": "For the test.",
+                        "status": "done", "agent_id": "agent-7" }],
+                }])),
+                _ => Ok(json!({})),
+            })
+        });
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let buffer = project.update(cx, |project, cx| {
+            project.open_local_buffer("/project/src/new.rs", cx)
+        });
+        cx.run_until_parked();
+        let buffer = buffer.await.expect("file opens");
+        let editor = cx.new_window_entity(|window, cx| {
+            Editor::for_buffer(buffer, Some(project.clone()), window, cx)
+        });
+        cx.run_until_parked();
+        let review = editor.read_with(cx, |editor, _| {
+            editor
+                .addon::<crate::review::ReviewAttached>()
+                .and_then(|attached| attached.0.clone())
+        });
+        let review = review.expect("plain file editors get notes too");
+        // Without a server connection the first load waits to be asked, as in the diff tab tests.
+        review.update(cx, |review, cx| review.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "note.list")[0]["path"],
+            "src/new.rs",
+            "relative to the workspace root"
+        );
+        assert!(
+            calls_to(&calls, "review.threads").is_empty(),
+            "file editors show notes only"
+        );
+        review.read_with(cx, |review, _| assert_eq!(review.notes().len(), 1));
+        assert!(editor.read_with(cx, |editor, _| editor.gutter_comment_hook().is_some()));
+
+        review.update(cx, |review, cx| review.open_transcript("agent-7", cx));
+        cx.run_until_parked();
+        assert_eq!(
+            calls_to(&calls, "agent.resume"),
+            [json!({ "id": "agent-7" })],
+            "an answer's transcript wakes its session from history"
         );
     }
 }

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use icarus_github::merge::MergeResult;
 use icarus_github::previews::{PrPreviews, PreviewConfig};
 use icarus_github::repo::RepoMergeMetadata;
+use icarus_github::review::GitHubUser;
 use icarus_github::snapshot::{PrDetails, PrTarget};
 use icarus_github::stack::{PollPolicy, StackMergeAction, StackMergeStatus, StackView};
 use icarus_github::{FakeGh, FakeResponse, Gh, GhCli, GhOutput, GhRequest, GitHub, GitHubError};
@@ -27,6 +28,7 @@ use crate::state::{Project, Workspace};
 const PR_TTL: Duration = Duration::from_secs(15);
 const METADATA_TTL: Duration = Duration::from_secs(600);
 const PREVIEW_TTL: Duration = Duration::from_secs(30);
+const USERS_TTL: Duration = Duration::from_secs(600);
 pub(crate) const STACK_INTENTS_KEY: &str = "rules.stack_auto_merge";
 
 /// The `gh` runner the server uses: the real CLI, or fixtures when `ICARUS_GH_FIXTURES` names a file.
@@ -269,6 +271,21 @@ fn fixture_response(fixtures: &Value, request: &GhRequest) -> (u16, Value) {
         "graphql UnresolveThread" => {
             data(json!({ "unresolveReviewThread": { "thread": { "isResolved": false } } }))
         }
+        "graphql AssignableUsers" => {
+            let nodes = match &fixtures["assignable_users"] {
+                Value::Array(users) => users.clone(),
+                _ => Vec::new(),
+            };
+            data(json!({ "repository": { "assignableUsers": {
+                "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": nodes } } }))
+        }
+        "graphql UpdateReviewComment" => data(json!({ "updatePullRequestReviewComment": {
+            "pullRequestReviewComment": { "body": variables["body"], "lastEditedAt": "2026-01-01T00:00:00Z" } } })),
+        "graphql UpdateReview" => data(json!({ "updatePullRequestReview": {
+            "pullRequestReview": { "body": variables["body"], "lastEditedAt": "2026-01-01T00:00:00Z" } } })),
+        "graphql DeleteReviewComment" => {
+            data(json!({ "deletePullRequestReviewComment": { "clientMutationId": null } }))
+        }
         "graphql AddReaction" | "graphql RemoveReaction" => {
             data(json!({ "reaction": { "subject": { "id": variables["subjectId"] } } }))
         }
@@ -347,6 +364,12 @@ fn rest_fixture(fixtures: &Value, request: &GhRequest) -> (u16, Value) {
             )
         }
         ("PUT", ["repos", _, _, "pulls", _, "merge-async"]) => (200, json!({ "status": "merged" })),
+        ("POST", ["repos", owner, name, "pulls", number, "comments"]) => (
+            201,
+            json!({ "id": 9001, "node_id": "PRRC_now",
+                "html_url": format!("https://github.com/{owner}/{name}/pull/{number}#discussion_r9001") }),
+        ),
+        ("PATCH" | "DELETE", ["repos", _, _, "issues", "comments", _]) => (200, json!({})),
         ("POST" | "DELETE", ["repos", _, _, "pulls", number, "requested_reviewers"]) => {
             (200, json!({ "number": number.parse::<u64>().ok() }))
         }
@@ -375,6 +398,7 @@ pub struct GitHubService {
     metadata: Mutex<HashMap<String, (Instant, RepoMergeMetadata)>>,
     stacks: Mutex<HashMap<String, (Instant, Option<StackView>)>>,
     previews: Mutex<HashMap<String, (Instant, PrPreviews)>>,
+    users: Mutex<HashMap<String, (Instant, Vec<GitHubUser>)>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -391,7 +415,26 @@ impl GitHubService {
             metadata: Mutex::new(HashMap::new()),
             stacks: Mutex::new(HashMap::new()),
             previews: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The repository's assignable users, cached for ten minutes (mentions and the reviewer picker).
+    pub(crate) async fn assignable_users(
+        &self,
+        repo: &RepoRef,
+        refresh: bool,
+    ) -> Result<Vec<GitHubUser>, GitHubError> {
+        let key = repo.slug();
+        if !refresh
+            && let Some((at, users)) = lock(&self.users).get(&key)
+            && at.elapsed() < USERS_TTL
+        {
+            return Ok(users.clone());
+        }
+        let users = self.client.assignable_users(repo).await?;
+        lock(&self.users).insert(key, (Instant::now(), users.clone()));
+        Ok(users)
     }
 
     pub fn from_env() -> Self {

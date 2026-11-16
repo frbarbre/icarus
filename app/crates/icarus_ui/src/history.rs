@@ -123,7 +123,7 @@ fn resume_on_server(entry: HistoryEntry, path: Option<PathBuf>, cx: &mut App) {
     .detach_and_log_err(cx);
 }
 
-fn open_resumed(agent_id: String, path: Option<PathBuf>, cx: &mut App) {
+pub(crate) fn open_resumed(agent_id: String, path: Option<PathBuf>, cx: &mut App) {
     let open =
         move |workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
             crate::open_agent_tab(Some(agent_id), None, workspace, window, cx);

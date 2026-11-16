@@ -230,6 +230,21 @@ impl Editor {
         cx.notify();
     }
 
+    /// Hands the gutter's "+" button to `hook` (shown even without the AI diff review flag).
+    pub fn set_gutter_comment_hook(
+        &mut self,
+        hook: Option<crate::GutterCommentHook>,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_diff_review_button = hook.is_some();
+        self.gutter_comment_hook = hook;
+        cx.notify();
+    }
+
+    pub fn gutter_comment_hook(&self) -> Option<&crate::GutterCommentHook> {
+        self.gutter_comment_hook.as_ref()
+    }
+
     fn set_show_scrollbars(&mut self, show: bool, cx: &mut Context<Self>) {
         self.show_scrollbars = ScrollbarAxes {
             horizontal: show,
