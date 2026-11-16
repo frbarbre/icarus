@@ -36,8 +36,8 @@ fn configured_workspace_root(home: &std::path::Path) -> Option<PathBuf> {
             return None;
         }
     };
-    let root = doc.get("workspace")?.get("root")?.as_str()?.trim().to_string();
-    expand_workspace_root(&root, home)
+    let root = doc.get("workspace")?.get("root")?.as_str()?;
+    expand_workspace_root(root.trim(), home)
 }
 
 fn expand_workspace_root(root: &str, home: &std::path::Path) -> Option<PathBuf> {
