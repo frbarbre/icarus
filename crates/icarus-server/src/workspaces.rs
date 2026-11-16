@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::agent::{AgentOptions, AgentState};
+use crate::hooks::{SetupDecision, setup_key, should_run_setup};
 use crate::next_action;
 use crate::server::{Server, params, rpc, to_value};
 use crate::state::{Workspace, workspace_slug};
@@ -58,6 +59,7 @@ impl Server {
         let mut value = serde_json::to_value(workspace).unwrap_or_default();
         value["agents"] = json!(agents);
         value["terminals"] = json!(terminals);
+        value["setup"] = json!(self.setup_status(&workspace.id));
         value["sleeping"] = json!(matches!(
             self.store.kv_get(&sleep_key(&workspace.id)),
             Ok(Some(_))
@@ -142,6 +144,8 @@ impl Server {
                     pr_url: Option<String>,
                     /// Start the agent with Claude Code's Remote Control; default `agents.remote_control`.
                     remote_control: Option<bool>,
+                    /// The project's setup script: run, skip, inherit (its `setupRunPolicy`) or auto.
+                    setup: Option<Value>,
                 }
                 let p: P = params(p)?;
                 let project = self
@@ -149,6 +153,12 @@ impl Server {
                     .project(&p.project)
                     .map_err(internal)?
                     .ok_or_else(|| rpc("not_found", format!("project {}", p.project)))?;
+                let setup_decision = SetupDecision::parse(p.setup.as_ref())?;
+                // Decided before the worktree exists, so an "ask" project leaves nothing behind.
+                let hooks = self.hooks_for(&project.root, &project.root);
+                if hooks.setup.is_some() {
+                    should_run_setup(hooks.run_policy, setup_decision)?;
+                }
                 // Checked before the worktree exists, so a typo leaves nothing behind.
                 if let Some(key) = p
                     .account
@@ -224,6 +234,10 @@ impl Server {
                     created_at_ms: now_ms(),
                 };
                 self.store.insert_workspace(&workspace).map_err(internal)?;
+                if let Err(error) = self.start_setup(&workspace, &project.root, setup_decision) {
+                    tracing::warn!("setup for {}: {}", workspace.name, error.message);
+                    self.record_setup_failure(&workspace.id, error.message);
+                }
                 if p.agent {
                     let settings = self.resolved_settings(Some(&project.root));
                     let provider = p
@@ -254,10 +268,24 @@ impl Server {
                         .await
                         .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
                     if let Some(prompt) = p.prompt {
-                        agent
-                            .send(&prompt, &[])
-                            .await
-                            .map_err(|e| rpc("send_failed", format!("{e:#}")))?;
+                        if self.agent_waits_for_setup(&workspace.id) {
+                            // `wait-for-setup`: the agent exists now, its first prompt goes once setup ends.
+                            let server = Arc::clone(self);
+                            let workspace_id = workspace.id.clone();
+                            tokio::spawn(async move {
+                                server.wait_for_setup(&workspace_id).await;
+                                if let Err(error) = agent.send(&prompt, &[]).await {
+                                    tracing::warn!(
+                                        "first prompt after setup of {workspace_id}: {error:#}"
+                                    );
+                                }
+                            });
+                        } else {
+                            agent
+                                .send(&prompt, &[])
+                                .await
+                                .map_err(|e| rpc("send_failed", format!("{e:#}")))?;
+                        }
                     }
                 }
                 let mut value = self.workspace_json(&workspace);
@@ -343,6 +371,12 @@ impl Server {
                     force: bool,
                     #[serde(default = "yes")]
                     delete_branch: bool,
+                    /// Remove without running the project's archive script.
+                    #[serde(default)]
+                    skip_archive: bool,
+                    /// Remove even if the archive script fails (`force` implies it).
+                    #[serde(default)]
+                    allow_failed_archive: bool,
                 }
                 let p: P = params(p)?;
                 let workspace = self.workspace_by_key(&p.id)?;
@@ -361,6 +395,33 @@ impl Server {
                     .project(&workspace.project_id)
                     .map_err(internal)?
                     .ok_or_else(|| rpc("not_found", "project"))?;
+                // Orca runs the archive hook before any teardown, and a failure stops the removal.
+                let archive = if p.skip_archive || !workspace.path.is_dir() {
+                    None
+                } else {
+                    self.run_archive(&workspace, &project.root).await
+                };
+                if let Some(outcome) = &archive
+                    && !outcome.success
+                    && !(p.force || p.allow_failed_archive)
+                {
+                    let output: String = outcome
+                        .output
+                        .chars()
+                        .rev()
+                        .take(2000)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    return Err(rpc(
+                        "archive_failed",
+                        format!(
+                            "the archive script failed, so {} was kept; remove with force (or allow_failed_archive) to remove it anyway\n{output}",
+                            workspace.name
+                        ),
+                    ));
+                }
                 let (root, path, force, delete_branch) = (
                     project.root,
                     workspace.path.clone(),
@@ -398,7 +459,40 @@ impl Server {
                     .remove_workspace(&workspace.id)
                     .map_err(internal)?;
                 let _ = self.store.kv_delete(&sleep_key(&workspace.id));
-                Ok(json!({ "removed": true }))
+                let _ = self.store.kv_delete(&setup_key(&workspace.id));
+                let runner = self
+                    .paths
+                    .home
+                    .join("setup-runners")
+                    .join(format!("{}.sh", workspace.id));
+                if runner.exists()
+                    && let Err(error) = std::fs::remove_file(&runner)
+                {
+                    tracing::warn!("removing {}: {error}", runner.display());
+                }
+                Ok(json!({ "removed": true, "archive": archive }))
+            }
+            "workspace.setup" => {
+                let key: Key = params(p)?;
+                let workspace = self.workspace_by_key(&key.id)?;
+                if self
+                    .setup_status(&workspace.id)
+                    .is_some_and(|s| s.state == crate::hooks::SetupState::Running)
+                {
+                    return Err(rpc("setup_running", "setup is already running"));
+                }
+                let project = self
+                    .store
+                    .project(&workspace.project_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| rpc("not_found", "project"))?;
+                match self.start_setup(&workspace, &project.root, SetupDecision::Run)? {
+                    Some(status) => Ok(json!(status)),
+                    None => Err(rpc(
+                        "no_setup_script",
+                        "this project has no setup script (scripts.setup in orca.yaml or project.hooks.scripts.setup)",
+                    )),
+                }
             }
             "workspace.sleep" => {
                 let key: Key = params(p)?;

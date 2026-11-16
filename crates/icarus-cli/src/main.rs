@@ -580,10 +580,20 @@ enum WorkspaceCommand {
         /// Start the agent with Claude Code's Remote Control; defaults to `agents.remote_control`.
         #[arg(long, value_name = "on|off")]
         remote_control: Option<Switch>,
+        /// Run the project's setup script even if its policy skips it (or asks).
+        #[arg(long, conflicts_with = "no_setup")]
+        setup: bool,
+        /// Don't run the project's setup script.
+        #[arg(long)]
+        no_setup: bool,
     },
     List {
         #[arg(long)]
         project: Option<String>,
+    },
+    /// Run the project's setup script again, in a new Setup terminal.
+    Setup {
+        id: String,
     },
     /// Arrange the workspace's tabs with a named layout; an app that opens later applies it then.
     Layout {
@@ -615,12 +625,20 @@ enum WorkspaceCommand {
     Turns {
         id: String,
     },
+    /// Remove the worktree; the project's archive script runs first and a failure keeps it.
     Remove {
         id: String,
+        /// Remove even with local changes or a failed archive script.
         #[arg(long)]
         force: bool,
         #[arg(long)]
         keep_branch: bool,
+        /// Don't run the project's archive script.
+        #[arg(long)]
+        skip_archive: bool,
+        /// Remove even if the archive script fails, but keep the dirty-checkout check.
+        #[arg(long)]
+        allow_failed_archive: bool,
     },
     /// Show the workspace's next step (the next-action button); --run runs it.
     NextAction {
@@ -1756,8 +1774,17 @@ async fn main() -> Result<()> {
         Command::Workspace { command } => {
             let client = connect(&cli).await?;
             let summary = |w: &Value| {
+                let setup = match (
+                    w["setup"]["state"].as_str(),
+                    w["setup"]["exit_code"].as_i64(),
+                ) {
+                    (Some("failed"), Some(code)) => format!("  setup failed ({code})"),
+                    (Some("failed"), None) => "  setup failed".to_owned(),
+                    (Some("running"), _) => "  setting up".to_owned(),
+                    _ => String::new(),
+                };
                 format!(
-                    "{}  {}  {}  {}",
+                    "{}  {}  {}  {}{setup}",
                     w["id"].as_str().unwrap_or_default(),
                     w["name"].as_str().unwrap_or_default(),
                     w["status"].as_str().unwrap_or("-"),
@@ -1779,10 +1806,17 @@ async fn main() -> Result<()> {
                     pr_url,
                     account,
                     remote_control,
+                    setup,
+                    no_setup,
                 } => {
                     let issue = from_linear
                         .as_ref()
                         .map(|id| json!({ "provider": "linear", "id": id }));
+                    let setup = match (setup, no_setup) {
+                        (true, _) => json!("run"),
+                        (_, true) => json!("skip"),
+                        _ => Value::Null,
+                    };
                     let value = client
                         .request_timeout(
                             "workspace.create",
@@ -1791,6 +1825,7 @@ async fn main() -> Result<()> {
                                 "fetch": fetch, "status": status, "prompt": prompt, "issue": issue,
                                 "agent": !no_agent, "layout": layout, "pr_url": pr_url,
                                 "account": account, "remote_control": remote_control.map(Switch::enabled),
+                                "setup": setup,
                             }),
                             Duration::from_secs(300),
                         )
@@ -1919,14 +1954,41 @@ async fn main() -> Result<()> {
                     id,
                     force,
                     keep_branch,
+                    skip_archive,
+                    allow_failed_archive,
                 } => {
                     let value = client
-                        .request(
+                        .request_timeout(
                             "workspace.remove",
-                            json!({ "id": id, "force": force, "delete_branch": !keep_branch }),
+                            json!({
+                                "id": id, "force": force, "delete_branch": !keep_branch,
+                                "skip_archive": skip_archive,
+                                "allow_failed_archive": allow_failed_archive,
+                            }),
+                            Duration::from_secs(300),
                         )
                         .await?;
-                    print(&cli, &value, |_| "removed".into());
+                    print(&cli, &value, |v| {
+                        if v["archive"]["success"] == false {
+                            format!(
+                                "removed (the archive script failed)\n{}",
+                                v["archive"]["output"].as_str().unwrap_or_default()
+                            )
+                        } else {
+                            "removed".into()
+                        }
+                    });
+                }
+                WorkspaceCommand::Setup { id } => {
+                    let value = client
+                        .request("workspace.setup", json!({ "id": id }))
+                        .await?;
+                    print(&cli, &value, |v| {
+                        format!(
+                            "setup running in terminal {}",
+                            v["terminal"].as_str().unwrap_or("?")
+                        )
+                    });
                 }
                 WorkspaceCommand::NextAction { id, run } => {
                     if *run {

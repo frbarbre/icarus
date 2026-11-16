@@ -239,6 +239,7 @@ impl Server {
         crate::ports::spawn(Arc::clone(&self));
         crate::linear::spawn(Arc::clone(&self));
         crate::updates::spawn(Arc::clone(&self));
+        self.resume_setups();
         // launchd and systemd stop (and restart) the service with SIGTERM; nothing may die.
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

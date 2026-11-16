@@ -187,6 +187,16 @@ fn hooks_schema() -> Schema {
             "Setup and archive scripts.",
             open(vec![field("setup", "", Str), field("archive", "", Str)]),
         ),
+        field(
+            "setupTimeoutMs",
+            "Stop the setup script after this many milliseconds (none by default).",
+            Schema::Integer,
+        ),
+        field(
+            "archiveTimeoutMs",
+            "Stop the archive script after this many milliseconds (default 120000).",
+            Schema::Integer,
+        ),
     ])
 }
 

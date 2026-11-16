@@ -749,6 +749,8 @@ impl Server {
                     "status": initial_column,
                     "title": title,
                     "agent": false,
+                    // Nobody is there to answer an "ask" project, so its setup runs, as Orca's review creation does.
+                    "setup": "auto",
                 }),
             )
             .await
@@ -770,6 +772,25 @@ impl Server {
             .update_workspace(&workspace)
             .map_err(|e| e.to_string())?;
         let agent = match agent {
+            Some(launch) if self.agent_waits_for_setup(&workspace.id) => {
+                // `wait-for-setup`: the review agent starts once setup ends; the tick doesn't wait for it.
+                let server = Arc::clone(self);
+                let launch = launch.clone();
+                let settings = settings.clone();
+                let workspace = workspace.clone();
+                tokio::spawn(async move {
+                    server.wait_for_setup(&workspace.id).await;
+                    let launched = server.launch(&workspace, &launch, &settings).await;
+                    if !launched.ok {
+                        tracing::warn!(
+                            "review agent for {} after setup: {}",
+                            workspace.name,
+                            launched.detail["error"]
+                        );
+                    }
+                });
+                json!({ "deferred": "until setup finishes" })
+            }
             Some(launch) => {
                 let launched = self.launch(&workspace, launch, settings).await;
                 if !launched.ok {

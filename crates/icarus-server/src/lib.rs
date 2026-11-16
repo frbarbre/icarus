@@ -9,6 +9,7 @@ pub mod github;
 pub mod gitops;
 pub mod handoff;
 pub mod history;
+pub mod hooks;
 pub mod layouts;
 pub mod linear;
 pub mod next_action;

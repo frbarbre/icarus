@@ -69,6 +69,9 @@ pub enum Tab {
     Terminal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command: Option<String>,
+        /// An existing server terminal to show (e.g. the workspace's Setup terminal) instead of a new one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_id: Option<String>,
     },
 }
 

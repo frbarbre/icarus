@@ -42,6 +42,13 @@ fn in_icarus_workspace(cwd: &Path, cx: &App) -> bool {
 
 /// "folder — zsh", as Zed titles its own shells, instead of the attach command line.
 fn tab_title(info: &serde_json::Value) -> Option<String> {
+    // A labelled terminal (the workspace's "Setup", a quick command) is named by its label.
+    if let Some(label) = info["label"]
+        .as_str()
+        .filter(|label| !label.trim().is_empty())
+    {
+        return Some(label.to_owned());
+    }
     let folder = Path::new(info["cwd"].as_str()?)
         .file_name()?
         .to_string_lossy()
@@ -210,6 +217,9 @@ mod tests {
         assert_eq!(tab_title(&info).as_deref(), Some("demo-1 — bash"));
         let info = serde_json::json!({ "cwd": "/w/demo-1", "command": [] });
         assert_eq!(tab_title(&info).as_deref(), Some("demo-1"));
+        let info =
+            serde_json::json!({ "cwd": "/w/demo-1", "command": ["/bin/zsh"], "label": "Setup" });
+        assert_eq!(tab_title(&info).as_deref(), Some("Setup"));
     }
 
     #[gpui::test]

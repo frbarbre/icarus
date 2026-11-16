@@ -45,7 +45,9 @@ use gpui::{
 };
 use gpui_tokio::Tokio;
 use icarus_client::Client;
-use ui::{ButtonLike, ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*};
+use ui::{
+    ButtonLike, CommonAnimationExt as _, ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*,
+};
 use util::ResultExt as _;
 use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
 use workspace::{AppState, MultiWorkspace, OpenOptions, Workspace};
@@ -53,8 +55,8 @@ use workspace::{AppState, MultiWorkspace, OpenOptions, Workspace};
 use crate::github_panel::{AvatarKind, render_avatar};
 
 pub use model::{
-    AgentSummary, IssueLabel, PrAuthor, PrSummary, StackGroup, StackLane, StackPlace, StatusColumn,
-    StatusGroup, WorkspaceSummary, group_by_stack, group_by_status,
+    AgentSummary, IssueLabel, PrAuthor, PrSummary, SetupBadge, SetupSummary, StackGroup, StackLane,
+    StackPlace, StatusColumn, StatusGroup, WorkspaceSummary, group_by_stack, group_by_status,
 };
 
 actions!(
@@ -82,6 +84,35 @@ actions!(
         OpenWorkspaceSwitcher,
     ]
 );
+
+/// A card's setup state: a spinner while the project's setup script runs, a warning if it failed.
+fn render_setup_badge(workspace_id: &str, badge: SetupBadge) -> impl IntoElement {
+    let (icon, label, color, tooltip) = match badge {
+        SetupBadge::Running => (
+            Icon::new(IconName::ArrowCircle)
+                .size(IconSize::XSmall)
+                .color(Color::Accent)
+                .with_rotate_animation(2),
+            "Setting up",
+            Color::Accent,
+            "The project's setup script is running in the Setup terminal.".to_owned(),
+        ),
+        SetupBadge::Failed(reason) => (
+            Icon::new(IconName::Warning)
+                .size(IconSize::XSmall)
+                .color(Color::Error),
+            "Setup failed",
+            Color::Error,
+            format!("{reason} Rerun it with icarus workspace setup."),
+        ),
+    };
+    h_flex()
+        .id(SharedString::from(format!("icarus-setup-{workspace_id}")))
+        .gap_0p5()
+        .child(icon)
+        .child(Label::new(label).size(LabelSize::XSmall).color(color))
+        .tooltip(Tooltip::text(tooltip))
+}
 
 /// Orca's tab.nextSameType / previousSameType: cycles the active pane's tabs of the active tab's kind.
 fn activate_item_of_same_type(
@@ -1882,6 +1913,10 @@ impl WorkspacesPanel {
                     )
                     .child(Label::new(workspace.display_title()).size(LabelSize::Default))
                     .child(div().flex_1())
+                    .when_some(
+                        workspace.setup.as_ref().and_then(SetupSummary::badge),
+                        |row, badge| row.child(render_setup_badge(&workspace.id, badge)),
+                    )
                     .when(view.shows("inline-agents") && agent_count > 0, |row| {
                         row.child(
                             Label::new(if working > 0 {
@@ -2498,6 +2533,7 @@ mod tests {
             agents: Vec::new(),
             pr_author: None,
             pr: None,
+            setup: None,
         }
     }
 

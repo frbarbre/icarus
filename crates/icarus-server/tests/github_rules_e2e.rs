@@ -582,6 +582,52 @@ async fn automation_tick_moves_a_status_and_creates_a_review_workspace() {
 }
 
 #[tokio::test]
+async fn deleting_a_merged_workspace_runs_the_archive_script_and_a_failure_keeps_it() {
+    let markers = tempfile::tempdir().expect("markers");
+    let marker = markers.path().join("archived.txt");
+    let mut settings = rules_settings(Some(true));
+    settings["rules"]["orca_compat"]["onResolved"] = json!("delete");
+    settings["project"] = json!({ "hooks": { "scripts": { "archive": format!(
+        "[ \"$ORCA_WORKSPACE_NAME\" = feat-keep ] && exit 1; echo \"$ORCA_WORKSPACE_NAME\" >> '{}'",
+        marker.display()
+    ) } } });
+    let world = World::new(settings, json!({ "viewer": "me" })).await;
+    let (gone, gone_path, gone_head) = world.workspace("feat-gone").await;
+    let (kept, kept_path, kept_head) = world.workspace("feat-keep").await;
+    world.set_fixtures(json!({
+        "viewer": "me",
+        "pulls": [
+            pull(11, "feat-gone", &gone_head, json!({ "state": "MERGED" })),
+            pull(12, "feat-keep", &kept_head, json!({ "state": "MERGED" })),
+        ],
+    }));
+
+    let tick = world.request("rules.tick", json!({})).await;
+    let ids: Vec<String> = world
+        .workspaces()
+        .await
+        .iter()
+        .filter_map(|w| w["id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(!ids.contains(&gone), "{tick}");
+    assert!(!gone_path.exists());
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("archive ran"),
+        "feat-gone\n"
+    );
+    assert!(
+        ids.contains(&kept),
+        "an unforced delete keeps a workspace whose archive failed: {tick}"
+    );
+    assert!(kept_path.is_dir());
+    assert!(
+        tick["errors"].to_string().contains("archive")
+            || tick.to_string().contains("archive_failed"),
+        "{tick}"
+    );
+}
+
+#[tokio::test]
 async fn unarmed_ticks_are_dry_runs_that_execute_nothing() {
     let world = World::new(rules_settings(None), json!({ "viewer": "me" })).await;
     let (own, _, own_head) = world.workspace("feat-a").await;

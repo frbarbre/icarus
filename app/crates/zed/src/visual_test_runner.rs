@@ -843,6 +843,7 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
                 .collect(),
             pr_author: None,
             pr: None,
+            setup: None,
         }
     };
     let with_author = |mut workspace: icarus_ui::WorkspaceSummary, login: &str| {
@@ -852,6 +853,15 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
         });
         workspace
     };
+    let with_setup =
+        |mut workspace: icarus_ui::WorkspaceSummary, state: &str, exit_code: Option<i64>| {
+            workspace.setup = Some(icarus_ui::SetupSummary {
+                state: state.into(),
+                exit_code,
+                error: None,
+            });
+            workspace
+        };
     vec![
         card(
             "abc-101",
@@ -870,12 +880,16 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
             ),
             "maria",
         ),
-        card(
-            "abc-98",
-            Some(("ABC-98", "Delete a screen and its pair")),
-            Some("PM Approval"),
-            None,
-            &["idle", "idle"],
+        with_setup(
+            card(
+                "abc-98",
+                Some(("ABC-98", "Delete a screen and its pair")),
+                Some("PM Approval"),
+                None,
+                &["idle", "idle"],
+            ),
+            "failed",
+            Some(3),
         ),
         with_author(
             card(
@@ -887,12 +901,16 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
             ),
             "frederik",
         ),
-        card(
-            "abc-120",
-            Some(("ABC-120", "Remove per-field layer commands")),
-            Some("Draft"),
+        with_setup(
+            card(
+                "abc-120",
+                Some(("ABC-120", "Remove per-field layer commands")),
+                Some("Draft"),
+                None,
+                &["idle"],
+            ),
+            "running",
             None,
-            &["idle"],
         ),
         card("main", None, None, Some("main"), &[]),
     ]

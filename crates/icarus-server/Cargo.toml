@@ -70,6 +70,7 @@ ureq = { version = "3.5.2", default-features = false, features = [
   "rustls-no-provider",
 ] }
 uuid = { version = "1.29.2", features = ["v4"] }
+yaml-rust2 = "0.13.0"
 
 [lints]
 workspace = true

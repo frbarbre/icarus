@@ -128,6 +128,13 @@ impl Server {
             .await;
         self.bind_agent_tabs(workspace, root.as_deref(), &mut layout)
             .await?;
+        if let Some(terminal) = self
+            .setup_status(&workspace.id)
+            .filter(|status| status.state == crate::hooks::SetupState::Running)
+            .and_then(|status| status.terminal)
+        {
+            crate::hooks::show_setup_terminal(&mut layout, &terminal);
+        }
         let payload = json!({
             "workspace_id": workspace.id,
             "path": workspace.path,

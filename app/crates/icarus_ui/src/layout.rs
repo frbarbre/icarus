@@ -420,9 +420,13 @@ impl Build<'_> {
                 let task = open_file(path, *line, index, pane, workspace, window, cx);
                 self.pending.push(task);
             }
-            Tab::Terminal { command } => {
+            Tab::Terminal {
+                command,
+                terminal_id,
+            } => {
                 let task = open_terminal(
                     command.clone(),
+                    terminal_id.clone(),
                     worktree_root,
                     index,
                     pane,
@@ -527,6 +531,7 @@ fn open_diff(
 
 fn open_terminal(
     command: Option<String>,
+    terminal_id: Option<String>,
     worktree_root: &Path,
     index: usize,
     pane: &Entity<Pane>,
@@ -536,8 +541,12 @@ fn open_terminal(
 ) -> Task<anyhow::Result<()>> {
     let project = workspace.project().clone();
     let cwd = worktree_root.to_path_buf();
-    let create = project.update(cx, |project, cx| match command {
-        Some(command) => project.create_terminal_task(
+    let create = project.update(cx, |project, cx| match (command, terminal_id) {
+        // An existing server terminal, e.g. the workspace's Setup: show it rather than start another.
+        (_, Some(terminal_id)) => {
+            project.create_terminal_shell_reattaching(Some(cwd), Some(terminal_id), cx)
+        }
+        (Some(command), None) => project.create_terminal_task(
             task::SpawnInTerminal {
                 label: command.clone(),
                 full_label: command.clone(),
@@ -551,7 +560,7 @@ fn open_terminal(
             },
             cx,
         ),
-        None => project.create_terminal_shell(Some(cwd), cx),
+        (None, None) => project.create_terminal_shell(Some(cwd), cx),
     });
     let pane = pane.downgrade();
     cx.spawn_in(window, async move |workspace, cx| {

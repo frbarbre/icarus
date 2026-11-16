@@ -12,7 +12,7 @@ use serde_json::{Value as Json, json};
 
 use crate::server::{Server, params, rpc};
 
-fn to_json(value: &icarus_settings::Value) -> Json {
+pub(crate) fn to_json(value: &icarus_settings::Value) -> Json {
     serde_json::from_str(&value.to_compact_string()).unwrap_or(Json::Null)
 }
 

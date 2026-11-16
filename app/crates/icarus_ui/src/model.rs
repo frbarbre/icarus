@@ -28,6 +28,40 @@ pub struct WorkspaceSummary {
     /// The pull request as the server last cached it; listing never waits on GitHub.
     #[serde(default)]
     pub pr: Option<PrSummary>,
+    /// The project's setup script run for this workspace, if it has one.
+    #[serde(default)]
+    pub setup: Option<SetupSummary>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct SetupSummary {
+    /// running, succeeded, failed or skipped.
+    pub state: String,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// What a card says about setup: only while it runs or after it failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupBadge {
+    Running,
+    Failed(String),
+}
+
+impl SetupSummary {
+    pub fn badge(&self) -> Option<SetupBadge> {
+        match self.state.as_str() {
+            "running" => Some(SetupBadge::Running),
+            "failed" => Some(SetupBadge::Failed(match (&self.error, self.exit_code) {
+                (Some(error), _) => error.clone(),
+                (None, Some(code)) => format!("The setup script exited with code {code}."),
+                (None, None) => "The setup script failed.".to_owned(),
+            })),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -274,7 +308,43 @@ mod tests {
             agents: Vec::new(),
             pr_author: None,
             pr: None,
+            setup: None,
         }
+    }
+
+    #[test]
+    fn cards_mention_setup_only_while_it_runs_or_after_it_failed() {
+        let setup = |state: &str, exit_code: Option<i64>, error: Option<&str>| SetupSummary {
+            state: state.into(),
+            exit_code,
+            error: error.map(str::to_owned),
+        };
+        assert_eq!(
+            setup("running", None, None).badge(),
+            Some(SetupBadge::Running)
+        );
+        assert_eq!(setup("succeeded", Some(0), None).badge(), None);
+        assert_eq!(setup("skipped", None, None).badge(), None);
+        assert_eq!(
+            setup("failed", Some(3), None).badge(),
+            Some(SetupBadge::Failed(
+                "The setup script exited with code 3.".into()
+            ))
+        );
+        assert_eq!(
+            setup("failed", None, Some("Setup timed out after 500ms.")).badge(),
+            Some(SetupBadge::Failed("Setup timed out after 500ms.".into()))
+        );
+        let parsed: WorkspaceSummary = serde_json::from_value(serde_json::json!({
+            "id": "ws-1", "project_id": "p", "name": "n", "path": "/w/n",
+            "branch": null, "status": null, "title": null, "issue": null,
+            "setup": { "state": "running", "terminal": "term-1", "started_at_ms": 1 },
+        }))
+        .expect("parses the server's listing");
+        assert_eq!(
+            parsed.setup.and_then(|s| s.badge()),
+            Some(SetupBadge::Running)
+        );
     }
 
     fn stacked(name: &str, status: Option<&str>, stack: u64, position: u32) -> WorkspaceSummary {

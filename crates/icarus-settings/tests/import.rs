@@ -181,6 +181,18 @@ fn projects_become_documents_keyed_by_remote() {
         Some(&Value::from("make worktree-setup"))
     );
     assert_eq!(
+        get(widgets, "project.hooks.scripts.archive"),
+        Some(&Value::from("make worktree-archive"))
+    );
+    assert_eq!(
+        get(widgets, "project.hooks.setupAgentStartupPolicy"),
+        Some(&Value::from("wait-for-setup"))
+    );
+    assert_eq!(
+        get(widgets, "project.hooks.setupRunPolicy"),
+        Some(&Value::from("run-by-default"))
+    );
+    assert_eq!(
         get(widgets, "project.ciTriage.prompt"),
         Some(&Value::from(
             "Triage the failure. Prefer reruns for flakes — never force-push."
