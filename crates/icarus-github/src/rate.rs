@@ -97,6 +97,15 @@ impl RateBudget {
             .is_none_or(|limit| limit.remaining >= floor)
     }
 
+    /// Whether a call to `resource` could only be refused: GitHub asked to wait, or none are left
+    /// before the reset. Failed calls still count against secondary limits, so they aren't sent.
+    pub fn exhausted_at(&self, resource: &str, now: u64) -> bool {
+        self.backoff_until.is_some_and(|until| until > now)
+            || self
+                .live(resource, now)
+                .is_some_and(|limit| limit.remaining == 0)
+    }
+
     pub fn allows(&self, resource: &str) -> bool {
         self.allows_at(resource, now_epoch())
     }

@@ -407,6 +407,22 @@ fn load_diff(
     else {
         return uncommitted(project.clone(), buffer.clone(), cx);
     };
+    let local_dir = (project.read(cx).is_local() && !project.read(cx).fs().is_fake())
+        .then(|| repo.read(cx).work_directory_abs_path.clone());
+    if let Some(dir) = local_dir {
+        let base_ref = base_ref.clone();
+        let path = repo_path.as_unix_str().to_owned();
+        let buffer = buffer.clone();
+        let lookup = cx.background_spawn(async move { base_blob(&dir, &base_ref, &path).await });
+        return cx.spawn(async move |cx| {
+            let old = lookup.await?;
+            git_store
+                .update(cx, |git_store, cx| {
+                    git_store.open_diff_since(old, buffer, repo, cx)
+                })
+                .await
+        });
+    }
     let tree = repo.update(cx, |repo, cx| {
         repo.diff_tree(
             DiffTreeType::MergeBaseWithWorktree {
@@ -440,6 +456,70 @@ fn load_diff(
             None => cx.update(|cx| uncommitted(project, buffer, cx)).await,
         }
     })
+}
+
+/// Counts diff opens, so a preview whose load finishes after a newer open is dropped instead of shown.
+static OPEN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A preview open that a newer one replaced before it loaded.
+#[derive(Debug)]
+pub struct Superseded;
+
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a newer file was opened")
+    }
+}
+
+impl std::error::Error for Superseded {}
+
+/// How long a resolved merge base is trusted; a rebase or fetch can move it.
+const MERGE_BASE_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
+static MERGE_BASES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(Arc<Path>, String), (String, std::time::Instant)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+async fn git_output(dir: &Path, args: &[&str]) -> Result<Option<String>> {
+    let output = util::command::new_command("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .await?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+}
+
+/// The file's blob at the merge base with `base`, or None when it didn't exist there. One `rev-parse`
+/// per file instead of diffing the whole tree, which takes seconds in a large repo.
+async fn base_blob(dir: &Arc<Path>, base: &str, path: &str) -> Result<Option<git::Oid>> {
+    let key = (dir.clone(), base.to_owned());
+    let cached = MERGE_BASES
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+        .filter(|(_, at)| at.elapsed() < MERGE_BASE_TTL)
+        .map(|(sha, _)| sha);
+    let merge_base = match cached {
+        Some(sha) => sha,
+        None => {
+            let sha = git_output(dir, &["merge-base", base, "HEAD"])
+                .await?
+                .with_context(|| format!("no merge base with {base}"))?;
+            if let Ok(mut cache) = MERGE_BASES.lock() {
+                cache.insert(key, (sha.clone(), std::time::Instant::now()));
+            }
+            sha
+        }
+    };
+    let spec = format!("{merge_base}:{path}");
+    match git_output(dir, &["rev-parse", "--verify", "--quiet", &spec]).await? {
+        Some(sha) => Ok(Some(sha.parse()?)),
+        None => Ok(None),
+    }
 }
 
 /// Opens `path`'s diff tab in `pane` (the active pane by default), or brings back the one already open.
@@ -493,6 +573,7 @@ fn open_diff_tab_as(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<Result<Entity<DiffTab>>> {
+    let generation = OPEN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let existing = workspace
         .items_of_type::<DiffTab>(cx)
         .find(|tab| tab.read(cx).path == path);
@@ -525,6 +606,9 @@ fn open_diff_tab_as(
         let diff = cx
             .update(|_, cx| load_diff(&project, &buffer, &project_path, &base, cx))?
             .await?;
+        if preview && OPEN_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            return Err(Superseded.into());
+        }
         workspace.update_in(cx, |workspace, window, cx| {
             let tab = cx.new(|cx| {
                 DiffTab::new(

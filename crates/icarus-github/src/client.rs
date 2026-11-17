@@ -119,6 +119,18 @@ impl<G: Gh> GitHub<G> {
     }
 
     pub async fn send(&self, request: GhRequest) -> Result<HttpResponse> {
+        let resource = if request.is_graphql() {
+            "graphql"
+        } else if request.endpoint.starts_with("search/") {
+            "search"
+        } else {
+            "core"
+        };
+        if lock(&self.budget).exhausted_at(resource, crate::rate::now_epoch()) {
+            return Err(GitHubError::RateLimited {
+                resource: resource.to_owned(),
+            });
+        }
         let output = self.gh.execute(&request).await?;
         let Some(response) = HttpResponse::parse(&output.stdout) else {
             let stderr = output.stderr.trim();

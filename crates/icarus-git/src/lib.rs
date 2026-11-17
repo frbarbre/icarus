@@ -464,10 +464,7 @@ pub fn local_state(worktree: &Path) -> Result<LocalState> {
         worktree,
         &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
     );
-    let status = git(
-        worktree,
-        &["status", "--porcelain=v2", "-z", "--untracked-files=normal"],
-    )?;
+    let status = shared_status(worktree, "normal")?;
     let records: Vec<&str> = status.split('\0').filter(|r| !r.is_empty()).collect();
     let has_local_conflicts = records.iter().any(|r| r.starts_with("u "));
     let has_uncommitted_changes = !records.is_empty();
@@ -722,11 +719,40 @@ fn line_counts(
     Ok((counts, binary))
 }
 
+type StatusSlot = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, String)>>>;
+
+static STATUS_RUNS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, &'static str), StatusSlot>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// `git status --porcelain=v2 -z` shared by concurrent callers: one waiting behind a run reuses the next
+/// run that started after it asked, so the answer is never older than the request. Many clients poll
+/// the same worktrees, and in a large repo each run costs hundreds of milliseconds.
+pub fn shared_status(worktree: &Path, untracked: &'static str) -> Result<String> {
+    let asked = std::time::Instant::now();
+    let slot = STATUS_RUNS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("git status cache poisoned"))?
+        .entry((worktree.to_path_buf(), untracked))
+        .or_default()
+        .clone();
+    let mut last = slot
+        .lock()
+        .map_err(|_| anyhow::anyhow!("git status slot poisoned"))?;
+    if let Some((started, output)) = last.as_ref()
+        && *started >= asked
+    {
+        return Ok(output.clone());
+    }
+    let started = std::time::Instant::now();
+    let flag = format!("--untracked-files={untracked}");
+    let output = git(worktree, &["status", "--porcelain=v2", "-z", &flag])?;
+    *last = Some((started, output.clone()));
+    Ok(output)
+}
+
 pub fn status_entries(worktree: &Path) -> Result<Vec<Entry>> {
-    let output = git(
-        worktree,
-        &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
-    )?;
+    let output = shared_status(worktree, "all")?;
     let mut entries = Vec::new();
     let mut fields = output.split('\0');
     while let Some(record) = fields.next() {

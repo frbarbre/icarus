@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use collections::{HashMap, HashSet};
@@ -41,6 +41,10 @@ actions!(
 );
 
 const GITHUB_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// How often a window that isn't in front re-reads the PR status.
+const GITHUB_BACKGROUND_INTERVAL: Duration = Duration::from_secs(60);
+/// Review threads are re-read at least this often while the panel shows, as Orca's 60s PR refresh.
+const THREADS_INTERVAL: Duration = Duration::from_secs(60);
 /// The trailing action slots of every row list, so icons line up whichever ones a row shows.
 const SLOT: Pixels = px(20.);
 
@@ -1018,6 +1022,20 @@ struct Snapshot {
     status: Option<PrStatus>,
     /// The PR's review threads, from the same server cache the diff gutters read.
     threads: Vec<ReviewThread>,
+    /// The workspace and PR `updated_at` the threads were read for; None when this snapshot skipped them.
+    threads_for: Option<(String, Option<String>)>,
+}
+
+/// When a snapshot reads the review threads. Like Orca they aren't polled: a comment or review
+/// changes the PR's `updated_at`, so they're read when that moves, on a manual refresh, or rarely.
+#[derive(Debug, Clone, PartialEq)]
+enum ThreadsFetch {
+    Refresh,
+    /// Read them if the PR isn't the one `known` describes, or if `due`.
+    IfChanged {
+        known: Option<(String, Option<String>)>,
+        due: bool,
+    },
 }
 
 async fn fetch_threads(client: &Client, workspace: &str, refresh: bool) -> Vec<ReviewThread> {
@@ -1039,7 +1057,7 @@ async fn fetch_threads(client: &Client, workspace: &str, refresh: bool) -> Vec<R
 async fn fetch_snapshot(
     client: Arc<Client>,
     paths: Vec<PathBuf>,
-    refresh_threads: bool,
+    threads_fetch: ThreadsFetch,
 ) -> Result<Snapshot> {
     let workspaces: Vec<WorkspaceEntry> = serde_json::from_value(
         client
@@ -1058,20 +1076,35 @@ async fn fetch_snapshot(
         )?),
         None => None,
     };
-    let has_pull_request = status
+    let pull_request = status
         .as_ref()
-        .is_some_and(|status| status.pull_request.is_some());
-    let threads = match &current {
-        Some(current) if has_pull_request => {
-            fetch_threads(&client, &current.id, refresh_threads).await
+        .and_then(|status| status.pull_request.as_ref());
+    let (threads, threads_for) = match (&current, pull_request) {
+        (Some(current), Some(pull_request)) => {
+            let key = (current.id.clone(), pull_request.updated_at.clone());
+            let wanted = match &threads_fetch {
+                ThreadsFetch::Refresh => true,
+                ThreadsFetch::IfChanged { known, due } => *due || known.as_ref() != Some(&key),
+            };
+            if wanted {
+                let refresh = threads_fetch == ThreadsFetch::Refresh;
+                (
+                    fetch_threads(&client, &current.id, refresh).await,
+                    Some(key),
+                )
+            } else {
+                (Vec::new(), None)
+            }
         }
-        _ => Vec::new(),
+        (Some(current), None) => (Vec::new(), Some((current.id.clone(), None))),
+        (None, _) => (Vec::new(), None),
     };
     Ok(Snapshot {
         workspaces,
         current,
         status,
         threads,
+        threads_for,
     })
 }
 
@@ -1141,6 +1174,9 @@ pub struct GitHubPanel {
     description_task: Option<Task<()>>,
     /// Workspaces whose description is folded.
     description_collapsed: HashSet<String>,
+    /// Showing in its dock; threads are only read while it is.
+    active: bool,
+    threads_read_at: Option<Instant>,
     _poll: Task<()>,
 }
 
@@ -1153,20 +1189,43 @@ impl GitHubPanel {
         workspace: WeakEntity<Workspace>,
         cx: AsyncWindowContext,
     ) -> Task<Result<Entity<Self>>> {
-        cx.spawn(async move |cx| cx.update(|_window, cx| cx.new(|cx| Self::new(workspace, cx))))
+        cx.spawn(async move |cx| {
+            cx.update(|window, cx| {
+                let handle = window.window_handle();
+                cx.new(|cx| Self::new(workspace, Some(handle), cx))
+            })
+        })
     }
 
-    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        window: Option<gpui::AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut panel = Self::empty(workspace, cx);
         panel.animate = true;
         if !crate::enabled(cx) {
             return panel;
         }
         panel._poll = cx.spawn(async move |this, cx| {
+            let mut last_poll: Option<Instant> = None;
             loop {
                 let Ok(workspace) = this.read_with(cx, |panel, _| panel.workspace.clone()) else {
                     return;
                 };
+                let in_front = window.is_none_or(|window| {
+                    cx.update_window(window, |_, window, _| window.is_window_active())
+                        .unwrap_or(false)
+                });
+                if !in_front
+                    && last_poll.is_some_and(|at| at.elapsed() < GITHUB_BACKGROUND_INTERVAL)
+                {
+                    cx.background_executor()
+                        .timer(GITHUB_REFRESH_INTERVAL)
+                        .await;
+                    continue;
+                }
+                last_poll = Some(Instant::now());
                 let client = cx.update(|cx| crate::routing::client_for_workspace(&workspace, cx));
                 let Some(client) = client else {
                     let offline = anyhow::anyhow!("not connected to the Icarus server");
@@ -1181,14 +1240,15 @@ impl GitHubPanel {
                         .await;
                     continue;
                 };
-                let Ok(paths) = this.update(cx, |panel, cx| {
+                let Ok((paths, threads_fetch)) = this.update(cx, |panel, cx| {
                     panel.load_layout(cx);
-                    panel.project_paths(cx)
+                    (panel.project_paths(cx), panel.threads_fetch(in_front))
                 }) else {
                     return;
                 };
                 let snapshot =
-                    Tokio::spawn_result(cx, fetch_snapshot(client.clone(), paths, false)).await;
+                    Tokio::spawn_result(cx, fetch_snapshot(client.clone(), paths, threads_fetch))
+                        .await;
                 let updated = this.update(cx, |panel, cx| match snapshot {
                     Ok(snapshot) => {
                         panel.client = Some(client);
@@ -1235,6 +1295,8 @@ impl GitHubPanel {
             description: None,
             description_task: None,
             description_collapsed: HashSet::default(),
+            active: false,
+            threads_read_at: None,
             _poll: Task::ready(()),
         }
     }
@@ -1530,6 +1592,7 @@ impl GitHubPanel {
                     current,
                     status: fixture.pr_status,
                     threads: fixture.threads,
+                    threads_for: None,
                 });
                 panel.preview_review = fixture.review.map(|review| (review, fixture.uncommitted));
             }
@@ -1567,9 +1630,18 @@ impl GitHubPanel {
         cx.notify();
     }
 
-    fn apply_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+    fn apply_snapshot(&mut self, mut snapshot: Snapshot, cx: &mut Context<Self>) {
         self.offline = None;
         self.refreshing = false;
+        if snapshot.threads_for.is_some() {
+            self.threads_read_at = Some(Instant::now());
+        } else if let Some(previous) = self.snapshot.take()
+            && previous.current.as_ref().map(|current| &current.id)
+                == snapshot.current.as_ref().map(|current| &current.id)
+        {
+            snapshot.threads = previous.threads;
+            snapshot.threads_for = previous.threads_for;
+        }
         self.snapshot = Some(snapshot);
         self.load_description(cx);
         cx.notify();
@@ -1727,6 +1799,38 @@ impl GitHubPanel {
         Some(frame.into_any_element())
     }
 
+    fn threads_fetch(&self, in_front: bool) -> ThreadsFetch {
+        ThreadsFetch::IfChanged {
+            known: self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.threads_for.clone()),
+            due: self.active
+                && in_front
+                && self
+                    .threads_read_at
+                    .is_none_or(|at| at.elapsed() >= THREADS_INTERVAL),
+        }
+    }
+
+    /// On opening the panel: the threads come back if the PR moved or they're over a minute old.
+    fn read_threads_if_stale(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let paths = self.project_paths(cx);
+        let threads_fetch = self.threads_fetch(true);
+        cx.spawn(async move |this, cx| {
+            let snapshot =
+                Tokio::spawn_result(cx, fetch_snapshot(client, paths, threads_fetch)).await;
+            this.update(cx, |panel, cx| match snapshot {
+                Ok(snapshot) => panel.apply_snapshot(snapshot, cx),
+                Err(error) => panel.set_offline(error, cx),
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
@@ -1735,7 +1839,8 @@ impl GitHubPanel {
         cx.notify();
         let paths = self.project_paths(cx);
         cx.spawn(async move |this, cx| {
-            let snapshot = Tokio::spawn_result(cx, fetch_snapshot(client, paths, true)).await;
+            let snapshot =
+                Tokio::spawn_result(cx, fetch_snapshot(client, paths, ThreadsFetch::Refresh)).await;
             this.update(cx, |panel, cx| match snapshot {
                 Ok(snapshot) => panel.apply_snapshot(snapshot, cx),
                 Err(error) => panel.set_offline(error, cx),
@@ -3549,6 +3654,14 @@ impl Panel for GitHubPanel {
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
         Some(IconName::PullRequest)
+    }
+
+    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        let became_active = active && !self.active;
+        self.active = active;
+        if became_active {
+            self.read_threads_if_stale(cx);
+        }
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

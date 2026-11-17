@@ -164,6 +164,8 @@ fn activate_item_of_same_type(
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// How often a window that isn't in front re-reads the workspaces; coming forward catches up within one tick.
+const BACKGROUND_INTERVAL: Duration = Duration::from_secs(30);
 /// A server round trip slower than this is logged; a local socket answers in a few milliseconds.
 pub(crate) const SLOW_REQUEST: Duration = Duration::from_millis(20);
 
@@ -1333,20 +1335,39 @@ impl WorkspacesPanel {
         workspace: WeakEntity<Workspace>,
         cx: AsyncWindowContext,
     ) -> Task<Result<Entity<Self>>> {
-        cx.spawn(async move |cx| cx.update(|_window, cx| cx.new(|cx| Self::new(workspace, cx))))
+        cx.spawn(async move |cx| {
+            cx.update(|window, cx| {
+                let handle = window.window_handle();
+                cx.new(|cx| Self::new(workspace, Some(handle), cx))
+            })
+        })
     }
 
-    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        window: Option<gpui::AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut panel = Self::preview(workspace, cx);
         if !enabled(cx) {
             return panel;
         }
         panel.view = cards::CardView::default();
         panel._poll = cx.spawn(async move |this, cx| {
+            let mut last_poll: Option<Instant> = None;
             loop {
                 if this.upgrade().is_none() {
                     return;
                 }
+                let in_front = window.is_none_or(|window| {
+                    cx.update_window(window, |_, window, _| window.is_window_active())
+                        .unwrap_or(false)
+                });
+                if !in_front && last_poll.is_some_and(|at| at.elapsed() < BACKGROUND_INTERVAL) {
+                    cx.background_executor().timer(REFRESH_INTERVAL).await;
+                    continue;
+                }
+                last_poll = Some(Instant::now());
                 // The app's own connection: this machine, or the saved server picked in the Servers menu.
                 let Some(client) = cx.update(|cx| app_client(cx)) else {
                     let unavailable = anyhow::anyhow!("not connected to the Icarus server");

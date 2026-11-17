@@ -68,8 +68,12 @@ actions!(
 
 /// How often an open Changes tab re-reads the list; the server coalesces the git reads behind it.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+/// How often a window that isn't in front re-reads the list; each read is a `git status` on the server.
+const BACKGROUND_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// Key repeat arrives far faster than two deliberate presses, so steps closer than this are a held key.
 const HOLD_REPEAT: Duration = Duration::from_millis(150);
+/// How long a step's diff may take to load before the active tab counts as where to step from again.
+const STEP_LOAD_GRACE: Duration = Duration::from_secs(2);
 
 /// The row a file step lands on: `None` at an end while the key is held, as Orca stops there.
 pub(crate) fn next_file(
@@ -697,6 +701,8 @@ pub struct SourceControlPanel {
     selected: Option<usize>,
     /// The last file step's direction and time, to tell a held key's repeats from single presses.
     last_step: Option<(bool, Instant)>,
+    /// The file the last step opened and when, while its diff may still be loading.
+    stepped_to: Option<(PathBuf, Instant)>,
     /// Folders folded shut in the tree view, by path.
     collapsed_dirs: collections::HashSet<String>,
     /// Open notes per changed file, shown as a badge on its row.
@@ -727,6 +733,7 @@ pub struct SourceControlPanel {
     position: DockPosition,
     active: bool,
     _poll: Task<()>,
+    _window_activation: Option<gpui::Subscription>,
 }
 
 impl SourceControlPanel {
@@ -754,9 +761,17 @@ impl SourceControlPanel {
             Task::ready(())
         } else {
             cx.spawn_in(window, async move |this, cx| {
+                let mut last_refresh: Option<Instant> = None;
                 loop {
-                    let refreshed = this.update(cx, |this, cx| {
-                        if this.active {
+                    let now = Instant::now();
+                    let refreshed = this.update_in(cx, |this, window, cx| {
+                        // A window in the back still catches up now and then; coming forward refreshes it at once.
+                        let due = window.is_window_active()
+                            || last_refresh.is_none_or(|at| {
+                                now.duration_since(at) >= BACKGROUND_REFRESH_INTERVAL
+                            });
+                        if this.active && due {
+                            last_refresh = Some(now);
                             this.refresh(cx);
                         }
                     });
@@ -777,6 +792,7 @@ impl SourceControlPanel {
             error: None,
             selected: None,
             last_step: None,
+            stepped_to: None,
             collapsed_dirs: Default::default(),
             note_counts: HashMap::default(),
             pr_thread_counts: HashMap::default(),
@@ -797,6 +813,13 @@ impl SourceControlPanel {
             position: DockPosition::Right,
             active: false,
             _poll: poll,
+            _window_activation: crate::enabled(cx).then(|| {
+                cx.observe_window_activation(window, |this, window, cx| {
+                    if this.active && window.is_window_active() {
+                        this.refresh(cx);
+                    }
+                })
+            }),
         }
     }
 
@@ -817,6 +840,7 @@ impl SourceControlPanel {
             error: None,
             selected,
             last_step: None,
+            stepped_to: None,
             collapsed_dirs: Default::default(),
             note_counts: HashMap::default(),
             pr_thread_counts: HashMap::default(),
@@ -837,6 +861,7 @@ impl SourceControlPanel {
             position: DockPosition::Right,
             active: true,
             _poll: Task::ready(()),
+            _window_activation: None,
         }
     }
 
@@ -1181,6 +1206,21 @@ impl SourceControlPanel {
         cx.notify();
     }
 
+    /// Row indices in the order the list shows them, folded folders included, so stepping follows the view.
+    fn step_order(&self, cx: &App) -> Vec<usize> {
+        if !self.tree_view(cx) {
+            return (0..self.rows().len()).collect();
+        }
+        let paths: Vec<&str> = self.rows().iter().map(|row| row.path.as_str()).collect();
+        tree_entries(&paths, &Default::default())
+            .into_iter()
+            .filter_map(|entry| match entry {
+                TreeEntry::File { index, .. } => Some(index),
+                TreeEntry::Folder { .. } => None,
+            })
+            .collect()
+    }
+
     pub fn tree(&self) -> Vec<TreeEntry> {
         let paths: Vec<&str> = self.rows().iter().map(|row| row.path.as_str()).collect();
         tree_entries(&paths, &self.collapsed_dirs)
@@ -1214,18 +1254,31 @@ impl SourceControlPanel {
             direction == forward && now.saturating_duration_since(at) < HOLD_REPEAT
         });
         self.last_step = Some((forward, now));
-        let count = self.rows().len();
-        if count == 0 {
+        let order = self.step_order(cx);
+        if order.is_empty() {
             return;
         }
-        let from_tab = current.and_then(|current| {
+        // While the last step's diff still loads the active tab is the file before it, so step on from there.
+        let loading = self.stepped_to.as_ref().is_some_and(|(path, at)| {
+            current != Some(path.as_path()) && now.saturating_duration_since(*at) < STEP_LOAD_GRACE
+        });
+        let from_tab = current.filter(|_| !loading).and_then(|current| {
             self.rows()
                 .iter()
                 .position(|row| self.root.join(&row.path) == current)
         });
-        let Some(next) = next_file(from_tab.or(self.selected), count, forward, held) else {
+        let position = from_tab
+            .or(self.selected)
+            .and_then(|index| order.iter().position(|&row| row == index));
+        let Some(next) = next_file(position, order.len(), forward, held)
+            .and_then(|position| order.get(position).copied())
+        else {
             return;
         };
+        self.stepped_to = self
+            .rows()
+            .get(next)
+            .map(|row| (self.root.join(&row.path), now));
         self.select(next, cx);
         self.open_selected_as(Opening::Preview(mode), window, cx);
     }
@@ -2808,7 +2861,14 @@ fn open_row(
                 open_diff_tab(path, base, DiffTabMode::Diff, None, workspace, window, cx)
             }
         };
-        open.detach_and_log_err(cx);
+        cx.spawn(async move |_, _| {
+            if let Err(error) = open.await
+                && !error.is::<crate::diff_tab::Superseded>()
+            {
+                log::error!("{error:#}");
+            }
+        })
+        .detach();
         return;
     }
     let sha = match scope {

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use icarus_github::merge::MergeResult;
 use icarus_github::previews::{PrPreviews, PreviewConfig};
+use icarus_github::rate::PollTier;
 use icarus_github::repo::RepoMergeMetadata;
 use icarus_github::review::GitHubUser;
 use icarus_github::review_threads::PrThread;
@@ -27,17 +28,19 @@ use crate::server::{Server, params, rpc};
 use crate::state::{Project, Workspace};
 
 /// Longer than [`PR_POLL`], so requests between polls read what the poller fetched.
-const PR_TTL: Duration = Duration::from_secs(30);
+const PR_TTL: Duration = Duration::from_secs(90);
 const METADATA_TTL: Duration = Duration::from_secs(600);
 const PREVIEW_TTL: Duration = Duration::from_secs(30);
 const USERS_TTL: Duration = Duration::from_secs(600);
-const THREADS_TTL: Duration = Duration::from_secs(20);
+const THREADS_TTL: Duration = Duration::from_secs(60);
 pub(crate) const STACK_INTENTS_KEY: &str = "rules.stack_auto_merge";
 const PR_CACHE_KEY: &str = "github.pr_cache";
 /// A `gh` call slower than this is logged with its route and duration.
 const SLOW_GH: Duration = Duration::from_millis(1500);
 /// How often cards' pull requests refresh while a client is connected.
-const PR_POLL: Duration = Duration::from_secs(20);
+const PR_POLL: Duration = Duration::from_secs(60);
+/// Under 500 GraphQL points left the cards refresh rarely, keeping the rest for what the user does.
+const PR_POLL_LOW_QUOTA: Duration = Duration::from_secs(300);
 /// Wake-ups closer together than this share one poll.
 const PR_POLL_GAP: Duration = Duration::from_secs(2);
 
@@ -60,8 +63,12 @@ pub(crate) fn spawn(server: Arc<Server>) {
             }
             last = Some(Instant::now());
             server.pr_poll().await;
+            let wait = match server.github.client.budget().tier() {
+                PollTier::Full => PR_POLL,
+                PollTier::FingerprintOnly | PollTier::Stopped => PR_POLL_LOW_QUOTA,
+            };
             tokio::select! {
-                () = tokio::time::sleep(PR_POLL) => {}
+                () = tokio::time::sleep(wait) => {}
                 () = server.github.poll.notified() => {}
             }
         }
@@ -469,6 +476,8 @@ pub(crate) struct ProjectPrs {
     pub by_branch: HashMap<String, Option<PrDetails>>,
 }
 
+type ThreadsCache = HashMap<String, (Option<Instant>, Vec<PrThread>)>;
+
 pub struct GitHubService {
     pub(crate) client: GitHub<ServerGh>,
     prs: Mutex<HashMap<String, ProjectPrs>>,
@@ -476,7 +485,9 @@ pub struct GitHubService {
     stacks: Mutex<HashMap<String, (Instant, Option<StackView>)>>,
     previews: Mutex<HashMap<String, (Instant, PrPreviews)>>,
     users: Mutex<HashMap<String, (Instant, Vec<GitHubUser>)>>,
-    threads: Mutex<HashMap<String, (Instant, Vec<PrThread>)>>,
+    /// Review threads by PR; `None` marks a copy that must be refetched but can stand in if that fails.
+    threads: Mutex<ThreadsCache>,
+    threads_loading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     poll: tokio::sync::Notify,
 }
 
@@ -496,6 +507,7 @@ impl GitHubService {
             previews: Mutex::new(HashMap::new()),
             users: Mutex::new(HashMap::new()),
             threads: Mutex::new(HashMap::new()),
+            threads_loading: Mutex::new(HashMap::new()),
             poll: tokio::sync::Notify::new(),
         }
     }
@@ -512,18 +524,46 @@ impl GitHubService {
         number: u64,
     ) -> Result<Vec<PrThread>, GitHubError> {
         let key = repo.match_key(number);
-        if let Some((at, threads)) = lock(&self.threads).get(&key)
-            && at.elapsed() < THREADS_TTL
-        {
-            return Ok(threads.clone());
+        let fresh = |cache: &ThreadsCache| {
+            cache
+                .get(&key)
+                .filter(|(at, _)| at.is_some_and(|at| at.elapsed() < THREADS_TTL))
+                .map(|(_, threads)| threads.clone())
+        };
+        if let Some(threads) = fresh(&lock(&self.threads)) {
+            return Ok(threads);
         }
-        let threads = self.client.pr_review_threads(repo, number).await?;
-        lock(&self.threads).insert(key, (Instant::now(), threads.clone()));
-        Ok(threads)
+        // Every open diff, editor and panel asks at once; one fetch answers them all.
+        let gate = lock(&self.threads_loading)
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        let _loading = gate.lock().await;
+        if let Some(threads) = fresh(&lock(&self.threads)) {
+            return Ok(threads);
+        }
+        match self.client.pr_review_threads(repo, number).await {
+            Ok(threads) => {
+                lock(&self.threads).insert(key, (Some(Instant::now()), threads.clone()));
+                Ok(threads)
+            }
+            // While GitHub refuses (rate limit, outage) the last copy beats an empty list.
+            Err(error) => match lock(&self.threads).get_mut(&key) {
+                Some((at, threads)) => {
+                    tracing::warn!("review threads kept from cache: {error}");
+                    *at = Some(Instant::now());
+                    Ok(threads.clone())
+                }
+                None => Err(error),
+            },
+        }
     }
 
+    /// Marks every cached PR's threads stale, keeping them to fall back on if the refetch fails.
     pub(crate) fn forget_review_threads(&self) {
-        lock(&self.threads).clear();
+        for (at, _) in lock(&self.threads).values_mut() {
+            *at = None;
+        }
     }
 
     /// Applies a mutation GitHub confirmed to the cached thread, so the next read shows it without
