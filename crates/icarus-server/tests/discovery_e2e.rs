@@ -195,15 +195,23 @@ async fn worktrees_from_other_tools_are_discovered_and_never_deleted_by_accident
 
     assert_eq!(
         fixture.names(false).await,
-        ["by-hand", "made-here"],
+        ["by-hand", "made-here", "widgets"],
         "external and source worktrees are hidden by default"
     );
     assert_eq!(
         fixture.names(true).await,
-        ["agent-a", "by-hand", "c1", "fix-login", "made-here", "poke"],
-        "the main checkout is the project, not a workspace"
+        [
+            "agent-a",
+            "by-hand",
+            "c1",
+            "fix-login",
+            "made-here",
+            "poke",
+            "widgets"
+        ],
     );
     let expect = [
+        ("widgets", "primary", true, false),
         ("made-here", "native", false, false),
         ("by-hand", "native", true, false),
         ("agent-a", "claude", true, true),
@@ -254,7 +262,7 @@ async fn worktrees_from_other_tools_are_discovered_and_never_deleted_by_accident
     assert_eq!(fixture.inbox().await, ["c1"]);
     assert_eq!(
         fixture.names(false).await,
-        ["by-hand", "fix-login", "made-here"]
+        ["by-hand", "fix-login", "made-here", "widgets"]
     );
 
     let shown = fixture
@@ -434,7 +442,7 @@ async fn a_hanging_git_never_blocks_the_list_and_marks_nothing_missing() {
         client,
         project: project["id"].as_str().expect("id").to_owned(),
     };
-    assert_eq!(fixture.names(true).await, ["fix-login"]);
+    assert_eq!(fixture.names(true).await, ["fix-login", "widgets"]);
 
     std::fs::write(&marker, "").expect("marker");
     git(
@@ -458,12 +466,12 @@ async fn a_hanging_git_never_blocks_the_list_and_marks_nothing_missing() {
         "the list is served from what is stored: {:?}",
         started.elapsed()
     );
-    assert_eq!(listed.as_array().map(Vec::len), Some(1));
+    assert_eq!(listed.as_array().map(Vec::len), Some(2));
 
     let started = Instant::now();
     assert_eq!(
         fixture.names(true).await,
-        ["fix-login"],
+        ["fix-login", "widgets"],
         "a scan that timed out marks nothing missing"
     );
     assert!(
@@ -473,8 +481,65 @@ async fn a_hanging_git_never_blocks_the_list_and_marks_nothing_missing() {
     );
 
     std::fs::remove_file(&marker).expect("unmark");
-    assert!(
-        fixture.names(true).await.is_empty(),
+    assert_eq!(
+        fixture.names(true).await,
+        ["widgets"],
         "once git answers, the removed worktree drops out"
     );
+}
+
+#[tokio::test]
+async fn the_main_checkout_is_listed_as_the_primary_workspace_and_cannot_be_removed() {
+    let home = tempfile::tempdir().expect("home");
+    let home = std::fs::canonicalize(home.path()).expect("canonical home");
+    let dirs = tempfile::tempdir().expect("dirs");
+    let dirs = std::fs::canonicalize(dirs.path()).expect("canonical");
+    let repo = dirs.join("widgets");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("readme.md"), "hello\n").expect("write");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+
+    let _server = start_server(&home);
+    let (client, _events) = Client::connect(&home, "test").await.expect("connect");
+    let project = client
+        .request("project.add", json!({ "path": repo }))
+        .await
+        .expect("add project");
+    let fixture = Fixture {
+        client,
+        project: project["id"].as_str().expect("id").to_owned(),
+    };
+
+    let primary = fixture.by_name("widgets").await;
+    assert_eq!(primary["path"], json!(repo.display().to_string()));
+    assert_eq!(primary["branch"], "main");
+    assert_eq!(primary["primary"], true);
+    assert_eq!(primary["origin"], "primary");
+    assert_eq!(primary["hidden"], false, "shown without any setting");
+    assert_eq!(primary["source_label"], "Primary");
+
+    for params in [
+        json!({ "id": primary["id"] }),
+        json!({ "id": primary["id"], "force": true, "delete_worktree": true }),
+    ] {
+        let refused = fixture
+            .client
+            .request("workspace.remove", params)
+            .await
+            .expect_err("the primary workspace can't be removed");
+        assert!(
+            format!("{refused:#}").contains("main checkout"),
+            "{refused:#}"
+        );
+    }
+    assert!(
+        repo.join("readme.md").is_file(),
+        "the checkout is untouched"
+    );
+    assert_eq!(fixture.names(false).await, ["widgets"], "and stays listed");
 }

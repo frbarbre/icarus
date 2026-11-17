@@ -176,12 +176,16 @@ impl World {
             .await
     }
 
+    /// Every workspace but the repository's main checkout, which is always listed.
     async fn workspaces(&self) -> Vec<Value> {
         self.request("workspace.list", json!({}))
             .await
             .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|workspace| workspace["primary"] != true)
             .cloned()
-            .unwrap_or_default()
+            .collect()
     }
 }
 
@@ -321,7 +325,12 @@ async fn pr_status_maps_the_branch_pull_request_in_one_batched_snapshot() {
     assert_eq!(
         world.count("graphql PrSnapshot"),
         1,
-        "both branches come from one cached snapshot"
+        "both branches come from one cached snapshot: {:?}",
+        world
+            .requests()
+            .iter()
+            .filter(|r| r["route"] == "graphql PrSnapshot")
+            .collect::<Vec<_>>()
     );
 
     let restarted = World::new(json!({}), json!({ "routes": { "graphql PrSnapshot": { "status": 502, "body": { "message": "down" } } } })).await;

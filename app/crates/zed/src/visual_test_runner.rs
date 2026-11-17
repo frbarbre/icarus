@@ -471,6 +471,18 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             }
         }
     }
+    println!("\n--- Icarus: icarus_workspace_card_current ---");
+    for (name, result) in run_icarus_current_card_tests(workspace_window, &mut cx, update_baseline)
+    {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
     println!("\n--- Icarus: icarus_workspaces_stack ---");
     for (name, result) in
         run_icarus_workspaces_stack_tests(workspace_window, &mut cx, update_baseline)
@@ -486,6 +498,17 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     }
     println!("\n--- Icarus: icarus_title_bar_actions ---");
     for (name, result) in run_icarus_title_bar_actions_tests(&mut cx, update_baseline) {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\n--- Icarus: icarus_quick_commands ---");
+    for (name, result) in run_icarus_quick_commands_tests(&mut cx, update_baseline) {
         match result {
             Ok(TestResult::Passed) => passed += 1,
             Ok(TestResult::BaselineUpdated(_)) => updated += 1,
@@ -856,6 +879,7 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
             manual_order: None,
             activity_at_ms: None,
             unread: None,
+            primary: false,
         }
     };
     let with_unread = |mut workspace: icarus_ui::WorkspaceSummary| {
@@ -1008,7 +1032,6 @@ fn icarus_github_fixture() -> serde_json::Value {
         },
         "audience": "all",
         "description": "Exports **totals per currency** for the billing CSV.\n\n![Totals export](https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555)\nhttps://github.com/user-attachments/assets/66666666-7777-8888-9999-000000000000\n",
-        "description_collapsed": true,
         "threads": [
             {
                 "id": "T1", "path": "src/export/totals.rs", "line": 42, "is_resolved": false,
@@ -1691,6 +1714,118 @@ fn run_icarus_workspace_ports_tests(
     results
 }
 
+struct IcarusQuickCommandsPreview {
+    button: Entity<icarus_ui::quick_commands::QuickCommandsButton>,
+}
+
+impl gpui::Render for IcarusQuickCommandsPreview {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use ui::prelude::*;
+
+        let colors = cx.theme().colors();
+        v_flex().size_full().bg(colors.editor_background).child(
+            h_flex()
+                .h(px(34.))
+                .w_full()
+                .px_2()
+                .justify_end()
+                .bg(colors.title_bar_background)
+                .border_b_1()
+                .border_color(colors.border)
+                .child(self.button.clone()),
+        )
+    }
+}
+
+/// The title bar's Run split button with its quick commands menu open: search, the project's
+/// commands then global ones, and "+ Command".
+fn run_icarus_quick_commands_tests(
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    let bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(480.0), px(420.0)),
+    };
+    let remote = "github.com/acme/app";
+    let command = |id: &str, label: &str, line: &str, project: bool| {
+        serde_json::json!({
+            "id": id, "label": label, "command": line,
+            "scope": if project {
+                serde_json::json!({ "type": "project", "remote": remote })
+            } else {
+                serde_json::json!({ "type": "global" })
+            },
+        })
+    };
+    let commands: Vec<icarus_ui::quick_commands::QuickCommand> =
+        match serde_json::from_value(serde_json::json!([
+            command("run", "Run", "mise run fu", true),
+            command(
+                "backend",
+                "Local Backend",
+                "mise trust && uvx --from ./tools/backend serve --reload",
+                true
+            ),
+            command(
+                "preview",
+                "Preview",
+                "mise run frontend-build && mise run preview",
+                true
+            ),
+            command("ide", "Open IDE", "cd ~/workspaces/app && code .", true),
+            command("status", "Git status", "git status --short", false),
+        ])) {
+            Ok(commands) => commands,
+            Err(error) => return vec![("icarus_quick_commands", Err(error.into()))],
+        };
+    let window = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: false,
+                show: false,
+                ..Default::default()
+            },
+            |_window, cx| {
+                let target =
+                    icarus_ui::quick_commands::Target::preview("ws-quick", Some(remote), commands);
+                let button =
+                    cx.new(|_| icarus_ui::quick_commands::QuickCommandsButton::preview(target));
+                cx.new(|_| IcarusQuickCommandsPreview { button })
+            },
+        )
+    });
+    let window = match window {
+        Ok(window) => window,
+        Err(error) => return vec![("icarus_quick_commands", Err(error))],
+    };
+    cx.run_until_parked();
+    let menu_shown = window.update(cx, |view, window, cx| {
+        let menu = view.button.read(cx).menu_handle();
+        menu.show(window, cx);
+    });
+    if let Err(error) = menu_shown {
+        return vec![("icarus_quick_commands", Err(error))];
+    }
+    cx.run_until_parked();
+    let results = run_icarus_dark_and_light(
+        "icarus_quick_commands",
+        "icarus_quick_commands_light",
+        window.into(),
+        cx,
+        update_baseline,
+    );
+    cx.update_window(window.into(), |_, window, _cx| window.remove_window())
+        .log_err();
+    cx.run_until_parked();
+    results
+}
+
 struct IcarusTitleBarPreview {
     next_action: Entity<icarus_ui::NextActionButton>,
     links: Entity<icarus_ui::WorkspaceLinks>,
@@ -1863,6 +1998,71 @@ fn icarus_orca_style_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
         }
     }
     workspaces
+}
+
+/// The open worktree's card (filled like Orca's selected card) with its agents listed, and the
+/// main checkout's card with its "primary" badge, in dark and light themes.
+#[cfg(target_os = "macos")]
+fn run_icarus_current_card_tests(
+    workspace_window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    let panel = workspace_window.update(cx, |workspace, window, cx| {
+        if let Some(previous) = workspace.panel::<icarus_ui::WorkspacesPanel>(cx) {
+            workspace.remove_panel(&previous, window, cx);
+        }
+        let open_path = workspace
+            .root_paths(cx)
+            .first()
+            .map(|path| path.to_path_buf());
+        let mut workspaces: Vec<_> = icarus_preview_workspaces()
+            .into_iter()
+            .filter(|workspace| matches!(workspace.name.as_str(), "abc-101" | "abc-98" | "main"))
+            .collect();
+        for card in &mut workspaces {
+            card.status = None;
+            match card.name.as_str() {
+                "abc-98" => {
+                    if let Some(path) = open_path.clone() {
+                        card.path = path;
+                    }
+                    for (agent, title) in card.agents.iter_mut().zip(["Agent", "Review #4161"]) {
+                        agent.title = Some(title.into());
+                    }
+                }
+                "main" => card.primary = true,
+                _ => {}
+            }
+        }
+        let weak = workspace.weak_handle();
+        let panel = cx.new(|cx| icarus_ui::WorkspacesPanel::preview(weak, cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_workspaces(workspaces, cx);
+            panel.toggle_agents("ws-abc-98", cx);
+        });
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<icarus_ui::WorkspacesPanel>(window, cx);
+        panel
+    });
+    let panel = match panel {
+        Ok(panel) => panel,
+        Err(error) => return vec![("icarus_workspace_card_current", Err(error))],
+    };
+    cx.run_until_parked();
+    let results = run_icarus_dark_and_light(
+        "icarus_workspace_card_current",
+        "icarus_workspace_card_current_light",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            workspace.remove_panel(&panel, window, cx);
+        })
+        .log_err();
+    results
 }
 
 fn run_icarus_workspaces_stack_tests(
@@ -3443,9 +3643,15 @@ fn run_icarus_agent_tabs_tests(
     update_baseline: bool,
 ) -> Vec<(&'static str, Result<TestResult>)> {
     // As in the app, where agent tabs replace Zed's agent panel and its status bar button.
-    cx.update(|cx| cx.set_global(agent_ui::agent_tab::AgentTabsEnabled));
+    cx.update(|cx| {
+        cx.set_global(agent_ui::agent_tab::AgentTabsEnabled);
+        icarus_ui::new_tab_menu::register(cx);
+    });
     let results = run_icarus_agent_tabs_screens(app_state, cx, update_baseline);
-    cx.update(|cx| cx.remove_global::<agent_ui::agent_tab::AgentTabsEnabled>());
+    cx.update(|cx| {
+        cx.remove_global::<agent_ui::agent_tab::AgentTabsEnabled>();
+        cx.remove_global::<workspace::NewItemMenu>();
+    });
     results
 }
 
@@ -3481,6 +3687,28 @@ fn run_icarus_agent_tabs_screens(
                 )),
                 Err(error) => results.push(("icarus_agent_tab_empty", Err(error))),
             }
+            match show_icarus_new_tab_menu(window, None, cx) {
+                Ok(()) => results.extend(run_icarus_dark_and_light(
+                    "icarus_new_tab_menu",
+                    "icarus_new_tab_menu_light",
+                    window.into(),
+                    cx,
+                    update_baseline,
+                )),
+                Err(error) => results.push(("icarus_new_tab_menu", Err(error))),
+            }
+            match show_icarus_new_tab_menu(window, Some("login"), cx) {
+                Ok(()) => results.push((
+                    "icarus_new_tab_menu_search",
+                    run_visual_test(
+                        "icarus_new_tab_menu_search",
+                        window.into(),
+                        cx,
+                        update_baseline,
+                    ),
+                )),
+                Err(error) => results.push(("icarus_new_tab_menu_search", Err(error))),
+            }
             window
                 .update(cx, |workspace, _window, cx| {
                     let project = workspace.project().clone();
@@ -3500,6 +3728,35 @@ fn run_icarus_agent_tabs_screens(
         }
         Err(error) => vec![("icarus_agent_tabs", Err(error))],
     }
+}
+
+/// The pane's "+" menu, open, with `query` typed into its search.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn show_icarus_new_tab_menu(
+    window: WindowHandle<Workspace>,
+    query: Option<&str>,
+    cx: &mut VisualTestAppContext,
+) -> Result<()> {
+    use icarus_ui::new_tab_menu::{open_menu, show_menu};
+
+    let pane = window.update(cx, |workspace, _, _| workspace.active_pane().clone())?;
+    cx.update_window(window.into(), |_, window, _| window.refresh())?;
+    cx.run_until_parked();
+    if cx.read(|cx| open_menu(&pane, cx)).is_none() {
+        cx.update_window(window.into(), |_, window, cx| show_menu(&pane, window, cx))?;
+        cx.run_until_parked();
+    }
+    let picker = cx
+        .read(|cx| open_menu(&pane, cx))
+        .context("the pane's + menu did not open")?;
+    let query = query.unwrap_or_default().to_string();
+    cx.update_window(window.into(), |_, window, cx| {
+        picker.update(cx, |picker, cx| picker.set_query(&query, window, cx))
+    })?;
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _| window.refresh())?;
+    cx.run_until_parked();
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", feature = "visual-tests"))]
@@ -3617,6 +3874,29 @@ fn open_icarus_agent_tabs_window(
         cx.update_window(window.into(), |_, window, cx| {
             editor.update(cx, |editor, cx| editor.set_text(draft, window, cx));
         })?;
+    }
+    // What `icarus acp` reports for each session: the harness running it, and a prompted one's title.
+    for (thread_view, provider, title) in [
+        (
+            &first_thread,
+            "claude",
+            Some("Fix the login redirect after the session expires"),
+        ),
+        (&second_thread, "codex", None),
+    ] {
+        let thread = cx.read(|cx| thread_view.read(cx).thread.clone());
+        thread.update(cx, |thread, cx| {
+            let mut update = agent_client_protocol::v2::schema::SessionInfoUpdate::new().meta(
+                agent_client_protocol::v2::schema::Meta::from_iter([(
+                    "icarus".into(),
+                    serde_json::json!({ "provider": provider }),
+                )]),
+            );
+            if let Some(title) = title {
+                update = update.title(title);
+            }
+            thread.update_session_info(update, cx)
+        });
     }
     window.update(cx, |workspace, window, cx| {
         workspace.activate_item(&first, true, false, window, cx);
@@ -3797,7 +4077,7 @@ fn show_icarus_notes_in_diff_tab(
             "replies": [
                 { "id": "r1", "author": "user", "body": "Can you switch it to a typed secret?" },
                 { "id": "r2", "author": "reply-agent", "status": "done",
-                  "body": "Done: login now takes a Password newtype; the call sites are updated.",
+                  "body": "Done: login now takes a **`Password`** newtype.\n\n- **Call sites** are updated.\n- The old `&str` overload is gone.",
                   "changed_files": ["src/login.rs", "src/session.rs"] },
                 { "id": "r3", "author": "user", "body": "Does logout need the same?" },
                 { "id": "r4", "author": "reply-agent", "status": "running", "body": "" },

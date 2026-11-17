@@ -199,6 +199,7 @@ impl Server {
         self.apply_account(&mut options, None)
             .map_err(|e| anyhow::anyhow!(e.message))?;
         let agent = self.agents.create(options).await?;
+        self.offer_agent_tab(&agent.info());
         agent.send(prompt, &[]).await?;
         Ok(agent.id().to_owned())
     }

@@ -813,8 +813,11 @@ fn main() {
         cx.set_global(icarus_ui::layout::AgentItemType(std::any::TypeId::of::<
             agent_ui::agent_tab::AgentTab,
         >()));
-        icarus_ui::set_open_agent_handler(cx, |agent_id, pane, workspace, window, cx| {
-            agent_ui::agent_tab::open_agent_tab(workspace, agent_id, pane, true, window, cx);
+        icarus_ui::set_open_agent_handler(cx, |agent_id, pane, focus, workspace, window, cx| {
+            agent_ui::agent_tab::open_agent_tab(workspace, agent_id, pane, focus, window, cx);
+        });
+        icarus_ui::new_tab_menu::set_open_harness_handler(cx, |harness, workspace, window, cx| {
+            agent_ui::agent_tab::open_provider_agent_tab(workspace, harness, window, cx);
         });
         cx.set_global(agent_ui::agent_tab::TabAgentServer(std::rc::Rc::new(
             icarus_ui::remote_agent::agent_server_for_project,

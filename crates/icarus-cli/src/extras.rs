@@ -121,6 +121,9 @@ pub async fn notifications(
 }
 
 fn percent(window: &Value) -> Option<String> {
+    if window["expired"] == json!(true) {
+        return Some("reset since".into());
+    }
     let used = window["utilization"].as_f64()?;
     Some(format!("{:.0}%", used * 100.0))
 }
@@ -302,6 +305,9 @@ mod tests {
         let usage = json!({ "at_ms": 0, "rate_limits": { "unifiedWindows": {
             "five_hour": { "utilization": 0.25 }, "seven_day": { "utilization": 0.5 } } } });
         assert!(usage_text(&usage).starts_with("session 25%, week 50% ("));
+        let reset = json!({ "at_ms": 0, "rate_limits": { "unifiedWindows": {
+            "five_hour": { "utilization": 0.0, "expired": true }, "seven_day": { "utilization": 0.5 } } } });
+        assert!(usage_text(&reset).starts_with("session reset since, week 50% ("));
         assert_eq!(usage_text(&Value::Null), "no usage seen yet");
     }
 }

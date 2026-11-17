@@ -26,7 +26,9 @@ pub const SIDEBAR_PANELS: [(&str, IconName, &str); 3] = [
 /// Puts the switcher above the right dock, whose width stays put as it switches panels.
 pub fn install_switcher(cx: &mut App) {
     cx.set_global(RightDockHeader(Arc::new(render_switcher)));
-    cx.set_global(SharedSideDockWidth);
+    if !cx.has_global::<SharedSideDockWidth>() {
+        cx.set_global(SharedSideDockWidth::default());
+    }
 }
 
 pub fn register(cx: &mut App) {

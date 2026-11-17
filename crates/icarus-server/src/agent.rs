@@ -785,6 +785,13 @@ impl AgentThread {
             let asking = Arc::clone(self);
             tokio::spawn(async move {
                 if let Ok(response) = settle("initialize", reply).await {
+                    // Claude Code only reports its session once it gets a message; answering means it waits for one.
+                    {
+                        let mut state = lock(&asking.state);
+                        if state.state == AgentState::Starting {
+                            state.state = AgentState::Idle;
+                        }
+                    }
                     asking.record_capabilities(claude_capabilities(&response));
                 }
             });

@@ -14,8 +14,7 @@ use remote::RemoteConnectionOptions;
 use crate::routing::{self, ServerRef};
 use crate::terminals::icarus_program;
 
-/// The agent id Icarus registers in the default settings (`agent_servers.Icarus`).
-pub(crate) const ICARUS_AGENT: &str = "Icarus";
+pub(crate) use agent_servers::harness::ICARUS_AGENT;
 
 pub struct IcarusOnServer {
     /// A saved server's name; `None` is this machine's.
@@ -58,11 +57,18 @@ impl IcarusOnServer {
 
 impl AgentServer for IcarusOnServer {
     fn logo(&self) -> ui::IconName {
-        ui::IconName::Terminal
+        self.provider
+            .as_deref()
+            .and_then(agent_servers::harness::harness)
+            .map_or(ui::IconName::Terminal, |harness| harness.icon)
     }
 
+    // The editor keeps one connection per agent id; a shared id would start a Codex tab on the
+    // default agent's `icarus acp`, whose new sessions run the default provider.
     fn agent_id(&self) -> AgentId {
-        AgentId::new(ICARUS_AGENT)
+        AgentId::new(agent_servers::harness::icarus_agent_id(
+            self.provider.as_deref(),
+        ))
     }
 
     fn connect(
@@ -155,6 +161,23 @@ mod tests {
         assert!(command.path.ends_with("icarus"));
         let codex = IcarusOnServer::with_provider(None, "codex".into());
         assert_eq!(codex.command().args, ["acp", "--provider", "codex"]);
+    }
+
+    #[test]
+    fn each_harness_gets_its_own_connection_so_its_sessions_list_its_own_models() {
+        let default = IcarusOnServer::new("desk".into());
+        let claude = IcarusOnServer::with_provider(Some("desk".into()), "claude".into());
+        let codex = IcarusOnServer::with_provider(Some("desk".into()), "codex".into());
+        let ids = [default.agent_id(), claude.agent_id(), codex.agent_id()];
+        assert_ne!(ids[0], ids[1]);
+        assert_ne!(ids[0], ids[2]);
+        assert_ne!(
+            ids[1], ids[2],
+            "a Codex tab never reuses the bridge that starts Claude sessions"
+        );
+        assert_eq!(codex.logo(), ui::IconName::AiOpenAi);
+        assert_eq!(claude.logo(), ui::IconName::AiClaude);
+        assert_eq!(default.logo(), ui::IconName::Terminal);
     }
 
     /// The test window's project is the folder `/project`.

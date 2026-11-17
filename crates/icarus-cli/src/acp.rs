@@ -338,6 +338,55 @@ fn remote_control_request(text: &str) -> Option<Option<bool>> {
     }
 }
 
+/// Longest title taken from a prompt; tabs cut it shorter and show it whole in their tooltip.
+const TITLE_LIMIT: usize = 200;
+
+/// Names a conversation after its first prompt, as Orca seeds a chat's name: the first line of
+/// what was asked, without attached context. Slash commands name nothing.
+pub fn title_from_prompt(text: &str) -> Option<String> {
+    let mut in_context = false;
+    let line = text.lines().map(str::trim).find(|line| {
+        if in_context {
+            in_context = *line != "</context>";
+            return false;
+        }
+        if line.starts_with("<context ") {
+            in_context = !line.ends_with("</context>");
+            return false;
+        }
+        !line.is_empty()
+    })?;
+    if line.starts_with('/') {
+        return None;
+    }
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= TITLE_LIMIT {
+        return Some(collapsed);
+    }
+    let cut: String = collapsed.chars().take(TITLE_LIMIT - 1).collect();
+    Some(format!("{}…", cut.trim_end()))
+}
+
+/// The server's title when someone chose it (an automation, a launch); new sessions are all "Agent".
+pub fn chosen_title(info: &Value) -> Option<String> {
+    let title = info["title"].as_str()?.trim();
+    let provider = provider_label(info["provider"].as_str().unwrap_or_default());
+    (!title.is_empty() && title != "Agent" && title != provider).then(|| title.to_string())
+}
+
+/// The session's title and, in `_meta.icarus.provider`, the harness running it, which the editor
+/// uses for the tab's name and logo.
+pub fn session_info_update(provider: &str, title: Option<&str>) -> Value {
+    let mut update = json!({
+        "sessionUpdate": "session_info_update",
+        "_meta": { "icarus": { "provider": provider } },
+    });
+    if let Some(title) = title {
+        update["title"] = json!(title);
+    }
+    update
+}
+
 type Writer = mpsc::UnboundedSender<Value>;
 type Connection = (Arc<Client>, mpsc::UnboundedReceiver<Event>);
 
@@ -369,6 +418,10 @@ struct Bridge {
     attached: Mutex<HashMap<String, u64>>,
     /// Sessions this bridge already handed out from `session/new`, so two new tabs never share an agent.
     claimed: Mutex<HashSet<String>>,
+    /// Each opened session's provider and title, so its first prompt can name it once.
+    labels: Mutex<HashMap<String, (String, Option<String>)>>,
+    /// First-prompt titles found (in a replay, or a prompt racing the label) before a session is labelled.
+    pending_titles: Mutex<HashMap<String, String>>,
 }
 
 impl Bridge {
@@ -421,7 +474,7 @@ impl Bridge {
             .client
             .request(
                 "agent.create",
-                json!({ "cwd": cwd, "provider": self.provider, "workspace": workspace, "title": "Agent" }),
+                json!({ "cwd": cwd, "provider": self.provider, "workspace": workspace, "title": "Agent", "offer_tab": false }),
             )
             .await?;
         let id = info["id"].as_str().unwrap_or_default().to_string();
@@ -474,6 +527,47 @@ impl Bridge {
         }
         self.respond(id, result);
         self.advertise_commands(session_id).await;
+        self.label_session(session_id).await;
+    }
+
+    /// Tells the editor the session's harness and title (the server's, else its first prompt's).
+    async fn label_session(&self, session_id: &str) {
+        let Ok(info) = self
+            .client
+            .request("agent.info", json!({ "id": session_id }))
+            .await
+        else {
+            return;
+        };
+        let provider = info["provider"].as_str().unwrap_or_default().to_string();
+        let mut labels = self.labels.lock().await;
+        let pending = self.pending_titles.lock().await.remove(session_id);
+        let title = chosen_title(&info).or(pending);
+        self.notify(session_id, session_info_update(&provider, title.as_deref()));
+        labels.insert(session_id.to_string(), (provider, title));
+    }
+
+    /// Names a still-untitled session after a prompt it was just sent.
+    async fn name_from_prompt(&self, session_id: &str, text: &str) {
+        let Some(named) = title_from_prompt(text) else {
+            return;
+        };
+        let mut labels = self.labels.lock().await;
+        match labels.get_mut(session_id) {
+            Some((provider, title @ None)) => {
+                self.notify(session_id, session_info_update(provider, Some(&named)));
+                *title = Some(named);
+            }
+            Some(_) => {}
+            // Not labelled yet: the label, when it comes, takes this name.
+            None => {
+                self.pending_titles
+                    .lock()
+                    .await
+                    .entry(session_id.to_string())
+                    .or_insert(named);
+            }
+        }
     }
 
     /// Runs Icarus's `/remote-control` for a Claude Code agent; None if the agent handles the text.
@@ -554,6 +648,18 @@ impl Bridge {
             .request("agent.attach", json!({ "id": session_id, "since": since }))
             .await?;
         if replay {
+            let first_prompt = attached["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|event| event["kind"] == "user_message")
+                .find_map(|event| title_from_prompt(event["data"]["text"].as_str()?));
+            if let Some(title) = first_prompt {
+                self.pending_titles
+                    .lock()
+                    .await
+                    .insert(session_id.to_string(), title);
+            }
             let mut tools = ToolState::default();
             for event in attached["events"].as_array().into_iter().flatten() {
                 for update in event_to_updates(event, Mode::Replay, &mut tools) {
@@ -628,6 +734,11 @@ impl Bridge {
             self.notify(&session_id, update);
         }
         let kind = agent_event["kind"].as_str().unwrap_or_default();
+        if kind == "user_message"
+            && let Some(text) = agent_event["data"]["text"].as_str()
+        {
+            self.name_from_prompt(&session_id, text).await;
+        }
         let reports_mode = agent_event["data"]["permission_mode"].is_string();
         match kind {
             "capabilities" => {
@@ -808,6 +919,8 @@ where
         tools: Mutex::default(),
         attached: Mutex::default(),
         claimed: Mutex::default(),
+        labels: Mutex::default(),
+        pending_titles: Mutex::default(),
     });
     tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -1066,6 +1179,93 @@ mod tests {
         );
         match parse(&plan[0]) {
             SessionUpdate::Plan(plan) => assert_eq!(plan.entries.len(), 3),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_model_picker_lists_the_sessions_own_harness_models() {
+        let modes = json!({ "current": "default", "modes": [] });
+        let codex = session_state(
+            &modes,
+            &json!({ "provider": "codex", "current": "gpt-5.5", "models": [
+                { "id": "gpt-5.5", "name": "GPT-5.5" }, { "id": "gpt-5.5-mini", "name": "GPT-5.5 mini" }
+            ] }),
+        );
+        let names: Vec<&str> = codex["configOptions"][1]["options"]
+            .as_array()
+            .expect("model options")
+            .iter()
+            .filter_map(|option| option["name"].as_str())
+            .collect();
+        assert_eq!(names, ["Codex GPT-5.5", "Codex GPT-5.5 mini"]);
+        let claude = session_state(
+            &modes,
+            &json!({ "provider": "claude", "current": "opus", "models": [{ "id": "opus", "name": "Opus" }] }),
+        );
+        assert_eq!(
+            claude["configOptions"][1]["options"][0]["name"],
+            "Claude Opus"
+        );
+    }
+
+    #[test]
+    fn a_conversation_is_named_after_its_first_prompt() {
+        assert_eq!(
+            title_from_prompt("\n  Fix the   login bug\nand add a test").as_deref(),
+            Some("Fix the login bug")
+        );
+        assert_eq!(
+            title_from_prompt(
+                "<context uri=\"file:///a.rs\">\nfn main() {}\n</context>\n\nExplain this"
+            )
+            .as_deref(),
+            Some("Explain this"),
+            "attached context is not what was asked"
+        );
+        assert_eq!(title_from_prompt("/compact"), None, "commands name nothing");
+        assert_eq!(title_from_prompt("  \n "), None);
+        let long = title_from_prompt(&"word ".repeat(100)).expect("a title");
+        assert_eq!(long.chars().count(), TITLE_LIMIT);
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn only_a_chosen_server_title_names_a_session() {
+        assert_eq!(
+            chosen_title(&json!({ "provider": "codex", "title": "Review #12" })).as_deref(),
+            Some("Review #12")
+        );
+        assert_eq!(
+            chosen_title(&json!({ "provider": "claude", "title": "Agent" })),
+            None
+        );
+        assert_eq!(
+            chosen_title(&json!({ "provider": "codex", "title": "Codex" })),
+            None
+        );
+        assert_eq!(
+            chosen_title(&json!({ "provider": "codex", "title": null })),
+            None
+        );
+    }
+
+    #[test]
+    fn session_info_carries_the_title_and_harness() {
+        let update = session_info_update("codex", Some("Fix the login bug"));
+        match parse(&update) {
+            SessionUpdate::SessionInfoUpdate(info) => {
+                assert_eq!(
+                    info.title,
+                    agent_client_protocol_schema::MaybeUndefined::Value("Fix the login bug".into())
+                );
+                let meta = info.meta.expect("meta");
+                assert_eq!(meta["icarus"]["provider"], "codex");
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&session_info_update("claude", None)) {
+            SessionUpdate::SessionInfoUpdate(info) => assert!(info.title.is_undefined()),
             other => panic!("{other:?}"),
         }
     }

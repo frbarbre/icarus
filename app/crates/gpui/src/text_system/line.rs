@@ -142,6 +142,14 @@ impl ShapedLine {
             &mut Window,
         ),
     ) -> Result<()> {
+        if crate::element_recording() && !self.text.is_empty() {
+            let size = crate::size(self.layout.width, line_height);
+            window.record_debug_element(
+                None,
+                Some(self.text.clone()),
+                crate::Bounds::new(origin, size),
+            );
+        }
         paint_line(
             origin,
             &self.layout,

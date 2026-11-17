@@ -23,8 +23,8 @@ use crate::{CopyPullRequestUrl, OpenFrontend, OpenPreview, OpenPullRequest};
 
 pub const GLOBE_ICON: &str = "icons/icarus/globe.svg";
 const LINKS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-/// Previews come from GitHub, so they are refreshed less often than local ports.
-const PREVIEWS_REFRESH_EVERY: u32 = 6;
+/// Previews come from GitHub, so they're re-read every five minutes, as often as the server polls.
+const PREVIEWS_REFRESH_EVERY: u32 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -889,5 +889,62 @@ mod tests {
         .expect("valid previews");
         assert!(list.previews[0].is_head);
         assert_eq!(list.previews[0].short_sha(), None);
+    }
+
+    /// Bindings that reach `key` in `keymap` outside search bars: the context and the bound action;
+    /// a chord that starts with `key` counts too, since it leaves the key waiting for more.
+    fn reaching(keymap: &str, key: &str) -> Vec<(String, String)> {
+        let normalized = |stroke: &str| {
+            let mut parts: Vec<String> = stroke.split('-').map(str::to_owned).collect();
+            parts.sort_unstable();
+            parts
+        };
+        let key = normalized(key);
+        let keymap = settings::KeymapFile::parse(keymap).expect("valid keymap");
+        let mut found = Vec::new();
+        for section in keymap.sections() {
+            if section.context.contains("Search") {
+                continue;
+            }
+            for (keys, action) in section.bindings() {
+                let mut strokes = keys.split_whitespace();
+                if strokes.next().map(normalized) != Some(key.clone()) {
+                    continue;
+                }
+                let action = if strokes.next().is_some() {
+                    format!("{keys} (chord)")
+                } else {
+                    action.to_string()
+                };
+                found.push((section.context.clone(), action));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn pull_request_and_preview_keys_reach_their_actions_everywhere() {
+        let mac = include_str!("../../../assets/keymaps/default-macos.json");
+        let linux = include_str!("../../../assets/keymaps/default-linux.json");
+        for (keymap, key, action) in [
+            (mac, "cmd-alt-g", "icarus::OpenPullRequest"),
+            (mac, "cmd-alt-shift-g", "icarus::CopyPullRequestUrl"),
+            (mac, "cmd-alt-p", "icarus::OpenPreview"),
+            (mac, "cmd-alt-l", "icarus::OpenLinearIssue"),
+            (linux, "ctrl-alt-p", "icarus::OpenPreview"),
+        ] {
+            let bindings = reaching(keymap, key);
+            assert!(
+                bindings
+                    .iter()
+                    .any(|(context, bound)| context == "Workspace" && bound == action),
+                "{key} isn't bound to {action}: {bindings:?}"
+            );
+            let shadows: Vec<_> = bindings
+                .iter()
+                .filter(|(_, bound)| bound != action)
+                .collect();
+            assert!(shadows.is_empty(), "{key} is taken by {shadows:?}");
+        }
     }
 }

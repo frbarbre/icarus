@@ -756,6 +756,12 @@ async fn response_headers_update_budget_and_backoff() {
         Some(40)
     );
     assert_eq!(github.budget().tier_at(0), PollTier::Stopped);
+    assert_eq!(
+        github.budget().resume_at_time("graphql", 0),
+        Some(4_102_444_800),
+        "under the floor, calls wait for the reset"
+    );
+    assert_eq!(github.budget().resume_at_time("core", 0), None);
     let error = github.rate_limits().await.expect_err("secondary limit");
     assert!(matches!(
         error,

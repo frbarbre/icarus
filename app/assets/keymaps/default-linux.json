@@ -246,7 +246,7 @@
     "bindings": {
       "ctrl-n": "agent::NewThread",
       "ctrl--": "pane::GoBack",
-      "ctrl-alt-p": "agent::ManageProfiles",
+      // Icarus: Ctrl+Alt+P is Open preview, also inside agent threads.
       "ctrl-alt-l": "agent::ManageSkills",
       "ctrl-i": "agent::ToggleProfileSelector",
       "shift-tab": "agent::CycleModeSelector",

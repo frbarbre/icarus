@@ -355,6 +355,29 @@ fn hidden_values_text_and_totals_narrow_the_base_scope() {
             .sum::<u64>()
     );
     assert!(narrowed.facets.iter().all(|f| f.active));
+    assert_eq!(
+        narrowed.all_rows, None,
+        "only asked-for listings carry every row"
+    );
+
+    let everything = listing(
+        &repo,
+        &classifier,
+        ListQuery {
+            hidden: hide(&[("type", "test")]),
+            all_rows: true,
+            ..ListQuery::default()
+        },
+    );
+    assert_eq!(everything.all_rows.as_ref(), Some(&all.rows));
+    assert!(
+        everything
+            .all_rows
+            .iter()
+            .flatten()
+            .any(|r| r.facets["type"].as_deref() == Some("test")),
+        "hidden rows come with their facet values"
+    );
 
     let text = listing(
         &repo,

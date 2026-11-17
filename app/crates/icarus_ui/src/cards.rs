@@ -445,6 +445,16 @@ pub fn chip(cx: &App) -> gpui::Div {
         .bg(cx.theme().colors().element_background)
 }
 
+/// The open worktree's card fill and border: Orca's text-tinted surface, which reads in light and dark themes.
+pub fn current_card_colors(cx: &App) -> (gpui::Hsla, gpui::Hsla) {
+    let colors = cx.theme().colors();
+    if cx.theme().appearance().is_light() {
+        (colors.text.opacity(0.08), colors.text.opacity(0.12))
+    } else {
+        (colors.text.opacity(0.10), colors.text.opacity(0.18))
+    }
+}
+
 /// A card in the panel: its server and workspace id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardKey {
@@ -516,6 +526,14 @@ pub fn count_label(verb: &str, count: usize) -> String {
     } else {
         format!("{verb} {count} Workspaces")
     }
+}
+
+/// Shows the worktree at `path` (switching to it when another is in front) and focuses the agent's tab,
+/// opening one attached to its live session when the worktree has none yet.
+pub fn open_agent(path: std::path::PathBuf, agent_id: String, cx: &mut App) {
+    crate::with_workspace_window(path, cx, move |workspace, window, cx| {
+        crate::open_agent_tab(Some(agent_id), None, workspace, window, cx);
+    });
 }
 
 struct SortChangedToast;
@@ -628,6 +646,7 @@ impl WorkspacesPanel {
                     .on_click(toggle)
             }
         };
+        let row_hover = cx.theme().colors().element_hover;
         let list = expanded.then(|| {
             v_flex()
                 .pl_1p5()
@@ -640,8 +659,25 @@ impl WorkspacesPanel {
                         .unwrap_or_else(|| {
                             crate::accounts::provider_name(&agent.provider).to_owned()
                         });
+                    let agent_row_id =
+                        SharedString::from(format!("icarus-agent-{}-{}", workspace.id, agent.id));
+                    let open = {
+                        let path = workspace.path.clone();
+                        let agent_id = agent.id.clone();
+                        cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            open_agent(path.clone(), agent_id.clone(), cx);
+                        })
+                    };
                     h_flex()
+                        .id(agent_row_id.clone())
+                        .debug_selector(|| agent_row_id.to_string())
+                        .px_0p5()
                         .gap_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(row_hover))
+                        .on_click(open)
                         .child(agent_state_icon(agent))
                         .child(agent_provider_icon(&agent.provider))
                         .child(
@@ -733,7 +769,11 @@ impl WorkspacesPanel {
         let selected = self.is_selected(&key);
         let dragged = self.dragged_cards(&key, title);
         let click_key = key.clone();
-        card.when(selected, |card| {
+        card.debug_selector(|| match &key.server {
+            ServerRef::Primary => format!("card:{}", key.id),
+            ServerRef::Saved(server) => format!("card:{server}/{}", key.id),
+        })
+        .when(selected, |card| {
             card.bg(cx.theme().colors().element_selected)
         })
         .on_click(
@@ -1552,6 +1592,64 @@ mod tests {
         cx.simulate_click(pill.center(), Modifiers::none());
         cx.run_until_parked();
         assert!(!panel.read_with(cx, |panel, _| panel.agents_expanded("ws-busy")));
+    }
+
+    #[gpui::test]
+    async fn clicking_an_agent_row_opens_that_agents_tab_in_its_worktree(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::tests::summary;
+        let mut open = summary("open", "/project", None);
+        open.agents = ["starting", "idle"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| AgentSummary {
+                id: format!("agent-{index}"),
+                state: state.into(),
+                provider: "claude".into(),
+                ..AgentSummary::default()
+            })
+            .collect();
+        let (_, panel, mut cx) = crate::tests::panel_window(vec![open], cx).await;
+        let cx = &mut cx;
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            crate::set_open_agent_handler(cx, move |agent_id, _, _, workspace, _, cx| {
+                opened
+                    .borrow_mut()
+                    .push((agent_id, workspace.root_paths(cx)[0].to_path_buf()));
+            });
+        });
+        cx.simulate_resize(gpui::size(px(1280.), px(800.)));
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_agents("ws-open", cx);
+            panel
+                .workspace
+                .update(cx, |workspace, cx| {
+                    workspace.open_panel::<WorkspacesPanel>(window, cx)
+                })
+                .ok();
+        });
+        cx.run_until_parked();
+
+        let row = cx
+            .debug_bounds("icarus-agent-ws-open-agent-1")
+            .expect("the expanded list draws a row per agent");
+        cx.simulate_click(row.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            *opened.borrow(),
+            [(
+                Some("agent-1".to_owned()),
+                std::path::PathBuf::from("/project")
+            )],
+            "the click opens that agent's tab in the card's worktree"
+        );
+        assert!(
+            panel.read_with(cx, |panel, _| panel.agents_expanded("ws-open")),
+            "the click doesn't fold the list"
+        );
     }
 
     #[test]

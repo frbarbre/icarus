@@ -263,12 +263,25 @@ impl BrowserTab {
                 canvas(
                     |_, _, _| {},
                     move |bounds: Bounds<Pixels>, _, window, cx| {
-                        if cx.has_active_drag() {
+                        let bounds = bounds.intersect(&window.content_mask().bounds);
+                        if cx.has_active_drag() || bounds.is_empty() {
                             native.hide();
                             return;
                         }
                         painted.set(true);
-                        native.place(&url, bounds, window, events);
+                        let held_back =
+                            covered_by_popover(bounds, &window.deferred_hitbox_bounds());
+                        if !held_back {
+                            native.place(&url, bounds, window, events.clone());
+                        }
+                        // Popovers paint after this element, so only the finished frame tells whether one covers the page.
+                        window.on_next_frame(move |window, _| {
+                            if covered_by_popover(bounds, &window.deferred_hitbox_bounds()) {
+                                native.hide();
+                            } else if held_back {
+                                native.place(&url, bounds, window, events);
+                            }
+                        });
                     },
                 )
                 .size_full(),
@@ -305,6 +318,11 @@ impl BrowserTab {
                 )
             })
     }
+}
+
+/// The native page draws above GPUI, so it has to step aside while a menu or popover overlaps it.
+fn covered_by_popover(page: Bounds<Pixels>, popovers: &[Bounds<Pixels>]) -> bool {
+    popovers.iter().any(|popover| page.intersects(popover))
 }
 
 /// A typed address becomes a URL: a bare host gets https, anything with a scheme is kept.
@@ -843,6 +861,61 @@ pub(crate) mod tests {
         restored.read_with(cx, |tab, _| {
             assert_eq!(tab.url().as_ref(), "https://github.com/acme/widgets/pull/7");
         });
+    }
+
+    struct PageWithMenu {
+        menu_open: bool,
+    }
+
+    impl Render for PageWithMenu {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().size(px(400.)))
+                // Like a dock's resize handle: deferred, but not something to step aside for.
+                .child(gpui::deferred(
+                    div()
+                        .id("resize-handle")
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(396.))
+                        .w(px(8.))
+                        .h(px(400.))
+                        .occlude(),
+                ))
+                .when(self.menu_open, |this| {
+                    this.child(
+                        gpui::deferred(
+                            gpui::anchored()
+                                .position(gpui::point(px(50.), px(60.)))
+                                .child(div().id("menu").occlude().w(px(120.)).h(px(80.))),
+                        )
+                        .with_priority(1),
+                    )
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn an_open_menu_hides_the_page_under_it(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| PageWithMenu { menu_open: false });
+        cx.run_until_parked();
+        let page = Bounds::new(gpui::point(px(0.), px(0.)), gpui::size(px(400.), px(400.)));
+        let popovers = cx.update(|window, _| window.deferred_hitbox_bounds());
+        assert!(!covered_by_popover(page, &popovers));
+
+        view.update(cx, |view, cx| {
+            view.menu_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let popovers = cx.update(|window, _| window.deferred_hitbox_bounds());
+        assert!(covered_by_popover(page, &popovers), "{popovers:?}");
+        let elsewhere = Bounds::new(
+            gpui::point(px(300.), px(300.)),
+            gpui::size(px(50.), px(50.)),
+        );
+        assert!(!covered_by_popover(elsewhere, &popovers));
     }
 
     #[test]

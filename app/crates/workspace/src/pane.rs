@@ -660,6 +660,10 @@ impl Pane {
         }
     }
 
+    pub fn workspace(&self) -> WeakEntity<Workspace> {
+        self.workspace.clone()
+    }
+
     pub fn has_focus(&self, window: &Window, cx: &App) -> bool {
         // We not only check whether our focus handle contains focus, but also
         // whether the active item might have focus, because we might have just activated an item
@@ -4346,14 +4350,48 @@ impl Pane {
     }
 }
 
+/// Replaces the tab bar's "+" menu (Icarus sets it).
+pub struct NewItemMenu {
+    pub render: Rc<dyn Fn(&mut Pane, &mut Window, &mut Context<Pane>) -> AnyElement>,
+    /// Whether the pane's menu has focus, which keeps the pane's buttons shown.
+    pub is_focused: Rc<dyn Fn(EntityId, &Window, &App) -> bool>,
+}
+
+impl gpui::Global for NewItemMenu {}
+
 fn default_render_tab_bar_buttons(
     pane: &mut Pane,
     window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
-    if !pane.has_focus(window, cx) && !pane.context_menu_focused(window, cx) {
-        return (None, None);
+    let new_item_menu = cx
+        .try_global::<NewItemMenu>()
+        .map(|menu| (menu.render.clone(), menu.is_focused.clone()));
+    let new_item_menu_focused = new_item_menu
+        .as_ref()
+        .is_some_and(|(_, is_focused)| is_focused(cx.entity_id(), window, cx));
+    if !pane.has_focus(window, cx)
+        && !pane.context_menu_focused(window, cx)
+        && !new_item_menu_focused
+    {
+        // As in Orca, every pane keeps its "+"; an agent tab's pane rarely has focus, its composer does.
+        return match new_item_menu {
+            Some((render, _)) => (
+                None,
+                Some(
+                    h_flex()
+                        .gap(DynamicSpacing::Base04.rems(cx))
+                        .child(render(pane, window, cx))
+                        .into_any_element(),
+                ),
+            ),
+            None => (None, None),
+        };
     }
+    let new_item_button = match new_item_menu {
+        Some((render, _)) => render(pane, window, cx),
+        None => default_new_item_menu(pane),
+    };
     let (can_clone, can_split_move) = match pane.active_item() {
         Some(active_item) if active_item.can_split(cx) => (true, false),
         Some(_) => (false, pane.items_len() > 1),
@@ -4364,30 +4402,7 @@ fn default_render_tab_bar_buttons(
     let right_children = h_flex()
         // Instead we need to replicate the spacing from the [TabBar]'s `end_slot` here.
         .gap(DynamicSpacing::Base04.rems(cx))
-        .child(
-            PopoverMenu::new("pane-tab-bar-popover-menu")
-                .trigger_with_tooltip(
-                    IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
-                    Tooltip::text("New…"),
-                )
-                .anchor(Anchor::TopRight)
-                .with_handle(pane.new_item_context_menu_handle.clone())
-                .menu(move |window, cx| {
-                    Some(ContextMenu::build(window, cx, |menu, _, _| {
-                        menu.action("New File", NewFile.boxed_clone())
-                            .action("Open File", ToggleFileFinder::default().boxed_clone())
-                            .separator()
-                            .action("Search Project", DeploySearch::default().boxed_clone())
-                            .action("Search Symbols", ToggleProjectSymbols.boxed_clone())
-                            .separator()
-                            .action("New Terminal", NewTerminal::default().boxed_clone())
-                            .action(
-                                "New Center Terminal",
-                                NewCenterTerminal::default().boxed_clone(),
-                            )
-                    }))
-                }),
-        )
+        .child(new_item_button)
         .child(
             PopoverMenu::new("pane-tab-bar-split")
                 .trigger_with_tooltip(
@@ -4436,6 +4451,32 @@ fn default_render_tab_bar_buttons(
         .into_any_element()
         .into();
     (None, right_children)
+}
+
+fn default_new_item_menu(pane: &Pane) -> AnyElement {
+    PopoverMenu::new("pane-tab-bar-popover-menu")
+        .trigger_with_tooltip(
+            IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
+            Tooltip::text("New…"),
+        )
+        .anchor(Anchor::TopRight)
+        .with_handle(pane.new_item_context_menu_handle.clone())
+        .menu(move |window, cx| {
+            Some(ContextMenu::build(window, cx, |menu, _, _| {
+                menu.action("New File", NewFile.boxed_clone())
+                    .action("Open File", ToggleFileFinder::default().boxed_clone())
+                    .separator()
+                    .action("Search Project", DeploySearch::default().boxed_clone())
+                    .action("Search Symbols", ToggleProjectSymbols.boxed_clone())
+                    .separator()
+                    .action("New Terminal", NewTerminal::default().boxed_clone())
+                    .action(
+                        "New Center Terminal",
+                        NewCenterTerminal::default().boxed_clone(),
+                    )
+            }))
+        })
+        .into_any_element()
 }
 
 impl Focusable for Pane {

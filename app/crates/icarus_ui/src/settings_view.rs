@@ -37,14 +37,17 @@ actions!(
         CustomizeOpenInApps,
         /// Opens Icarus's settings at the Linear API key.
         ConnectLinear,
+        /// Opens Icarus's settings at the agents: the default harness and Remote Control.
+        OpenAgentSettings,
     ]
 );
 
 const OPEN_IN: &str = "sourceControl.openIn";
 
 /// The scrolled blocks of the view, so a block can be scrolled into view.
-const LINEAR_BLOCK: usize = 1;
-const OPEN_IN_BLOCK: usize = 2;
+const AGENTS_BLOCK: usize = 1;
+const LINEAR_BLOCK: usize = 2;
+const OPEN_IN_BLOCK: usize = 3;
 
 /// One app in the "Open in" list editor.
 struct OpenInRow {
@@ -812,6 +815,10 @@ impl SettingsView {
         } else {
             self.reveal = Some(block);
         }
+    }
+
+    pub fn reveal_agents(&mut self, cx: &mut Context<Self>) {
+        self.reveal_block(AGENTS_BLOCK, cx);
     }
 
     pub fn reveal_open_in(&mut self, cx: &mut Context<Self>) {
@@ -2134,7 +2141,10 @@ impl Render for SettingsView {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                     )
-                    .children(action_prompts)
+                    .children(action_prompts),
+            )
+            .child(
+                column()
                     .child(Self::section("AGENTS", cx))
                     .children(agents),
             )
@@ -2249,6 +2259,14 @@ pub fn open_linear_settings(
     open_settings(workspace, window, cx).update(cx, |view, cx| view.reveal_linear(window, cx));
 }
 
+pub fn open_agent_settings(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_settings(workspace, window, cx).update(cx, |view, cx| view.reveal_agents(cx));
+}
+
 pub fn register(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
@@ -2259,6 +2277,9 @@ pub fn register(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &ConnectLinear, window, cx| {
             open_linear_settings(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &OpenAgentSettings, window, cx| {
+            open_agent_settings(workspace, window, cx);
         });
     })
     .detach();

@@ -257,7 +257,10 @@ impl Server {
             return Ok(self.finish_tick(report, started));
         }
 
-        let (facts, details, ci_triage) = self.gather_facts(&targets, &config, &mut errors).await;
+        let force = trigger != "timer";
+        let (facts, details, ci_triage) = self
+            .gather_facts(&targets, &config, force, &mut errors)
+            .await;
         // Notifications are news, not actions, so dry runs send them too.
         report["notifications"] = json!(self.notify_facts(&facts));
         let statuses: Vec<StatusDef> = setting(&config.settings, &["workspace", "statuses"])
@@ -358,6 +361,7 @@ impl Server {
         &self,
         targets: &[Target],
         config: &RulesSettings,
+        force: bool,
         errors: &mut Vec<String>,
     ) -> (Facts, BTreeMap<String, PrDetails>, Vec<(String, Value)>) {
         let mut workspaces = Vec::new();
@@ -382,7 +386,8 @@ impl Server {
                     continue;
                 }
             };
-            let prs = match self.project_prs(project, None, true).await {
+            // The PR poller keeps these current; a timer tick reads its copy, an explicit one refetches.
+            let prs = match self.project_prs(project, None, force).await {
                 Ok(prs) => Some(prs),
                 Err(error) => {
                     errors.push(format!("{}: {error}", project.name));
@@ -438,7 +443,7 @@ impl Server {
         let mut review_requested = Vec::new();
         if orca.review_inbox.enabled {
             let repos: Vec<RepoRef> = targets.iter().map(|t| t.repo.clone()).collect();
-            match self.github.client.review_inbox(&repos).await {
+            match self.github.review_inbox(&repos).await {
                 Ok(inbox) => {
                     viewer = viewer.or(inbox.viewer_login);
                     review_requested = inbox.pulls.iter().map(|d| d.pr.clone()).collect();
@@ -451,18 +456,13 @@ impl Server {
         }
         let mut team_members = BTreeMap::new();
         if let Some(team) = &orca.pm_approval_team {
-            match self
-                .github
-                .client
-                .team_roster(std::slice::from_ref(team))
-                .await
-            {
+            match self.github.team_roster(team).await {
                 Ok(roster) => team_members = roster,
                 Err(error) => errors.push(format!("team {team}: {error}")),
             }
         }
         if viewer.is_none() {
-            match self.github.client.viewer_login().await {
+            match self.github.viewer_login().await {
                 Ok(login) => viewer = Some(login),
                 Err(error) => errors.push(format!("viewer: {error}")),
             }

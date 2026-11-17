@@ -1,5 +1,6 @@
 mod acp;
 mod custom;
+pub mod harness;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;

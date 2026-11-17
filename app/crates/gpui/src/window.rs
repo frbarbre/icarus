@@ -1061,10 +1061,8 @@ pub(crate) struct Frame {
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
-    #[cfg(any(test, feature = "test-support"))]
-    debug_bounds_records: Vec<(String, Bounds<Pixels>)>,
+    debug_bounds_records: Vec<DebugElement>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) next_inspector_instance_ids: FxHashMap<Rc<crate::InspectorElementPath>, usize>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1085,7 +1083,6 @@ pub(crate) struct PrepaintStateIndex {
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
-    #[cfg(any(test, feature = "test-support"))]
     debug_bounds_index: usize,
     mouse_listeners_index: usize,
     input_handlers_index: usize,
@@ -1095,11 +1092,39 @@ pub(crate) struct PaintIndex {
     line_layout_index: LineLayoutIndex,
 }
 
+static ELEMENT_RECORDING: AtomicBool = AtomicBool::new(false);
+
+/// Starts or stops recording each frame's debug selectors and painted text, for driving a
+/// running app (see [`Window::debug_elements`]). Test builds always record.
+pub fn set_element_recording(enabled: bool) {
+    ELEMENT_RECORDING.store(enabled, SeqCst);
+}
+
+/// Whether frames record debug selectors and painted text.
+pub fn element_recording() -> bool {
+    cfg!(any(test, all(debug_assertions, feature = "test-support")))
+        || ELEMENT_RECORDING.load(SeqCst)
+}
+
+/// What a frame painted that an app driver can find: an element's debug selector or a run of text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugElement {
+    /// The element's [`crate::InteractiveElement::debug_selector`].
+    pub selector: Option<String>,
+    /// The painted text, for text runs.
+    pub text: Option<SharedString>,
+    /// Where it was laid out, in window coordinates.
+    pub bounds: Bounds<Pixels>,
+    /// The part of `bounds` its clipping leaves on screen; empty when it is scrolled or clipped away.
+    pub visible: Bounds<Pixels>,
+}
+
 impl Frame {
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn record_debug_bounds(&mut self, selector: String, bounds: Bounds<Pixels>) {
-        self.debug_bounds.insert(selector.clone(), bounds);
-        self.debug_bounds_records.push((selector, bounds));
+    pub(crate) fn record_debug_element(&mut self, element: DebugElement) {
+        if let Some(selector) = &element.selector {
+            self.debug_bounds.insert(selector.clone(), element.bounds);
+        }
+        self.debug_bounds_records.push(element);
     }
 
     pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
@@ -1118,9 +1143,7 @@ impl Frame {
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
 
-            #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
-            #[cfg(any(test, feature = "test-support"))]
             debug_bounds_records: Vec::new(),
 
             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1146,12 +1169,8 @@ impl Frame {
         self.deferred_draws.clear();
         self.tab_stops.clear();
         self.focus = None;
-
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            self.debug_bounds.clear();
-            self.debug_bounds_records.clear();
-        }
+        self.debug_bounds.clear();
+        self.debug_bounds_records.clear();
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         {
@@ -3200,6 +3219,32 @@ impl Window {
         self.platform_window.bounds()
     }
 
+    /// The debug selectors and text the last frame painted, in paint order, while
+    /// [`element_recording`] is on.
+    pub fn debug_elements(&self) -> &[DebugElement] {
+        &self.rendered_frame.debug_bounds_records
+    }
+
+    /// Whether something changed since the last frame was drawn.
+    pub fn needs_draw(&self) -> bool {
+        self.invalidator.is_dirty()
+    }
+
+    pub(crate) fn record_debug_element(
+        &mut self,
+        selector: Option<String>,
+        text: Option<SharedString>,
+        bounds: Bounds<Pixels>,
+    ) {
+        let visible = bounds.intersect(&self.content_mask().bounds);
+        self.next_frame.record_debug_element(DebugElement {
+            selector,
+            text,
+            bounds,
+            visible,
+        });
+    }
+
     /// Returns the regions of this window obscured by system UI and the keyboard.
     pub fn insets(&self) -> WindowInsets {
         self.platform_window.insets()
@@ -4421,7 +4466,6 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
-            #[cfg(any(test, feature = "test-support"))]
             debug_bounds_index: self.next_frame.debug_bounds_records.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
@@ -4434,12 +4478,13 @@ impl Window {
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
         // Cached elements still exist in the frame even when their paint methods don't run.
-        #[cfg(any(test, feature = "test-support"))]
-        for (selector, bounds) in &self.rendered_frame.debug_bounds_records
-            [range.start.debug_bounds_index..range.end.debug_bounds_index]
+        for element in self
+            .rendered_frame
+            .debug_bounds_records
+            .get(range.start.debug_bounds_index..range.end.debug_bounds_index)
+            .unwrap_or_default()
         {
-            self.next_frame
-                .record_debug_bounds(selector.clone(), *bounds);
+            self.next_frame.record_debug_element(element.clone());
         }
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
@@ -4693,6 +4738,25 @@ impl Window {
                     size: self.viewport_size,
                 },
             })
+    }
+
+    /// The visible bounds of the hitboxes that prioritized deferred elements (popovers, menus)
+    /// inserted in the last rendered frame, so native views drawn over the window can step aside
+    /// for them. Priority 0 ones, like dock resize handles, are left out.
+    pub fn deferred_hitbox_bounds(&self) -> Vec<Bounds<Pixels>> {
+        let frame = &self.rendered_frame;
+        frame
+            .deferred_draws
+            .iter()
+            .filter(|draw| draw.priority > 0)
+            .flat_map(|draw| {
+                let range = draw.prepaint_range.start.hitboxes_index
+                    ..draw.prepaint_range.end.hitboxes_index;
+                frame.hitboxes.get(range).unwrap_or_default()
+            })
+            .map(|hitbox| hitbox.bounds.intersect(&hitbox.content_mask.bounds))
+            .filter(|bounds| !bounds.is_empty())
+            .collect()
     }
 
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.

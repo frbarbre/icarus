@@ -67,6 +67,8 @@ impl Server {
                     base: Option<String>,
                     #[serde(default)]
                     uncommitted_only: bool,
+                    #[serde(default)]
+                    all_rows: bool,
                 }
                 let p: P = params(p)?;
                 let workspace = self.workspace_by_key(&p.id)?;
@@ -85,6 +87,7 @@ impl Server {
                         None => self.stored_hidden(&workspace.id),
                     },
                     text: p.text,
+                    all_rows: p.all_rows,
                 };
                 let classifier = self.classifier(&workspace)?;
                 let path = workspace.path.clone();

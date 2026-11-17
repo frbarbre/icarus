@@ -902,24 +902,13 @@ pub trait InteractiveElement: Sized {
     /// Set a key that can be used to look up this element's bounds
     /// in the [`crate::VisualTestContext::debug_bounds`] map.
     ///
-    /// Selectors are only recorded in debug builds with the `test-support`
-    /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
-    /// in release builds without the per-frame cost.
-    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+    /// Selectors are recorded in debug builds with the `test-support` feature,
+    /// and elsewhere only while [`crate::element_recording`] is on, so release
+    /// builds don't pay for them per frame.
     fn debug_selector(mut self, f: impl FnOnce() -> String) -> Self {
-        self.interactivity().debug_selector = Some(f());
-        self
-    }
-
-    /// Set a key that can be used to look up this element's bounds
-    /// in the [`crate::VisualTestContext::debug_bounds`] map.
-    ///
-    /// Selectors are only recorded in debug builds with the `test-support`
-    /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
-    /// in release builds without the per-frame cost.
-    #[cfg(not(any(test, all(debug_assertions, feature = "test-support"))))]
-    #[inline]
-    fn debug_selector(self, _: impl FnOnce() -> String) -> Self {
+        if crate::element_recording() {
+            self.interactivity().debug_selector = Some(f());
+        }
         self
     }
 
@@ -2295,7 +2284,6 @@ pub struct Interactivity {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
 
-    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
     pub(crate) debug_selector: Option<String>,
 }
 
@@ -2621,11 +2609,8 @@ impl Interactivity {
 
                 let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
 
-                #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
                 if let Some(debug_selector) = &self.debug_selector {
-                    window
-                        .next_frame
-                        .record_debug_bounds(debug_selector.clone(), bounds);
+                    window.record_debug_element(Some(debug_selector.clone()), None, bounds);
                 }
 
                 self.paint_hover_group_handler(window, cx);

@@ -200,11 +200,15 @@ fn main() {
             json!({ "type": "assistant", "message": { "id": message_id, "role": "assistant",
                 "content": [ { "type": "text", "text": reply } ] }, "parent_tool_use_id": null, "session_id": session_id }),
         );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
         emit(
             &mut out,
             json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "allowed", "unifiedWindows": {
-                "five_hour": { "utilization": 0.1, "resetsAt": 1, "status": "allowed" },
-                "seven_day": { "utilization": 0.2, "resetsAt": 2, "status": "allowed" } } }, "session_id": session_id }),
+                "five_hour": { "utilization": 0.1, "resetsAt": now + 5 * 3600, "status": "allowed" },
+                "seven_day": { "utilization": 0.2, "resetsAt": now + 7 * 86400, "status": "allowed" } } }, "session_id": session_id }),
         );
         let failed = text.starts_with("fail");
         emit(

@@ -414,6 +414,59 @@ enum AppCommand {
         #[arg(long)]
         args: Option<String>,
     },
+    /// The front window's visible elements: debug selectors (ids such as `card:<workspace>`,
+    /// `scm-row:<path>`, `diff-tab:<path>`, `composer`, `agent-tab:<id>`), text, and bounds.
+    ///
+    /// Selectors for click and wait: an id (`card:ws-1`), an id prefix ending in `*`
+    /// (`scm-row:*`), text (`text:"Changes"`, exact, else the first containing it), or a point
+    /// (`120,48`). Input is simulated inside the app, so it needs no OS permissions and works
+    /// over SSH. Example flow:
+    ///   icarus app click 'scm-row:src/main.rs' --wait 'diff-tab:src/main.rs'
+    ///   icarus app key alt-f7 --repeat 20 --interval 30 --wait 'diff-tab:*'
+    Tree,
+    /// Clicks an element (see `tree` for selectors), optionally waiting for another to show.
+    Click {
+        target: String,
+        /// After clicking, wait for this selector and report how long it took.
+        #[arg(long)]
+        wait: Option<String>,
+        /// With --wait: wait for it to disappear instead.
+        #[arg(long)]
+        gone: bool,
+        /// Milliseconds to wait.
+        #[arg(long, default_value_t = 10_000)]
+        timeout: u64,
+    },
+    /// Types text into the focused element, as typing on the keyboard would.
+    Type { text: String },
+    /// Presses keystrokes (`cmd-k`, `alt-f7`, `escape`; several separated by spaces).
+    Key {
+        keys: String,
+        /// Press it this many times, like a held key's repeats.
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        /// Milliseconds between repeats.
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+        /// After pressing, wait for this selector and report how long it took.
+        #[arg(long)]
+        wait: Option<String>,
+        /// With --wait: wait for it to disappear instead.
+        #[arg(long)]
+        gone: bool,
+        /// Milliseconds to wait.
+        #[arg(long, default_value_t = 10_000)]
+        timeout: u64,
+    },
+    /// Waits until an element shows (or with --gone, disappears) and prints how long it took.
+    Wait {
+        target: String,
+        #[arg(long)]
+        gone: bool,
+        /// Milliseconds to wait before failing.
+        #[arg(long, default_value_t = 10_000)]
+        timeout: u64,
+    },
     /// The app's own settings (its `client.json`): view state kept per app, such as card fields,
     /// folded groups or the changes view. A key the server also has is overridden for this app only.
     Config {
@@ -434,7 +487,11 @@ enum AppConfigCommand {
 
 /// Waits for the app to write its answer to `path`, then removes the file.
 async fn app_answer(path: &std::path::Path) -> Result<Value> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    app_answer_within(path, Duration::from_secs(10)).await
+}
+
+async fn app_answer_within(path: &std::path::Path, within: Duration) -> Result<Value> {
+    let deadline = std::time::Instant::now() + within;
     loop {
         if let Ok(text) = std::fs::read_to_string(path)
             && let Ok(value) = serde_json::from_str::<Value>(&text)
@@ -446,10 +503,112 @@ async fn app_answer(path: &std::path::Path) -> Result<Value> {
             return Ok(value);
         }
         if std::time::Instant::now() > deadline {
-            anyhow::bail!("the app did not answer within 10s");
+            anyhow::bail!("the app did not answer within {}s", within.as_secs());
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// The `client.drive` request for an app driver command, and how long to wait for the app's answer.
+fn drive_request(command: &AppCommand) -> (Value, Duration) {
+    let wait = |target: &Option<String>, gone: bool, timeout: u64| {
+        target
+            .as_ref()
+            .map(|target| json!({ "target": target, "gone": gone, "timeout_ms": timeout }))
+    };
+    let slack = Duration::from_secs(10);
+    match command {
+        AppCommand::Click {
+            target,
+            wait: until,
+            gone,
+            timeout,
+        } => (
+            json!({ "op": "click", "target": target, "wait": wait(until, *gone, *timeout) }),
+            Duration::from_millis(*timeout) + slack,
+        ),
+        AppCommand::Type { text } => (json!({ "op": "type", "text": text }), slack),
+        AppCommand::Key {
+            keys,
+            repeat,
+            interval,
+            wait: until,
+            gone,
+            timeout,
+        } => (
+            json!({
+                "op": "key",
+                "keys": keys,
+                "repeat": repeat,
+                "interval_ms": interval,
+                "wait": wait(until, *gone, *timeout),
+            }),
+            Duration::from_millis(*timeout + u64::from(*repeat) * *interval) + slack,
+        ),
+        AppCommand::Wait {
+            target,
+            gone,
+            timeout,
+        } => (
+            json!({ "op": "wait", "wait": wait(&Some(target.clone()), *gone, *timeout) }),
+            Duration::from_millis(*timeout) + slack,
+        ),
+        _ => (json!({ "op": "tree" }), slack),
+    }
+}
+
+fn drive_summary(value: &Value) -> String {
+    fn walk(node: &Value, depth: usize, out: &mut Vec<String>) {
+        let bounds = node["bounds"]
+            .as_array()
+            .map(|b| {
+                let n = |i: usize| b.get(i).and_then(Value::as_f64).unwrap_or_default();
+                format!("{:.0},{:.0} {:.0}x{:.0}", n(0), n(1), n(2), n(3))
+            })
+            .unwrap_or_default();
+        let label = match (node["id"].as_str(), node["text"].as_str()) {
+            (Some(id), _) => id.to_owned(),
+            (None, Some(text)) => format!("{:?}", text.replace('\n', " ⏎ ")),
+            _ => String::new(),
+        };
+        out.push(format!("{}{label}  [{bounds}]", "  ".repeat(depth)));
+        for child in node["children"].as_array().into_iter().flatten() {
+            walk(child, depth + 1, out);
+        }
+    }
+    let mut lines = Vec::new();
+    if let Some(nodes) = value["nodes"].as_array() {
+        for node in nodes {
+            walk(node, 0, &mut lines);
+        }
+    }
+    if let Some(clicked) = value["clicked"].as_object() {
+        lines.push(format!(
+            "clicked {} at {:.0},{:.0}",
+            clicked["target"].as_str().unwrap_or_default(),
+            clicked["x"].as_f64().unwrap_or_default(),
+            clicked["y"].as_f64().unwrap_or_default()
+        ));
+    }
+    if let Some(pressed) = value["pressed"].as_str() {
+        lines.push(format!("pressed {pressed}"));
+    }
+    if let Some(typed) = value["typed"].as_str() {
+        lines.push(format!("typed {typed:?}"));
+    }
+    if let Some(waited) = value["waited"].as_object() {
+        lines.push(format!(
+            "{} {} after {} ms",
+            waited["target"].as_str().unwrap_or_default(),
+            if waited["gone"].as_bool() == Some(true) {
+                "was gone"
+            } else {
+                "showed"
+            },
+            waited["elapsed_ms"].as_u64().unwrap_or_default()
+        ));
+    }
+    lines.join("\n")
 }
 
 fn answer_path(kind: &str) -> Result<PathBuf> {
@@ -1725,6 +1884,19 @@ async fn main() -> Result<()> {
                     print(&cli, &value, |v| {
                         format!("dispatched {}", v["action"].as_str().unwrap_or_default())
                     });
+                }
+                AppCommand::Tree
+                | AppCommand::Click { .. }
+                | AppCommand::Type { .. }
+                | AppCommand::Key { .. }
+                | AppCommand::Wait { .. } => {
+                    let (request, within) = drive_request(command);
+                    let result = answer_path("drive")?;
+                    let mut request = request;
+                    request["result"] = json!(result);
+                    client.request("client.drive", request).await?;
+                    let value = app_answer_within(&result, within).await?;
+                    print(&cli, &value, drive_summary);
                 }
                 AppCommand::Config { command } => {
                     let (op, key, value) = match command {
@@ -3158,8 +3330,9 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{facet_selection, split_position};
+    use super::{AppCommand, drive_request, drive_summary, facet_selection, split_position};
     use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn hide_flags_group_values_by_facet() {
@@ -3189,6 +3362,39 @@ mod tests {
         assert_eq!(
             split_position("/w/odd:name.ts:3"),
             ("/w/odd:name.ts".into(), Some(3), None)
+        );
+    }
+
+    #[test]
+    fn app_driver_commands_ask_the_app_and_read_its_answer() {
+        let (request, within) = drive_request(&AppCommand::Key {
+            keys: "alt-f7".into(),
+            repeat: 20,
+            interval: 30,
+            wait: Some("diff-tab:*".into()),
+            gone: false,
+            timeout: 2000,
+        });
+        assert_eq!(
+            request,
+            json!({
+                "op": "key", "keys": "alt-f7", "repeat": 20, "interval_ms": 30,
+                "wait": { "target": "diff-tab:*", "gone": false, "timeout_ms": 2000 },
+            })
+        );
+        assert_eq!(within, Duration::from_millis(2000 + 20 * 30 + 10_000));
+
+        let answer = json!({
+            "nodes": [{ "id": "card:ws-1", "bounds": [0.0, 0.0, 200.0, 40.0], "children": [
+                { "text": "Fix login\nmain", "bounds": [8.0, 4.0, 120.0, 16.0] },
+            ]}],
+            "clicked": { "target": "card:ws-1", "x": 100.0, "y": 20.0 },
+            "waited": { "target": "text:Changes", "gone": false, "elapsed_ms": 42 },
+        });
+        assert_eq!(
+            drive_summary(&answer),
+            "card:ws-1  [0,0 200x40]\n  \"Fix login ⏎ main\"  [8,4 120x16]\n\
+             clicked card:ws-1 at 100,20\ntext:Changes showed after 42 ms"
         );
     }
 }

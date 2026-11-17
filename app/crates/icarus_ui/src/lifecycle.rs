@@ -91,7 +91,11 @@ fn single_line(placeholder: &str, window: &mut Window, cx: &mut App) -> Entity<E
     })
 }
 
-fn render_field(label: &'static str, editor: &Entity<Editor>, cx: &App) -> impl IntoElement {
+pub(crate) fn render_field(
+    label: &'static str,
+    editor: &Entity<Editor>,
+    cx: &App,
+) -> impl IntoElement {
     v_flex()
         .gap_0p5()
         .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
@@ -119,7 +123,7 @@ fn render_busy(text: &'static str) -> impl IntoElement {
         .child(Label::new(text).size(LabelSize::Small).color(Color::Muted))
 }
 
-fn render_error(error: &str) -> impl IntoElement {
+pub(crate) fn render_error(error: &str) -> impl IntoElement {
     h_flex()
         .gap_1p5()
         .items_start()
@@ -153,7 +157,7 @@ fn render_fact(label: &'static str, value: String) -> impl IntoElement {
         )
 }
 
-fn modal_frame(key_context: &'static str, title: &'static str, cx: &App) -> Div {
+pub(crate) fn modal_frame(key_context: &'static str, title: &'static str, cx: &App) -> Div {
     v_flex()
         .key_context(key_context)
         .w(rems(34.))
@@ -1908,7 +1912,10 @@ pub fn card_menu(
             let workspace = workspace.clone();
             menu = menu.item(
                 ContextMenuEntry::new(action.label())
-                    .disabled(action == CardAction::RerunSetup && setup_running)
+                    .disabled(
+                        (action == CardAction::RerunSetup && setup_running)
+                            || (action == CardAction::Delete && summary.primary),
+                    )
                     .handler(move |window, cx| {
                         run_card_action(action, &server, &summary, &workspace, window, cx)
                     }),
@@ -2031,11 +2038,14 @@ pub fn bulk_actions(
             asleep,
         ));
     }
-    actions.push((
-        BulkAction::Delete,
-        format!("{}…", crate::cards::count_label("Delete", targets.len())),
-        targets.to_vec(),
-    ));
+    let removable = pick(&|workspace| !workspace.primary);
+    if !removable.is_empty() {
+        actions.push((
+            BulkAction::Delete,
+            format!("{}…", crate::cards::count_label("Delete", removable.len())),
+            removable,
+        ));
+    }
     actions
 }
 

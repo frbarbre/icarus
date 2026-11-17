@@ -23,7 +23,7 @@ use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
 
 use crate::AppConnection;
-use crate::diff_tab::{DiffBase, DiffTabMode, open_diff_tab};
+use crate::diff_tab::{DiffBase, DiffTabMode, ReadyDiff, open_diff_tab};
 use crate::source_control_settings::{
     OpenInApp, Section, SectionLayout, SourceControlSettings, reveal_label,
 };
@@ -74,6 +74,10 @@ const BACKGROUND_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const HOLD_REPEAT: Duration = Duration::from_millis(150);
 /// How long a step's diff may take to load before the active tab counts as where to step from again.
 const STEP_LOAD_GRACE: Duration = Duration::from_secs(2);
+/// Files on each side of the selection whose diffs are kept loaded, so stepping shows them in the same frame.
+const READY_AROUND: usize = 8;
+/// How long a loaded diff is trusted before it's reloaded; a rebase or fetch can move the merge base.
+const READY_TTL: Duration = Duration::from_secs(20);
 
 /// The row a file step lands on: `None` at an end while the key is held, as Orca stops there.
 pub(crate) fn next_file(
@@ -127,6 +131,9 @@ pub struct Listing {
     pub commit: Option<CommitRef>,
     #[serde(default)]
     pub rows: Vec<Row>,
+    /// Every row in scope, hidden ones included, so facet toggles re-filter without the server.
+    #[serde(default)]
+    pub all_rows: Option<Vec<Row>>,
     #[serde(default)]
     pub totals: Totals,
     #[serde(default)]
@@ -186,6 +193,69 @@ pub struct Row {
     pub untracked: bool,
     #[serde(default)]
     pub conflicted: bool,
+    #[serde(default)]
+    pub facets: HashMap<String, Option<String>>,
+}
+
+impl Listing {
+    /// Re-filters `all_rows` by the facets' hidden values, as the server would.
+    fn apply_hidden(&mut self) -> bool {
+        let Some(all_rows) = &self.all_rows else {
+            return false;
+        };
+        let hidden: HashMap<&str, Vec<&str>> = self
+            .facets
+            .iter()
+            .map(|facet| {
+                let values = facet
+                    .values
+                    .iter()
+                    .filter(|value| value.hidden)
+                    .map(|value| value.id.as_str())
+                    .collect();
+                (facet.id.as_str(), values)
+            })
+            .collect();
+        let rows: Vec<Row> = all_rows
+            .iter()
+            .filter(|row| {
+                row.facets.iter().all(|(facet, value)| {
+                    value.as_deref().is_none_or(|value| {
+                        !hidden
+                            .get(facet.as_str())
+                            .is_some_and(|hidden| hidden.contains(&value))
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+        self.totals = Totals {
+            files: rows.len(),
+            added: rows.iter().filter_map(|row| row.added).sum(),
+            removed: rows.iter().filter_map(|row| row.removed).sum(),
+        };
+        self.rows = rows;
+        true
+    }
+
+    /// Carries `from`'s hidden values over, for a reply that was asked before the user toggled one.
+    fn take_hidden_from(&mut self, from: &Listing) {
+        for facet in &mut self.facets {
+            let Some(source) = from.facets.iter().find(|source| source.id == facet.id) else {
+                continue;
+            };
+            for value in &mut facet.values {
+                if let Some(source) = source.values.iter().find(|source| source.id == value.id) {
+                    value.hidden = source.hidden;
+                }
+            }
+            facet.active = facet
+                .values
+                .iter()
+                .any(|value| value.present && value.hidden);
+        }
+        self.apply_hidden();
+    }
 }
 
 fn local_scope(scope: &ChangesScope) -> bool {
@@ -703,6 +773,13 @@ pub struct SourceControlPanel {
     last_step: Option<(bool, Instant)>,
     /// The file the last step opened and when, while its diff may still be loading.
     stepped_to: Option<(PathBuf, Instant)>,
+    /// Diffs of the files around the selection, loaded so a step shows its file at once.
+    ready_diffs: HashMap<(PathBuf, DiffBase), (ReadyDiff, Instant)>,
+    warming: HashMap<(PathBuf, DiffBase), Task<()>>,
+    /// Bumped by each facet toggle, so a list asked for before it doesn't undo it.
+    filter_epoch: u64,
+    /// Facet toggles the server hasn't saved yet; lists read meanwhile keep the local choice.
+    filter_writes: usize,
     /// Folders folded shut in the tree view, by path.
     collapsed_dirs: collections::HashSet<String>,
     /// Open notes per changed file, shown as a badge on its row.
@@ -793,6 +870,10 @@ impl SourceControlPanel {
             selected: None,
             last_step: None,
             stepped_to: None,
+            ready_diffs: HashMap::default(),
+            warming: HashMap::default(),
+            filter_epoch: 0,
+            filter_writes: 0,
             collapsed_dirs: Default::default(),
             note_counts: HashMap::default(),
             pr_thread_counts: HashMap::default(),
@@ -841,6 +922,10 @@ impl SourceControlPanel {
             selected,
             last_step: None,
             stepped_to: None,
+            ready_diffs: HashMap::default(),
+            warming: HashMap::default(),
+            filter_epoch: 0,
+            filter_writes: 0,
             collapsed_dirs: Default::default(),
             note_counts: HashMap::default(),
             pr_thread_counts: HashMap::default(),
@@ -863,6 +948,24 @@ impl SourceControlPanel {
             _poll: Task::ready(()),
             _window_activation: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn show_listing_for_tests(&mut self, listing: Listing, cx: &mut Context<Self>) {
+        self.listing = Some(listing);
+        self.refreshing = Some(Task::ready(()));
+        self.warm_diffs(cx);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_diff_count_for_tests(&self) -> usize {
+        self.ready_diffs.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_for_tests(&self) -> Option<usize> {
+        self.selected
     }
 
     /// Fills the turns and branch state a server would, for previews.
@@ -1014,6 +1117,7 @@ impl SourceControlPanel {
         let root = self.root.clone();
         let known = self.icarus_workspace.clone();
         let scope = self.scope.clone();
+        let epoch = self.filter_epoch;
         let fetch = Tokio::spawn_result(cx, {
             let client = client.clone();
             async move {
@@ -1028,7 +1132,7 @@ impl SourceControlPanel {
                 let value = client
                     .request(
                         "workspace.changes",
-                        serde_json::json!({ "id": id, "scope": scope.wire() }),
+                        serde_json::json!({ "id": id, "scope": scope.wire(), "all_rows": true }),
                     )
                     .await?;
                 anyhow::Ok((id, serde_json::from_value::<Listing>(value)?))
@@ -1040,16 +1144,16 @@ impl SourceControlPanel {
             let id = this.update(cx, |this, cx| {
                 cx.notify();
                 match result {
-                    Ok((id, listing)) => {
+                    Ok((id, mut listing)) => {
                         this.icarus_workspace = Some(id.clone());
                         this.error = None;
-                        if let Some(selected) = this.selected
-                            && selected >= listing.rows.len()
+                        if (this.filter_epoch != epoch || this.filter_writes > 0)
+                            && let Some(current) = &this.listing
                         {
-                            this.selected = listing.rows.len().checked_sub(1);
+                            listing.take_hidden_from(current);
                         }
                         if this.listing.as_ref() != Some(&listing) {
-                            this.listing = Some(listing);
+                            this.show_listing(listing, cx);
                         }
                         Some(id)
                     }
@@ -1123,14 +1227,17 @@ impl SourceControlPanel {
     }
 
     /// Hides or shows one facet value for every client (the server persists it), updating the list at once.
-    fn toggle_facet_value(&mut self, facet: String, value: String, cx: &mut Context<Self>) {
-        let Some(id) = self.icarus_workspace.clone() else {
+    pub(crate) fn toggle_facet_value(
+        &mut self,
+        facet: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        let mut now_hidden = true;
+        let Some(mut listing) = self.listing.clone() else {
             return;
         };
-        let mut now_hidden = true;
-        if let Some(listing) = &mut self.listing
-            && let Some(entry) = listing.facets.iter_mut().find(|entry| entry.id == facet)
-        {
+        if let Some(entry) = listing.facets.iter_mut().find(|entry| entry.id == facet) {
             if let Some(item) = entry.values.iter_mut().find(|item| item.id == value) {
                 item.hidden = !item.hidden;
                 now_hidden = item.hidden;
@@ -1140,10 +1247,14 @@ impl SourceControlPanel {
                 .iter()
                 .any(|value| value.present && value.hidden);
         }
+        listing.apply_hidden();
+        self.filter_epoch += 1;
+        self.show_listing(listing, cx);
         cx.notify();
-        let Some(client) = self.client(cx) else {
+        let (Some(id), Some(client)) = (self.icarus_workspace.clone(), self.client(cx)) else {
             return;
         };
+        self.filter_writes += 1;
         let mut change = serde_json::Map::new();
         change.insert(facet, serde_json::json!([value]));
         let params = if now_hidden {
@@ -1157,12 +1268,137 @@ impl SourceControlPanel {
         cx.spawn(async move |this, cx| {
             request.await.log_err();
             this.update(cx, |this, cx| {
+                this.filter_writes = this.filter_writes.saturating_sub(1);
                 this.refreshing = None;
                 this.refresh(cx)
             })
             .log_err();
         })
         .detach();
+    }
+
+    /// Shows `listing`, keeping the selected file selected, and keeps the diffs around it ready.
+    fn show_listing(&mut self, listing: Listing, cx: &mut Context<Self>) {
+        let selected_path = self
+            .selected
+            .and_then(|index| self.rows().get(index))
+            .map(|row| row.path.clone());
+        // A file that changed kind (deleted, renamed, re-added) needs its diff read again.
+        let kinds: HashMap<PathBuf, (&str, Option<&str>)> = listing
+            .all_rows
+            .as_ref()
+            .unwrap_or(&listing.rows)
+            .iter()
+            .map(|row| {
+                (
+                    self.root.join(&row.path),
+                    (row.status.as_str(), row.old_path.as_deref()),
+                )
+            })
+            .collect();
+        let previous_kinds: HashMap<PathBuf, (&str, Option<&str>)> = self
+            .listing
+            .iter()
+            .flat_map(|previous| previous.all_rows.as_ref().unwrap_or(&previous.rows))
+            .map(|row| {
+                (
+                    self.root.join(&row.path),
+                    (row.status.as_str(), row.old_path.as_deref()),
+                )
+            })
+            .collect();
+        self.ready_diffs.retain(|(path, _), _| {
+            kinds
+                .get(path)
+                .is_some_and(|kind| previous_kinds.get(path) == Some(kind))
+        });
+        if let Some(selected) = self.selected {
+            self.selected = selected_path
+                .and_then(|path| listing.rows.iter().position(|row| row.path == path))
+                .or_else(|| {
+                    listing
+                        .rows
+                        .len()
+                        .checked_sub(1)
+                        .map(|last| selected.min(last))
+                });
+        }
+        self.listing = Some(listing);
+        self.warm_diffs(cx);
+        cx.notify();
+    }
+
+    /// Loads the diffs of the files within `READY_AROUND` steps of the selection and lets the rest go.
+    fn warm_diffs(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let Some(base) = self
+            .listing
+            .as_ref()
+            .and_then(|listing| diff_base_for(&self.scope, listing))
+        else {
+            self.ready_diffs.clear();
+            self.warming.clear();
+            return;
+        };
+        let order = self.step_order(cx);
+        let count = order.len();
+        let position = self
+            .selected
+            .and_then(|index| order.iter().position(|&row| row == index));
+        // With nothing selected the first step lands on either end.
+        let window: Vec<usize> = match position {
+            Some(position) => (position.saturating_sub(READY_AROUND)
+                ..(position + READY_AROUND + 1).min(count))
+                .collect(),
+            None => (0..READY_AROUND.min(count))
+                .chain(count.saturating_sub(READY_AROUND)..count)
+                .collect(),
+        };
+        let wanted: Vec<(PathBuf, DiffBase)> = window
+            .into_iter()
+            .filter_map(|position| order.get(position))
+            .filter_map(|&index| self.rows().get(index))
+            .map(|row| (self.root.join(&row.path), base.clone()))
+            .collect();
+        self.ready_diffs.retain(|key, _| wanted.contains(key));
+        self.warming.retain(|key, _| wanted.contains(key));
+        let now = cx.background_executor().now();
+        for key in wanted {
+            let fresh = self
+                .ready_diffs
+                .get(&key)
+                .is_some_and(|(_, at)| now.saturating_duration_since(*at) < READY_TTL);
+            if fresh || self.warming.contains_key(&key) {
+                continue;
+            }
+            let load = crate::diff_tab::load_ready_diff(&project, &key.0, &key.1, cx);
+            let task = cx.spawn({
+                let key = key.clone();
+                async move |this, cx| {
+                    let ready = load.await;
+                    this.update(cx, |this, cx| {
+                        this.warming.remove(&key);
+                        match ready {
+                            Ok(ready) => {
+                                let now = cx.background_executor().now();
+                                this.ready_diffs.insert(key, (ready, now));
+                            }
+                            Err(error) => log::debug!("preloading a diff failed: {error:#}"),
+                        }
+                    })
+                    .log_err();
+                }
+            });
+            self.warming.insert(key, task);
+        }
+    }
+
+    fn ready_diff(&self, path: &Path, base: &DiffBase) -> Option<ReadyDiff> {
+        self.ready_diffs
+            .get(&(path.to_path_buf(), base.clone()))
+            .map(|(ready, _)| ready.clone())
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1187,6 +1423,7 @@ impl SourceControlPanel {
             index
         };
         self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+        self.warm_diffs(cx);
         cx.notify();
     }
 
@@ -1299,13 +1536,23 @@ impl SourceControlPanel {
             return;
         };
         let scope = self.scope.clone();
-        let listing = self.listing.clone().unwrap_or_default();
         let root = self.root.clone();
+        let listing = self.listing.as_ref();
+        let base = listing.and_then(|listing| diff_base_for(&scope, listing));
+        let ready = base
+            .as_ref()
+            .and_then(|base| self.ready_diff(&root.join(&row.path), base));
+        let sha = match &scope {
+            ChangesScope::Commit(sha) => Some(sha.clone()),
+            _ => listing
+                .and_then(|listing| listing.turn.as_ref())
+                .map(|turn| turn.oid.clone()),
+        };
         // Deferred: the step actions run inside a Workspace update, which would double-lease it.
         window.defer(cx, move |window, cx| {
             workspace.update(cx, |workspace, cx| {
                 open_row(
-                    &row, &scope, &listing, &root, opening, workspace, window, cx,
+                    &row, base, sha, ready, &root, opening, workspace, window, cx,
                 );
             });
         });
@@ -1879,6 +2126,7 @@ impl SourceControlPanel {
         let weak = cx.entity().downgrade();
         let element = h_flex()
             .id(("changes-row", index))
+            .debug_selector(|| format!("scm-row:{}", row.path))
             .group("changes-row")
             .relative()
             .h(px(26.))
@@ -2210,6 +2458,7 @@ impl SourceControlPanel {
         let count = self.rows().len();
         let collapsed = self.collapsed(Section::Changes);
         v_flex()
+            .debug_selector(|| "scm-section:changes".into())
             .w_full()
             .when(!collapsed, |this| this.flex_1().min_h_0())
             .when(!first, |this| {
@@ -2843,19 +3092,20 @@ enum Opening {
 #[allow(clippy::too_many_arguments)]
 fn open_row(
     row: &Row,
-    scope: &ChangesScope,
-    listing: &Listing,
+    base: Option<DiffBase>,
+    sha: Option<String>,
+    ready: Option<ReadyDiff>,
     root: &Path,
     opening: Opening,
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if let Some(base) = diff_base_for(scope, listing) {
+    if let Some(base) = base {
         let path = root.join(&row.path);
         let open = match opening {
             Opening::Preview(mode) => {
-                crate::diff_tab::open_diff_preview(path, base, mode, workspace, window, cx)
+                crate::diff_tab::open_diff_preview(path, base, mode, ready, workspace, window, cx)
             }
             Opening::Kept => {
                 open_diff_tab(path, base, DiffTabMode::Diff, None, workspace, window, cx)
@@ -2871,10 +3121,6 @@ fn open_row(
         .detach();
         return;
     }
-    let sha = match scope {
-        ChangesScope::Commit(sha) => Some(sha.clone()),
-        _ => listing.turn.as_ref().map(|turn| turn.oid.clone()),
-    };
     if let Some(sha) = sha {
         open_commit_view(sha, Some(&row.path), workspace, window, cx);
     }
@@ -3239,6 +3485,7 @@ impl Render for SourceControlPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("IcarusChanges")
+            .debug_selector(|| "scm-panel".into())
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().panel_background)
@@ -3409,6 +3656,37 @@ mod tests {
     }
 
     #[test]
+    fn hidden_values_filter_every_row_locally_and_survive_an_older_reply() {
+        let listing = |hidden: bool| -> Listing {
+            let rows = serde_json::json!([
+                { "path": "a.rs", "status": "modified", "added": 3, "facets": { "type": "implementation" } },
+                { "path": "a_test.rs", "status": "modified", "added": 5, "facets": { "type": "test" } },
+                { "path": "README.md", "status": "modified", "added": 1, "facets": { "type": null } },
+            ]);
+            serde_json::from_value(serde_json::json!({
+                "rows": rows, "all_rows": rows,
+                "facets": [{ "id": "type", "label": "Types", "values": [
+                    { "id": "implementation", "label": "Implementation", "present": true },
+                    { "id": "test", "label": "Tests", "present": true, "hidden": hidden },
+                ] }],
+            }))
+            .expect("listing")
+        };
+        let mut local = listing(true);
+        assert!(local.apply_hidden());
+        let paths = |listing: &Listing| -> Vec<String> {
+            listing.rows.iter().map(|row| row.path.clone()).collect()
+        };
+        assert_eq!(paths(&local), ["a.rs", "README.md"]);
+        assert_eq!((local.totals.files, local.totals.added), (2, 4));
+
+        let mut stale = listing(false);
+        stale.take_hidden_from(&local);
+        assert_eq!(paths(&stale), ["a.rs", "README.md"]);
+        assert!(stale.facets[0].active);
+    }
+
+    #[test]
     fn the_filter_pill_names_what_is_still_shown() {
         let listing = sample_listing();
         assert_eq!(
@@ -3458,6 +3736,7 @@ mod tests {
             unstaged,
             untracked,
             conflicted,
+            facets: HashMap::default(),
         };
         let base = ChangesScope::Base;
         assert_eq!(
@@ -3812,6 +4091,7 @@ mod tests {
             unstaged,
             untracked,
             conflicted: false,
+            facets: HashMap::default(),
         };
         let base = ChangesScope::Base;
         assert_eq!(

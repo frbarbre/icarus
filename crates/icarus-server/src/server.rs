@@ -108,6 +108,9 @@ pub struct Server {
     paired_connections: std::sync::Mutex<Vec<(String, Arc<Notify>)>>,
     /// The workspace each connected client shows, by connection id (`client.focus`).
     pub(crate) focus: std::sync::Mutex<HashMap<String, String>>,
+    reads: crate::coalesce::Coalesced,
+    /// Bumped as each git write finishes, so a read never joins a run that started before it.
+    git_writes: std::sync::atomic::AtomicU64,
 }
 
 type Outbound = mpsc::UnboundedSender<ServerMessage>;
@@ -164,6 +167,13 @@ pub(crate) fn params<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, Rp
 impl Server {
     /// Binds the socket and writes the token, refusing to start if another server is alive.
     pub async fn bind(paths: ServerPaths) -> Result<(Arc<Self>, UnixListener)> {
+        Self::bind_with(paths, crate::github::GitHubService::from_env()).await
+    }
+
+    pub(crate) async fn bind_with(
+        paths: ServerPaths,
+        github: crate::github::GitHubService,
+    ) -> Result<(Arc<Self>, UnixListener)> {
         std::fs::create_dir_all(&paths.home)
             .with_context(|| format!("create {}", paths.home.display()))?;
         std::fs::set_permissions(&paths.home, std::fs::Permissions::from_mode(0o700))?;
@@ -232,7 +242,7 @@ impl Server {
             agents,
             store,
             workspace_root,
-            github: crate::github::GitHubService::from_env(),
+            github,
             linear: crate::linear::LinearService::from_env(crate::linear_key::default_store(
                 &paths.home,
             )),
@@ -259,6 +269,8 @@ impl Server {
             tls_fingerprint: std::sync::Mutex::new(None),
             paired_connections: std::sync::Mutex::new(Vec::new()),
             focus: std::sync::Mutex::new(HashMap::new()),
+            reads: Default::default(),
+            git_writes: Default::default(),
         });
         Ok((server, listener))
     }
@@ -778,6 +790,9 @@ impl Server {
                     remote_control: Option<bool>,
                     /// Permission mode to start in; default follows `bypass_permissions`.
                     mode: Option<String>,
+                    /// Whether the app opens a tab for it in its workspace; an agent tab creating its own says no.
+                    #[serde(default = "default_true")]
+                    offer_tab: bool,
                 }
                 let p: P = params(params_value)?;
                 let cwd = match p.cwd {
@@ -829,6 +844,9 @@ impl Server {
                     .create(options)
                     .await
                     .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
+                if p.offer_tab {
+                    self.offer_agent_tab(&thread.info());
+                }
                 if let Some(prompt) = p.prompt {
                     thread
                         .send(&prompt, &[])
@@ -1023,6 +1041,7 @@ impl Server {
                     .agents
                     .get(&p.id)
                     .ok_or_else(|| rpc("not_found", &p.id))?;
+                self.withdraw_agent_tab(&thread.info());
                 let (backlog, mut receiver) = thread.attach(p.since);
                 let next = backlog.last().map(|e| e.seq + 1).unwrap_or(p.since);
                 let id = p.id.clone();
@@ -1175,6 +1194,34 @@ impl Server {
                     "client.dispatch",
                     json!({ "action": p.action, "args": p.args, "result": p.result }),
                 );
+                if delivered == 0 {
+                    return Err(rpc(
+                        "no_client",
+                        "no Icarus window is connected; open the app first",
+                    ));
+                }
+                Ok(json!({ "delivered": delivered }))
+            }
+            "client.drive" => {
+                #[derive(Deserialize)]
+                struct P {
+                    /// tree, click, type, key or wait.
+                    op: String,
+                    /// A file the app writes the outcome to, so callers can wait for it.
+                    result: PathBuf,
+                }
+                let request = params_value.clone();
+                let p: P = params(params_value)?;
+                if !matches!(p.op.as_str(), "tree" | "click" | "type" | "key" | "wait") {
+                    return Err(rpc(
+                        "invalid_params",
+                        "op must be tree, click, type, key or wait",
+                    ));
+                }
+                if !p.result.is_absolute() {
+                    return Err(rpc("invalid_params", "result must be an absolute path"));
+                }
+                let delivered = self.send_to_apps("client.drive", request);
                 if delivered == 0 {
                     return Err(rpc(
                         "no_client",
@@ -1513,6 +1560,9 @@ impl Server {
             other if other.starts_with("notification.") => {
                 self.notifications_dispatch(other, params_value).await
             }
+            other if other.starts_with("quick_command.") => {
+                self.quick_commands_dispatch(other, params_value).await
+            }
             other if other.starts_with("account.") => {
                 self.accounts_dispatch(other, params_value).await
             }
@@ -1530,12 +1580,38 @@ impl Server {
                 self.attachments_dispatch(other, params_value).await
             }
             other if other.starts_with("rules.") => self.rules_dispatch(other, params_value).await,
+            "git.status" | "workspace.changes" => {
+                let writes = self.git_writes.load(std::sync::atomic::Ordering::SeqCst);
+                let key = format!("{method} {writes} {params_value}");
+                let server = self.clone();
+                let method = method.to_owned();
+                self.reads
+                    .run(key, || async move {
+                        if method == "git.status" {
+                            server.git_dispatch(&method, params_value).await
+                        } else {
+                            server.changes_dispatch(&method, params_value).await
+                        }
+                    })
+                    .await
+            }
             other if other.starts_with("note.") => self.notes_dispatch(other, params_value).await,
-            other if other.starts_with("git.") => self.git_dispatch(other, params_value).await,
-            "workspace.changes"
-            | "workspace.changes.explain"
-            | "workspace.changes.filter"
-            | "workspace.turns" => self.changes_dispatch(method, params_value).await,
+            other if other.starts_with("git.") => {
+                let reply = self.git_dispatch(other, params_value).await;
+                if !matches!(other, "git.changed" | "git.commits" | "git.commit_files") {
+                    self.git_writes
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                reply
+            }
+            "workspace.changes.explain" | "workspace.changes.filter" | "workspace.turns" => {
+                let reply = self.changes_dispatch(method, params_value).await;
+                if method == "workspace.changes.filter" {
+                    self.git_writes
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                reply
+            }
             "workspace.layout" | "workspace.take_layout" | "workspace.pending_layouts" => {
                 self.layouts_dispatch(method, params_value).await
             }
@@ -1617,6 +1693,16 @@ impl Server {
 
     pub(crate) fn client_count(&self) -> usize {
         self.clients.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connect_test_client(&self) -> mpsc::UnboundedReceiver<ServerMessage> {
+        let (outbound, inbound) = mpsc::unbounded_channel();
+        self.clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(("test".into(), "icarus-app".into(), outbound));
+        inbound
     }
 
     /// Tells every client when a terminal's keyboard mode or label changes, attached or not.

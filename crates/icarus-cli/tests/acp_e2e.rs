@@ -177,6 +177,14 @@ fn editor_threads_live_on_the_server_and_reload_after_the_editor_quits() {
         "{kinds:?}"
     );
     assert_eq!(std::fs::read_to_string(&target).expect("written"), "data");
+    let first_prompt = format!("write:{} data", target.display());
+    let named = updates
+        .iter()
+        .map(|u| &u["params"]["update"])
+        .find(|u| u["sessionUpdate"] == "session_info_update" && u["title"].is_string())
+        .expect("the first prompt names the session");
+    assert_eq!(named["title"], first_prompt.as_str());
+    assert!(named["_meta"]["icarus"]["provider"].is_string());
 
     drop(editor);
     let mut editor = Editor::start(home.path());
@@ -204,6 +212,11 @@ fn editor_threads_live_on_the_server_and_reload_after_the_editor_quits() {
     assert!(
         kinds.contains(&"tool_call") && kinds.contains(&"agent_message_chunk"),
         "{kinds:?}"
+    );
+    assert_eq!(
+        editor.update("session_info_update")["title"],
+        first_prompt.as_str(),
+        "a reloaded session keeps its name"
     );
 
     let (result, _) = editor.call(

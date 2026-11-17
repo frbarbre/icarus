@@ -91,17 +91,45 @@ pub fn login_command(provider: &str, home: &Path, binary: &str) -> String {
     )
 }
 
-/// The newest rate-limit payload among the agents that ran on this login.
-pub fn latest_usage(agents: &[AgentInfo], provider: &str, account: Option<&str>) -> Value {
+/// The newest rate-limit payload among the agents that ran on this login, as of `now_ms`.
+pub fn latest_usage(
+    agents: &[AgentInfo],
+    provider: &str,
+    account: Option<&str>,
+    now_ms: u64,
+) -> Value {
     agents
         .iter()
         .filter(|a| a.provider == provider && a.account.as_deref() == account)
         .filter_map(|a| Some((a.rate_limits_at_ms?, a.rate_limits.as_ref()?, &a.id)))
         .max_by_key(|(at, _, _)| *at)
-        .map_or(
-            Value::Null,
-            |(at, limits, id)| json!({ "rate_limits": limits, "at_ms": at, "agent_id": id }),
-        )
+        .map_or(Value::Null, |(at, limits, id)| {
+            json!({
+                "rate_limits": expire_windows(limits, now_ms),
+                "at_ms": at,
+                "age_ms": now_ms.saturating_sub(at),
+                "agent_id": id,
+            })
+        })
+}
+
+/// Usage is only seen when an agent's turn reports it, so a window whose reset time has passed
+/// since then is reported empty and marked `expired` instead of showing its old use.
+fn expire_windows(limits: &Value, now_ms: u64) -> Value {
+    let mut limits = limits.clone();
+    if let Some(windows) = limits
+        .get_mut("unifiedWindows")
+        .and_then(Value::as_object_mut)
+    {
+        for window in windows.values_mut() {
+            let resets_ms = window["resetsAt"].as_u64().map(|s| s.saturating_mul(1000));
+            if resets_ms.is_some_and(|resets| resets <= now_ms) {
+                window["utilization"] = json!(0.0);
+                window["expired"] = json!(true);
+            }
+        }
+    }
+    limits
 }
 
 /// The signed-in email from Claude Code's state file (no credentials live there).
@@ -192,6 +220,16 @@ impl Server {
         Ok(())
     }
 
+    /// A finished turn may have reported new usage; clients showing it reload.
+    pub(crate) fn usage_seen(&self, agent: &AgentInfo) {
+        if agent.rate_limits_at_ms.is_some() {
+            self.broadcast(
+                "account.usage",
+                json!({ "provider": agent.provider, "account": agent.account.as_deref().unwrap_or(SYSTEM) }),
+            );
+        }
+    }
+
     fn login_binary(&self, provider: &str) -> String {
         configured_command(&self.resolved_settings(None), provider)
             .and_then(|command| command.into_iter().next())
@@ -217,7 +255,7 @@ impl Server {
             &account.home,
             &self.login_binary(&account.provider)
         ));
-        value["usage"] = latest_usage(agents, &account.provider, Some(&account.id));
+        value["usage"] = latest_usage(agents, &account.provider, Some(&account.id), now_ms());
         value
     }
 
@@ -250,7 +288,7 @@ impl Server {
                         "home": null,
                         "managed": false,
                         "default": self.default_account(provider).is_none(),
-                        "usage": latest_usage(&agents, provider, None),
+                        "usage": latest_usage(&agents, provider, None, now_ms()),
                     }));
                     for account in accounts.iter().filter(|a| a.provider == provider) {
                         out.push(self.account_json(account, &agents));
@@ -421,10 +459,33 @@ mod tests {
             agent("a3", Some("acct-1"), None),
             agent("a4", None, Some(50)),
         ];
-        let usage = latest_usage(&agents, "claude", Some("acct-1"));
+        let usage = latest_usage(&agents, "claude", Some("acct-1"), 100);
         assert_eq!(usage["agent_id"], "a2");
         assert_eq!(usage["rate_limits"]["at"], 30);
-        assert_eq!(latest_usage(&agents, "claude", None)["agent_id"], "a4");
-        assert!(latest_usage(&agents, "codex", None).is_null());
+        assert_eq!(usage["age_ms"], 70);
+        assert_eq!(latest_usage(&agents, "claude", None, 100)["agent_id"], "a4");
+        assert!(latest_usage(&agents, "codex", None, 100).is_null());
+    }
+
+    #[test]
+    fn a_window_whose_reset_has_passed_reads_empty_instead_of_its_old_use() {
+        let mut seen = agent("a1", None, Some(1_000_000));
+        seen.rate_limits = Some(json!({ "unifiedWindows": {
+            "five_hour": { "resetsAt": 2_000, "utilization": 0.65 },
+            "seven_day": { "resetsAt": 90_000, "utilization": 0.45 },
+        } }));
+        let before = latest_usage(std::slice::from_ref(&seen), "claude", None, 1_500_000);
+        assert_eq!(
+            before["rate_limits"]["unifiedWindows"]["five_hour"]["utilization"],
+            0.65
+        );
+        assert!(before["rate_limits"]["unifiedWindows"]["five_hour"]["expired"].is_null());
+
+        let after = latest_usage(&[seen], "claude", None, 2_000_000);
+        let windows = &after["rate_limits"]["unifiedWindows"];
+        assert_eq!(windows["five_hour"]["utilization"], 0.0);
+        assert_eq!(windows["five_hour"]["expired"], true);
+        assert_eq!(windows["seven_day"]["utilization"], 0.45);
+        assert_eq!(after["age_ms"], 1_000_000);
     }
 }

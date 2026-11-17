@@ -63,6 +63,9 @@ pub struct WorkspaceSummary {
     /// Set by the server when an agent finished or needs input while no client showed the workspace.
     #[serde(default)]
     pub unread: Option<Unread>,
+    /// The repository's main checkout, which can't be removed.
+    #[serde(default)]
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -495,6 +498,7 @@ mod tests {
             manual_order: None,
             activity_at_ms: None,
             unread: None,
+            primary: false,
         }
     }
 

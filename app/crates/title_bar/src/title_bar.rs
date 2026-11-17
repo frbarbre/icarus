@@ -231,6 +231,7 @@ pub struct TitleBar {
     update_version: Entity<UpdateVersion>,
     icarus_next_action: Entity<icarus_ui::NextActionButton>,
     icarus_links: Entity<icarus_ui::WorkspaceLinks>,
+    icarus_quick_commands: Entity<icarus_ui::quick_commands::QuickCommandsButton>,
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
 }
@@ -393,6 +394,7 @@ impl Render for TitleBar {
                 .pr_1()
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(self.icarus_quick_commands.clone())
                 .child(self.icarus_links.clone())
                 .child(self.icarus_next_action.clone())
                 .child(self.render_call_controls(window, cx))
@@ -534,6 +536,10 @@ impl TitleBar {
             let project = project.clone();
             cx.new(|cx| icarus_ui::WorkspaceLinks::new(project, window, cx))
         };
+        let icarus_quick_commands = {
+            let project = project.clone();
+            cx.new(|cx| icarus_ui::quick_commands::QuickCommandsButton::new(project, window, cx))
+        };
         let platform_titlebar = cx.new(|cx| {
             let mut titlebar = PlatformTitleBar::new(id, cx).without_system_window_tabs();
             if let Some(mw) = multi_workspace.clone() {
@@ -557,6 +563,7 @@ impl TitleBar {
             update_version,
             icarus_next_action,
             icarus_links,
+            icarus_quick_commands,
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
         };

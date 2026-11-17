@@ -176,6 +176,19 @@ async fn agent_turns_are_snapshotted_and_filters_apply_in_every_scope() {
     assert!(paths(&hidden_once).is_empty());
     assert_eq!(hidden_once["unfiltered"]["files"], 1);
     assert_eq!(hidden_once["totals"]["files"], 0);
+    assert!(hidden_once.get("all_rows").is_none());
+
+    let with_hidden = client
+        .request(
+            "workspace.changes",
+            json!({ "id": id, "scope": "turn:latest", "hide": { "type": ["test"] }, "all_rows": true }),
+        )
+        .await
+        .expect("all rows");
+    assert!(paths(&with_hidden).is_empty());
+    assert_eq!(with_hidden["all_rows"][0]["path"], "web/app.test.ts");
+    assert_eq!(with_hidden["all_rows"][0]["facets"]["type"], "test");
+    assert_eq!(with_hidden["all_rows"][0]["facets"]["area"], "frontend");
 
     let base = client
         .request("workspace.changes", json!({ "id": id, "text": "SERVER" }))

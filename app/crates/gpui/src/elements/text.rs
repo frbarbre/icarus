@@ -802,6 +802,17 @@ impl TextLayout {
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
         let text_style = window.text_style();
+        if crate::element_recording()
+            && matches!(pass, TextPaintPass::All | TextPaintPass::Foreground)
+        {
+            let text = element_state
+                .lines
+                .iter()
+                .map(|line| line.text.as_ref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            window.record_debug_element(None, Some(text.into()), bounds);
+        }
         for line in &element_state.lines {
             if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
                 line.paint_background(

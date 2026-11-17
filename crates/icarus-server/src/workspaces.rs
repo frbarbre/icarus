@@ -191,6 +191,7 @@ impl Server {
             .collect();
         let mut value = serde_json::to_value(workspace).unwrap_or_default();
         value["source_label"] = json!(crate::discovery::source_label(workspace));
+        value["primary"] = json!(workspace.discovery.origin == crate::discovery::ORIGIN_PRIMARY);
         value["agents"] = json!(agents);
         value["terminals"] = json!(terminals);
         value["setup"] = json!(self.setup_status(&workspace.id));
@@ -396,6 +397,11 @@ impl Server {
                 let key: Key = params(p)?;
                 Ok(self.workspace_json(&self.workspace_by_key(&key.id)?))
             }
+            "workspace.take_agent_tabs" => {
+                let key: Key = params(p)?;
+                let workspace = self.workspace_by_key(&key.id)?;
+                Ok(json!({ "agents": self.take_agent_tabs(&workspace.id) }))
+            }
             "workspace.set" => {
                 #[derive(Deserialize)]
                 struct P {
@@ -490,6 +496,15 @@ impl Server {
                 }
                 let p: P = params(p)?;
                 let workspace = self.workspace_by_key(&p.id)?;
+                if workspace.discovery.origin == crate::discovery::ORIGIN_PRIMARY {
+                    return Err(rpc(
+                        "primary",
+                        format!(
+                            "{} is the repository's main checkout and can't be removed",
+                            workspace.name
+                        ),
+                    ));
+                }
                 let created = self.created_by_icarus(&workspace);
                 if !p.delete_worktree.unwrap_or(created) {
                     self.stop_workspace_processes(&workspace.id).await;
@@ -1360,6 +1375,86 @@ fn sleep_key(workspace_id: &str) -> String {
 
 fn unread_key(workspace_id: &str) -> String {
     format!("workspace.unread.{workspace_id}")
+}
+
+fn agent_tabs_key(workspace_id: &str) -> String {
+    format!("workspace.agent_tabs.{workspace_id}")
+}
+
+/// Offers and withdrawals read, change and write one list; this keeps them from interleaving.
+static AGENT_TABS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl Server {
+    /// Remembers an agent the server started for a workspace until an app shows it as a tab there,
+    /// and tells the apps, which open it at once if that workspace is open.
+    pub(crate) fn offer_agent_tab(&self, agent: &crate::agent::AgentInfo) {
+        let Some(workspace) = self.agent_workspace(agent) else {
+            return;
+        };
+        self.edit_agent_tabs(&workspace.id, |ids| {
+            if !ids.contains(&agent.id) {
+                ids.push(agent.id.clone());
+            }
+        });
+        self.send_to_apps(
+            "agent_tabs",
+            json!({ "workspace_id": workspace.id, "path": workspace.path }),
+        );
+    }
+
+    /// Something attached to the agent (an agent tab, usually), so no app needs to open one for it.
+    pub(crate) fn withdraw_agent_tab(&self, agent: &crate::agent::AgentInfo) {
+        let Some(workspace) = self.agent_workspace(agent) else {
+            return;
+        };
+        self.edit_agent_tabs(&workspace.id, |ids| ids.retain(|id| id != &agent.id));
+    }
+
+    fn agent_workspace(&self, agent: &crate::agent::AgentInfo) -> Option<Workspace> {
+        self.store
+            .workspace(agent.workspace.as_deref()?)
+            .ok()
+            .flatten()
+    }
+
+    /// The offered agents of a workspace that still run (or sleep), handed out once.
+    pub(crate) fn take_agent_tabs(&self, workspace_id: &str) -> Vec<String> {
+        let mut taken = Vec::new();
+        self.edit_agent_tabs(workspace_id, |ids| taken = std::mem::take(ids));
+        taken
+            .into_iter()
+            .filter(|id| {
+                self.agents
+                    .get(id)
+                    .is_some_and(|agent| agent.state() != AgentState::Exited)
+            })
+            .collect()
+    }
+
+    fn edit_agent_tabs(&self, workspace_id: &str, edit: impl FnOnce(&mut Vec<String>)) {
+        let _guard = AGENT_TABS.lock().unwrap_or_else(|p| p.into_inner());
+        let key = agent_tabs_key(workspace_id);
+        let mut ids: Vec<String> = self
+            .store
+            .kv_get(&key)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let before = ids.clone();
+        edit(&mut ids);
+        if ids == before {
+            return;
+        }
+        let stored = if ids.is_empty() {
+            self.store.kv_delete(&key).map(|_| ())
+        } else {
+            self.store.kv_set(&key, &json!(ids))
+        };
+        if let Err(error) = stored {
+            tracing::warn!("agent tabs for {workspace_id}: {error:#}");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

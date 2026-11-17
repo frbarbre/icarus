@@ -639,7 +639,12 @@ async fn workspace_lifecycle_creates_a_worktree_with_an_agent_and_lists_changes(
         .request("workspace.list", json!({}))
         .await
         .expect("list");
-    assert_eq!(listed, json!([]));
+    assert_eq!(
+        listed.as_array().map(Vec::len),
+        Some(1),
+        "only the main checkout is left: {listed}"
+    );
+    assert_eq!(listed[0]["primary"], true);
     let agents = client
         .request("agent.list", json!({}))
         .await
@@ -997,6 +1002,89 @@ async fn open_file_requests_reach_the_app_connection_only() {
             .is_err(),
         "only the app connection opens files, so a file never opens twice"
     );
+}
+
+#[tokio::test]
+async fn agents_the_server_starts_for_a_workspace_are_offered_to_the_app_as_tabs_once() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let repo = tempfile::tempdir().expect("repo");
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    git(repo.path(), &["config", "user.email", "t@example.com"]);
+    git(repo.path(), &["config", "user.name", "T"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.path().join("readme.md"), "hello\n").expect("write");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "init"]);
+    let _server = start_server(home.path());
+    let fake = env!("CARGO_BIN_EXE_icarus-fake-agent");
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let (_app, mut app_events) = Client::connect(home.path(), "icarus-app")
+        .await
+        .expect("app");
+    let project = client
+        .request("project.add", json!({ "path": repo.path() }))
+        .await
+        .expect("add project");
+    let workspace = client
+        .request(
+            "workspace.create",
+            json!({ "project": project["id"], "name": "review", "agent": false }),
+        )
+        .await
+        .expect("create workspace");
+    let path = workspace["path"].as_str().expect("path").to_owned();
+    let create = |offer_tab: Option<bool>| {
+        let mut params = json!({
+            "cwd": path, "workspace": workspace["id"], "command": [fake],
+            "env": { "ICARUS_FAKE_LAZY_INIT": "1" },
+        });
+        if let Some(offer_tab) = offer_tab {
+            params["offer_tab"] = json!(offer_tab);
+        }
+        let client = &client;
+        async move {
+            let info = client
+                .request("agent.create", params)
+                .await
+                .expect("create agent");
+            info["id"].as_str().expect("id").to_owned()
+        }
+    };
+    let review = create(None).await;
+    let offered = next_event(&mut app_events, "agent_tabs").await;
+    assert_eq!(offered["workspace_id"], workspace["id"]);
+    assert_eq!(offered["path"], json!(path));
+    let screenshots = create(None).await;
+    let attached = create(None).await;
+    create(Some(false)).await;
+    client
+        .request("agent.attach", json!({ "id": attached }))
+        .await
+        .expect("attach");
+
+    let idle = client
+        .request("agent.wait", json!({ "id": review, "timeout_ms": 5000 }))
+        .await
+        .expect("an agent waiting for its first message reads as idle, not starting");
+    assert_eq!(idle["state"], "idle");
+
+    let taken = client
+        .request("workspace.take_agent_tabs", json!({ "id": path }))
+        .await
+        .expect("take");
+    assert_eq!(
+        taken["agents"],
+        json!([review, screenshots]),
+        "an attached agent already has a tab, and a tab's own agent is never offered"
+    );
+    let again = client
+        .request(
+            "workspace.take_agent_tabs",
+            json!({ "id": workspace["id"] }),
+        )
+        .await
+        .expect("take again");
+    assert_eq!(again["agents"], json!([]), "handed out once");
 }
 
 #[tokio::test]

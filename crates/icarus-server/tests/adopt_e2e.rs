@@ -280,7 +280,13 @@ async fn adopting_a_discovered_worktree_keeps_its_record_and_shows_it() {
         )
         .await
         .expect("list");
-    let found = hidden[0].clone();
+    let found = hidden
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|workspace| workspace["primary"] != true)
+        .cloned()
+        .expect("the outside worktree");
     assert_eq!(found["hidden"], true);
     let adopted = client
         .request("workspace.adopt", json!({ "path": outside }))
@@ -296,5 +302,9 @@ async fn adopting_a_discovered_worktree_keeps_its_record_and_shows_it() {
         )
         .await
         .expect("list");
-    assert_eq!(listed.as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        listed.as_array().map(Vec::len),
+        Some(2),
+        "the adopted worktree and the main checkout"
+    );
 }

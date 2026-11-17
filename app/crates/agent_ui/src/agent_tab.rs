@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use acp_thread::ThreadStatus;
 use agent_client_protocol::v2::schema as acp_v2;
+use agent_servers::harness::{self, Harness};
 use anyhow::Context as _;
 use db::kvp::KeyValueStore;
 use gpui::{
@@ -11,7 +12,6 @@ use gpui::{
 };
 use project::Project;
 use ui::{Color, Icon, IconName, Label, LabelSize, prelude::*};
-use util::ResultExt as _;
 use workspace::item::{Item, ItemEvent, SerializableItem};
 use workspace::{ItemId, Pane, SaveIntent, Workspace, WorkspaceId};
 
@@ -32,9 +32,6 @@ actions!(
         FocusComposer,
     ]
 );
-
-/// The agent providers a new tab can start, as (`agents.default` value, name).
-pub const PROVIDERS: [(&str, &str); 2] = [("claude", "Claude"), ("codex", "Codex")];
 
 /// Picks the agent server that starts a new `provider` agent in a project; Icarus sets it.
 pub struct TabAgentProviderServer(
@@ -57,6 +54,32 @@ pub fn open_provider_agent_tab(
         .map(|picker| picker.0.clone())
         .and_then(|picker| picker(workspace.project(), provider, cx));
     open_tab(workspace, server, None, None, true, window, cx)
+}
+
+/// Longest title a tab shows; its tooltip shows the whole one.
+const TAB_TITLE_LIMIT: usize = 40;
+
+/// What an agent tab is called: its conversation's title, else the harness it runs.
+pub(crate) fn tab_title(title: SharedString, harness: Option<&Harness>) -> SharedString {
+    match harness {
+        Some(harness) if title.as_ref() == crate::DEFAULT_THREAD_TITLE => harness.name.into(),
+        _ => title,
+    }
+}
+
+/// The harness behind a conversation: what its session reports, else what its agent was started for.
+pub(crate) fn conversation_harness(
+    conversation_view: &ConversationView,
+    cx: &App,
+) -> Option<&'static Harness> {
+    conversation_view
+        .root_thread_view()
+        .and_then(|view| thread_harness(view.read(cx).thread.read(cx)))
+        .or_else(|| harness::harness_for_agent_id(&conversation_view.agent_key().id().0))
+}
+
+pub(crate) fn thread_harness(thread: &acp_thread::AcpThread) -> Option<&'static Harness> {
+    harness::session_harness(thread.session_info().meta.as_ref())
 }
 
 /// An agent conversation shown as a center tab; its composer lives in the workspace's [`AgentComposer`].
@@ -190,6 +213,14 @@ impl AgentTab {
         self.thread_view(cx)
             .is_some_and(|view| view.read(cx).thread.read(cx).status() != ThreadStatus::Idle)
     }
+
+    pub fn harness(&self, cx: &App) -> Option<&'static Harness> {
+        conversation_harness(self.conversation_view.read(cx), cx)
+    }
+
+    fn title(&self, cx: &App) -> SharedString {
+        tab_title(self.conversation_view.read(cx).title(cx), self.harness(cx))
+    }
 }
 
 impl EventEmitter<ItemEvent> for AgentTab {}
@@ -214,30 +245,29 @@ impl Item for AgentTab {
         } else {
             params.text_color()
         };
-        Label::new(self.tab_content_text(params.detail.unwrap_or_default(), cx))
+        let title = self.tab_content_text(params.detail.unwrap_or_default(), cx);
+        Label::new(util::truncate_and_trailoff(&title, TAB_TITLE_LIMIT))
             .single_line()
             .color(color)
             .into_any_element()
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        self.conversation_view.read(cx).title(cx)
+        self.title(cx)
     }
 
     fn tab_icon(&self, _window: &Window, cx: &App) -> Option<Icon> {
-        let working = self.is_working(cx);
-        Some(
-            Icon::new(if working {
-                IconName::ArrowCircle
-            } else {
-                IconName::ZedAgent
-            })
-            .color(if working { Color::Accent } else { Color::Muted }),
-        )
+        if self.is_working(cx) {
+            return Some(Icon::new(IconName::ArrowCircle).color(Color::Accent));
+        }
+        let icon = self
+            .harness(cx)
+            .map_or(IconName::ZedAgent, |harness| harness.icon);
+        Some(Icon::new(icon).color(Color::Muted))
     }
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
-        Some(self.conversation_view.read(cx).title(cx))
+        Some(self.title(cx))
     }
 
     fn show_toolbar(&self) -> bool {
@@ -253,6 +283,7 @@ impl Render for AgentTab {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .track_focus(&self.focus_handle)
+            .debug_selector(|| format!("agent-tab:{}", self.title(cx)))
             .relative()
             .size_full()
             .child(self.conversation_view.clone())
@@ -486,7 +517,6 @@ pub struct AgentComposer {
     ensure_scheduled: bool,
     /// Focus asked for before the target's conversation loaded; given once it has.
     pending_focus: bool,
-    agent_tab_count: usize,
     _target_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -512,7 +542,6 @@ impl AgentComposer {
             observed_target: None,
             ensure_scheduled: false,
             pending_focus: false,
-            agent_tab_count: 0,
             _target_subscriptions: Vec::new(),
             _subscriptions: vec![subscription],
         }
@@ -590,7 +619,6 @@ impl AgentComposer {
         };
         let tabs: Vec<Entity<AgentTab>> =
             workspace.read(cx).items_of_type::<AgentTab>(cx).collect();
-        self.agent_tab_count = tabs.len();
         let target = self.observed_target;
         let several = tabs.len() > 1;
         for tab in tabs {
@@ -659,33 +687,6 @@ impl AgentComposer {
         })
     }
 
-    /// "+" above the composer: a new agent tab, choosing Claude or Codex.
-    fn render_new_agent_menu(&self) -> impl IntoElement {
-        let workspace = self.workspace.clone();
-        ui::PopoverMenu::new("icarus-new-agent-menu")
-            .trigger_with_tooltip(
-                IconButton::new("icarus-new-agent", IconName::Plus).icon_size(IconSize::XSmall),
-                ui::Tooltip::text("New Agent"),
-            )
-            .anchor(gpui::Anchor::BottomRight)
-            .menu(move |window, cx| {
-                let workspace = workspace.clone();
-                Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    for (provider, name) in PROVIDERS {
-                        let workspace = workspace.clone();
-                        menu = menu.entry(format!("New {name} Agent"), None, move |window, cx| {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    open_provider_agent_tab(workspace, provider, window, cx);
-                                })
-                                .log_err();
-                        });
-                    }
-                    menu
-                }))
-            })
-    }
-
     /// Swaps a tab whose agent no longer exists for a fresh agent in the same pane.
     fn replace_failed_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(workspace), Some(tab)) = (self.workspace.upgrade(), self.target()) else {
@@ -732,40 +733,11 @@ impl Render for AgentComposer {
             let focus_handle = thread_view.read(cx).message_editor.focus_handle(cx);
             window.defer(cx, move |window, cx| focus_handle.focus(window, cx));
         }
-        let several = self.agent_tab_count > 1;
-        let target_title = self
-            .target()
-            .map(|tab| tab.read(cx).conversation_view.read(cx).title(cx));
-        let header_color = if several { Color::Accent } else { Color::Muted };
         let composer = self.target_thread_view(cx).map(|thread_view| {
-            let composer = thread_view.update(cx, |thread_view, cx| {
-                thread_view.render_hosted_composer(window, cx)
-            });
-            v_flex()
-                .w_full()
-                .child(
-                    h_flex()
-                        .px_3()
-                        .pt_1()
-                        .gap_1()
-                        .border_t_1()
-                        .border_color(cx.theme().colors().border)
-                        .bg(cx.theme().colors().editor_background)
-                        .child(
-                            Icon::new(IconName::ZedAgent)
-                                .size(IconSize::XSmall)
-                                .color(header_color),
-                        )
-                        .child(
-                            Label::new(format!("To {}", target_title.unwrap_or_default()))
-                                .size(LabelSize::XSmall)
-                                .color(header_color)
-                                .truncate(),
-                        )
-                        .child(div().flex_1())
-                        .child(self.render_new_agent_menu()),
-                )
-                .child(composer)
+            thread_view
+                .update(cx, |thread_view, cx| {
+                    thread_view.render_hosted_composer(window, cx)
+                })
                 .into_any_element()
         });
         let failed = self
@@ -773,10 +745,14 @@ impl Render for AgentComposer {
             .is_some_and(|tab| tab.read(cx).conversation_view.read(cx).failed_to_load());
         div()
             .id("icarus-agent-composer")
+            .debug_selector(|| "composer".into())
             .w_full()
             .flex_none()
             .map(|this| match composer {
-                Some(composer) => this.child(composer),
+                Some(composer) => this
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(composer),
                 None => this
                     .border_t_1()
                     .border_color(cx.theme().colors().border)
@@ -1064,6 +1040,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_untitled_tab_is_named_after_its_harness() {
+        let codex = harness::harness("codex");
+        assert_eq!(
+            tab_title(crate::DEFAULT_THREAD_TITLE.into(), codex),
+            "Codex"
+        );
+        assert_eq!(
+            tab_title("Fix the login bug".into(), codex),
+            "Fix the login bug"
+        );
+        assert_eq!(
+            tab_title("Loading…".into(), codex),
+            "Loading…",
+            "loading and errors still say so"
+        );
+        assert_eq!(
+            tab_title(crate::DEFAULT_THREAD_TITLE.into(), None),
+            crate::DEFAULT_THREAD_TITLE
+        );
+    }
+
     #[gpui::test]
     fn an_agent_that_was_never_used_is_still_a_target(cx: &mut TestAppContext) {
         let tabs = ids(cx, 2);
@@ -1212,6 +1210,112 @@ mod tests {
             "agents live in tabs; Zed's agent panel never shows"
         );
         assert!(!has_button, "and has no status bar button");
+    }
+
+    #[gpui::test]
+    async fn a_tab_takes_its_sessions_title_and_harness_logo(cx: &mut TestAppContext) {
+        crate::test_support::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            crate::thread_metadata_store::init(cx);
+            init(cx);
+        });
+        let _connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        fs.insert_tree("/project", serde_json::json!({ "a.txt": "" }))
+            .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            panel.update(cx, |panel, cx| {
+                panel.select_agent(crate::Agent::Stub, window, cx)
+            });
+            workspace.add_panel(panel, window, cx);
+        });
+        cx.run_until_parked();
+        let tab = agent_tabs(&workspace, cx)[0].clone();
+        let named = |tab: &Entity<AgentTab>, cx: &mut VisualTestContext| {
+            tab.read_with(cx, |tab, cx| {
+                (
+                    tab.tab_content_text(0, cx),
+                    tab.harness(cx).map(|harness| harness.icon),
+                )
+            })
+        };
+        assert_eq!(named(&tab, cx), (crate::DEFAULT_THREAD_TITLE.into(), None));
+
+        let thread = tab.read_with(cx, |tab, cx| {
+            tab.thread_view(cx)
+                .expect("connected agent")
+                .read(cx)
+                .thread
+                .clone()
+        });
+        let codex = acp_v2::Meta::from_iter([(
+            "icarus".into(),
+            serde_json::json!({ "provider": "codex" }),
+        )]);
+        thread.update(cx, |thread, cx| {
+            thread.update_session_info(acp_v2::SessionInfoUpdate::new().meta(codex), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            named(&tab, cx),
+            ("Codex".into(), Some(IconName::AiOpenAi)),
+            "before its first prompt the tab says which harness it runs"
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread.update_session_info(
+                acp_v2::SessionInfoUpdate::new().title("Fix the login redirect"),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            named(&tab, cx),
+            ("Fix the login redirect".into(), Some(IconName::AiOpenAi)),
+            "the session's title names the tab once the agent has one"
+        );
+
+        let harness_server: std::rc::Rc<dyn agent_servers::AgentServer> = std::rc::Rc::new(
+            crate::test_support::StubAgentServer::new(StubAgentConnection::new()),
+        );
+        let selected_agent = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let panel = workspace.read(cx).panel::<AgentPanel>(cx).expect("panel");
+                panel.read(cx).selected_agent(cx)
+            })
+        };
+        let selected_before = selected_agent(cx);
+        let harness_tab = workspace
+            .update_in(cx, |workspace, window, cx| {
+                open_agent_tab_with_server(workspace, harness_server, false, window, cx)
+            })
+            .expect("harness tab");
+        cx.run_until_parked();
+        let key = harness_tab.read_with(cx, |tab, cx| {
+            tab.conversation_view.read(cx).agent_key().clone()
+        });
+        assert_eq!(
+            key,
+            crate::Agent::Custom { id: "Test".into() },
+            "a harness's tab connects to its own agent, so its session lists its own models"
+        );
+        assert_eq!(
+            selected_agent(cx),
+            selected_before,
+            "and new tabs keep starting the selected agent"
+        );
     }
 
     #[gpui::test]

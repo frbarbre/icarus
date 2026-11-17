@@ -627,8 +627,7 @@ impl Server {
                 let (workspace, target) = self.review_target(&at).await?;
                 let context = self
                     .github
-                    .client
-                    .review_context(&target.repo, target.number)
+                    .review_context(&target.repo, target.number, false)
                     .await
                     .map_err(github_error)?;
                 let applied = self
@@ -686,8 +685,7 @@ impl Server {
                     .map_err(github_error)?;
                 let author = self
                     .github
-                    .client
-                    .review_context(&target.repo, target.number)
+                    .review_context(&target.repo, target.number, false)
                     .await
                     .ok()
                     .and_then(|context| context.author_login);
@@ -710,8 +708,7 @@ impl Server {
                     .unwrap_or_default();
                 let author = self
                     .github
-                    .client
-                    .review_context(&target.repo, target.number)
+                    .review_context(&target.repo, target.number, false)
                     .await
                     .ok()
                     .and_then(|context| context.author_login);
@@ -1043,7 +1040,11 @@ impl Server {
                 Ok::<_, RpcError>((session.into_value(), result))
             })
             .map_err(internal)??;
-        self.review_changed(Some(&workspace.id), None);
+        // A session is local (drafts, summary, base), so GitHub's threads stay cached.
+        self.broadcast(
+            REVIEW_CHANGED_TOPIC,
+            json!({ "workspace": workspace.id, "thread": null }),
+        );
         Ok(result)
     }
 
@@ -1140,8 +1141,7 @@ impl Server {
         // Why fail open: a lookup that did not answer must not hide what the reviewer is entitled to do.
         let (context, context_error) = match self
             .github
-            .client
-            .review_context(&target.repo, target.number)
+            .review_context(&target.repo, target.number, false)
             .await
         {
             Ok(context) => (Some(context), None),
@@ -1254,8 +1254,7 @@ impl Server {
         let (draft, note) = self.build_draft(workspace, target, add).await?;
         let context = self
             .github
-            .client
-            .review_context(&target.repo, target.number)
+            .review_context(&target.repo, target.number, false)
             .await
             .map_err(github_error)?;
         let posted = self
@@ -1427,8 +1426,7 @@ impl Server {
         }
         let context = self
             .github
-            .client
-            .review_context(&target.repo, target.number)
+            .review_context(&target.repo, target.number, false)
             .await
             .map_err(github_error)?;
         if context.viewer_did_author && verdict != Verdict::Comment {
@@ -1453,6 +1451,7 @@ impl Server {
             Ok(())
         })?;
         self.github.invalidate(&workspace.project_id);
+        self.github.forget_review_threads();
         Ok(json!({
             "id": review.id,
             "state": review.state,

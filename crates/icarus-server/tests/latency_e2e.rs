@@ -231,7 +231,11 @@ async fn twenty_worktrees_scan_in_well_under_a_second() {
         scans.push(started.elapsed());
     }
     let listed = request(&client, "workspace.list", json!({})).await;
-    assert_eq!(listed.as_array().map(Vec::len), Some(20));
+    assert_eq!(
+        listed.as_array().map(Vec::len),
+        Some(21),
+        "the twenty and the main checkout"
+    );
     eprintln!("scans of 20 worktrees: {scans:?}");
     let slowest = scans.iter().max().copied().unwrap_or_default();
     assert!(slowest < Duration::from_millis(1500), "{scans:?}");

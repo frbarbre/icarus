@@ -831,6 +831,7 @@ pub struct ListQuery {
     pub scope: Scope,
     pub hidden: Hidden,
     pub text: Option<String>,
+    pub all_rows: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -890,6 +891,9 @@ pub struct Listing {
     pub turn: Option<Turn>,
     pub commit: Option<CommitInfo>,
     pub rows: Vec<ClassifiedRow>,
+    /// Every row in scope, shown or not, so a client can re-filter without asking again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all_rows: Option<Vec<ClassifiedRow>>,
     pub totals: Totals,
     pub unfiltered: Totals,
     pub facets: Vec<FacetSummary>,
@@ -994,17 +998,23 @@ pub fn list(worktree: &Path, classifier: &Classifier, query: &ListQuery) -> Resu
         classified.push((row, values));
     }
     let unfiltered = Totals::of(scope_rows.iter());
-    let rows: Vec<ClassifiedRow> = classified
+    let every: Vec<ClassifiedRow> = classified
         .into_iter()
-        .filter(|(row, values)| {
-            is_shown(values, &query.hidden) && text_matches(query.text.as_deref(), &row.path)
-        })
         .map(|(row, facets)| ClassifiedRow {
             discardable: live && (row.unstaged || row.untracked) && !row.conflicted,
             row: row.clone(),
             facets,
         })
         .collect();
+    let rows: Vec<ClassifiedRow> = every
+        .iter()
+        .filter(|row| {
+            is_shown(&row.facets, &query.hidden)
+                && text_matches(query.text.as_deref(), &row.row.path)
+        })
+        .cloned()
+        .collect();
+    let all_rows = query.all_rows.then_some(every);
     let totals = Totals::of(rows.iter().map(|r| &r.row));
     let facets = classifier
         .config
@@ -1039,6 +1049,7 @@ pub fn list(worktree: &Path, classifier: &Classifier, query: &ListQuery) -> Resu
         added: totals.added,
         removed: totals.removed,
         rows,
+        all_rows,
         totals,
         unfiltered,
         facets,

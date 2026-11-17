@@ -110,6 +110,21 @@ impl RateBudget {
         self.allows_at(resource, now_epoch())
     }
 
+    /// When calls to `resource` may go out again (epoch seconds), if they're held back now: until
+    /// GitHub's backoff ends, or until the reset once fewer than [`STOP_FLOOR`] are left.
+    pub fn resume_at(&self, resource: &str) -> Option<u64> {
+        self.resume_at_time(resource, now_epoch())
+    }
+
+    pub fn resume_at_time(&self, resource: &str, now: u64) -> Option<u64> {
+        let backoff = self.backoff_until.filter(|until| *until > now);
+        let spent = self
+            .live(resource, now)
+            .filter(|limit| limit.remaining < STOP_FLOOR)
+            .map(|limit| limit.reset);
+        backoff.max(spent)
+    }
+
     fn live(&self, resource: &str, now: u64) -> Option<RateLimit> {
         self.get(resource).filter(|limit| limit.reset > now)
     }
@@ -132,7 +147,7 @@ pub(crate) fn retry_after(response: &HttpResponse) -> Option<Duration> {
     None
 }
 
-pub(crate) fn now_epoch() -> u64 {
+pub fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())

@@ -14418,23 +14418,22 @@ impl ThreadView {
 
     /// What an agent tab shows before its first message, since its composer lives outside the tab.
     fn render_hosted_empty_state(&self, cx: &Context<Self>) -> impl IntoElement {
-        let title = self
-            .thread
-            .read(cx)
+        let thread = self.thread.read(cx);
+        let harness = crate::agent_tab::thread_harness(thread)
+            .or_else(|| agent_servers::harness::harness_for_agent_id(&self.agent_id.0));
+        let title = thread
             .title()
             .filter(|title| !title.is_empty())
+            .or_else(|| harness.map(|harness| harness.name.into()))
             .unwrap_or_else(|| self.agent_display_name.clone());
+        let icon = harness.map_or(self.agent_icon, |harness| harness.icon);
         v_flex()
             .id("hosted-empty-state")
             .size_full()
             .items_center()
             .justify_center()
             .gap_2()
-            .child(
-                Icon::new(self.agent_icon)
-                    .size(IconSize::XLarge)
-                    .color(Color::Muted),
-            )
+            .child(Icon::new(icon).size(IconSize::XLarge).color(Color::Muted))
             .child(Label::new(title).size(LabelSize::Large))
             .child(
                 Label::new(crate::conversation_view::HOSTED_COMPOSER_PLACEHOLDER)

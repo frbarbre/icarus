@@ -43,8 +43,8 @@ actions!(
 const GITHUB_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// How often a window that isn't in front re-reads the PR status.
 const GITHUB_BACKGROUND_INTERVAL: Duration = Duration::from_secs(60);
-/// Review threads are re-read at least this often while the panel shows, as Orca's 60s PR refresh.
-const THREADS_INTERVAL: Duration = Duration::from_secs(60);
+/// Opening the panel re-reads review threads older than this; they're never polled otherwise.
+const THREADS_STALE: Duration = Duration::from_secs(300);
 /// The trailing action slots of every row list, so icons line up whichever ones a row shows.
 const SLOT: Pixels = px(20.);
 
@@ -480,6 +480,24 @@ pub struct PrStatus {
     pub error: Option<String>,
     pub previews: Vec<PreviewDeployment>,
     pub primary_preview: Option<PreviewDeployment>,
+    /// While GitHub's quota is spent: when the server asks again (epoch seconds); the rest is cached.
+    pub rate_limited_until: Option<i64>,
+}
+
+/// "GitHub rate limit, retrying at 14:05", in local time.
+fn rate_limit_note(until: i64) -> String {
+    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    match OffsetDateTime::from_unix_timestamp(until) {
+        Ok(at) => {
+            let at = at.to_offset(offset);
+            format!(
+                "GitHub rate limit, retrying at {:02}:{:02}",
+                at.hour(),
+                at.minute()
+            )
+        }
+        Err(_) => "GitHub rate limit, retrying later".to_owned(),
+    }
 }
 
 impl PrStatus {
@@ -1133,7 +1151,8 @@ struct PreviewFixture {
     audience: Option<String>,
     /// `pr.body`'s description.
     description: Option<String>,
-    description_collapsed: bool,
+    /// `false` unfolds the description, which starts folded.
+    description_collapsed: Option<bool>,
 }
 
 pub struct GitHubPanel {
@@ -1172,8 +1191,8 @@ pub struct GitHubPanel {
     /// The PR description: the workspace and PR update time it was read at, and the text.
     description: Option<(String, Option<String>, String)>,
     description_task: Option<Task<()>>,
-    /// Workspaces whose description is folded.
-    description_collapsed: HashSet<String>,
+    /// Workspaces whose description is unfolded; it starts folded, as in Orca.
+    description_expanded: HashSet<String>,
     /// Showing in its dock; threads are only read while it is.
     active: bool,
     threads_read_at: Option<Instant>,
@@ -1182,6 +1201,31 @@ pub struct GitHubPanel {
 
 fn markdown_style(panel: &GitHubPanel) -> markdown::MarkdownStyle {
     panel.markdown_style.clone().unwrap_or_default()
+}
+
+/// Small body text with headings barely above it, like Orca's 12 px PR panel.
+pub(crate) fn compact_markdown_style(
+    mut style: markdown::MarkdownStyle,
+    cx: &App,
+) -> markdown::MarkdownStyle {
+    let heading = |size: f32| {
+        Some(gpui::TextStyleRefinement {
+            font_size: Some(gpui::rems(size).into()),
+            font_weight: Some(gpui::FontWeight::SEMIBOLD),
+            ..Default::default()
+        })
+    };
+    style.base_text_style.font_size = ui::TextSize::Small.rems(cx).into();
+    style.base_text_style.line_height = gpui::relative(1.45);
+    style.heading_level_styles = Some(markdown::HeadingLevelStyles {
+        h1: heading(0.875),
+        h2: heading(0.8125),
+        h3: heading(0.75),
+        h4: heading(0.75),
+        h5: heading(0.75),
+        h6: heading(0.75),
+    });
+    style
 }
 
 impl GitHubPanel {
@@ -1242,7 +1286,7 @@ impl GitHubPanel {
                 };
                 let Ok((paths, threads_fetch)) = this.update(cx, |panel, cx| {
                     panel.load_layout(cx);
-                    (panel.project_paths(cx), panel.threads_fetch(in_front))
+                    (panel.project_paths(cx), panel.threads_fetch(false))
                 }) else {
                     return;
                 };
@@ -1294,7 +1338,7 @@ impl GitHubPanel {
             heights: HashMap::default(),
             description: None,
             description_task: None,
-            description_collapsed: HashSet::default(),
+            description_expanded: HashSet::default(),
             active: false,
             threads_read_at: None,
             _poll: Task::ready(()),
@@ -1573,8 +1617,8 @@ impl GitHubPanel {
                 if fixture.checks_expanded {
                     panel.checks_expanded.insert(workspace.clone());
                 }
-                if fixture.description_collapsed {
-                    panel.description_collapsed.insert(workspace.clone());
+                if fixture.description_collapsed == Some(false) {
+                    panel.description_expanded.insert(workspace.clone());
                 }
                 if let Some(body) = fixture.description {
                     let updated_at = fixture
@@ -1701,17 +1745,17 @@ impl GitHubPanel {
         let Some(workspace) = self.current_workspace_id().map(str::to_owned) else {
             return;
         };
-        if !self.description_collapsed.remove(&workspace) {
-            self.description_collapsed.insert(workspace);
+        if !self.description_expanded.remove(&workspace) {
+            self.description_expanded.insert(workspace);
         }
         cx.notify();
     }
 
     fn render_description(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let body = self.current_description()?.to_owned();
-        let collapsed = self
+        let collapsed = !self
             .current_workspace_id()
-            .is_some_and(|workspace| self.description_collapsed.contains(workspace));
+            .is_some_and(|workspace| self.description_expanded.contains(workspace));
         let colors = cx.theme().colors();
         let (text, media) = crate::media::split_media(&body);
         let mut frame = v_flex()
@@ -1771,10 +1815,10 @@ impl GitHubPanel {
             } else {
                 match self.markdown.get(DESCRIPTION_KEY) {
                     Some((_, markdown)) => div()
-                        .text_sm()
+                        .text_ui_sm(cx)
                         .child(markdown::MarkdownElement::new(
                             markdown.clone(),
-                            markdown_style(self),
+                            compact_markdown_style(markdown_style(self), cx),
                         ))
                         .into_any_element(),
                     None => Label::new(text).size(LabelSize::Small).into_any_element(),
@@ -1799,21 +1843,22 @@ impl GitHubPanel {
         Some(frame.into_any_element())
     }
 
-    fn threads_fetch(&self, in_front: bool) -> ThreadsFetch {
+    /// Polls read threads only when the PR's `updated_at` moved; `opening` the panel also reads
+    /// them when they're older than [`THREADS_STALE`].
+    fn threads_fetch(&self, opening: bool) -> ThreadsFetch {
         ThreadsFetch::IfChanged {
             known: self
                 .snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.threads_for.clone()),
-            due: self.active
-                && in_front
+            due: opening
                 && self
                     .threads_read_at
-                    .is_none_or(|at| at.elapsed() >= THREADS_INTERVAL),
+                    .is_none_or(|at| at.elapsed() >= THREADS_STALE),
         }
     }
 
-    /// On opening the panel: the threads come back if the PR moved or they're over a minute old.
+    /// On opening the panel: the threads come back if the PR moved or they're stale.
     fn read_threads_if_stale(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
@@ -2187,6 +2232,7 @@ impl GitHubPanel {
                 "icarus-github-{}",
                 section.id()
             )))
+            .debug_selector(|| format!("pr-section:{}", section.id()))
             .w_full()
             .border_t_1()
             .border_color(cx.theme().colors().border_variant)
@@ -2824,7 +2870,7 @@ impl GitHubPanel {
             .child(
                 v_flex()
                     .gap_0p5()
-                    .child(Label::new(pull_request.title.clone()))
+                    .child(Label::new(pull_request.title.clone()).size(LabelSize::Small))
                     .child(
                         h_flex()
                             .gap_1()
@@ -3547,9 +3593,18 @@ impl GitHubPanel {
                 .into_any_element();
         };
         let branch = current.branch_name().unwrap_or("this branch").to_string();
+        let rate_limit = status.rate_limited_until.map(rate_limit_note);
         match &status.pull_request {
             Some(pull_request) => v_flex()
                 .w_full()
+                .when_some(rate_limit, |column, note| {
+                    column.child(
+                        div()
+                            .px_2()
+                            .pt_1()
+                            .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+                })
                 .child(
                     div()
                         .p_2()
@@ -3566,9 +3621,12 @@ impl GitHubPanel {
                 })
                 .children(self.render_sections(status, pull_request, cx))
                 .into_any_element(),
-            None if !status.known => self
-                .render_message("Couldn't load the pull request.", status.error.clone())
-                .into_any_element(),
+            None if !status.known => match rate_limit {
+                Some(note) => self.render_message(note, None).into_any_element(),
+                None => self
+                    .render_message("Couldn't load the pull request.", status.error.clone())
+                    .into_any_element(),
+            },
             None => self
                 .render_message(
                     format!("No pull request for {branch}"),
@@ -3589,6 +3647,7 @@ impl Render for GitHubPanel {
         self.sync_markdown(window, cx);
         v_flex()
             .key_context("IcarusGitHubPanel")
+            .debug_selector(|| "pr-panel".into())
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().panel_background)
@@ -4266,7 +4325,12 @@ mod tests {
                 panel.current_description(),
                 Some("**Why** ![s](https://github.com/user-attachments/assets/a)")
             );
+            assert!(
+                panel.description_expanded.is_empty(),
+                "the description starts folded"
+            );
             panel.toggle_description(cx);
+            assert_eq!(panel.description_expanded.len(), 1);
             assert!(panel.render_description(cx).is_some());
         });
         panel.update_in(cx, |panel, window, cx| panel.sync_markdown(window, cx));
@@ -4320,5 +4384,22 @@ mod tests {
         assert_eq!(preview_state_badge("failure"), ("Failed", Tone::Blocked));
         assert_eq!(preview_state_badge("inactive"), ("Inactive", Tone::Neutral));
         assert_eq!(preview_state_badge("mystery"), ("Unknown", Tone::Neutral));
+    }
+
+    #[test]
+    fn a_spent_quota_reads_as_a_retry_time() {
+        let status: PrStatus = serde_json::from_value(serde_json::json!({
+            "known": false, "error": "GitHub graphql rate limit nearly exhausted",
+            "rate_limited_until": 1_763_400_000,
+        }))
+        .expect("status");
+        let note = rate_limit_note(status.rate_limited_until.expect("until"));
+        assert!(
+            note.starts_with("GitHub rate limit, retrying at "),
+            "{note}"
+        );
+        let time = note.rsplit(' ').next().unwrap_or_default();
+        assert_eq!(time.len(), 5, "HH:MM, got {time}");
+        assert_eq!(&time[2..3], ":");
     }
 }

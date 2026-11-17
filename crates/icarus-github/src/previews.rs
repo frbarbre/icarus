@@ -1,4 +1,4 @@
-use crate::client::GitHub;
+use crate::client::{GitHub, decode};
 use crate::error::{GitHubError, Result};
 use crate::raw::Nodes;
 use crate::runner::{Gh, GhRequest};
@@ -768,14 +768,17 @@ impl<G: Gh> GitHub<G> {
         covered: &HashSet<String>,
         config: &PreviewConfig,
     ) -> Result<Vec<Preview>> {
-        let deployments: Vec<RestDeployment> = self
-            .rest_json(GhRequest::get(format!(
+        // Conditional requests: an unchanged list answers 304, which costs no REST quota.
+        let deployments: Vec<RestDeployment> = decode(
+            self.get_conditional(GhRequest::get(format!(
                 "repos/{}/{}/deployments?ref={}&per_page={REF_DEPLOYMENTS}",
                 repo.owner,
                 repo.name,
                 encode(branch)
             )))
-            .await?;
+            .await?
+            .body,
+        )?;
         let mut newest: BTreeMap<String, RestDeployment> = BTreeMap::new();
         for deployment in deployments {
             let Some(environment) = deployment.environment.clone() else {
@@ -794,11 +797,13 @@ impl<G: Gh> GitHub<G> {
         let mut found = Vec::new();
         for (environment, deployment) in newest {
             let statuses: Vec<RestDeploymentStatus> = self
-                .rest_json(GhRequest::get(format!(
+                .get_conditional(GhRequest::get(format!(
                     "repos/{}/{}/deployments/{}/statuses?per_page=1",
                     repo.owner, repo.name, deployment.id
                 )))
                 .await
+                .ok()
+                .and_then(|statuses| decode(statuses.body).ok())
                 .unwrap_or_default();
             let status = statuses.into_iter().next();
             let sha = deployment.sha.unwrap_or_default();

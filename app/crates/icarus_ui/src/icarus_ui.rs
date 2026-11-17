@@ -6,6 +6,7 @@ pub mod client_settings;
 pub mod comment_input;
 pub mod commit_modal;
 pub mod diff_tab;
+mod driver;
 mod focus;
 pub mod github_panel;
 pub mod history;
@@ -14,10 +15,13 @@ pub mod lifecycle;
 pub mod links;
 pub mod media;
 mod model;
+pub mod new_tab_menu;
 mod next_action;
 pub mod notifications;
 pub mod palettes;
 pub mod pane_nav;
+#[cfg(test)]
+mod perf_tests;
 pub mod pr_comments;
 pub mod quick_commands;
 pub mod remote_agent;
@@ -324,6 +328,7 @@ type OpenAgentHandler = Arc<
     dyn Fn(
             Option<String>,
             Option<Entity<workspace::Pane>>,
+            bool,
             &mut Workspace,
             &mut Window,
             &mut Context<Workspace>,
@@ -334,12 +339,13 @@ struct GlobalOpenAgentHandler(OpenAgentHandler);
 
 impl gpui::Global for GlobalOpenAgentHandler {}
 
-/// The app crate owns agent tabs; this crate asks it to open one.
+/// The app crate owns agent tabs; this crate asks it to open one, focused or not.
 pub fn set_open_agent_handler(
     cx: &mut App,
     handler: impl Fn(
         Option<String>,
         Option<Entity<workspace::Pane>>,
+        bool,
         &mut Workspace,
         &mut Window,
         &mut Context<Workspace>,
@@ -356,13 +362,62 @@ pub fn open_agent_tab(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    request_agent_tab(agent_id, pane, true, workspace, window, cx);
+}
+
+fn request_agent_tab(
+    agent_id: Option<String>,
+    pane: Option<Entity<workspace::Pane>>,
+    focus: bool,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     match cx
         .try_global::<GlobalOpenAgentHandler>()
         .map(|handler| handler.0.clone())
     {
-        Some(handler) => handler(agent_id, pane, workspace, window, cx),
+        Some(handler) => handler(agent_id, pane, focus, workspace, window, cx),
         None => log::error!("no open-agent handler registered"),
     }
+}
+
+/// Opens tabs, without taking focus, for the agents the server started in the workspace at `path`
+/// that no tab shows yet: review and automation agents, or ones started from the CLI.
+pub(crate) fn open_offered_agent_tabs(path: PathBuf, cx: &mut App) {
+    let Some(client) = app_client(cx) else {
+        return;
+    };
+    cx.spawn(async move |cx| {
+        let key = path.to_string_lossy().into_owned();
+        let taken = Tokio::spawn_result(cx, async move {
+            client
+                .request(
+                    "workspace.take_agent_tabs",
+                    serde_json::json!({ "id": key }),
+                )
+                .await
+        })
+        .await?;
+        let agents: Vec<String> = serde_json::from_value(taken["agents"].clone())?;
+        if agents.is_empty() {
+            return anyhow::Ok(());
+        }
+        cx.update(|cx| {
+            let Some((window, workspace)) = window_for_path(&path, cx) else {
+                return anyhow::Ok(());
+            };
+            window.update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    for agent_id in agents {
+                        request_agent_tab(Some(agent_id), None, false, workspace, window, cx);
+                    }
+                })
+            })
+        })?;
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
 }
 
 /// Shows the workspace's window (opening it if needed) and arranges its tabs as `pending` says.
@@ -483,6 +538,7 @@ fn show_workspace_window(
                 .workspace
                 .update(cx, |workspace, cx| then(workspace, window, cx))
         })?;
+        cx.update(|cx| open_offered_agent_tabs(path, cx));
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
@@ -742,6 +798,7 @@ pub(crate) fn handle_view_event(topic: &str, payload: serde_json::Value, cx: &mu
         "git.changed" => changes_tab::git_changed(payload, cx),
         "ports.changed" => links::ports_changed(payload, cx),
         "config.changed" => settings_view::config_changed(cx),
+        "account.usage" => accounts::usage_changed(cx),
         _ => {}
     }
 }
@@ -840,10 +897,13 @@ fn start_app_connection(cx: &mut App) {
                 Tokio::spawn_result(cx, worktree_trust::list_workspace_paths(client.clone())).await;
             if let Some(listed) = listed.log_err() {
                 cx.update(|cx| {
-                    worktree_trust::set_icarus_workspace_paths(
-                        listed.into_iter().map(|(_, path)| path).collect(),
-                        cx,
-                    )
+                    let paths: Vec<PathBuf> = listed.into_iter().map(|(_, path)| path).collect();
+                    for path in &paths {
+                        if window_for_path(path, cx).is_some() {
+                            open_offered_agent_tabs(path.clone(), cx);
+                        }
+                    }
+                    worktree_trust::set_icarus_workspace_paths(paths, cx)
                 });
             }
             apply_pending_for_open_windows(client.clone(), cx).await;
@@ -913,8 +973,16 @@ fn start_app_connection(cx: &mut App) {
                         };
                         cx.update(|cx| dispatch_action(request, cx));
                     }
+                    "client.drive" => {
+                        let Some(request) =
+                            serde_json::from_value::<driver::DriveRequest>(event.payload).log_err()
+                        else {
+                            continue;
+                        };
+                        cx.update(|cx| driver::handle_request(request, cx));
+                    }
                     "review.changed" | "note.changed" | "git.changed" | "ports.changed"
-                    | "config.changed" => {
+                    | "config.changed" | "account.usage" => {
                         cx.update(|cx| handle_view_event(&event.topic, event.payload, cx));
                     }
                     "terminal.keyboard" | "terminal.label" => cx.update(|cx| {
@@ -929,6 +997,16 @@ fn start_app_connection(cx: &mut App) {
                     "notification" | "notifications.changed" => {
                         cx.update(|cx| {
                             notifications::handle_event(&event.topic, event.payload, cx)
+                        });
+                    }
+                    "agent_tabs" => {
+                        let Some(path) = event.payload["path"].as_str().map(PathBuf::from) else {
+                            continue;
+                        };
+                        cx.update(|cx| {
+                            if window_for_path(&path, cx).is_some() {
+                                open_offered_agent_tabs(path, cx);
+                            }
                         });
                     }
                     "open_layout" => {
@@ -1034,6 +1112,7 @@ pub fn init(cx: &mut App) {
     client_settings::init(cx);
     focus::register(cx);
     pane_nav::register(cx);
+    new_tab_menu::register(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_some() {
             // A workspace opened after its layout was stored (e.g. the app was closed) applies it now.
@@ -2400,8 +2479,8 @@ impl WorkspacesPanel {
             .cursor_pointer()
             .map(|card| {
                 if shown {
-                    card.bg(colors.elevated_surface_background)
-                        .border_color(colors.border)
+                    let (background, border) = cards::current_card_colors(cx);
+                    card.bg(background).border_color(border).shadow_xs()
                 } else {
                     card.border_color(gpui::transparent_black())
                         .hover(|style| style.bg(colors.element_hover))
@@ -2435,16 +2514,31 @@ impl WorkspacesPanel {
                         },
                     ))
                     .child(
-                        div().flex_1().min_w_0().child(
-                            Label::new(title)
-                                .weight(gpui::FontWeight::SEMIBOLD)
-                                .color(if inactive {
-                                    Color::Muted
-                                } else {
-                                    Color::Default
-                                })
-                                .truncate(),
-                        ),
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1p5()
+                            .child(
+                                div().min_w_0().child(
+                                    Label::new(title)
+                                        .weight(gpui::FontWeight::SEMIBOLD)
+                                        .color(if inactive {
+                                            Color::Muted
+                                        } else {
+                                            Color::Default
+                                        })
+                                        .truncate(),
+                                ),
+                            )
+                            .when(workspace.primary, |row| {
+                                row.child(
+                                    cards::chip(cx).child(
+                                        Label::new("primary")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                            }),
                     )
                     .when(workspace.pinned, |row| {
                         row.child(
@@ -3210,6 +3304,7 @@ mod tests {
             manual_order: None,
             activity_at_ms: None,
             unread: None,
+            primary: false,
         }
     }
 

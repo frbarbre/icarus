@@ -292,13 +292,34 @@ pub struct Dock {
     restored_active_panel: bool,
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
-    shared_size: Option<PanelSizeState>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
-/// Set by an app that wants each side dock to keep one width whatever panel it shows.
-#[derive(Clone, Copy)]
-pub struct SharedSideDockWidth;
+/// Set by an app that wants each side dock to keep one width whatever panel it shows, in every
+/// workspace and window at once.
+#[derive(Clone, Copy, Default)]
+pub struct SharedSideDockWidth {
+    left: Option<PanelSizeState>,
+    right: Option<PanelSizeState>,
+}
+
+impl SharedSideDockWidth {
+    pub fn get(&self, position: DockPosition) -> Option<PanelSizeState> {
+        match position {
+            DockPosition::Left => self.left,
+            DockPosition::Right => self.right,
+            DockPosition::Bottom => None,
+        }
+    }
+
+    fn set(&mut self, position: DockPosition, size_state: PanelSizeState) {
+        match position {
+            DockPosition::Left => self.left = Some(size_state),
+            DockPosition::Right => self.right = Some(size_state),
+            DockPosition::Bottom => {}
+        }
+    }
+}
 
 impl gpui::Global for SharedSideDockWidth {}
 
@@ -455,6 +476,12 @@ impl Dock {
                     dock.zoom_layer_open = is_zoomed;
                 }
             });
+            let shared_width_subscription = cx.observe_global_in::<SharedSideDockWidth>(
+                window,
+                |dock: &mut Dock, window, cx| {
+                    dock.apply_shared_size(window, cx);
+                },
+            );
             Self {
                 position,
                 workspace: workspace.downgrade(),
@@ -462,12 +489,15 @@ impl Dock {
                 active_panel_index: None,
                 is_open: false,
                 focus_handle: focus_handle.clone(),
-                _subscriptions: [focus_subscription, zoom_subscription],
+                _subscriptions: [
+                    focus_subscription,
+                    zoom_subscription,
+                    shared_width_subscription,
+                ],
                 restoration: DockRestoreState::Restoring { pending: None },
                 restored_active_panel: false,
                 zoom_layer_open: false,
                 modal_layer,
-                shared_size: None,
             }
         });
 
@@ -697,7 +727,7 @@ impl Dock {
                         let index =
                             new_dock.add_panel(panel.clone(), workspace.clone(), window, cx);
                         let keeps_its_width =
-                            new_dock.shares_width(cx) && new_dock.shared_size.is_some();
+                            new_dock.shares_width(cx) && new_dock.shared_size(cx).is_some();
                         if !keeps_its_width
                             && let Some(added_panel) = new_dock.panel_for_id(panel_id).cloned()
                         {
@@ -817,18 +847,21 @@ impl Dock {
             *active_index += 1;
         }
         let size_state = if self.shares_width(cx) {
-            let shared = self.shared_size.unwrap_or_else(|| {
-                let panel = panel.read(cx);
-                let initial = panel.initial_size_state(window, cx);
-                PanelSizeState {
-                    size: initial
-                        .size
-                        .or_else(|| Some(panel.default_size(window, cx))),
-                    flex: initial.flex,
+            match self.shared_size(cx) {
+                Some(shared) => shared,
+                None => {
+                    let panel = panel.read(cx);
+                    let initial = panel.initial_size_state(window, cx);
+                    let shared = PanelSizeState {
+                        size: initial
+                            .size
+                            .or_else(|| Some(panel.default_size(window, cx))),
+                        flex: initial.flex,
+                    };
+                    self.set_shared_size(shared, cx);
+                    shared
                 }
-            });
-            self.shared_size = Some(shared);
-            shared
+            }
         } else {
             panel.read(cx).initial_size_state(window, cx)
         };
@@ -1092,12 +1125,12 @@ impl Dock {
         };
         entry.size_state = size_state;
         if shares_width {
-            let shared = self.shared_size.unwrap_or_default();
+            let shared = self.shared_size(cx).unwrap_or_default();
             let size_state = PanelSizeState {
                 size: size_state.size.or(shared.size),
                 flex: size_state.flex.or(shared.flex),
             };
-            self.shared_size = Some(size_state);
+            self.set_shared_size(size_state, cx);
             for entry in &mut self.panel_entries {
                 entry.size_state = size_state;
             }
@@ -1110,8 +1143,36 @@ impl Dock {
         self.position != DockPosition::Bottom && cx.has_global::<SharedSideDockWidth>()
     }
 
-    pub fn shared_size(&self) -> Option<PanelSizeState> {
-        self.shared_size
+    pub fn shared_size(&self, cx: &App) -> Option<PanelSizeState> {
+        cx.try_global::<SharedSideDockWidth>()?.get(self.position)
+    }
+
+    fn set_shared_size(&self, size_state: PanelSizeState, cx: &mut App) {
+        let position = self.position;
+        let Some(current) = cx.try_global::<SharedSideDockWidth>() else {
+            return;
+        };
+        if current.get(position) == Some(size_state) {
+            return;
+        }
+        cx.update_global::<SharedSideDockWidth, _>(|shared, _| shared.set(position, size_state));
+    }
+
+    fn apply_shared_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shared) = self.shared_size(cx).filter(|_| self.shares_width(cx)) else {
+            return;
+        };
+        let mut changed = false;
+        for entry in &mut self.panel_entries {
+            if entry.size_state != shared {
+                entry.size_state = shared;
+                entry.panel.size_state_changed(window, cx);
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
     }
 
     /// The key a shared side-dock width persists under, next to the per-panel sizes.
@@ -1135,20 +1196,12 @@ impl Dock {
             size: size.map(|size| size.max(RESIZE_HANDLE_SIZE).round()),
             flex,
         };
-        self.shared_size = Some(size_state);
+        self.set_shared_size(size_state, cx);
         for entry in &mut self.panel_entries {
             entry.size_state = size_state;
             entry.panel.size_state_changed(window, cx);
         }
-        let key = self.shared_size_key();
-        let workspace = self.workspace.clone();
-        cx.defer(move |cx| {
-            if let Some(workspace) = workspace.upgrade() {
-                workspace.update(cx, |workspace, cx| {
-                    workspace.persist_panel_size_state(key, size_state, cx);
-                });
-            }
-        });
+        persist_shared_size_state(self.shared_size_key(), size_state, cx);
         cx.notify();
     }
 
@@ -1371,6 +1424,32 @@ impl Dock {
             .flatten()
             .and_then(|json| serde_json::from_str::<PanelSizeState>(&json).log_err())
     }
+
+    /// The shared width persisted for every workspace, else the one this workspace kept before
+    /// the width became app-wide.
+    pub(crate) fn load_shared_size_state(
+        workspace: &Workspace,
+        shared_key: &'static str,
+        cx: &App,
+    ) -> Option<PanelSizeState> {
+        KeyValueStore::global(cx)
+            .scoped(PANEL_SIZE_STATE_KEY)
+            .read(shared_key)
+            .log_err()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<PanelSizeState>(&json).log_err())
+            .or_else(|| Self::load_persisted_size_state(workspace, shared_key, cx))
+    }
+}
+
+fn persist_shared_size_state(shared_key: &'static str, size_state: PanelSizeState, cx: &mut App) {
+    let kvp = KeyValueStore::global(cx);
+    cx.background_spawn(async move {
+        kvp.scoped(PANEL_SIZE_STATE_KEY)
+            .write(shared_key.to_string(), serde_json::to_string(&size_state)?)
+            .await
+    })
+    .detach_and_log_err(cx);
 }
 
 /// A header an app can show above the right dock's panel, such as a switcher between sibling panels.

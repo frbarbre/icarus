@@ -412,13 +412,18 @@ pub fn markdown_images(body: &str) -> Vec<String> {
 /// Text lines a body takes at roughly 90 characters a line, plus room for image previews.
 fn body_lines(body: &str) -> u32 {
     let (text, media) = crate::media::split_media(body);
-    let text: u32 = text
+    let lines: u32 = text
         .lines()
         .map(|line| (line.chars().count() as u32).div_ceil(90).max(1))
         .sum::<u32>()
         .max(1);
+    // Markdown code blocks carry padding and margins worth about two more lines each.
+    let fences = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("```"))
+        .count() as u32;
     // A row of up to three thumbnails, each at most 180 px tall.
-    text + (media.len() as u32).div_ceil(3) * 10
+    lines + fences + (media.len() as u32).div_ceil(3) * 10
 }
 
 /// Editor lines a thread card needs; a resolved thread starts as one collapsed row.
@@ -1925,10 +1930,7 @@ impl DiffReview {
                 host_index = Some((blocks.len(), height));
                 height += reply_height;
             }
-            let card = cx.new(|_| ReviewCard {
-                card,
-                review: this.clone(),
-            });
+            let card = cx.new(|_| ReviewCard::new(card, this.clone()));
             blocks.push(BlockProperties {
                 placement: BlockPlacement::Below(anchor),
                 height: Some(height),
@@ -2631,32 +2633,73 @@ fn card_frame(cx: &App) -> Div {
         .bg(cx.theme().colors().editor_background)
 }
 
-/// A comment's text, then its images and videos; `gallery` is what the viewer steps through, by
-/// default the comment's own media.
-fn render_body(
-    id: &str,
-    body: &str,
-    gallery: Option<&[crate::media::MediaRef]>,
-    cx: &mut App,
-) -> AnyElement {
-    let (text, media) = crate::media::split_media(body);
-    let gallery = gallery.unwrap_or(&media).to_vec();
-    v_flex()
-        .gap_1()
-        .when(!text.is_empty(), |column| {
-            column.child(Label::new(text).size(LabelSize::Small))
-        })
-        .children(crate::media::render_media_strip(id, &media, &gallery, cx))
-        .into_any_element()
+/// Card text stays at the small label size so a body still fits the editor lines its block reserves.
+fn card_markdown_style(window: &Window, cx: &App) -> markdown::MarkdownStyle {
+    crate::github_panel::compact_markdown_style(
+        markdown::MarkdownStyle::themed(markdown::MarkdownFont::Editor, window, cx),
+        cx,
+    )
 }
 
 /// One inline card: a PR thread or a queued draft.
 pub struct ReviewCard {
     card: AnyCard,
     review: WeakEntity<DiffReview>,
+    markdown: RefCell<HashMap<String, (String, Entity<markdown::Markdown>)>>,
+    markdown_style: Option<markdown::MarkdownStyle>,
 }
 
 impl ReviewCard {
+    fn new(card: AnyCard, review: WeakEntity<DiffReview>) -> Self {
+        Self {
+            card,
+            review,
+            markdown: RefCell::default(),
+            markdown_style: None,
+        }
+    }
+
+    /// The Markdown view for `id`, rebuilt only when its text changes.
+    fn markdown_for(&self, id: &str, text: &str, cx: &mut App) -> Entity<markdown::Markdown> {
+        let mut cache = self.markdown.borrow_mut();
+        if let Some((known, markdown)) = cache.get(id)
+            && known == text
+        {
+            return markdown.clone();
+        }
+        let markdown = cx.new(|cx| markdown::Markdown::new(text.to_owned().into(), None, None, cx));
+        cache.insert(id.to_owned(), (text.to_owned(), markdown.clone()));
+        markdown
+    }
+
+    /// A comment's text as Markdown, then its images and videos; `gallery` is what the viewer
+    /// steps through, by default the comment's own media.
+    fn render_body(
+        &self,
+        id: &str,
+        body: &str,
+        gallery: Option<&[crate::media::MediaRef]>,
+        cx: &mut App,
+    ) -> AnyElement {
+        let (text, media) = crate::media::split_media(body);
+        let gallery = gallery.unwrap_or(&media).to_vec();
+        let text = (!text.is_empty()).then(|| {
+            let markdown = self.markdown_for(id, &text, cx);
+            div()
+                .text_ui_sm(cx)
+                .child(markdown::MarkdownElement::new(
+                    markdown,
+                    self.markdown_style.clone().unwrap_or_default(),
+                ))
+                .into_any_element()
+        });
+        v_flex()
+            .gap_1()
+            .children(text)
+            .children(crate::media::render_media_strip(id, &media, &gallery, cx))
+            .into_any_element()
+    }
+
     fn render_thread(
         &self,
         thread: &ReviewThread,
@@ -2827,7 +2870,7 @@ impl ReviewCard {
                             ),
                         )
                     })
-                    .child(render_body(
+                    .child(self.render_body(
                         &format!("comment-{}", comment.id),
                         &comment.body,
                         Some(&gallery),
@@ -3020,12 +3063,7 @@ impl ReviewCard {
                         }),
                     ),
             )
-            .child(render_body(
-                &format!("draft-{}", draft.id),
-                &draft.body,
-                None,
-                cx,
-            ))
+            .child(self.render_body(&format!("draft-{}", draft.id), &draft.body, None, cx))
             .into_any_element()
     }
 }
@@ -3140,12 +3178,7 @@ impl ReviewCard {
                     }),
                 ),
         );
-        card = card.child(render_body(
-            &format!("note-{}", note.id),
-            &note.body,
-            None,
-            cx,
-        ));
+        card = card.child(self.render_body(&format!("note-{}", note.id), &note.body, None, cx));
         for reply in &note.replies {
             card = card.child(self.render_note_reply(&note.id, reply, cx));
         }
@@ -3350,7 +3383,7 @@ impl ReviewCard {
                     ),
             );
         } else {
-            column = column.child(render_body(
+            column = column.child(self.render_body(
                 &format!("note-reply-{}", reply.id),
                 &reply.body,
                 None,
@@ -3394,7 +3427,10 @@ impl ReviewCard {
 }
 
 impl Render for ReviewCard {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.markdown_style.is_none() {
+            self.markdown_style = Some(card_markdown_style(window, cx));
+        }
         match self.card.clone() {
             AnyCard::Thread(thread, expanded) => self.render_thread(&thread, expanded, cx),
             AnyCard::Draft(draft) => self.render_draft(&draft, cx),
@@ -4177,5 +4213,42 @@ pub(crate) mod tests {
         };
         assert_eq!(markdown_images(&draft.body), ["https://x/y.png"]);
         assert_eq!(draft_height(&draft), 3 + 1 + 10);
+    }
+
+    #[gpui::test]
+    async fn note_bodies_and_answers_render_as_markdown(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let note: WorkspaceNote = serde_json::from_value(json!({
+            "id": "n1", "path": "src/a.rs", "line": 1, "end_line": 2, "author": "agent",
+            "body": "Migration is **safe**.",
+            "replies": [
+                { "id": "r1", "author": "user", "body": "is that `good`?" },
+                { "id": "r2", "author": "reply-agent", "status": "done",
+                  "body": "Yes.\n\n- **The migration** is safe.\n- Rollout is fine." },
+            ],
+        }))
+        .expect("note");
+        let (card, cx) = cx.add_window_view(|_, _| {
+            ReviewCard::new(AnyCard::Note(note, true), WeakEntity::new_invalid())
+        });
+        cx.run_until_parked();
+        card.read_with(cx, |card, cx| {
+            let sources: HashMap<String, String> = card
+                .markdown
+                .borrow()
+                .iter()
+                .map(|(id, (_, markdown))| (id.clone(), markdown.read(cx).source().to_string()))
+                .collect();
+            assert_eq!(sources["note-n1"], "Migration is **safe**.");
+            assert_eq!(sources["note-reply-r1"], "is that `good`?");
+            assert_eq!(
+                sources["note-reply-r2"],
+                "Yes.\n\n- **The migration** is safe.\n- Rollout is fine."
+            );
+        });
     }
 }

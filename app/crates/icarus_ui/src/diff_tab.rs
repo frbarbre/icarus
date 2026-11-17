@@ -107,7 +107,7 @@ pub(crate) fn step_change(
 }
 
 /// What the file is compared against.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffBase {
     /// The merge base with this ref (`origin/main` and so on), against the file on disk.
@@ -459,7 +459,11 @@ fn load_diff(
 }
 
 /// Counts diff opens, so a preview whose load finishes after a newer open is dropped instead of shown.
-static OPEN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Kept per app rather than in a static, so apps in parallel tests don't supersede each other's opens.
+#[derive(Default)]
+struct OpenGeneration(u64);
+
+impl gpui::Global for OpenGeneration {}
 
 /// A preview open that a newer one replaced before it loaded.
 #[derive(Debug)]
@@ -532,20 +536,61 @@ pub fn open_diff_tab(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<Result<Entity<DiffTab>>> {
-    open_diff_tab_as(path, base, mode, pane, false, workspace, window, cx)
+    open_diff_tab_as(path, base, mode, pane, false, None, workspace, window, cx)
 }
 
 /// Opens the diff as the pane's preview tab (italic), in place of the current preview when that is
 /// a file tab too, as Orca's openDiffAtLocation does; an edit or a double-click on the tab keeps it.
+/// With a `ready` diff the tab shows in this frame instead of after a load.
 pub fn open_diff_preview(
     path: PathBuf,
     base: DiffBase,
     mode: DiffTabMode,
+    ready: Option<ReadyDiff>,
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<Result<Entity<DiffTab>>> {
-    open_diff_tab_as(path, base, mode, None, true, workspace, window, cx)
+    open_diff_tab_as(path, base, mode, None, true, ready, workspace, window, cx)
+}
+
+/// A file's buffer and its diff against a base, loaded ahead so its tab can open without waiting.
+#[derive(Clone)]
+pub struct ReadyDiff {
+    project_path: ProjectPath,
+    buffer: Entity<Buffer>,
+    diff: Entity<BufferDiff>,
+}
+
+/// Opens `path`'s buffer and loads its diff against `base`.
+pub fn load_ready_diff(
+    project: &Entity<Project>,
+    path: &Path,
+    base: &DiffBase,
+    cx: &mut App,
+) -> Task<Result<ReadyDiff>> {
+    let Some(project_path) = project.read(cx).find_project_path(path, cx) else {
+        return Task::ready(Err(anyhow::anyhow!(
+            "{} is outside the workspace",
+            path.display()
+        )));
+    };
+    let open_buffer = project.update(cx, |project, cx| {
+        project.open_buffer(project_path.clone(), cx)
+    });
+    let project = project.clone();
+    let base = base.clone();
+    cx.spawn(async move |cx| {
+        let buffer = open_buffer.await?;
+        let diff = cx
+            .update(|cx| load_diff(&project, &buffer, &project_path, &base, cx))
+            .await?;
+        Ok(ReadyDiff {
+            project_path,
+            buffer,
+            diff,
+        })
+    })
 }
 
 /// Where a new preview goes: just after a preview it may replace (file tabs replace each other),
@@ -569,11 +614,16 @@ fn open_diff_tab_as(
     mode: DiffTabMode,
     pane: Option<Entity<Pane>>,
     preview: bool,
+    ready: Option<ReadyDiff>,
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<Result<Entity<DiffTab>>> {
-    let generation = OPEN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let generation = {
+        let opens = cx.default_global::<OpenGeneration>();
+        opens.0 += 1;
+        opens.0
+    };
     let existing = workspace
         .items_of_type::<DiffTab>(cx)
         .find(|tab| tab.read(cx).path == path);
@@ -590,59 +640,71 @@ fn open_diff_tab_as(
         workspace.activate_item(&existing, true, true, window, cx);
         return Task::ready(Ok(existing));
     }
-    let project = workspace.project().clone();
-    let Some(project_path) = project.read(cx).find_project_path(&path, cx) else {
-        return Task::ready(Err(anyhow::anyhow!(
-            "{} is outside the workspace",
-            path.display()
-        )));
-    };
     let pane = pane.unwrap_or_else(|| workspace.active_pane().clone());
-    let open_buffer = project.update(cx, |project, cx| {
-        project.open_buffer(project_path.clone(), cx)
-    });
+    if let Some(ready) = ready {
+        return Task::ready(Ok(add_diff_tab(
+            path, base, mode, ready, pane, preview, workspace, window, cx,
+        )));
+    }
+    let project = workspace.project().clone();
+    let load = load_ready_diff(&project, &path, &base, cx);
     cx.spawn_in(window, async move |workspace, cx| {
-        let buffer = open_buffer.await?;
-        let diff = cx
-            .update(|_, cx| load_diff(&project, &buffer, &project_path, &base, cx))?
-            .await?;
-        if preview && OPEN_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        let ready = load.await?;
+        if preview && cx.update(|_, cx| cx.default_global::<OpenGeneration>().0)? != generation {
             return Err(Superseded.into());
         }
         workspace.update_in(cx, |workspace, window, cx| {
-            let tab = cx.new(|cx| {
-                DiffTab::new(
-                    path,
-                    base,
-                    mode,
-                    project,
-                    project_path,
-                    buffer,
-                    diff,
-                    window,
-                    cx,
-                )
-            });
-            if !preview {
-                workspace.add_item(pane, Box::new(tab.clone()), None, true, true, window, cx);
-                return tab;
-            }
-            let slot = pane.update(cx, |pane, _| preview_slot(pane));
-            workspace.add_item(
-                pane.clone(),
-                Box::new(tab.clone()),
-                slot,
-                true,
-                true,
-                window,
-                cx,
-            );
-            pane.update(cx, |pane, cx| {
-                pane.replace_preview_item_id(tab.entity_id(), window, cx)
-            });
-            tab
+            add_diff_tab(
+                path, base, mode, ready, pane, preview, workspace, window, cx,
+            )
         })
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_diff_tab(
+    path: PathBuf,
+    base: DiffBase,
+    mode: DiffTabMode,
+    ready: ReadyDiff,
+    pane: Entity<Pane>,
+    preview: bool,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<DiffTab> {
+    let project = workspace.project().clone();
+    let tab = cx.new(|cx| {
+        DiffTab::new(
+            path,
+            base,
+            mode,
+            project,
+            ready.project_path,
+            ready.buffer,
+            ready.diff,
+            window,
+            cx,
+        )
+    });
+    if !preview {
+        workspace.add_item(pane, Box::new(tab.clone()), None, true, true, window, cx);
+        return tab;
+    }
+    let slot = pane.update(cx, |pane, _| preview_slot(pane));
+    workspace.add_item(
+        pane.clone(),
+        Box::new(tab.clone()),
+        slot,
+        true,
+        true,
+        window,
+        cx,
+    );
+    pane.update(cx, |pane, cx| {
+        pane.replace_preview_item_id(tab.entity_id(), window, cx)
+    });
+    tab
 }
 
 pub fn register(cx: &mut App) {
@@ -859,6 +921,7 @@ impl Render for DiffTab {
         }
         v_flex()
             .key_context(key_context)
+            .debug_selector(|| format!("diff-tab:{}", self.project_path.path.as_unix_str()))
             .size_full()
             .on_action(
                 cx.listener(|this, _: &ShowEdit, _, cx| this.set_mode(DiffTabMode::Edit, cx)),

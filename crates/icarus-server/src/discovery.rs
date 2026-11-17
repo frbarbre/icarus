@@ -14,6 +14,8 @@ use crate::server::{Server, params, rpc};
 use crate::state::{Discovery, ORIGIN_ADOPTED, ORIGIN_NATIVE, Project, Workspace, workspace_slug};
 
 pub const ORIGIN_EXTERNAL: &str = "external";
+/// The repository's main checkout, listed as Orca does with a "primary" badge; it can't be removed.
+pub const ORIGIN_PRIMARY: &str = "primary";
 const BUILT_IN_SOURCES: [(&str, &[&str]); 2] = [
     ("claude", &[".claude", "worktrees"]),
     ("gsd", &[".gsd-workspaces"]),
@@ -259,7 +261,7 @@ impl Policy {
     /// Orca's precedence: a project's preference, then (built-ins) its agent policy, then the default.
     pub(crate) fn source_shown(&self, origin: &str) -> bool {
         match origin {
-            ORIGIN_NATIVE | ORIGIN_ADOPTED => true,
+            ORIGIN_NATIVE | ORIGIN_ADOPTED | ORIGIN_PRIMARY => true,
             ORIGIN_EXTERNAL => self.external_shown,
             "claude" | "gsd" => self
                 .project_built_in
@@ -306,6 +308,7 @@ pub(crate) fn source_label(workspace: &Workspace) -> String {
     match origin {
         ORIGIN_NATIVE => "Icarus".into(),
         ORIGIN_ADOPTED => "Adopted".into(),
+        ORIGIN_PRIMARY => "Primary".into(),
         "claude" => "Claude Code".into(),
         "gsd" => "GSD".into(),
         ORIGIN_EXTERNAL => workspace
@@ -321,9 +324,21 @@ struct Listed {
     path: PathBuf,
     canonical: PathBuf,
     branch: Option<String>,
+    main: bool,
 }
 
-/// The project's linked worktrees, or None when git could not say (nothing is marked missing then).
+impl Listed {
+    fn origin(&self, policy: &Policy) -> String {
+        if self.main {
+            ORIGIN_PRIMARY.into()
+        } else {
+            policy.origin(&self.canonical)
+        }
+    }
+}
+
+/// The project's worktrees, its main checkout included, or None when git could not say (nothing
+/// is marked missing then).
 fn list_linked(root: &Path, paths: &DiscoveryState) -> Option<Vec<Listed>> {
     let worktrees = match icarus_git::list_worktrees_timeout(root, GIT_TIMEOUT) {
         Ok(worktrees) => worktrees,
@@ -338,7 +353,7 @@ fn list_linked(root: &Path, paths: &DiscoveryState) -> Option<Vec<Listed>> {
     Some(
         worktrees
             .into_iter()
-            .filter(|w| !w.main && !w.bare && !w.prunable)
+            .filter(|w| !w.bare && !w.prunable)
             // Orca's half-made worktrees carry this lock until they are ready.
             .filter(|w| {
                 !w.locked
@@ -349,6 +364,7 @@ fn list_linked(root: &Path, paths: &DiscoveryState) -> Option<Vec<Listed>> {
                 canonical: paths.canonical(&w.path),
                 branch: if w.detached { None } else { w.branch },
                 path: w.path,
+                main: w.main,
             })
             .collect(),
     )
@@ -498,7 +514,7 @@ impl Server {
                     matched.insert(canonical_path.clone());
                     discovery.missing_at_ms = None;
                     if discovery.discovered {
-                        discovery.origin = policy.origin(&listed.canonical);
+                        discovery.origin = listed.origin(&policy);
                         branch = listed.branch.clone();
                     }
                 }
@@ -526,7 +542,7 @@ impl Server {
                 .unwrap_or_default();
             let name = unique_name(&workspace_slug(&folder, SLUG_MAX), &taken);
             let mut discovery = Discovery {
-                origin: policy.origin(&listed.canonical),
+                origin: listed.origin(&policy),
                 discovered: true,
                 ..Discovery::default()
             };

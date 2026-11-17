@@ -4216,6 +4216,10 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ConversationView> {
+        // A harness picked for one tab (its own agent id) must not become the agent new tabs start.
+        let keep_selected_agent = server_override
+            .is_some()
+            .then(|| self.selected_agent.clone());
         let server_override = server_override.or_else(|| {
             cx.try_global::<crate::agent_tab::TabAgentServer>()
                 .map(|hook| hook.0.clone())
@@ -4247,6 +4251,9 @@ impl AgentPanel {
             window,
             cx,
         );
+        if let Some(agent) = keep_selected_agent {
+            self.set_selected_agent_and_persist(agent, cx);
+        }
         thread.conversation_view.update(cx, |view, cx| {
             view.set_composer_hosted_externally(true, window, cx)
         });
@@ -10300,7 +10307,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_skills_menu_entry_shows_manage_skills_shortcut(cx: &mut TestAppContext) {
+    async fn test_skills_menu_entry_is_listed_without_a_shortcut(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
             let default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
@@ -10347,9 +10354,10 @@ mod tests {
             cx.debug_bounds("MENU_ITEM-Skills").is_some(),
             "Skills menu item should be visible"
         );
+        // Icarus gives ⌥⌘L to the preview link, so Manage Skills lives in the palette only.
         assert!(
-            cx.debug_bounds("KEY_BINDING-l").is_some(),
-            "Skills menu item should show the ManageSkills shortcut"
+            cx.debug_bounds("KEY_BINDING-l").is_none(),
+            "ManageSkills should have no default shortcut"
         );
     }
 

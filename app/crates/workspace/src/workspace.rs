@@ -2948,11 +2948,11 @@ impl Workspace {
             (
                 dock.shares_width(cx),
                 dock.shared_size_key(),
-                dock.shared_size().is_some(),
+                dock.shared_size(cx).is_some(),
             )
         };
-        let persisted_shared_size = shares_width
-            .then(|| self.persisted_panel_size_state(shared_key, cx))
+        let persisted_shared_size = (shares_width && !has_shared_size)
+            .then(|| dock::Dock::load_shared_size_state(self, shared_key, cx))
             .flatten();
         // A side dock that already has its width doesn't take a newly added panel's own.
         let panel_size_applies = !shares_width || !has_shared_size;
@@ -16969,7 +16969,7 @@ mod tests {
     #[gpui::test]
     async fn test_shared_side_dock_width_survives_switching_panels(cx: &mut gpui::TestAppContext) {
         init_test(cx);
-        cx.update(|cx| cx.set_global(dock::SharedSideDockWidth));
+        cx.update(|cx| cx.set_global(dock::SharedSideDockWidth::default()));
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
         let (multi_workspace, cx) =
@@ -17026,7 +17026,7 @@ mod tests {
         cx.run_until_parked();
 
         let persisted = workspace.read_with(cx, |workspace, cx| {
-            workspace.persisted_panel_size_state("dock:right", cx)
+            dock::Dock::load_shared_size_state(workspace, "dock:right", cx)
         });
         assert_eq!(persisted.and_then(|state| state.size), Some(px(420.)));
 
@@ -17045,6 +17045,83 @@ mod tests {
                 "a panel added later takes the dock's width"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_shared_side_dock_width_is_the_same_in_every_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| cx.set_global(dock::SharedSideDockWidth::default()));
+        let fs = FakeFs::new(cx.executor());
+
+        let mut windows = Vec::new();
+        for _ in 0..2 {
+            let project = Project::test(fs.clone(), [], cx).await;
+            let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+            let workspace = window
+                .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+                .unwrap();
+            window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.set_random_database_id();
+                        workspace.bounds.size.width = px(1600.);
+                        for (position, priority) in
+                            [(DockPosition::Left, 100), (DockPosition::Right, 200)]
+                        {
+                            let panel = cx.new(|cx| TestPanel::new(position, priority, cx));
+                            workspace.add_panel(panel, window, cx);
+                            workspace.dock_at_position(position).update(cx, |dock, cx| {
+                                dock.activate_panel(0, window, cx);
+                                dock.set_open(true, window, cx);
+                            });
+                        }
+                    })
+                })
+                .unwrap();
+            windows.push((window, workspace));
+        }
+        cx.run_until_parked();
+
+        let (first_window, first) = &windows[0];
+        first_window
+            .update(cx, |_, window, cx| {
+                first.update(cx, |workspace, cx| {
+                    workspace.resize_left_dock(px(310.), window, cx);
+                    workspace.resize_right_dock(px(430.), window, cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        for (window, workspace) in &windows {
+            window
+                .update(cx, |_, window, cx| {
+                    let workspace = workspace.read(cx);
+                    assert_eq!(
+                        workspace.dock_size(&workspace.left_dock().read(cx), window, cx),
+                        Some(px(310.)),
+                        "the left dock's width applies in every window"
+                    );
+                    assert_eq!(
+                        workspace.dock_size(&workspace.right_dock().read(cx), window, cx),
+                        Some(px(430.)),
+                        "the right dock's width applies in every window"
+                    );
+                })
+                .unwrap();
+        }
+
+        let (_, second) = &windows[1];
+        let persisted = second.read_with(cx, |workspace, cx| {
+            (
+                dock::Dock::load_shared_size_state(workspace, "dock:left", cx),
+                dock::Dock::load_shared_size_state(workspace, "dock:right", cx),
+            )
+        });
+        assert_eq!(persisted.0.and_then(|state| state.size), Some(px(310.)));
+        assert_eq!(persisted.1.and_then(|state| state.size), Some(px(430.)));
     }
 
     #[gpui::test]

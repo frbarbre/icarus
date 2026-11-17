@@ -15,6 +15,8 @@ The Linux column applies to the app built from source; releases ship a macOS app
 | Run the next action | ⌘⌥Enter | Ctrl+Alt+Enter | `icarus::RunNextAction` |
 | Open the running frontend | ⌘⇧B | Ctrl+Shift+B | `icarus::OpenFrontend` |
 | Open the PR's preview | ⌘⌥P | Ctrl+Alt+P | `icarus::OpenPreview` |
+| Open the PR on GitHub | ⌥⌘G | none | `icarus::OpenPullRequest` |
+| Copy the PR's URL | ⌥⌘⇧G | none | `icarus::CopyPullRequestUrl` |
 | Open the linked Linear issue | ⌥⌘L | none | `icarus::OpenLinearIssue` |
 | Toggle a card field | ⌘K C 1…9, 0 | Ctrl+K C 1…9, 0 | `icarus::ToggleCardField` |
 
@@ -75,7 +77,6 @@ With one tab group, ⌥⌘← / ⌥⌘→ go back and forward in history. Zed's 
 | `icarus::SetPaneTitle` / `ClearPaneTitle` | Name a terminal pane. |
 | `icarus::ToggleRemoteControl` | Remote Control for the active agent. |
 | `icarus::ShowNotifications` / `MarkAllNotificationsRead` / `ClearNotifications` | Notifications. |
-| `icarus::OpenPullRequest` / `CopyPullRequestUrl` | The workspace's PR. |
 | `icarus::AddProject` | Add a project. |
 | `icarus::ToggleWorkspacesPanel` | Show or hide the Workspaces panel. |
 | `icarus::CommitChanges`, `PushBranch`, `PullBranch`, `SyncBranch`, `ForcePushWithLease` | Git actions on the workspace. |
