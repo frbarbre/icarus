@@ -111,6 +111,38 @@ pub struct Server {
 }
 
 type Outbound = mpsc::UnboundedSender<ServerMessage>;
+type Subscriptions = Arc<std::sync::Mutex<HashMap<String, JoinHandle<()>>>>;
+
+/// A request taking longer than this is logged with its duration.
+const SLOW_RPC: Duration = Duration::from_millis(20);
+
+struct Call {
+    id: u64,
+    method: String,
+    params: Value,
+    received: Instant,
+}
+
+/// Replaces (or with None ends) the connection's event forwarding for one terminal or agent.
+fn subscribe(subscriptions: &Subscriptions, id: String, task: Option<JoinHandle<()>>) {
+    let mut subscriptions = subscriptions.lock().unwrap_or_else(|p| p.into_inner());
+    let previous = match task {
+        Some(task) => subscriptions.insert(id, task),
+        None => subscriptions.remove(&id),
+    };
+    if let Some(previous) = previous {
+        previous.abort();
+    }
+}
+
+/// Requests about one terminal or agent run in the order they came; everything else runs at once.
+fn lane(method: &str, params: &Value) -> Option<String> {
+    let (namespace, action) = method.split_once('.')?;
+    if !matches!(namespace, "terminal" | "agent") || matches!(action, "wait" | "read" | "events") {
+        return None;
+    }
+    Some(format!("{namespace}:{}", params.get("id")?.as_str()?))
+}
 
 #[derive(Clone, Copy)]
 enum Origin {
@@ -175,6 +207,7 @@ impl Server {
         std::fs::write(paths.token(), &token)?;
         std::fs::set_permissions(paths.token(), std::fs::Permissions::from_mode(0o600))?;
         std::fs::write(paths.pid(), std::process::id().to_string())?;
+        icarus_git::turns::set_scratch_dir(paths.home.join("tmp"));
         let agents = AgentManager::new(Some(paths.home.join("threads")))
             .with_turn_hook(Arc::new(crate::turns::TurnRecorder::default()));
         let restored = agents.restore_all();
@@ -301,6 +334,7 @@ impl Server {
         crate::linear::spawn(Arc::clone(&self));
         crate::updates::spawn(Arc::clone(&self));
         crate::discovery::spawn(Arc::clone(&self));
+        crate::github::spawn(Arc::clone(&self));
         self.spawn_terminal_changes();
         self.resume_setups();
         // launchd and systemd stop (and restart) the service with SIGTERM; nothing may die.
@@ -418,7 +452,8 @@ impl Server {
         let mut authenticated = false;
         let mut remote = false;
         let mut client_id: Option<String> = None;
-        let mut subscriptions: HashMap<String, JoinHandle<()>> = HashMap::new();
+        let subscriptions: Subscriptions = Arc::default();
+        let mut lanes: HashMap<String, mpsc::UnboundedSender<Call>> = HashMap::new();
         let result = async {
             loop {
                 let n = tokio::select! {
@@ -468,11 +503,18 @@ impl Server {
                                     .push((paired.clone(), Arc::clone(&closed)));
                             }
                             let id = uuid::Uuid::new_v4().simple().to_string();
-                            self.clients
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .push((id.clone(), client_name.clone(), outbound.clone()));
+                            let first = {
+                                let mut clients =
+                                    self.clients.lock().unwrap_or_else(|p| p.into_inner());
+                                clients.push((id.clone(), client_name.clone(), outbound.clone()));
+                                clients.len() == 1
+                            };
                             client_id = Some(id.clone());
+                            // Cards show pull requests and issues: fetch them as soon as someone looks.
+                            if first || client_name == "icarus-app" {
+                                self.github.wake_poll();
+                                self.linear.wake_poll();
+                            }
                             let _ = outbound.send(ServerMessage::Welcome {
                                 version: PROTOCOL_VERSION,
                                 server_version: crate::updates::VERSION.to_string(),
@@ -507,23 +549,63 @@ impl Server {
                             };
                             let _ = outbound.send(ServerMessage::Response { id, result, error });
                         }
+                        ClientMessage::Request { id, method, .. } if !authenticated => {
+                            let error = rpc("unauthorized", format!("send hello before {method}"));
+                            let _ = outbound.send(ServerMessage::Response {
+                                id,
+                                result: None,
+                                error: Some(error),
+                            });
+                        }
+                        ClientMessage::Request { id, method, .. }
+                            if remote && LOCAL_ONLY_METHODS.contains(&method.as_str()) =>
+                        {
+                            let error = rpc(
+                                "forbidden",
+                                format!("{method} only works on the server's own machine"),
+                            );
+                            let _ = outbound.send(ServerMessage::Response {
+                                id,
+                                result: None,
+                                error: Some(error),
+                            });
+                        }
+                        // A slow request (a `gh` call, a scan) must not hold up the ones behind it, so
+                        // each runs on its own; only one terminal's or agent's requests keep their order.
                         ClientMessage::Request { id, method, params } => {
-                            let reply = if !authenticated {
-                                Err(rpc("unauthorized", "send hello first"))
-                            } else if remote && LOCAL_ONLY_METHODS.contains(&method.as_str()) {
-                                Err(rpc(
-                                    "forbidden",
-                                    format!("{method} only works on the server's own machine"),
-                                ))
-                            } else {
-                                self.dispatch(&method, params, &outbound, &mut subscriptions)
-                                    .await
+                            let call = Call {
+                                id,
+                                method,
+                                params,
+                                received: Instant::now(),
                             };
-                            let (result, error) = match reply {
-                                Ok(value) => (Some(value), None),
-                                Err(error) => (None, Some(error)),
-                            };
-                            let _ = outbound.send(ServerMessage::Response { id, result, error });
+                            match lane(&call.method, &call.params) {
+                                Some(key) => {
+                                    let sender = lanes.entry(key).or_insert_with(|| {
+                                        let (sender, mut queue) = mpsc::unbounded_channel::<Call>();
+                                        let server = Arc::clone(&self);
+                                        let outbound = outbound.clone();
+                                        let subscriptions = Arc::clone(&subscriptions);
+                                        tokio::spawn(async move {
+                                            while let Some(call) = queue.recv().await {
+                                                server
+                                                    .answer(call, &outbound, &subscriptions)
+                                                    .await;
+                                            }
+                                        });
+                                        sender
+                                    });
+                                    let _ = sender.send(call);
+                                }
+                                None => {
+                                    let server = Arc::clone(&self);
+                                    let outbound = outbound.clone();
+                                    let subscriptions = Arc::clone(&subscriptions);
+                                    tokio::spawn(async move {
+                                        server.answer(call, &outbound, &subscriptions).await;
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -541,7 +623,12 @@ impl Server {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|(_, signal)| !Arc::ptr_eq(signal, &closed));
-        for (_, task) in subscriptions {
+        drop(lanes);
+        for (_, task) in subscriptions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain()
+        {
             task.abort();
         }
         drop(outbound);
@@ -549,12 +636,47 @@ impl Server {
         result
     }
 
+    async fn answer(
+        self: &Arc<Self>,
+        call: Call,
+        outbound: &Outbound,
+        subscriptions: &Subscriptions,
+    ) {
+        let started = Instant::now();
+        let queued = started.duration_since(call.received);
+        let reply = self
+            .dispatch(&call.method, call.params, outbound, subscriptions)
+            .await;
+        let took = started.elapsed();
+        if took + queued > SLOW_RPC {
+            tracing::info!(
+                "rpc {} took {took:.1?}{}{}",
+                call.method,
+                if queued > SLOW_RPC {
+                    format!(" after waiting {queued:.1?}")
+                } else {
+                    String::new()
+                },
+                if reply.is_err() { " (failed)" } else { "" },
+            );
+        }
+        let (result, error) = match reply {
+            Ok(value) => (Some(value), None),
+            Err(error) => (None, Some(error)),
+        };
+        let _ = outbound.send(ServerMessage::Response {
+            id: call.id,
+            result,
+            error,
+        });
+    }
+
     async fn dispatch(
         self: &Arc<Self>,
         method: &str,
         params_value: Value,
         outbound: &Outbound,
-        subscriptions: &mut HashMap<String, JoinHandle<()>>,
+        subscriptions: &Subscriptions,
     ) -> Result<Value, RpcError> {
         match method {
             "server.info" => Ok(json!({
@@ -932,9 +1054,7 @@ impl Server {
                         }
                     }
                 });
-                if let Some(previous) = subscriptions.insert(p.id, task) {
-                    previous.abort();
-                }
+                subscribe(subscriptions, p.id, Some(task));
                 Ok(json!({ "events": backlog, "next_seq": next, "info": thread.info() }))
             }
             "agent.detach" => {
@@ -943,9 +1063,7 @@ impl Server {
                     id: String,
                 }
                 let p: P = params(params_value)?;
-                if let Some(task) = subscriptions.remove(&p.id) {
-                    task.abort();
-                }
+                subscribe(subscriptions, p.id, None);
                 Ok(json!({ "detached": true }))
             }
             "agent.wait" => {
@@ -1236,9 +1354,7 @@ impl Server {
                         }
                     }
                 });
-                if let Some(previous) = subscriptions.insert(p.id, task) {
-                    previous.abort();
-                }
+                subscribe(subscriptions, p.id, Some(task));
                 Ok(json!({
                     "snapshot": attachment.snapshot,
                     "chunks": attachment
@@ -1257,9 +1373,7 @@ impl Server {
                     id: String,
                 }
                 let p: P = params(params_value)?;
-                if let Some(task) = subscriptions.remove(&p.id) {
-                    task.abort();
-                }
+                subscribe(subscriptions, p.id, None);
                 Ok(json!({ "detached": true }))
             }
             "terminal.write" => {

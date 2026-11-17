@@ -50,6 +50,7 @@ pub struct LinearService {
     /// Whether the stored key has been read; set and clear keep it current afterwards.
     stored_loaded: tokio::sync::Mutex<bool>,
     viewer: Mutex<Option<(KeySource, String)>>,
+    poll: tokio::sync::Notify,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -74,7 +75,13 @@ impl LinearService {
             store: Arc::from(store),
             stored_loaded: tokio::sync::Mutex::new(false),
             viewer: Mutex::new(None),
+            poll: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Asks the poller to refresh linked issues now.
+    pub(crate) fn wake_poll(&self) {
+        self.poll.notify_one();
     }
 
     /// Reads the stored key once, and only when neither env nor a command would win over it.
@@ -171,23 +178,81 @@ fn linear_rpc(error: LinearError) -> RpcError {
     rpc(error.code(), error)
 }
 
+/// Wake-ups closer together than this share one poll.
+const POLL_GAP: Duration = Duration::from_secs(2);
+const ISSUE_CACHE_KEY: &str = "linear.issue_cache";
+
+/// Refreshes linked issues while a client is connected: at once when one connects or worktrees
+/// change, then every `linear.poll_interval_ms`.
 pub(crate) fn spawn(server: Arc<Server>) {
+    server.load_issue_cache();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut last: Option<Instant> = None;
         loop {
-            if server.client_count() > 0 {
-                match server.linear_poll().await {
-                    Ok(_) | Err(LinearError::NotConfigured) => {}
-                    Err(error) => tracing::debug!("linear poll failed: {error}"),
+            if server.client_count() == 0 {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    () = server.linear.poll.notified() => {}
                 }
+                continue;
+            }
+            if let Some(last) = last {
+                tokio::time::sleep(POLL_GAP.saturating_sub(last.elapsed())).await;
+            }
+            last = Some(Instant::now());
+            let started = Instant::now();
+            match server.linear_poll().await {
+                Ok(_) | Err(LinearError::NotConfigured) => {}
+                Err(error) => tracing::warn!("linear poll failed: {error}"),
+            }
+            let took = started.elapsed();
+            if took > Duration::from_secs(2) {
+                tracing::info!("linear poll took {took:.1?}");
             }
             let interval = poll_interval(&server.resolved_settings(None));
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = server.linear.poll.notified() => {}
+            }
         }
     });
 }
 
 impl Server {
+    fn save_issue_cache(&self) {
+        let saved: BTreeMap<String, Issue> = lock(&self.linear.cache)
+            .iter()
+            .filter_map(|(id, cached)| Some((id.clone(), cached.issue.clone()?)))
+            .collect();
+        let written = serde_json::to_value(&saved)
+            .map_err(anyhow::Error::from)
+            .and_then(|value| self.store.kv_set(ISSUE_CACHE_KEY, &value));
+        if let Err(error) = written {
+            tracing::warn!("saving Linear issues: {error:#}");
+        }
+    }
+
+    /// The issues the last server knew, so cards show them before the first poll answers.
+    fn load_issue_cache(&self) {
+        let Ok(Some(value)) = self.store.kv_get(ISSUE_CACHE_KEY) else {
+            return;
+        };
+        let Ok(saved) = serde_json::from_value::<BTreeMap<String, Issue>>(value) else {
+            return;
+        };
+        // Stale on purpose: shown at once, refetched by the first poll.
+        let fetched = Instant::now()
+            .checked_sub(ISSUE_TTL)
+            .unwrap_or_else(Instant::now);
+        let mut cache = lock(&self.linear.cache);
+        for (identifier, issue) in saved {
+            cache.entry(identifier).or_insert(Cached {
+                fetched,
+                issue: Some(issue),
+            });
+        }
+    }
+
     /// Follows `linear.api_key_command` from the user layer only, never from a repo's `icarus.json`.
     async fn linear_sync_settings(&self) {
         let settings = self.resolved_settings(None);
@@ -252,6 +317,9 @@ impl Server {
         self.linear_sync_settings().await;
         let ids: Vec<String> = linked.iter().map(|(_, id)| id.clone()).collect();
         let (found, changed) = self.linear.fetch(&ids).await?;
+        if !changed.is_empty() {
+            self.save_issue_cache();
+        }
         let changed_workspaces: Vec<&String> = linked
             .iter()
             .filter(|(_, id)| changed.contains(id))

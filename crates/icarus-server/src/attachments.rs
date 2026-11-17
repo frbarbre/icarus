@@ -584,16 +584,29 @@ impl Server {
         unresolved: bool,
         humans_only: bool,
     ) -> Result<Value, RpcError> {
-        let view = self.workspace_pr(workspace).await?;
-        let (Some(pr), Some(repo)) = (view.pr.as_ref(), view.repo.as_ref()) else {
-            return Err(rpc("no_pull_request", "no pull request"));
+        // The card's pull request and the threads the PR panel just showed: no GitHub round trip.
+        let cached = workspace
+            .branch
+            .as_deref()
+            .and_then(|branch| self.github.cached_pr(&workspace.project_id, branch));
+        let (repo, number) = match cached {
+            Some(pr) => (pr.repo, pr.number),
+            None => {
+                let view = self.workspace_pr(workspace).await?;
+                let (Some(pr), Some(repo)) = (view.pr, view.repo) else {
+                    return Err(rpc("no_pull_request", "no pull request"));
+                };
+                (repo, pr.number)
+            }
         };
-        let threads = self
+        let threads: Vec<ReviewThread> = self
             .github
-            .client
-            .review_threads(repo, pr.number)
+            .review_threads(&repo, number)
             .await
-            .map_err(|e| rpc("github_failed", e))?;
+            .map_err(|e| rpc("github_failed", e))?
+            .into_iter()
+            .map(review_thread)
+            .collect();
         let mut added = Vec::new();
         let mut delivered = 0;
         for mut thread in threads {
@@ -624,7 +637,7 @@ impl Server {
                 "comment_ids": thread.comments.iter().map(|c| &c.id).collect::<Vec<_>>(),
                 "path": thread.path,
                 "line": thread.line,
-                "pr": pr.number,
+                "pr": number,
                 "is_resolved": thread.is_resolved,
                 "is_outdated": thread.is_outdated,
             });
@@ -639,6 +652,29 @@ impl Server {
             added.push(attachment);
         }
         Ok(json!({ "attachments": added, "delivered": delivered }))
+    }
+}
+
+fn review_thread(thread: icarus_github::review_threads::PrThread) -> ReviewThread {
+    ReviewThread {
+        id: thread.id,
+        path: (!thread.path.is_empty()).then_some(thread.path),
+        line: thread.line,
+        start_line: thread.start_line,
+        is_resolved: thread.is_resolved,
+        is_outdated: thread.is_outdated,
+        comments: thread
+            .comments
+            .into_iter()
+            .map(|comment| icarus_github::threads::ThreadComment {
+                id: comment.id,
+                author: comment.author,
+                is_bot: comment.is_bot,
+                body: comment.body,
+                url: comment.url,
+                created_at: comment.created_at,
+            })
+            .collect(),
     }
 }
 

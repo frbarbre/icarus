@@ -29,10 +29,14 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const SCAN_DEADLINE: Duration = Duration::from_secs(12);
 /// After a failed or abandoned scan, timer and list scans leave the project alone this long.
 const FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+/// A scan slower than this logs where its time went.
+const SLOW_SCAN: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 pub(crate) struct DiscoveryState {
     projects: Mutex<HashMap<String, ProjectScan>>,
+    // Every scan resolves every workspace path of every project; each resolution touches the disk.
+    canonical: Mutex<HashMap<PathBuf, PathBuf>>,
     // Applying results one project at a time keeps two scans from picking the same name.
     gate: tokio::sync::Mutex<()>,
 }
@@ -83,6 +87,21 @@ impl DiscoveryState {
         if let Some(scan) = self.lock().get_mut(project_id) {
             scan.backoff_until = None;
             scan.policy = Some(policy);
+        }
+    }
+
+    /// A path's canonical form, resolved once; a path that doesn't resolve yet is tried again next time.
+    fn canonical(&self, path: &Path) -> PathBuf {
+        let known = || self.canonical.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(found) = known().get(path) {
+            return found.clone();
+        }
+        match std::fs::canonicalize(path) {
+            Ok(found) => {
+                known().insert(path.to_path_buf(), found.clone());
+                found
+            }
+            Err(_) => path.to_path_buf(),
         }
     }
 
@@ -305,7 +324,7 @@ struct Listed {
 }
 
 /// The project's linked worktrees, or None when git could not say (nothing is marked missing then).
-fn list_linked(root: &Path) -> Option<Vec<Listed>> {
+fn list_linked(root: &Path, paths: &DiscoveryState) -> Option<Vec<Listed>> {
     let worktrees = match icarus_git::list_worktrees_timeout(root, GIT_TIMEOUT) {
         Ok(worktrees) => worktrees,
         Err(error) => {
@@ -327,7 +346,7 @@ fn list_linked(root: &Path) -> Option<Vec<Listed>> {
                     .is_some_and(|reason| reason.starts_with(PREPARATION_LOCK_PREFIX))
             })
             .map(|w| Listed {
-                canonical: canonical(&w.path),
+                canonical: paths.canonical(&w.path),
                 branch: if w.detached { None } else { w.branch },
                 path: w.path,
             })
@@ -362,22 +381,40 @@ struct Scanned {
 
 /// Everything that touches the disk or runs git, so it can run off the async threads under a deadline.
 fn scan(server: &Server, project: &Project) -> anyhow::Result<Scanned> {
+    let started = Instant::now();
     let policy = Policy::new(
         &server.resolved_settings(Some(&project.root)),
         &project.root,
         &server.workspace_root,
     );
+    let settings_done = started.elapsed();
     // Rows are read before git lists, so a workspace created meanwhile is never marked missing.
     let everything = server.store.all_workspaces(None)?;
-    let listed = list_linked(&project.root);
+    let rows_done = started.elapsed();
+    let listed = list_linked(&project.root, &server.discovery);
+    let git_done = started.elapsed();
     let rows = everything
         .into_iter()
         .map(|w| {
-            let canonical = canonical(&w.path);
-            let exists = w.project_id == project.id && w.path.is_dir();
+            let canonical = server.discovery.canonical(&w.path);
+            // Only an adopted worktree git didn't list needs its folder checked.
+            let exists = w.project_id == project.id
+                && w.discovery.origin == ORIGIN_ADOPTED
+                && w.path.is_dir();
             (w, canonical, exists)
         })
         .collect();
+    let elapsed = started.elapsed();
+    if elapsed > SLOW_SCAN {
+        tracing::info!(
+            "discovery: scanning {} took {elapsed:.1?} (settings {settings_done:.1?}, \
+             stored rows {:.1?}, git worktree list {:.1?}, paths {:.1?})",
+            project.root.display(),
+            rows_done - settings_done,
+            git_done - rows_done,
+            elapsed - git_done,
+        );
+    }
     Ok(Scanned {
         policy,
         listed,
@@ -562,6 +599,8 @@ impl Server {
                 "workspace.changed",
                 json!({ "workspaces": changed, "source": "discovery" }),
             );
+            self.github.wake_poll();
+            self.linear.wake_poll();
         }
         changed
     }

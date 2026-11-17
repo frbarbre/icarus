@@ -361,7 +361,11 @@ pub fn pr_state_color(state: &str) -> Color {
 
 /// What the card's PR icon says on hover.
 pub fn pr_tooltip(pr: &PrSummary) -> String {
-    let state = if pr.state.is_empty() { "open" } else { &pr.state };
+    let state = if pr.state.is_empty() {
+        "open"
+    } else {
+        &pr.state
+    };
     let mut text = format!("#{} · {state}", pr.number);
     match pr.checks.as_deref() {
         Some("failure") => text.push_str(" · checks failing"),
@@ -625,29 +629,33 @@ impl WorkspacesPanel {
             }
         };
         let list = expanded.then(|| {
-            v_flex().pl_1p5().gap_0p5().children(workspace.agents.iter().map(|agent| {
-                let title = agent
-                    .title
-                    .clone()
-                    .filter(|title| !title.trim().is_empty())
-                    .unwrap_or_else(|| crate::accounts::provider_name(&agent.provider).to_owned());
-                h_flex()
-                    .gap_1()
-                    .child(agent_state_icon(agent))
-                    .child(agent_provider_icon(&agent.provider))
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Label::new(title)
+            v_flex()
+                .pl_1p5()
+                .gap_0p5()
+                .children(workspace.agents.iter().map(|agent| {
+                    let title = agent
+                        .title
+                        .clone()
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            crate::accounts::provider_name(&agent.provider).to_owned()
+                        });
+                    h_flex()
+                        .gap_1()
+                        .child(agent_state_icon(agent))
+                        .child(agent_provider_icon(&agent.provider))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Label::new(title).size(LabelSize::XSmall).truncate()),
+                        )
+                        .child(
+                            Label::new(agent.state.clone())
                                 .size(LabelSize::XSmall)
-                                .truncate(),
-                        ),
-                    )
-                    .child(
-                        Label::new(agent.state.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-            }))
+                                .color(Color::Muted),
+                        )
+                }))
         });
         Some(
             v_flex()

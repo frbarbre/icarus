@@ -44,7 +44,7 @@ pub use next_action::{NextAction, NextActionButton};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use collections::HashSet;
@@ -164,6 +164,8 @@ fn activate_item_of_same_type(
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// A server round trip slower than this is logged; a local socket answers in a few milliseconds.
+pub(crate) const SLOW_REQUEST: Duration = Duration::from_millis(20);
 
 /// A request from the server (e.g. `icarus file open`) to show a file at a position.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -464,25 +466,21 @@ fn show_workspace_window(
         };
         let latest =
             cx.update(|cx| cx.default_global::<OpeningWorkspaces>().latest.as_ref() == Some(&path));
-        opened
-            .window
-            .update(cx, |multi_workspace, window, cx| {
-                if latest {
-                    multi_workspace.activate(opened.workspace.clone(), None, window, cx);
-                    window.activate_window();
-                } else {
-                    multi_workspace.add(opened.workspace.clone(), window, cx);
-                }
-            })?;
+        opened.window.update(cx, |multi_workspace, window, cx| {
+            if latest {
+                multi_workspace.activate(opened.workspace.clone(), None, window, cx);
+                window.activate_window();
+            } else {
+                multi_workspace.add(opened.workspace.clone(), window, cx);
+            }
+        })?;
         // Layouts wait for the saved tabs, which would otherwise be restored on top of them.
         opened.loaded.await;
-        opened
-            .window
-            .update(cx, |_, window, cx| {
-                opened
-                    .workspace
-                    .update(cx, |workspace, cx| then(workspace, window, cx))
-            })?;
+        opened.window.update(cx, |_, window, cx| {
+            opened
+                .workspace
+                .update(cx, |workspace, cx| then(workspace, window, cx))
+        })?;
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
@@ -525,7 +523,8 @@ fn open_local_workspace(path: PathBuf, app_state: Arc<AppState>, cx: &mut App) -
     cx.spawn(async move |cx| {
         let (window, workspace) = created_rx.await.ok()?;
         let switched = started.elapsed();
-        let scanned = workspace.read_with(cx, |workspace, cx| workspace.worktree_scans_complete(cx));
+        let scanned =
+            workspace.read_with(cx, |workspace, cx| workspace.worktree_scans_complete(cx));
         cx.spawn(async move |_| {
             scanned.await;
             log::info!(
@@ -754,6 +753,8 @@ pub(crate) struct AppConnection {
     pub(crate) primary: Option<String>,
     /// Ends the current connection so the next one goes to a newly picked primary server.
     pub(crate) reconnect: Option<futures::channel::oneshot::Sender<()>>,
+    /// Woken as soon as a connection is up, so views refresh then rather than on their next poll.
+    pub(crate) waiters: Vec<futures::channel::oneshot::Sender<()>>,
 }
 
 impl gpui::Global for AppConnection {}
@@ -765,9 +766,15 @@ pub fn fetch_attachment_text(id: String, cx: &mut App) -> Task<Result<String>> {
         text: String,
     }
 
+    let shared = app_client(cx);
     Tokio::spawn_result(cx, async move {
-        let home = server_home().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-        let (client, _events) = Client::connect(&home, "icarus-panel").await?;
+        let client = match shared {
+            Some(client) => client,
+            None => {
+                let home = server_home().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+                Client::connect(&home, "icarus-panel").await?.0
+            }
+        };
         let response = client
             .request("attachment.get", serde_json::json!({ "id": id }))
             .await?;
@@ -779,6 +786,8 @@ pub fn fetch_attachment_text(id: String, cx: &mut App) -> Task<Result<String>> {
 /// Keeps one app-wide connection to the server for requests aimed at the editor, reconnecting as needed.
 fn start_app_connection(cx: &mut App) {
     cx.spawn(async move |cx| {
+        let mut lost_at = Instant::now();
+        let mut ever_connected = false;
         loop {
             let primary = cx.update(|cx| cx.default_global::<AppConnection>().primary.clone());
             let connect = Tokio::spawn_result(cx, async move {
@@ -800,14 +809,30 @@ fn start_app_connection(cx: &mut App) {
                 }
             });
             let Ok((client, mut events)) = connect.await else {
-                cx.background_executor().timer(REFRESH_INTERVAL * 2).await;
+                cx.background_executor()
+                    .timer(reconnect_delay(lost_at.elapsed()))
+                    .await;
                 continue;
             };
+            log::info!(
+                "icarus: {} the server (v{}) after {:.0?}",
+                if ever_connected {
+                    "reconnected to"
+                } else {
+                    "connected to"
+                },
+                client.server_version,
+                lost_at.elapsed()
+            );
+            ever_connected = true;
             let (reconnect, mut switched) = futures::channel::oneshot::channel();
             cx.update(|cx| {
                 let connection = cx.default_global::<AppConnection>();
                 connection.client = Some(client.clone());
                 connection.reconnect = Some(reconnect);
+                for waiter in connection.waiters.drain(..) {
+                    let _ = waiter.send(());
+                }
             });
             let listed =
                 Tokio::spawn_result(cx, worktree_trust::list_workspace_paths(client.clone())).await;
@@ -940,10 +965,32 @@ fn start_app_connection(cx: &mut App) {
             }
             cx.update(|cx| cx.default_global::<AppConnection>().client = None);
             drop(client);
-            cx.background_executor().timer(REFRESH_INTERVAL).await;
+            log::info!("icarus: lost the server connection; reconnecting");
+            lost_at = Instant::now();
         }
     })
     .detach();
+}
+
+/// Retries quickly while a restarting server comes back, then settles to once a second.
+fn reconnect_delay(since_lost: Duration) -> Duration {
+    if since_lost < Duration::from_secs(10) {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_secs(1)
+    }
+}
+
+/// Resolves once the app has a server connection (at once when it already has one).
+pub(crate) fn app_connected(cx: &mut App) -> futures::channel::oneshot::Receiver<()> {
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    let connection = cx.default_global::<AppConnection>();
+    if connection.client.is_some() {
+        let _ = sender.send(());
+    } else {
+        connection.waiters.push(sender);
+    }
+    receiver
 }
 
 struct IcarusEnabled;
@@ -1210,6 +1257,7 @@ struct Snapshot {
     discovered: worktree_inbox::Discovered,
 }
 
+/// The snapshot's requests go out together: one round trip, not seven in a row.
 async fn fetch_snapshot(client: Arc<Client>) -> Result<Snapshot> {
     let get = |key: &'static str| {
         let client = client.clone();
@@ -1219,17 +1267,21 @@ async fn fetch_snapshot(client: Arc<Client>) -> Result<Snapshot> {
                 .await
         }
     };
-    let workspaces = client
-        .request("workspace.list", serde_json::json!({}))
-        .await?;
-    let statuses = get("workspace.statuses").await?;
-    let card_fields = get("workspace.cardFields").await.unwrap_or_default();
-    let sidebar = get("sidebar").await.unwrap_or_default();
-    let rules = get("rules.pr").await.unwrap_or_default();
-    let projects = client
-        .request("project.list", serde_json::json!({}))
-        .await
-        .unwrap_or_default();
+    let (workspaces, statuses, card_fields, sidebar, rules, projects, inbox) = futures::join!(
+        client.request("workspace.list", serde_json::json!({})),
+        get("workspace.statuses"),
+        get("workspace.cardFields"),
+        get("sidebar"),
+        get("rules.pr"),
+        client.request("project.list", serde_json::json!({})),
+        worktree_inbox::fetch_inbox(&client),
+    );
+    let workspaces = workspaces?;
+    let statuses = statuses?;
+    let card_fields = card_fields.unwrap_or_default();
+    let sidebar = sidebar.unwrap_or_default();
+    let rules = rules.unwrap_or_default();
+    let projects = projects.unwrap_or_default();
     let project_names = projects
         .as_array()
         .into_iter()
@@ -1241,7 +1293,6 @@ async fn fetch_snapshot(client: Arc<Client>) -> Result<Snapshot> {
             ))
         })
         .collect();
-    let inbox = worktree_inbox::fetch_inbox(&client).await;
     let discovered = worktree_inbox::Discovered::new(&workspaces, inbox);
     Ok(Snapshot {
         discovered,
@@ -1305,10 +1356,17 @@ impl WorkspacesPanel {
                     {
                         return;
                     }
-                    cx.background_executor().timer(REFRESH_INTERVAL).await;
+                    let connected = cx.update(|cx| app_connected(cx));
+                    let timer = cx.background_executor().timer(REFRESH_INTERVAL);
+                    futures::future::select(connected, timer).await;
                     continue;
                 };
+                let started = Instant::now();
                 let snapshot = Tokio::spawn_result(cx, fetch_snapshot(client.clone())).await;
+                let took = started.elapsed();
+                if took > SLOW_REQUEST {
+                    log::info!("icarus: the workspaces snapshot took {took:.0?}");
+                }
                 let updated = this.update(cx, |panel, cx| match snapshot {
                     Ok(snapshot) => {
                         panel.connection = Connection::Connected {
@@ -1727,7 +1785,11 @@ impl WorkspacesPanel {
             .child(
                 cards::chip(cx)
                     .child(chip_icon.size(IconSize::XSmall))
-                    .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted)),
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
             ),
         )
         .menu(move |window, cx| {
@@ -1905,93 +1967,92 @@ impl WorkspacesPanel {
                 .color(Color::Muted)
         };
         let workspaces = self.arranged_workspaces();
-        let mut sections: Vec<(Icon, String, Vec<WorkspaceSummary>)> =
-            match self.view.group_by {
-                cards::GroupBy::Status => group_by_status(&workspaces, &self.status_order)
-                    .into_iter()
-                    .map(|group| match group.status.as_deref() {
-                        Some(id) => (
-                            self.status_icon(id, cx),
-                            self.status_label(id),
-                            group.workspaces,
-                        ),
-                        None => (no_status_icon(), "No status".into(), group.workspaces),
-                    })
-                    .collect(),
-                cards::GroupBy::PrStatus => group_by_pr(&workspaces)
-                    .into_iter()
-                    .map(|(lane, workspaces)| {
-                        let (icon, color) = match lane {
-                            PrGroup::Done => (IconName::Check, Color::Success),
-                            PrGroup::InReview => (IconName::Eye, Color::Accent),
-                            PrGroup::InProgress => (IconName::PullRequest, Color::Muted),
-                            PrGroup::Closed => (IconName::XCircle, Color::Muted),
-                        };
-                        (
-                            Icon::new(icon).size(IconSize::Small).color(color),
-                            lane.label().into(),
-                            workspaces,
-                        )
-                    })
-                    .collect(),
-                cards::GroupBy::Stack => {
-                    // Why: a stack lane is ordered by stack position, so pins don't reorder it.
-                    return group_by_stack(
-                        &workspaces,
-                        &self.status_order,
-                        self.view.reviewing_status.as_deref(),
-                        self.view.stack_ascending,
+        let mut sections: Vec<(Icon, String, Vec<WorkspaceSummary>)> = match self.view.group_by {
+            cards::GroupBy::Status => group_by_status(&workspaces, &self.status_order)
+                .into_iter()
+                .map(|group| match group.status.as_deref() {
+                    Some(id) => (
+                        self.status_icon(id, cx),
+                        self.status_label(id),
+                        group.workspaces,
+                    ),
+                    None => (no_status_icon(), "No status".into(), group.workspaces),
+                })
+                .collect(),
+            cards::GroupBy::PrStatus => group_by_pr(&workspaces)
+                .into_iter()
+                .map(|(lane, workspaces)| {
+                    let (icon, color) = match lane {
+                        PrGroup::Done => (IconName::Check, Color::Success),
+                        PrGroup::InReview => (IconName::Eye, Color::Accent),
+                        PrGroup::InProgress => (IconName::PullRequest, Color::Muted),
+                        PrGroup::Closed => (IconName::XCircle, Color::Muted),
+                    };
+                    (
+                        Icon::new(icon).size(IconSize::Small).color(color),
+                        lane.label().into(),
+                        workspaces,
                     )
-                    .into_iter()
-                    .map(|mut group| {
-                        if !matches!(group.lane, StackLane::Stack { .. }) {
-                            pinned_first(&mut group.workspaces);
-                        }
-                        group
-                    })
-                    .map(|group| match group.lane {
-                        StackLane::Reviewing => {
-                            let id = self.view.reviewing_status.clone().unwrap_or_default();
-                            (
-                                self.status_icon(&id, cx),
-                                self.status_label(&id),
-                                group.workspaces,
-                            )
-                        }
-                        StackLane::Stack { number, .. } => (
-                            Icon::new(IconName::ListTree)
-                                .size(IconSize::Small)
-                                .color(Color::Accent),
-                            format!("Stack #{number}"),
-                            group.workspaces,
-                        ),
-                        StackLane::None => {
-                            (no_status_icon(), "Not in a stack".into(), group.workspaces)
-                        }
-                    })
-                    .collect();
-                }
-                cards::GroupBy::Project => self
-                    .project_groups()
-                    .into_iter()
-                    .map(|(_, name, workspaces)| {
+                })
+                .collect(),
+            cards::GroupBy::Stack => {
+                // Why: a stack lane is ordered by stack position, so pins don't reorder it.
+                return group_by_stack(
+                    &workspaces,
+                    &self.status_order,
+                    self.view.reviewing_status.as_deref(),
+                    self.view.stack_ascending,
+                )
+                .into_iter()
+                .map(|mut group| {
+                    if !matches!(group.lane, StackLane::Stack { .. }) {
+                        pinned_first(&mut group.workspaces);
+                    }
+                    group
+                })
+                .map(|group| match group.lane {
+                    StackLane::Reviewing => {
+                        let id = self.view.reviewing_status.clone().unwrap_or_default();
                         (
-                            Icon::new(IconName::Folder)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                            name,
-                            workspaces,
+                            self.status_icon(&id, cx),
+                            self.status_label(&id),
+                            group.workspaces,
                         )
-                    })
-                    .collect(),
-                cards::GroupBy::None => vec![(
-                    Icon::new(IconName::GitBranch)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                    "All workspaces".into(),
-                    workspaces,
-                )],
-            };
+                    }
+                    StackLane::Stack { number, .. } => (
+                        Icon::new(IconName::ListTree)
+                            .size(IconSize::Small)
+                            .color(Color::Accent),
+                        format!("Stack #{number}"),
+                        group.workspaces,
+                    ),
+                    StackLane::None => {
+                        (no_status_icon(), "Not in a stack".into(), group.workspaces)
+                    }
+                })
+                .collect();
+            }
+            cards::GroupBy::Project => self
+                .project_groups()
+                .into_iter()
+                .map(|(_, name, workspaces)| {
+                    (
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                        name,
+                        workspaces,
+                    )
+                })
+                .collect(),
+            cards::GroupBy::None => vec![(
+                Icon::new(IconName::GitBranch)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+                "All workspaces".into(),
+                workspaces,
+            )],
+        };
         for (_, _, workspaces) in &mut sections {
             pinned_first(workspaces);
         }
@@ -2115,9 +2176,7 @@ impl WorkspacesPanel {
             .flex_none()
             .gap_1p5()
             .when_some(
-                workspace
-                    .issue_url()
-                    .filter(|_| view.shows("linear-title")),
+                workspace.issue_url().filter(|_| view.shows("linear-title")),
                 |row, url| {
                     let tooltip = format!("Open {} in Linear", workspace.display_title());
                     row.child(
@@ -2179,7 +2238,10 @@ impl WorkspacesPanel {
                 |row, author| {
                     row.child(
                         div()
-                            .id(SharedString::from(format!("icarus-author-{}", workspace.id)))
+                            .id(SharedString::from(format!(
+                                "icarus-author-{}",
+                                workspace.id
+                            )))
                             .tooltip(Tooltip::text(format!("@{}", author.login)))
                             .child(render_avatar(
                                 author.avatar_url.as_deref(),
@@ -2339,19 +2401,18 @@ impl WorkspacesPanel {
             .child(
                 h_flex()
                     .gap_1p5()
-                    .child(
-                        div()
-                            .relative()
-                            .flex_none()
-                            .child(lead_icon)
-                            .when_some(unread, |icon, unread| {
-                                icon.child(
-                                    div().absolute().left(px(-9.)).top(px(3.)).child(
-                                        cards::render_unread_dot(&workspace.id, unread, cx),
-                                    ),
-                                )
-                            }),
-                    )
+                    .child(div().relative().flex_none().child(lead_icon).when_some(
+                        unread,
+                        |icon, unread| {
+                            icon.child(
+                                div()
+                                    .absolute()
+                                    .left(px(-9.))
+                                    .top(px(3.))
+                                    .child(cards::render_unread_dot(&workspace.id, unread, cx)),
+                            )
+                        },
+                    ))
                     .child(
                         div().flex_1().min_w_0().child(
                             Label::new(title)
@@ -2371,7 +2432,6 @@ impl WorkspacesPanel {
                                 .color(Color::Muted),
                         )
                     })
-                    .children(self.discovered.origin_badge(&workspace.id))
                     .when_some(
                         workspace.setup.as_ref().and_then(SetupSummary::badge),
                         |row, badge| row.child(render_setup_badge(&workspace.id, badge)),
@@ -2494,6 +2554,11 @@ impl WorkspacesPanel {
             },
             cx,
         );
+        let origin = server
+            .saved_name()
+            .is_none()
+            .then(|| self.discovered.origin_note(&workspace.id))
+            .flatten();
         right_click_menu(SharedString::from(format!(
             "icarus-card-menu-{}-{}",
             server.saved_name().unwrap_or_default(),
@@ -2507,6 +2572,7 @@ impl WorkspacesPanel {
             lifecycle::card_menu(
                 server.clone(),
                 summary.clone(),
+                origin.clone(),
                 weak_workspace.clone(),
                 window,
                 cx,
@@ -3533,9 +3599,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_clicked_workspace_shows_before_its_files_are_scanned(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn a_clicked_workspace_shows_before_its_files_are_scanned(cx: &mut gpui::TestAppContext) {
         let app_state = cx.update(|cx| {
             let app_state = AppState::test(cx);
             AppState::set_global(app_state.clone(), cx);
@@ -3574,9 +3638,10 @@ mod tests {
                         .any(|root| root.as_ref() == Path::new("/w/big"));
                     if is_big && scanning_when_shown.get().is_none() {
                         let scanning = shown.worktree_scans_complete(cx).now_or_never().is_none();
-                        let restoring = cx.try_global::<OpeningWorkspaces>().is_some_and(|opening| {
-                            opening.opening.contains_key(Path::new("/w/big"))
-                        });
+                        let restoring =
+                            cx.try_global::<OpeningWorkspaces>().is_some_and(|opening| {
+                                opening.opening.contains_key(Path::new("/w/big"))
+                            });
                         scanning_when_shown.set(Some((scanning, restoring)));
                     }
                 })
@@ -3591,10 +3656,15 @@ mod tests {
             "the window switches while the worktree is scanned and its tabs restore"
         );
         let shown = window
-            .read_with(&cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .read_with(&cx, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
             .expect("window");
         let scanned = shown.read_with(&cx, |workspace, cx| {
-            workspace.worktree_scans_complete(cx).now_or_never().is_some()
+            workspace
+                .worktree_scans_complete(cx)
+                .now_or_never()
+                .is_some()
         });
         assert!(scanned, "and the scan finishes behind it");
     }

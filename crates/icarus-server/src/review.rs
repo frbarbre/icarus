@@ -16,7 +16,7 @@ use icarus_github::attachment::{
 use icarus_github::diff_lines::{Placement, file_comment_body};
 use icarus_github::review::{CommentRef, CommentTarget, DraftComment, Reaction, Side, Verdict};
 use icarus_github::review_context::ReviewContext;
-use icarus_github::review_threads::PrThread;
+use icarus_github::review_threads::{PrComment, PrThread, ReactionSummary};
 use icarus_protocol::RpcError;
 use icarus_rules::facts::{RepoRef, RequestedReviewer};
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,36 @@ fn now_ms() -> u64 {
 
 fn internal(error: impl std::fmt::Display) -> RpcError {
     rpc("internal", error)
+}
+
+/// Now in GitHub's timestamp format, e.g. `2026-11-17T09:30:00Z`.
+fn now_rfc3339() -> String {
+    rfc3339(now_ms() / 1000)
+}
+
+fn rfc3339(seconds: u64) -> String {
+    let (days, of_day) = ((seconds / 86_400) as i64, seconds % 86_400);
+    // Howard Hinnant's days-to-civil conversion.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        of_day / 3600,
+        of_day % 3600 / 60,
+        of_day % 60
+    )
 }
 
 fn github_error(error: GitHubError) -> RpcError {
@@ -817,7 +847,24 @@ impl Server {
                     .reply_in_thread(&reply.thread, &reply.body)
                     .await
                     .map_err(github_error)?;
-                self.review_changed(reply.workspace.as_deref(), Some(&reply.thread));
+                let comment = PrComment {
+                    id: posted.id.clone(),
+                    database_id: posted.database_id,
+                    author: self.github.viewer(),
+                    author_avatar_url: None,
+                    is_bot: false,
+                    body: reply.body.clone(),
+                    url: posted.url.clone(),
+                    created_at: Some(now_rfc3339()),
+                    last_edited_at: None,
+                    viewer_can_update: true,
+                    viewer_can_delete: true,
+                    reactions: Vec::new(),
+                };
+                let patched = self
+                    .github
+                    .patch_thread(&reply.thread, |thread| thread.comments.push(comment));
+                self.review_mutated(reply.workspace.as_deref(), &reply.thread, patched);
                 Ok(json!({ "thread": reply.thread, "comment": posted }))
             }
             "review.resolve" | "review.unresolve" => {
@@ -828,7 +875,12 @@ impl Server {
                     .set_thread_resolved(&thread.thread, method == "review.resolve")
                     .await
                     .map_err(github_error)?;
-                self.review_changed(thread.workspace.as_deref(), Some(&thread.thread));
+                let patched = self.github.patch_thread(&thread.thread, |cached| {
+                    cached.is_resolved = resolved;
+                    cached.viewer_can_resolve = !resolved;
+                    cached.viewer_can_unresolve = resolved;
+                });
+                self.review_mutated(thread.workspace.as_deref(), &thread.thread, patched);
                 Ok(json!({ "thread": thread.thread, "resolved": resolved }))
             }
             "review.react" => {
@@ -844,7 +896,36 @@ impl Server {
                     .set_reaction(&react.subject, reaction, !react.remove)
                     .await
                     .map_err(github_error)?;
-                self.review_changed(react.workspace.as_deref(), None);
+                let content = reaction.short();
+                let patched = self.github.patch_comment(&react.subject, |comment| {
+                    let reacted = !react.remove;
+                    match comment.reactions.iter_mut().find(|r| r.content == content) {
+                        Some(summary) if summary.viewer_has_reacted != reacted => {
+                            summary.viewer_has_reacted = reacted;
+                            summary.count = if reacted {
+                                summary.count + 1
+                            } else {
+                                summary.count.saturating_sub(1)
+                            };
+                        }
+                        Some(_) => {}
+                        None if reacted => comment.reactions.push(ReactionSummary {
+                            content: content.to_owned(),
+                            count: 1,
+                            viewer_has_reacted: true,
+                            reactors: Vec::new(),
+                        }),
+                        None => {}
+                    }
+                    comment.reactions.retain(|r| r.count > 0);
+                });
+                if !patched {
+                    self.github.forget_review_threads();
+                }
+                self.broadcast(
+                    REVIEW_CHANGED_TOPIC,
+                    json!({ "workspace": react.workspace, "thread": null }),
+                );
                 Ok(json!({
                     "subject": react.subject,
                     "reaction": reaction.short(),
@@ -964,6 +1045,17 @@ impl Server {
             .map_err(internal)??;
         self.review_changed(Some(&workspace.id), None);
         Ok(result)
+    }
+
+    /// Like [`Self::review_changed`], but keeps the cached threads when the mutation was applied to them.
+    fn review_mutated(&self, workspace: Option<&str>, thread: &str, patched: bool) {
+        if !patched {
+            self.github.forget_review_threads();
+        }
+        self.broadcast(
+            REVIEW_CHANGED_TOPIC,
+            json!({ "workspace": workspace, "thread": thread }),
+        );
     }
 
     fn review_changed(&self, workspace: Option<&str>, thread: Option<&str>) {
@@ -1449,6 +1541,13 @@ impl Server {
 mod tests {
     use super::*;
     use icarus_github::review_context::{PrCommit, ViewerReview};
+
+    #[test]
+    fn timestamps_read_like_githubs() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_000_000_000), "2001-09-09T01:46:40Z");
+        assert_eq!(rfc3339(1_709_210_096), "2024-02-29T12:34:56Z");
+    }
 
     fn context() -> ReviewContext {
         ReviewContext {

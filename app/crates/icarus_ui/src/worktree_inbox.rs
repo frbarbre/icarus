@@ -1,4 +1,4 @@
-//! Worktrees the server discovered: the origin badge on cards and Orca's "New worktrees" inbox row,
+//! Worktrees the server discovered: the origin in a card's menu and Orca's "New worktrees" inbox row,
 //! where newly found external worktrees wait for Show, Hide or Show all from their source.
 
 use std::sync::Arc;
@@ -89,24 +89,10 @@ impl Discovered {
             .is_some_and(|origin| origin.origin != "native")
     }
 
-    /// A small tag naming where a card's worktree came from; native ones (Icarus's own) have none.
-    pub fn origin_badge(&self, workspace_id: &str) -> Option<AnyElement> {
+    /// Where a card's worktree came from, for its context menu; native ones (Icarus's own) say nothing.
+    pub fn origin_note(&self, workspace_id: &str) -> Option<String> {
         let origin = self.origins.get(workspace_id)?;
-        let text = match origin.origin.as_str() {
-            "native" => return None,
-            "adopted" => "adopted".to_owned(),
-            "claude" => "claude".to_owned(),
-            "gsd" => "gsd".to_owned(),
-            "external" => "external".to_owned(),
-            other => other.strip_prefix("custom:").unwrap_or(other).to_owned(),
-        };
-        Some(
-            div()
-                .id(SharedString::from(format!("icarus-origin-{workspace_id}")))
-                .tooltip(Tooltip::text(format!("Worktree from {}", origin.label)))
-                .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
-                .into_any_element(),
-        )
+        (origin.origin != "native").then(|| format!("Worktree from {}", origin.label))
     }
 
     /// The inbox row of a project shown as its own group.
@@ -312,13 +298,18 @@ mod tests {
             ]
         }]);
         let mut discovered = Discovered::new(&workspaces, inbox);
-        assert!(
-            discovered.origin_badge("a").is_none(),
-            "Icarus's own need no badge"
+        assert_eq!(
+            discovered.origin_note("a"),
+            None,
+            "Icarus's own say nothing"
         );
-        assert!(discovered.origin_badge("b").is_some());
-        assert!(
-            discovered.origin_badge("c").is_none(),
+        assert_eq!(
+            discovered.origin_note("b").as_deref(),
+            Some("Worktree from conductor")
+        );
+        assert_eq!(
+            discovered.origin_note("c"),
+            None,
             "an older server sends no origin"
         );
         assert_eq!(discovered.inbox[0].workspaces.len(), 2);

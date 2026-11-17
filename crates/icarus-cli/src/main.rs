@@ -1061,16 +1061,29 @@ type Connection = (
 /// Connects to the `--server` saved server, or else the local one.
 async fn open(cli: &Cli, client_name: &str) -> Result<Connection> {
     match &cli.server {
-        Some(name) => {
+        Some(name) => open_target(Some(name), None, client_name).await,
+        None => open_target(None, Some(&home(cli)?), client_name).await,
+    }
+}
+
+/// Connects to a saved server by name, else to the local server in `home`.
+async fn open_target(
+    server: Option<&str>,
+    home: Option<&std::path::Path>,
+    client_name: &str,
+) -> Result<Connection> {
+    match (server, home) {
+        (Some(name), _) => {
             let saved = icarus_client::servers::SavedServers::load()?;
             let server = saved.get(name).with_context(|| {
                 format!("no saved server named {name} (see `icarus remote list`)")
             })?;
             Client::connect_saved(server, client_name).await
         }
-        None => Client::connect(&home(cli)?, client_name)
+        (None, Some(home)) => Client::connect(home, client_name)
             .await
             .context("no Icarus server is running (start one with `icarus server start`)"),
+        (None, None) => anyhow::bail!("no home directory"),
     }
 }
 
@@ -1609,7 +1622,25 @@ async fn main() -> Result<()> {
             },
         },
         Command::Acp { provider } => {
-            acp::run(open(&cli, "icarus-acp").await?, provider.clone()).await?;
+            let server = cli.server.clone();
+            let home = Some(home.clone());
+            let reconnect = move || {
+                let server = server.clone();
+                let home = home.clone();
+                async move { open_target(server.as_deref(), home.as_deref(), "icarus-acp").await }
+            };
+            // A tab opened while the server restarts waits for it instead of failing to launch.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let connection = loop {
+                match reconnect().await {
+                    Ok(connection) => break connection,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            acp::run(connection, provider.clone(), reconnect).await?;
         }
         Command::Remote { command } => remote_command(&cli, command).await?,
         Command::Recipe { command } => recipe::run(&cli, command).await?,

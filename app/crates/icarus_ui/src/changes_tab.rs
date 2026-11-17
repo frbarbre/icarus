@@ -1195,15 +1195,17 @@ impl SourceControlPanel {
 
     /// Steps through the rows and opens the file there; a single press wraps (§5.3).
     pub fn step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.step_from(forward, None, window, cx);
+        self.step_from(forward, None, DiffTabMode::Diff, window, cx);
     }
 
     /// Steps from `current` (the open diff tab's file) when it's in the list, else from the selection.
     /// A single press wraps; a held key's repeats stop at the ends (Orca's changed-file-hold-navigation).
+    /// The file opens as the preview tab, in the view (`mode`) the current one showed.
     pub fn step_from(
         &mut self,
         forward: bool,
         current: Option<&Path>,
+        mode: DiffTabMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1225,10 +1227,14 @@ impl SourceControlPanel {
             return;
         };
         self.select(next, cx);
-        self.open_selected(window, cx);
+        self.open_selected_as(Opening::Preview(mode), window, cx);
     }
 
     fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_selected_as(Opening::Preview(DiffTabMode::Diff), window, cx);
+    }
+
+    fn open_selected_as(&mut self, opening: Opening, window: &mut Window, cx: &mut Context<Self>) {
         let Some(row) = self
             .selected
             .and_then(|index| self.rows().get(index))
@@ -1245,7 +1251,9 @@ impl SourceControlPanel {
         // Deferred: the step actions run inside a Workspace update, which would double-lease it.
         window.defer(cx, move |window, cx| {
             workspace.update(cx, |workspace, cx| {
-                open_row(&row, &scope, &listing, &root, workspace, window, cx);
+                open_row(
+                    &row, &scope, &listing, &root, opening, workspace, window, cx,
+                );
             });
         });
     }
@@ -1829,9 +1837,14 @@ impl SourceControlPanel {
                 this.bg(cx.theme().colors().element_selected)
             })
             .hover(|style| style.bg(cx.theme().colors().element_hover))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.select(index, cx);
-                this.open_selected(window, cx);
+                let opening = if event.click_count() >= 2 {
+                    Opening::Kept
+                } else {
+                    Opening::Preview(DiffTabMode::Diff)
+                };
+                this.open_selected_as(opening, window, cx);
             }))
             .children(icon.map(|icon| Icon::from_path(icon).size(IconSize::Small).color(color)))
             .child(
@@ -2767,26 +2780,35 @@ pub(crate) fn diff_base_for(scope: &ChangesScope, listing: &Listing) -> Option<D
 
 /// Opens a row the way its scope defines it: a diff tab against the base or the uncommitted change, or the
 /// turn's or commit's snapshot in the commit view.
+/// How a row's diff opens: as the preview tab (a click, a step) or as a kept tab (a double-click).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Opening {
+    Preview(DiffTabMode),
+    Kept,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn open_row(
     row: &Row,
     scope: &ChangesScope,
     listing: &Listing,
     root: &Path,
+    opening: Opening,
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
     if let Some(base) = diff_base_for(scope, listing) {
-        open_diff_tab(
-            root.join(&row.path),
-            base,
-            DiffTabMode::Diff,
-            None,
-            workspace,
-            window,
-            cx,
-        )
-        .detach_and_log_err(cx);
+        let path = root.join(&row.path);
+        let open = match opening {
+            Opening::Preview(mode) => {
+                crate::diff_tab::open_diff_preview(path, base, mode, workspace, window, cx)
+            }
+            Opening::Kept => {
+                open_diff_tab(path, base, DiffTabMode::Diff, None, workspace, window, cx)
+            }
+        };
+        open.detach_and_log_err(cx);
         return;
     }
     let sha = match scope {
@@ -2894,10 +2916,22 @@ fn step_changed_file(
     let current = workspace
         .active_item(cx)
         .and_then(|item| item.downcast::<crate::diff_tab::DiffTab>())
-        .map(|tab| tab.read(cx).path().to_path_buf());
+        .map(|tab| {
+            let tab = tab.read(cx);
+            (tab.path().to_path_buf(), tab.mode())
+        });
+    let mode = current
+        .as_ref()
+        .map_or(DiffTabMode::Diff, |(_, mode)| *mode);
     if let Some(changes) = changes_tab(workspace, window, cx) {
         changes.update(cx, |changes, cx| {
-            changes.step_from(forward, current.as_deref(), window, cx)
+            changes.step_from(
+                forward,
+                current.as_ref().map(|(path, _)| path.as_path()),
+                mode,
+                window,
+                cx,
+            )
         });
     }
 }
@@ -4150,15 +4184,28 @@ mod tests {
             assert!(dock.is_open(), "stepping reveals Source Control");
         });
 
+        let second = panel.read_with(cx, |panel, _| panel.root.join(&panel.rows()[1].path));
+        let preview = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                let pane = workspace.active_pane().read(cx);
+                pane.preview_item()
+                    .and_then(|item| item.downcast::<crate::DiffTab>())
+                    .map(|tab| tab.read(cx).path().to_path_buf())
+            })
+        };
+        assert_eq!(preview(cx), Some(PathBuf::from("/project/src/app.rs")));
+
         cx.dispatch_action(NextChangedFile);
         cx.run_until_parked();
+        assert_eq!(
+            opened(cx),
+            std::slice::from_ref(&second),
+            "the step replaced the preview tab"
+        );
+        assert_eq!(preview(cx), Some(second));
         cx.dispatch_action(PreviousChangedFile);
         cx.run_until_parked();
-        assert_eq!(
-            opened(cx).len(),
-            2,
-            "stepping back returns to the first file's tab"
-        );
+        assert_eq!(opened(cx), [PathBuf::from("/project/src/app.rs")]);
         let active = workspace.read_with(cx, |workspace, cx| {
             workspace
                 .active_item(cx)
@@ -4166,6 +4213,67 @@ mod tests {
                 .map(|tab| tab.read(cx).path().to_path_buf())
         });
         assert_eq!(active, Some(PathBuf::from("/project/src/app.rs")));
+    }
+
+    #[gpui::test]
+    async fn a_stepped_preview_is_kept_once_edited_and_keeps_its_view(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, mut cx) = crate::diff_tab::tests::git_workspace(cx).await;
+        let cx = &mut cx;
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| SourceControlPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        panel.update(cx, |panel, _| {
+            let mut listing = sample_listing();
+            listing.rows.truncate(2);
+            panel.listing = Some(listing);
+            panel.refreshing = Some(Task::ready(()));
+        });
+        let tabs = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .items_of_type::<crate::DiffTab>(cx)
+                    .map(|tab| (tab.read(cx).path().to_path_buf(), tab.read(cx).mode()))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        cx.dispatch_action(NextChangedFile);
+        cx.run_until_parked();
+        let first = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.items_of_type::<crate::DiffTab>(cx).next()
+            })
+            .expect("a diff tab");
+        first.update_in(cx, |tab, window, cx| {
+            tab.set_mode(DiffTabMode::Edit, cx);
+            tab.editor()
+                .update(cx, |editor, cx| editor.insert("// kept\n", window, cx));
+        });
+        cx.run_until_parked();
+        let still_preview = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .is_active_preview_item(first.entity_id())
+        });
+        assert!(!still_preview, "an edit keeps the tab");
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.dispatch_action(NextChangedFile);
+        cx.run_until_parked();
+        let second = panel.read_with(cx, |panel, _| panel.root.join(&panel.rows()[1].path));
+        assert_eq!(
+            tabs(cx),
+            [
+                (PathBuf::from("/project/src/app.rs"), DiffTabMode::Edit),
+                (second, DiffTabMode::Edit),
+            ],
+            "the kept tab stays, and the next file opens in the same view"
+        );
     }
 
     #[gpui::test]

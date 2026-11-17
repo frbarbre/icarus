@@ -377,6 +377,17 @@ fn permission_flags(options: &AgentOptions) -> Vec<String> {
     flags
 }
 
+fn spawn_error(program: &str, error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::NotFound && !program.contains('/') {
+        let path = std::env::var("PATH").unwrap_or_default();
+        return anyhow!(
+            "start agent `{program}`: not found on the server's PATH ({path}); \
+             if it is installed, run `icarus server restart` so the server picks up your shell's PATH"
+        );
+    }
+    anyhow::Error::new(error).context(format!("start agent `{program}`"))
+}
+
 /// The command line for a provider, built from the user's installed agent binary.
 pub fn provider_command(options: &AgentOptions) -> Result<Vec<String>> {
     if options.command.as_ref().is_some_and(Vec::is_empty) {
@@ -617,11 +628,22 @@ impl AgentThread {
         };
         let info = self.info();
         let prompt = prompt.map(str::to_string);
+        let started = std::time::Instant::now();
+        let starting = prompt.is_some();
         let _ = tokio::task::spawn_blocking(move || match prompt {
             Some(prompt) => hook.turn_started(&info, &prompt),
             None => hook.turn_ended(&info),
         })
         .await;
+        let took = started.elapsed();
+        // The start snapshot runs before the prompt reaches the agent, so its time is the user's wait.
+        if took > std::time::Duration::from_millis(100) {
+            tracing::info!(
+                "agent {}: turn {} snapshot took {took:.1?}",
+                self.id,
+                if starting { "start" } else { "end" }
+            );
+        }
     }
 
     pub async fn spawn(
@@ -717,7 +739,7 @@ impl AgentThread {
         }
         let mut child = process
             .spawn()
-            .with_context(|| format!("start agent `{}`", command[0]))?;
+            .map_err(|error| spawn_error(&command[0], error))?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().context("agent stdout")?;
         let stderr = child.stderr.take().context("agent stderr")?;
@@ -1525,6 +1547,16 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_agent_binary_blames_the_server_path_and_suggests_a_restart() {
+        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        let message = format!("{:#}", spawn_error("claude", missing()));
+        assert!(message.contains("server's PATH"), "{message}");
+        assert!(message.contains("icarus server restart"), "{message}");
+        let message = format!("{:#}", spawn_error("/opt/claude", missing()));
+        assert!(!message.contains("icarus server restart"), "{message}");
+    }
 
     #[test]
     fn claude_command_uses_the_unmodified_binary_in_stream_json_mode() {

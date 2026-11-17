@@ -18,7 +18,22 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
     git_env(repo, args, &[])
 }
 
+/// A git run slower than this is logged with its arguments and duration.
+const SLOW_GIT: std::time::Duration = std::time::Duration::from_millis(300);
+
+fn log_slow(repo: &Path, args: &[&str], started: std::time::Instant) {
+    let took = started.elapsed();
+    if took > SLOW_GIT {
+        tracing::info!(
+            "git {} in {} took {took:.1?}",
+            args.join(" "),
+            repo.display()
+        );
+    }
+}
+
 pub fn git_env(repo: &Path, args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> Result<String> {
+    let started = std::time::Instant::now();
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -27,6 +42,7 @@ pub fn git_env(repo: &Path, args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> 
         .envs(env.iter().map(|(k, v)| (k, v)))
         .output()
         .with_context(|| format!("run git {}", args.join(" ")))?;
+    log_slow(repo, args, started);
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
@@ -43,6 +59,7 @@ pub fn git_timeout(repo: &Path, args: &[&str], timeout: std::time::Duration) -> 
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
 
+    let started = std::time::Instant::now();
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -56,13 +73,20 @@ pub fn git_timeout(repo: &Path, args: &[&str], timeout: std::time::Duration) -> 
         .spawn()
         .with_context(|| format!("run git {}", args.join(" ")))?;
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
                 let _ = pipe.read_to_end(&mut bytes);
             }
-            bytes
-        })
+            let _ = sender.send(bytes);
+        });
+        receiver
+    };
+    let kill_group = |pid: u32| {
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .status();
     };
     let stdout = drain(
         child
@@ -82,9 +106,7 @@ pub fn git_timeout(repo: &Path, args: &[&str], timeout: std::time::Duration) -> 
             break status;
         }
         if std::time::Instant::now() >= deadline {
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{}", child.id())])
-                .status();
+            kill_group(child.id());
             let _ = child.kill();
             let _ = child.wait();
             bail!(
@@ -96,8 +118,26 @@ pub fn git_timeout(repo: &Path, args: &[&str], timeout: std::time::Duration) -> 
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
+    log_slow(repo, args, started);
+    // Something git started can keep the pipes open after git exited; the deadline still holds.
+    let collect = |receiver: &std::sync::mpsc::Receiver<Vec<u8>>| {
+        let wait = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(std::time::Duration::from_millis(200));
+        receiver.recv_timeout(wait).or_else(|_| {
+            kill_group(child.id());
+            receiver.recv_timeout(std::time::Duration::from_secs(1))
+        })
+    };
+    let Ok(stdout) = collect(&stdout) else {
+        bail!(
+            "git {} in {} kept its output open past {}s",
+            args.join(" "),
+            repo.display(),
+            timeout.as_secs()
+        );
+    };
+    let stderr = collect(&stderr).unwrap_or_default();
     if !status.success() {
         bail!(
             "git {} failed: {}",

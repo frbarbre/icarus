@@ -7,7 +7,7 @@ use editor::Editor;
 use gpui::{AnyElement, App, Context, Window};
 use ui::{IconButton, Tab, Tooltip, prelude::*};
 use workspace::Workspace;
-use workspace::dock::{Dock, RightDockHeader};
+use workspace::dock::{Dock, RightDockHeader, SharedSideDockWidth};
 
 use crate::changes_tab::SOURCE_CONTROL_PANEL;
 use crate::diff_tab::DiffTab;
@@ -23,9 +23,10 @@ pub const SIDEBAR_PANELS: [(&str, IconName, &str); 3] = [
     (GITHUB_PANEL, IconName::PullRequest, "GitHub"),
 ];
 
-/// Puts the switcher above the right dock.
+/// Puts the switcher above the right dock, whose width stays put as it switches panels.
 pub fn install_switcher(cx: &mut App) {
     cx.set_global(RightDockHeader(Arc::new(render_switcher)));
+    cx.set_global(SharedSideDockWidth);
 }
 
 pub fn register(cx: &mut App) {

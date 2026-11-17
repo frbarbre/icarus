@@ -292,8 +292,15 @@ pub struct Dock {
     restored_active_panel: bool,
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
+    shared_size: Option<PanelSizeState>,
     _subscriptions: [Subscription; 2],
 }
+
+/// Set by an app that wants each side dock to keep one width whatever panel it shows.
+#[derive(Clone, Copy)]
+pub struct SharedSideDockWidth;
+
+impl gpui::Global for SharedSideDockWidth {}
 
 enum DockRestoreState {
     Restoring { pending: Option<DockData> },
@@ -460,6 +467,7 @@ impl Dock {
                 restored_active_panel: false,
                 zoom_layer_open: false,
                 modal_layer,
+                shared_size: None,
             }
         });
 
@@ -688,7 +696,11 @@ impl Dock {
                     new_dock.update(cx, |new_dock, cx| {
                         let index =
                             new_dock.add_panel(panel.clone(), workspace.clone(), window, cx);
-                        if let Some(added_panel) = new_dock.panel_for_id(panel_id).cloned() {
+                        let keeps_its_width =
+                            new_dock.shares_width(cx) && new_dock.shared_size.is_some();
+                        if !keeps_its_width
+                            && let Some(added_panel) = new_dock.panel_for_id(panel_id).cloned()
+                        {
                             new_dock.set_panel_size_state(added_panel.as_ref(), size_state, cx);
                         }
                         if was_visible {
@@ -804,7 +816,22 @@ impl Dock {
         {
             *active_index += 1;
         }
-        let size_state = panel.read(cx).initial_size_state(window, cx);
+        let size_state = if self.shares_width(cx) {
+            let shared = self.shared_size.unwrap_or_else(|| {
+                let panel = panel.read(cx);
+                let initial = panel.initial_size_state(window, cx);
+                PanelSizeState {
+                    size: initial
+                        .size
+                        .or_else(|| Some(panel.default_size(window, cx))),
+                    flex: initial.flex,
+                }
+            });
+            self.shared_size = Some(shared);
+            shared
+        } else {
+            panel.read(cx).initial_size_state(window, cx)
+        };
 
         self.panel_entries.insert(
             index,
@@ -1055,17 +1082,74 @@ impl Dock {
         size_state: PanelSizeState,
         cx: &mut Context<Self>,
     ) -> bool {
-        if let Some(entry) = self
+        let shares_width = self.shares_width(cx);
+        let Some(entry) = self
             .panel_entries
             .iter_mut()
             .find(|entry| entry.panel.panel_id() == panel.panel_id())
-        {
-            entry.size_state = size_state;
-            cx.notify();
-            true
-        } else {
-            false
+        else {
+            return false;
+        };
+        entry.size_state = size_state;
+        if shares_width {
+            let shared = self.shared_size.unwrap_or_default();
+            let size_state = PanelSizeState {
+                size: size_state.size.or(shared.size),
+                flex: size_state.flex.or(shared.flex),
+            };
+            self.shared_size = Some(size_state);
+            for entry in &mut self.panel_entries {
+                entry.size_state = size_state;
+            }
         }
+        cx.notify();
+        true
+    }
+
+    pub fn shares_width(&self, cx: &App) -> bool {
+        self.position != DockPosition::Bottom && cx.has_global::<SharedSideDockWidth>()
+    }
+
+    pub fn shared_size(&self) -> Option<PanelSizeState> {
+        self.shared_size
+    }
+
+    /// The key a shared side-dock width persists under, next to the per-panel sizes.
+    pub fn shared_size_key(&self) -> &'static str {
+        match self.position {
+            DockPosition::Left => "dock:left",
+            DockPosition::Right => "dock:right",
+            DockPosition::Bottom => "dock:bottom",
+        }
+    }
+
+    fn resize_shared(
+        &mut self,
+        size: Option<Pixels>,
+        flex: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Both are kept so fixed-width and flexible panels open at the same width.
+        let size_state = PanelSizeState {
+            size: size.map(|size| size.max(RESIZE_HANDLE_SIZE).round()),
+            flex,
+        };
+        self.shared_size = Some(size_state);
+        for entry in &mut self.panel_entries {
+            entry.size_state = size_state;
+            entry.panel.size_state_changed(window, cx);
+        }
+        let key = self.shared_size_key();
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.persist_panel_size_state(key, size_state, cx);
+                });
+            }
+        });
+        cx.notify();
     }
 
     pub fn toggle_panel_flexible_size(
@@ -1139,7 +1223,9 @@ impl Dock {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.should_resize_all_panels(cx) {
+        if self.shares_width(cx) {
+            self.resize_shared(size, flex, window, cx);
+        } else if self.should_resize_all_panels(cx) {
             self.resize_all_panels(size, flex, window, cx);
         } else {
             self.resize_active_panel(size, flex, window, cx);
@@ -1149,7 +1235,12 @@ impl Dock {
     /// Resets the active panel and, when this dock is included in
     /// `resize_all_panels_in_dock`, all panels using the same sizing mode.
     pub fn reset_panel_sizes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.should_resize_all_panels(cx) {
+        if self.shares_width(cx) {
+            let size = self
+                .active_panel_entry()
+                .map(|entry| entry.panel.default_size(window, cx));
+            self.resize_shared(size, None, window, cx);
+        } else if self.should_resize_all_panels(cx) {
             self.reset_all_panel_sizes(window, cx);
         } else {
             self.reset_active_panel_size(window, cx);

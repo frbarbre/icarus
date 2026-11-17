@@ -452,6 +452,47 @@ pub fn open_diff_tab(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<Result<Entity<DiffTab>>> {
+    open_diff_tab_as(path, base, mode, pane, false, workspace, window, cx)
+}
+
+/// Opens the diff as the pane's preview tab (italic), in place of the current preview when that is
+/// a file tab too, as Orca's openDiffAtLocation does; an edit or a double-click on the tab keeps it.
+pub fn open_diff_preview(
+    path: PathBuf,
+    base: DiffBase,
+    mode: DiffTabMode,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<Result<Entity<DiffTab>>> {
+    open_diff_tab_as(path, base, mode, None, true, workspace, window, cx)
+}
+
+/// Where a new preview goes: just after a preview it may replace (file tabs replace each other),
+/// or None after releasing a preview of another kind, which then stays as a normal tab.
+fn preview_slot(pane: &mut Pane) -> Option<usize> {
+    let preview = pane.preview_item()?;
+    let replaceable =
+        preview.downcast::<DiffTab>().is_some() || preview.downcast::<Editor>().is_some();
+    if replaceable {
+        pane.preview_item_idx().map(|index| index + 1)
+    } else {
+        pane.unpreview_item_if_preview(preview.item_id());
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_diff_tab_as(
+    path: PathBuf,
+    base: DiffBase,
+    mode: DiffTabMode,
+    pane: Option<Entity<Pane>>,
+    preview: bool,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<Result<Entity<DiffTab>>> {
     let existing = workspace
         .items_of_type::<DiffTab>(cx)
         .find(|tab| tab.read(cx).path == path);
@@ -460,6 +501,11 @@ pub fn open_diff_tab(
             tab.set_base(base, window, cx);
             tab.set_mode(mode, cx);
         });
+        if !preview && let Some(pane) = workspace.pane_for(&existing) {
+            pane.update(cx, |pane, _| {
+                pane.unpreview_item_if_preview(existing.entity_id())
+            });
+        }
         workspace.activate_item(&existing, true, true, window, cx);
         return Task::ready(Ok(existing));
     }
@@ -493,7 +539,23 @@ pub fn open_diff_tab(
                     cx,
                 )
             });
-            workspace.add_item(pane, Box::new(tab.clone()), None, true, true, window, cx);
+            if !preview {
+                workspace.add_item(pane, Box::new(tab.clone()), None, true, true, window, cx);
+                return tab;
+            }
+            let slot = pane.update(cx, |pane, _| preview_slot(pane));
+            workspace.add_item(
+                pane.clone(),
+                Box::new(tab.clone()),
+                slot,
+                true,
+                true,
+                window,
+                cx,
+            );
+            pane.update(cx, |pane, cx| {
+                pane.replace_preview_item_id(tab.entity_id(), window, cx)
+            });
             tab
         })
     })
@@ -563,6 +625,19 @@ impl Item for DiffTab {
         Some(Icon::new(IconName::Diff).color(Color::Muted))
     }
 
+    fn tab_content(
+        &self,
+        params: workspace::item::TabContentParams,
+        _window: &Window,
+        cx: &App,
+    ) -> AnyElement {
+        Label::new(self.tab_content_text(params.detail.unwrap_or_default(), cx))
+            .single_line()
+            .color(params.text_color())
+            .when(params.preview, |label| label.italic())
+            .into_any_element()
+    }
+
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
         self.path
             .file_name()
@@ -581,6 +656,11 @@ impl Item for DiffTab {
 
     fn to_item_events(event: &EditorEvent, f: &mut dyn FnMut(ItemEvent)) {
         Editor::to_item_events(event, f)
+    }
+
+    // Laying out the diff's excerpts reports an edit too; only a change to the file ends the preview.
+    fn preserve_preview(&self, cx: &App) -> bool {
+        self.editor.read(cx).preserve_preview(cx)
     }
 
     fn deactivated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1957,5 +2037,87 @@ pub(crate) mod tests {
             [json!({ "id": "agent-7" })],
             "an answer's transcript wakes its session from history"
         );
+    }
+
+    #[gpui::test]
+    async fn notes_and_thread_changes_show_before_the_server_answers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::review::tests::{calls_to, hold_rpc, stub_rpc};
+
+        let (workspace, mut cx) = git_workspace(cx).await;
+        let cx = &mut cx;
+        let calls = cx.update(|_, cx| {
+            stub_rpc(cx, move |method, _| match method {
+                "note.list" => Ok(json!([
+                    { "id": "n1", "path": "src/app.rs", "line": 1, "end_line": 1, "author": "user",
+                      "body": "Why main?", "resolved": false, "replies": [] },
+                    { "id": "n2", "path": "src/app.rs", "line": 2, "end_line": 2, "author": "user",
+                      "body": "And this?", "resolved": false, "replies": [] },
+                ])),
+                "review.threads" => Ok(json!({ "threads": [thread_json("T1", 1, false)] })),
+                _ => Ok(json!({})),
+            })
+        });
+        // GitHub is slow: threads and drafts never answer, the mutations neither.
+        cx.update(|_, cx| {
+            hold_rpc(
+                cx,
+                &[
+                    "review.threads",
+                    "review.comment.list",
+                    "note.remove",
+                    "note.resolve",
+                    "review.resolve",
+                    "review.react",
+                ],
+            )
+        });
+        let tab = open(&workspace, "/project/src/app.rs", DiffBase::Uncommitted, cx);
+        cx.run_until_parked();
+        let tab = tab.await.expect("diff tab");
+        let review = tab.update(cx, |tab, cx| {
+            tab.enable_review("/project".into(), "src/app.rs".into(), cx);
+            tab.review().cloned().expect("review")
+        });
+        review.update(cx, |review, cx| review.reload(cx));
+        cx.run_until_parked();
+        review.read_with(cx, |review, _| {
+            assert_eq!(
+                review.notes().len(),
+                2,
+                "notes show without waiting for GitHub's threads"
+            );
+        });
+
+        review.update(cx, |review, cx| review.remove_note("n1", None, cx));
+        review.update(cx, |review, cx| review.set_note_resolved("n2", true, cx));
+        review.read_with(cx, |review, _| {
+            assert_eq!(review.notes().len(), 1, "a deleted note is gone at once");
+            assert!(
+                review.notes()[0].resolved,
+                "a resolved note shows resolved at once"
+            );
+        });
+        assert_eq!(calls_to(&calls, "note.remove").len(), 1);
+
+        cx.update(|_, cx| {
+            hold_rpc(cx, &["note.remove", "review.resolve", "review.react"]);
+        });
+        review.update(cx, |review, cx| review.reload(cx));
+        cx.run_until_parked();
+        review.update(cx, |review, cx| {
+            review.set_resolved("T1", true, cx);
+            review.toggle_reaction("T1-c1", "+1", false, cx);
+        });
+        review.read_with(cx, |review, _| {
+            let thread = &review.threads()[0];
+            assert!(
+                thread.is_resolved,
+                "a resolved thread shows resolved at once"
+            );
+            let reaction = &thread.comments[0].reactions[0];
+            assert_eq!((reaction.count, reaction.viewer_has_reacted), (3, true));
+        });
     }
 }

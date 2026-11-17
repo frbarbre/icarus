@@ -37,7 +37,7 @@ pub enum PrTarget {
     Branch(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
 pub struct PrDetails {
     pub node_id: String,
     pub pr: PullRequest,

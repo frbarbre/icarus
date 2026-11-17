@@ -343,6 +343,23 @@ fn download_verified(check: &Value, name: &str, dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Long enough for a busy Mac's login-shell PATH probe (two tries of 15 s) before the server listens.
+const START_TIMEOUT: Duration = Duration::from_secs(45);
+
+async fn wait_for_server(home: &Path) -> Result<()> {
+    let deadline = Instant::now() + START_TIMEOUT;
+    while Client::connect(home, "icarus-update").await.is_err() {
+        if Instant::now() > deadline {
+            bail!(
+                "the new server did not come up; see {}",
+                home.join("server.log").display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(())
+}
+
 /// Stops the server with its terminals parked, then starts the new one, which takes them back.
 pub async fn restart_server(
     cli: &Cli,
@@ -355,6 +372,7 @@ pub async fn restart_server(
         .request("server.shutdown", json!({ "keep_terminals": true }))
         .await;
     let deadline = Instant::now() + Duration::from_secs(30);
+    let service = service::installed_for(&home);
     // A server busy parking still holds its socket but no longer answers.
     while !matches!(
         tokio::time::timeout(
@@ -365,15 +383,32 @@ pub async fn restart_server(
         Ok(Err(_))
     ) {
         if Instant::now() > deadline {
+            if service {
+                service::kickstart(server, &home)?;
+                return wait_for_server(&home).await.map(|()| {
+                    "the old server did not stop; the login service restarted it".into()
+                });
+            }
             bail!(
                 "the old server did not stop; restart it with `icarus server stop && icarus server start`"
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    if service::installed_for(&home) {
-        service::install(server, &home)?;
-        return Ok("restarted the login service".into());
+    if service {
+        let started = service::start_again(server, &home);
+        if started.is_ok() && wait_for_server(&home).await.is_ok() {
+            return Ok("restarted the login service".into());
+        }
+        match started {
+            Err(error) => {
+                eprintln!("starting the login service failed ({error:#}); kickstarting it")
+            }
+            Ok(()) => eprintln!("the new server did not come up; kickstarting the login service"),
+        }
+        service::kickstart(server, &home).context("kickstart the login service")?;
+        wait_for_server(&home).await?;
+        return Ok("restarted the login service with a kickstart".into());
     }
     let status = Process::new(exe)
         .arg("--home")

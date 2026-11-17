@@ -297,7 +297,16 @@ impl Store {
     }
 
     pub(crate) fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.connection.lock().unwrap_or_else(|p| p.into_inner())
+        if let Ok(connection) = self.connection.try_lock() {
+            return connection;
+        }
+        let started = std::time::Instant::now();
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let waited = started.elapsed();
+        if waited > std::time::Duration::from_millis(50) {
+            tracing::info!("state.db: waited {waited:.1?} for the database");
+        }
+        connection
     }
 
     pub fn add_project(

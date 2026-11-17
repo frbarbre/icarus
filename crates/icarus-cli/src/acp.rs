@@ -339,15 +339,34 @@ fn remote_control_request(text: &str) -> Option<Option<bool>> {
 }
 
 type Writer = mpsc::UnboundedSender<Value>;
+type Connection = (Arc<Client>, mpsc::UnboundedReceiver<Event>);
+
+/// The server connection, swapped for a new one when the server restarts.
+struct SharedClient(std::sync::RwLock<Arc<Client>>);
+
+impl SharedClient {
+    fn current(&self) -> Arc<Client> {
+        Arc::clone(&self.0.read().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.current().request(method, params).await
+    }
+
+    fn replace(&self, client: Arc<Client>) {
+        *self.0.write().unwrap_or_else(|p| p.into_inner()) = client;
+    }
+}
 
 struct Bridge {
-    client: Arc<Client>,
+    client: SharedClient,
     out: Writer,
     provider: Option<String>,
     /// Prompts waiting for their turn to end, by session id.
     pending: Mutex<HashMap<String, (Value, bool)>>,
     tools: Mutex<HashMap<String, ToolState>>,
-    attached: Mutex<HashMap<String, ()>>,
+    /// Attached sessions and the next event each expects, to resume from after a reconnect.
+    attached: Mutex<HashMap<String, u64>>,
     /// Sessions this bridge already handed out from `session/new`, so two new tabs never share an agent.
     claimed: Mutex<HashSet<String>>,
 }
@@ -546,11 +565,39 @@ impl Bridge {
                 .await
                 .insert(session_id.to_string(), tools);
         }
+        let next = attached["next_seq"].as_u64().unwrap_or(0);
         self.attached
             .lock()
             .await
-            .insert(session_id.to_string(), ());
-        Ok(attached["next_seq"].as_u64().unwrap_or(0))
+            .insert(session_id.to_string(), next);
+        Ok(next)
+    }
+
+    /// After the server came back: attaches every session again and plays what was missed live.
+    async fn reattach(&self) {
+        let sessions: Vec<(String, u64)> = self
+            .attached
+            .lock()
+            .await
+            .iter()
+            .map(|(id, next)| (id.clone(), *next))
+            .collect();
+        for (session_id, since) in sessions {
+            let attached = match self
+                .client
+                .request("agent.attach", json!({ "id": session_id, "since": since }))
+                .await
+            {
+                Ok(attached) => attached,
+                Err(error) => {
+                    eprintln!("icarus acp: reattaching {session_id}: {error:#}");
+                    continue;
+                }
+            };
+            for event in attached["events"].as_array().into_iter().flatten() {
+                self.on_agent_event(&session_id, event).await;
+            }
+        }
     }
 
     async fn on_server_event(&self, event: Event) {
@@ -558,7 +605,20 @@ impl Bridge {
             return;
         }
         let session_id = event.payload["id"].as_str().unwrap_or_default().to_string();
-        let agent_event = &event.payload["event"];
+        self.on_agent_event(&session_id, &event.payload["event"])
+            .await;
+    }
+
+    async fn on_agent_event(&self, session_id: &str, agent_event: &Value) {
+        let session_id = session_id.to_owned();
+        if let Some(seq) = agent_event["seq"].as_u64()
+            && let Some(next) = self.attached.lock().await.get_mut(&session_id)
+        {
+            if seq < *next {
+                return;
+            }
+            *next = seq + 1;
+        }
         let updates = {
             let mut tools = self.tools.lock().await;
             let state = tools.entry(session_id.clone()).or_default();
@@ -727,13 +787,21 @@ impl Bridge {
     }
 }
 
-pub async fn run(
-    (client, mut events): (Arc<Client>, mpsc::UnboundedReceiver<icarus_client::Event>),
+/// How often a lost server connection is retried; a restarting server is back within a second or two.
+const RECONNECT_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+pub async fn run<F, C>(
+    (client, mut events): Connection,
     provider: Option<String>,
-) -> Result<()> {
+    reconnect: C,
+) -> Result<()>
+where
+    C: Fn() -> F + Send + 'static,
+    F: std::future::Future<Output = Result<Connection>> + Send,
+{
     let (out, mut outbox) = mpsc::unbounded_channel::<Value>();
     let bridge = Arc::new(Bridge {
-        client,
+        client: SharedClient(std::sync::RwLock::new(client)),
         out,
         provider,
         pending: Mutex::default(),
@@ -753,8 +821,24 @@ pub async fn run(
     });
     let listening = Arc::clone(&bridge);
     tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            listening.on_server_event(event).await;
+        loop {
+            while let Some(event) = events.recv().await {
+                listening.on_server_event(event).await;
+            }
+            let lost = std::time::Instant::now();
+            let (client, reconnected) = loop {
+                match reconnect().await {
+                    Ok(connection) => break connection,
+                    Err(_) => tokio::time::sleep(RECONNECT_EVERY).await,
+                }
+            };
+            eprintln!(
+                "icarus acp: reconnected to the server after {:.0?}",
+                lost.elapsed()
+            );
+            listening.client.replace(client);
+            events = reconnected;
+            listening.reattach().await;
         }
     });
     let mut lines = BufReader::new(tokio::io::stdin()).lines();

@@ -1886,6 +1886,7 @@ pub fn card_actions(summary: &WorkspaceSummary) -> Vec<CardAction> {
 pub fn card_menu(
     server: ServerRef,
     summary: WorkspaceSummary,
+    origin: Option<String>,
     workspace: WeakEntity<Workspace>,
     window: &mut Window,
     cx: &mut App,
@@ -1895,6 +1896,9 @@ pub fn card_menu(
         .as_ref()
         .is_some_and(|setup| setup.state == "running");
     ContextMenu::build(window, cx, move |mut menu, _, _| {
+        if let Some(origin) = origin {
+            menu = menu.header(origin);
+        }
         for action in card_actions(&summary) {
             if matches!(action, CardAction::Rename | CardAction::Delete) {
                 menu = menu.separator();

@@ -26,12 +26,47 @@ use serde_json::{Value, json};
 use crate::server::{Server, params, rpc};
 use crate::state::{Project, Workspace};
 
-const PR_TTL: Duration = Duration::from_secs(15);
+/// Longer than [`PR_POLL`], so requests between polls read what the poller fetched.
+const PR_TTL: Duration = Duration::from_secs(30);
 const METADATA_TTL: Duration = Duration::from_secs(600);
 const PREVIEW_TTL: Duration = Duration::from_secs(30);
 const USERS_TTL: Duration = Duration::from_secs(600);
 const THREADS_TTL: Duration = Duration::from_secs(20);
 pub(crate) const STACK_INTENTS_KEY: &str = "rules.stack_auto_merge";
+const PR_CACHE_KEY: &str = "github.pr_cache";
+/// A `gh` call slower than this is logged with its route and duration.
+const SLOW_GH: Duration = Duration::from_millis(1500);
+/// How often cards' pull requests refresh while a client is connected.
+const PR_POLL: Duration = Duration::from_secs(20);
+/// Wake-ups closer together than this share one poll.
+const PR_POLL_GAP: Duration = Duration::from_secs(2);
+
+/// Keeps every workspace card's pull request current while a client is connected: at once when one
+/// connects or worktrees change, then every [`PR_POLL`].
+pub(crate) fn spawn(server: Arc<Server>) {
+    server.load_pr_cache();
+    tokio::spawn(async move {
+        let mut last: Option<Instant> = None;
+        loop {
+            if server.client_count() == 0 {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    () = server.github.poll.notified() => {}
+                }
+                continue;
+            }
+            if let Some(last) = last {
+                tokio::time::sleep(PR_POLL_GAP.saturating_sub(last.elapsed())).await;
+            }
+            last = Some(Instant::now());
+            server.pr_poll().await;
+            tokio::select! {
+                () = tokio::time::sleep(PR_POLL) => {}
+                () = server.github.poll.notified() => {}
+            }
+        }
+    });
+}
 
 /// The `gh` runner the server uses: the real CLI, or fixtures when `ICARUS_GH_FIXTURES` names a file.
 pub enum ServerGh {
@@ -41,10 +76,18 @@ pub enum ServerGh {
 
 impl Gh for ServerGh {
     async fn execute(&self, request: &GhRequest) -> std::io::Result<GhOutput> {
-        match self {
+        let started = Instant::now();
+        let output = match self {
             Self::Cli(cli) => cli.execute(request).await,
             Self::Fixture(fixture) => fixture.execute(request).await,
+        };
+        let took = started.elapsed();
+        if took > SLOW_GH {
+            tracing::info!("gh {} took {took:.1?}", request.route());
+        } else {
+            tracing::debug!("gh {} took {took:.1?}", request.route());
         }
+        output
     }
 }
 
@@ -434,6 +477,7 @@ pub struct GitHubService {
     previews: Mutex<HashMap<String, (Instant, PrPreviews)>>,
     users: Mutex<HashMap<String, (Instant, Vec<GitHubUser>)>>,
     threads: Mutex<HashMap<String, (Instant, Vec<PrThread>)>>,
+    poll: tokio::sync::Notify,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -452,7 +496,13 @@ impl GitHubService {
             previews: Mutex::new(HashMap::new()),
             users: Mutex::new(HashMap::new()),
             threads: Mutex::new(HashMap::new()),
+            poll: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Asks the poller to refresh every project's pull requests now (a client connected, worktrees changed).
+    pub(crate) fn wake_poll(&self) {
+        self.poll.notify_one();
     }
 
     /// A PR's review threads, shared for a few seconds by every open diff tab and file editor.
@@ -474,6 +524,49 @@ impl GitHubService {
 
     pub(crate) fn forget_review_threads(&self) {
         lock(&self.threads).clear();
+    }
+
+    /// Applies a mutation GitHub confirmed to the cached thread, so the next read shows it without
+    /// fetching every thread again; false when no cached PR holds the thread.
+    pub(crate) fn patch_thread(&self, thread_id: &str, patch: impl FnOnce(&mut PrThread)) -> bool {
+        let mut cached = lock(&self.threads);
+        let found = cached
+            .values_mut()
+            .flat_map(|(_, threads)| threads.iter_mut())
+            .find(|thread| thread.id == thread_id);
+        match found {
+            Some(thread) => {
+                patch(thread);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Like [`Self::patch_thread`], for one comment of a cached thread.
+    pub(crate) fn patch_comment(
+        &self,
+        comment_id: &str,
+        patch: impl FnOnce(&mut icarus_github::review_threads::PrComment),
+    ) -> bool {
+        let mut cached = lock(&self.threads);
+        let found = cached
+            .values_mut()
+            .flat_map(|(_, threads)| threads.iter_mut())
+            .flat_map(|thread| thread.comments.iter_mut())
+            .find(|comment| comment.id == comment_id);
+        match found {
+            Some(comment) => {
+                patch(comment);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The signed-in GitHub user, as the last pull request poll reported it.
+    pub(crate) fn viewer(&self) -> Option<String> {
+        lock(&self.prs).values().find_map(|prs| prs.viewer.clone())
     }
 
     /// The repository's assignable users, cached for ten minutes (mentions and the reviewer picker).
@@ -504,6 +597,16 @@ impl GitHubService {
     pub(crate) fn invalidate(&self, project_id: &str) {
         lock(&self.prs).remove(project_id);
         lock(&self.stacks).clear();
+    }
+
+    /// The pull request of a branch as last polled, however old.
+    pub(crate) fn cached_pr(&self, project_id: &str, branch: &str) -> Option<PullRequest> {
+        lock(&self.prs)
+            .get(project_id)?
+            .by_branch
+            .get(branch)?
+            .as_ref()
+            .map(|details| details.pr.clone())
     }
 
     pub(crate) fn cached_pr_author(&self, project_id: &str, branch: &str) -> Value {
@@ -861,7 +964,122 @@ impl Server {
             }
         }
         lock(&self.github.prs).insert(project.id.clone(), prs.clone());
+        self.save_pr_cache();
         Ok(prs)
+    }
+
+    /// Every project's pull requests in one batched query per repository, all repositories at once;
+    /// returns the workspaces whose card changed and tells clients about them.
+    pub(crate) async fn pr_poll(self: &Arc<Self>) -> Vec<String> {
+        let started = Instant::now();
+        let projects: Vec<Project> = match self.store.projects() {
+            Ok(projects) => projects
+                .into_iter()
+                .filter(|p| repo_ref(p).is_some())
+                .collect(),
+            Err(error) => {
+                tracing::warn!("pr poll: {error:#}");
+                return Vec::new();
+            }
+        };
+        let workspaces = self.store.workspaces(None).unwrap_or_default();
+        let cards = |server: &Self| -> HashMap<String, Value> {
+            workspaces
+                .iter()
+                .filter_map(|w| {
+                    let branch = w.branch.as_deref()?;
+                    Some((
+                        w.id.clone(),
+                        server.github.cached_pr_summary(&w.project_id, branch),
+                    ))
+                })
+                .collect()
+        };
+        let before = cards(self);
+        let fetches: Vec<_> = projects
+            .into_iter()
+            .map(|project| {
+                let server = Arc::clone(self);
+                tokio::spawn(async move {
+                    let started = Instant::now();
+                    let result = server.project_prs(&project, None, true).await;
+                    (project, started.elapsed(), result)
+                })
+            })
+            .collect();
+        let mut fetched = 0;
+        for fetch in fetches {
+            match fetch.await {
+                Ok((project, took, Ok(prs))) => {
+                    fetched += 1;
+                    tracing::debug!(
+                        "pr poll: {} ({} branches) in {took:.1?}",
+                        project.name,
+                        prs.by_branch.len()
+                    );
+                }
+                Ok((project, took, Err(error))) => {
+                    tracing::warn!("pr poll: {} failed after {took:.1?}: {error}", project.name)
+                }
+                Err(error) => tracing::warn!("pr poll: {error}"),
+            }
+        }
+        let after = cards(self);
+        let changed: Vec<String> = after
+            .iter()
+            .filter(|(id, card)| before.get(*id) != Some(*card))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if !changed.is_empty() {
+            self.broadcast(
+                "workspace.changed",
+                json!({ "workspaces": changed, "source": "github" }),
+            );
+        }
+        let took = started.elapsed();
+        if took > Duration::from_secs(2) {
+            tracing::info!("pr poll took {took:.1?} for {fetched} project(s)");
+        }
+        changed
+    }
+
+    fn save_pr_cache(&self) {
+        let saved: HashMap<String, HashMap<String, Option<PrDetails>>> = lock(&self.github.prs)
+            .iter()
+            .map(|(project, prs)| (project.clone(), prs.by_branch.clone()))
+            .collect();
+        match serde_json::to_value(&saved) {
+            Ok(value) => {
+                if let Err(error) = self.store.kv_set(PR_CACHE_KEY, &value) {
+                    tracing::warn!("saving pull requests: {error:#}");
+                }
+            }
+            Err(error) => tracing::warn!("saving pull requests: {error}"),
+        }
+    }
+
+    /// The pull requests the last server knew, so cards show them before the first poll answers.
+    pub(crate) fn load_pr_cache(&self) {
+        let Ok(Some(value)) = self.store.kv_get(PR_CACHE_KEY) else {
+            return;
+        };
+        let Ok(saved) =
+            serde_json::from_value::<HashMap<String, HashMap<String, Option<PrDetails>>>>(value)
+        else {
+            return;
+        };
+        // Stale on purpose: shown at once, but the first request or poll fetches afresh.
+        let at = Instant::now()
+            .checked_sub(PR_TTL)
+            .unwrap_or_else(Instant::now);
+        let mut prs = lock(&self.github.prs);
+        for (project, by_branch) in saved {
+            prs.entry(project).or_insert(ProjectPrs {
+                at,
+                viewer: None,
+                by_branch,
+            });
+        }
     }
 
     pub(crate) async fn merge_metadata(

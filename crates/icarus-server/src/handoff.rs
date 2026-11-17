@@ -205,9 +205,18 @@ enum Next {
 }
 
 fn serve(stream: &UnixStream, held: &mut Option<(Parcel, Vec<OwnedFd>)>) -> Result<Next> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    match read_byte(stream)? {
+    // Readiness probes connect and hang up at once; macOS then fails setsockopt with EINVAL.
+    let timeouts = stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)));
+    let mut request = [0u8; 1];
+    let mut reader = stream;
+    match reader.read(&mut request) {
+        Ok(0) => return Ok(Next::Continue),
+        Ok(_) => timeouts?,
+        Err(error) => return Err(error).context("read a handoff request"),
+    }
+    match request[0] {
         PUT if held.is_some() => {
             write_byte(stream, BUSY)?;
             Ok(Next::Continue)
@@ -323,6 +332,25 @@ pub fn spawn_holder(paths: &ServerPaths) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_that_hangs_up_at_once_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("h.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        for _ in 0..3 {
+            drop(UnixStream::connect(&path).expect("probe"));
+            let (stream, _) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_millis(20));
+            let mut held = None;
+            match serve(&stream, &mut held) {
+                Ok(Next::Continue) => {}
+                Ok(Next::Done) => panic!("a probe ended the holder"),
+                Err(error) => panic!("{error:#}"),
+            }
+            assert!(held.is_none());
+        }
+    }
 
     #[test]
     fn a_parcel_and_its_fds_cross_a_socket() {

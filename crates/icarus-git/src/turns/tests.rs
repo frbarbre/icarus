@@ -82,6 +82,45 @@ fn empty_turns_are_skipped_and_ignored_files_do_not_count() {
 }
 
 #[test]
+fn an_unreadable_index_still_snapshots_from_head_outside_the_git_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = repo();
+    let root = repo.root.as_path();
+    write(root, "staged.txt", "staged\n");
+    run(root, &["add", "staged.txt"]);
+    let index = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )
+    .expect("index path");
+    let index = PathBuf::from(index.trim());
+    let git_dir = index.parent().expect("git dir").to_path_buf();
+    let before: Vec<_> = std::fs::read_dir(&git_dir).expect("ls").collect();
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let scratch = tempfile::tempdir().expect("scratch");
+
+    let start_tree = snapshot_tree_in(root, scratch.path()).expect("start");
+    write(root, "a.txt", "changed\n");
+    let end_tree = snapshot_tree_in(root, scratch.path()).expect("end");
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+    let changed = git(root, &["diff", "--name-only", &start_tree, &end_tree]).expect("diff");
+    assert_eq!(changed, "a.txt\n");
+    let files = git(root, &["ls-tree", "--name-only", &start_tree]).expect("ls-tree");
+    assert!(files.contains("staged.txt"), "{files}");
+    assert_eq!(
+        std::fs::read_dir(&git_dir).expect("ls").count(),
+        before.len(),
+        "nothing is left in the git dir"
+    );
+    assert_eq!(
+        std::fs::read_dir(scratch.path()).expect("ls").count(),
+        0,
+        "temporary indexes are removed"
+    );
+}
+
+#[test]
 fn turns_list_newest_first_and_are_pruned_per_worktree() {
     let repo = repo();
     let root = repo.root.as_path();

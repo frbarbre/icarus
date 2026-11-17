@@ -462,6 +462,32 @@ pub fn note_height(note: &WorkspaceNote, expanded: bool) -> u32 {
     3 + body_lines(&note.body) + replies
 }
 
+/// Shows the viewer's reaction added or removed before GitHub confirms it.
+pub(crate) fn toggle_reaction_locally(
+    reactions: &mut Vec<ReactionSummary>,
+    content: &str,
+    react: bool,
+) {
+    match reactions.iter_mut().find(|r| r.content == content) {
+        Some(summary) if summary.viewer_has_reacted != react => {
+            summary.viewer_has_reacted = react;
+            summary.count = if react {
+                summary.count + 1
+            } else {
+                summary.count.saturating_sub(1)
+            };
+        }
+        Some(_) => {}
+        None if react => reactions.push(ReactionSummary {
+            content: content.to_owned(),
+            count: 1,
+            viewer_has_reacted: true,
+        }),
+        None => {}
+    }
+    reactions.retain(|r| r.count > 0);
+}
+
 pub(crate) fn reaction_emoji(content: &str) -> &'static str {
     match content {
         "+1" => "👍",
@@ -683,7 +709,14 @@ pub(crate) fn request(
 ) -> Option<Task<Result<Value>>> {
     #[cfg(test)]
     if let Some(stub) = cx.try_global::<RpcStub>() {
-        return Some(Task::ready((stub.0)(method, &params)));
+        let answer = (stub.0)(method, &params);
+        if cx
+            .try_global::<tests::HeldRpc>()
+            .is_some_and(|held| held.0.contains(&method))
+        {
+            return Some(cx.background_spawn(futures::future::pending()));
+        }
+        return Some(Task::ready(answer));
     }
     let client = client?;
     Some(Tokio::spawn_result(cx, async move {
@@ -1137,7 +1170,9 @@ impl ReviewSection {
         let name = row.name.clone();
         let remove_name = row.name.clone();
         let state_label = row.state.label();
+        let group = SharedString::from(format!("icarus-reviewer-{}", row.name));
         h_flex()
+            .group(group.clone())
             .h_7()
             .gap_1p5()
             .child(render_avatar(
@@ -1157,46 +1192,45 @@ impl ReviewSection {
                     .min_w_0()
                     .child(Label::new(display).size(LabelSize::Small).truncate()),
             )
-            // Fixed slots (remove, re-request, state) so the icons line up across rows; the state, which
-            // every row has, sits flush with the right edge.
-            .child(h_flex().w(REVIEWER_SLOT).flex_none().justify_center().when(
-                row.can_remove,
-                |slot| {
-                    slot.child(
-                        IconButton::new(
-                            SharedString::from(format!("remove-{remove_name}")),
-                            IconName::Close,
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_0p5()
+                    .visible_on_hover(group)
+                    .when(row.can_rerequest, |actions| {
+                        actions.child(
+                            IconButton::new(
+                                SharedString::from(format!("rerequest-{name}")),
+                                IconName::RotateCw,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .disabled(blocked || self.busy.is_some())
+                            .tooltip(Tooltip::text(rerequest_tooltip))
+                            .on_click(cx.listener(
+                                move |this, _: &ClickEvent, window, cx| {
+                                    this.request_reviewers(vec![name.clone()], window, cx)
+                                },
+                            )),
                         )
-                        .icon_size(IconSize::XSmall)
-                        .disabled(self.busy.is_some())
-                        .tooltip(Tooltip::text(format!("Remove {remove_name}")))
-                        .on_click(cx.listener(
-                            move |this, _: &ClickEvent, window, cx| {
-                                this.remove_reviewer(remove_name.clone(), window, cx)
-                            },
-                        )),
-                    )
-                },
-            ))
-            .child(h_flex().w(REVIEWER_SLOT).flex_none().justify_center().when(
-                row.can_rerequest,
-                |slot| {
-                    slot.child(
-                        IconButton::new(
-                            SharedString::from(format!("rerequest-{name}")),
-                            IconName::RotateCw,
+                    })
+                    .when(row.can_remove, |actions| {
+                        actions.child(
+                            IconButton::new(
+                                SharedString::from(format!("remove-{remove_name}")),
+                                IconName::Close,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .disabled(self.busy.is_some())
+                            .tooltip(Tooltip::text(format!("Remove {remove_name}")))
+                            .on_click(cx.listener(
+                                move |this, _: &ClickEvent, window, cx| {
+                                    this.remove_reviewer(remove_name.clone(), window, cx)
+                                },
+                            )),
                         )
-                        .icon_size(IconSize::XSmall)
-                        .disabled(blocked || self.busy.is_some())
-                        .tooltip(Tooltip::text(rerequest_tooltip))
-                        .on_click(cx.listener(
-                            move |this, _: &ClickEvent, window, cx| {
-                                this.request_reviewers(vec![name.clone()], window, cx)
-                            },
-                        )),
-                    )
-                },
-            ))
+                    }),
+            )
+            // Every row has a state, so it alone holds the right edge, under the header's verdict.
             .child(
                 h_flex()
                     .id(SharedString::from(format!("state-{}", row.name)))
@@ -1745,21 +1779,26 @@ impl DiffReview {
         ) else {
             return Task::ready(());
         };
+        // Notes are local and answer at once; they must not wait for GitHub's threads.
+        let notes = cx.spawn(async move |this, cx| {
+            let Some(notes) = notes else {
+                return;
+            };
+            let notes = notes.await;
+            this.update(cx, |this, cx| match notes {
+                Ok(notes) => {
+                    this.notes = serde_json::from_value(notes).unwrap_or_default();
+                    this.rebuild_blocks(cx);
+                }
+                Err(error) => log::warn!("loading notes failed: {error:#}"),
+            })
+            .log_err();
+        });
         cx.spawn(async move |this, cx| {
             let threads = threads.await;
             let drafts = drafts.await;
-            let notes = match notes {
-                Some(notes) => Some(notes.await),
-                None => None,
-            };
+            notes.await;
             this.update(cx, |this, cx| {
-                match notes {
-                    Some(Ok(notes)) => {
-                        this.notes = serde_json::from_value(notes).unwrap_or_default();
-                    }
-                    Some(Err(error)) => log::warn!("loading notes failed: {error:#}"),
-                    None => {}
-                }
                 match (threads, drafts) {
                     (Ok(threads), Ok(drafts)) => {
                         this.load_error = None;
@@ -2286,7 +2325,17 @@ impl DiffReview {
                     this.close_composer(cx);
                     // A new note goes into the agent's composer at once, so the prompt can follow.
                     match added["id"].as_str().filter(|_| new_note) {
-                        Some(note) => this.add_note_to_agent(note, cx),
+                        Some(note) => {
+                            if let Ok(created) =
+                                serde_json::from_value::<WorkspaceNote>(added.clone())
+                                && created.path == this.path
+                            {
+                                this.notes.retain(|existing| existing.id != created.id);
+                                this.notes.push(created);
+                                this.rebuild_blocks(cx);
+                            }
+                            this.add_note_to_agent(note, cx)
+                        }
                         None => this.reload(cx),
                     }
                 }
@@ -2330,6 +2379,10 @@ impl DiffReview {
         } else {
             "review.unresolve"
         };
+        if let Some(found) = self.threads.iter_mut().find(|t| t.id == thread) {
+            found.is_resolved = resolved;
+            self.rebuild_blocks(cx);
+        }
         let params = json!({ "workspace": self.workspace_key, "thread": thread });
         self.mutate(method, params, cx);
     }
@@ -2342,6 +2395,15 @@ impl DiffReview {
         reacted: bool,
         cx: &mut Context<Self>,
     ) {
+        if let Some(found) = self
+            .threads
+            .iter_mut()
+            .flat_map(|thread| thread.comments.iter_mut())
+            .find(|candidate| candidate.id == comment)
+        {
+            toggle_reaction_locally(&mut found.reactions, reaction, !reacted);
+            self.rebuild_blocks(cx);
+        }
         let params = json!({
             "workspace": self.workspace_key, "subject": comment, "reaction": reaction,
             "remove": reacted,
@@ -2402,6 +2464,16 @@ impl DiffReview {
     }
 
     pub fn remove_note(&mut self, note: &str, reply: Option<&str>, cx: &mut Context<Self>) {
+        // Gone at once; a failed removal reloads and brings it back with the error.
+        match reply {
+            Some(reply) => {
+                if let Some(owner) = self.notes.iter_mut().find(|n| n.id == note) {
+                    owner.replies.retain(|r| r.id != reply);
+                }
+            }
+            None => self.notes.retain(|n| n.id != note),
+        }
+        self.rebuild_blocks(cx);
         self.mutate("note.remove", json!({ "id": note, "reply_id": reply }), cx);
     }
 
@@ -2411,6 +2483,10 @@ impl DiffReview {
         } else {
             "note.unresolve"
         };
+        if let Some(found) = self.notes.iter_mut().find(|n| n.id == note) {
+            found.resolved = resolved;
+            self.rebuild_blocks(cx);
+        }
         self.mutate(method, json!({ "id": note }), cx);
     }
 
@@ -3802,6 +3878,16 @@ pub(crate) mod tests {
             answer(method, params)
         })));
         calls
+    }
+
+    /// Requests to these methods are recorded but never answered, so a test can check what the
+    /// view shows while the server is still working.
+    pub(crate) struct HeldRpc(pub(crate) Vec<&'static str>);
+
+    impl gpui::Global for HeldRpc {}
+
+    pub(crate) fn hold_rpc(cx: &mut App, methods: &[&'static str]) {
+        cx.set_global(HeldRpc(methods.to_vec()));
     }
 
     pub(crate) fn calls_to(calls: &Mutex<Vec<(String, Value)>>, method: &str) -> Vec<Value> {

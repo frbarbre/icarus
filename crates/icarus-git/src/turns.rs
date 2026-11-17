@@ -1,5 +1,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -51,8 +53,32 @@ fn identity() -> [(&'static str, &'static OsStr); 4] {
     ]
 }
 
+static SCRATCH: OnceLock<PathBuf> = OnceLock::new();
+static SEED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Where temporary indexes go (the server's home); the system temp folder until set.
+pub fn set_scratch_dir(dir: PathBuf) {
+    let _ = SCRATCH.set(dir);
+}
+
+fn scratch_dir() -> PathBuf {
+    SCRATCH.get().cloned().unwrap_or_else(std::env::temp_dir)
+}
+
+// Byte copy: std::fs::copy also copies metadata, which macOS refuses for some files in ~/Documents.
+fn copy_bytes(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut source = std::fs::File::open(from)?;
+    let mut target = std::fs::File::create(to)?;
+    std::io::copy(&mut source, &mut target)?;
+    Ok(())
+}
+
 // A temporary index keeps the user's real index, and so their staging, untouched.
 pub fn snapshot_tree(worktree: &Path) -> Result<String> {
+    snapshot_tree_in(worktree, &scratch_dir())
+}
+
+fn snapshot_tree_in(worktree: &Path, scratch: &Path) -> Result<String> {
     let real = git(
         worktree,
         &["rev-parse", "--path-format=absolute", "--git-path", "index"],
@@ -62,13 +88,24 @@ pub fn snapshot_tree(worktree: &Path) -> Result<String> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let temp =
-        TempIndex(real.with_file_name(format!("icarus-turn-{}-{nanos}.index", std::process::id())));
-    // Seeding from the real index keeps its stat cache, so `add -A` rehashes only what changed.
-    if real.exists() {
-        std::fs::copy(&real, &temp.0).context("copy index")?;
-    }
+    std::fs::create_dir_all(scratch).with_context(|| format!("create {}", scratch.display()))?;
+    let temp = TempIndex(scratch.join(format!("icarus-turn-{}-{nanos}.index", std::process::id())));
     let env = [("GIT_INDEX_FILE", temp.0.as_os_str())];
+    // Seeding from the real index keeps its stat cache, so `add -A` rehashes only what changed.
+    if real.exists()
+        && let Err(error) = copy_bytes(&real, &temp.0)
+    {
+        if !SEED_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "turn snapshots: cannot read {} ({error}); seeding from HEAD instead, which rehashes every file",
+                real.display()
+            );
+        }
+        let _ = std::fs::remove_file(&temp.0);
+        if git_ok(worktree, &["rev-parse", "--verify", "-q", "HEAD"]).is_some() {
+            git_env(worktree, &["read-tree", "HEAD"], &env)?;
+        }
+    }
     git_env(worktree, &["add", "-A", "--", "."], &env)?;
     Ok(git_env(worktree, &["write-tree"], &env)?.trim().to_string())
 }

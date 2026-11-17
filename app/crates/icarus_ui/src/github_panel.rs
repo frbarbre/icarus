@@ -22,7 +22,9 @@ use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
 use crate::diff_tab::DiffBase;
 use crate::links::{PreviewDeployment, ordered_previews};
 use crate::pr_comments;
-use crate::review::{ReviewDraft, ReviewSection, ReviewThread, ReviewView};
+use crate::review::{
+    ReviewDraft, ReviewSection, ReviewThread, ReviewView, ThreadComment as ReviewThreadComment,
+};
 use crate::sections::{Layout, SectionHeader, SectionKind, drag_preview, sections_menu};
 use crate::status_style;
 
@@ -1283,6 +1285,15 @@ impl GitHubPanel {
         reacted: bool,
         cx: &mut Context<Self>,
     ) {
+        if let Some(comment) = self.snapshot.as_mut().and_then(|snapshot| {
+            snapshot
+                .threads
+                .iter_mut()
+                .flat_map(|thread| thread.comments.iter_mut())
+                .find(|comment| comment.id == subject)
+        }) {
+            crate::review::toggle_reaction_locally(&mut comment.reactions, &reaction, !reacted);
+        }
         let params =
             serde_json::json!({ "subject": subject, "reaction": reaction, "remove": reacted });
         self.run_review_call("review.react", params, None, cx);
@@ -1843,6 +1854,13 @@ impl GitHubPanel {
         } else {
             "review.unresolve"
         };
+        if let Some(found) = self
+            .snapshot
+            .as_mut()
+            .and_then(|snapshot| snapshot.threads.iter_mut().find(|t| t.id == thread))
+        {
+            found.is_resolved = resolved;
+        }
         let params = serde_json::json!({ "thread": thread });
         self.run_review_call(method, params, Some(thread), cx);
     }
@@ -1892,8 +1910,35 @@ impl GitHubPanel {
             return;
         }
         let thread = thread.clone();
+        self.show_pending_reply(&thread, &body);
+        self.reply = None;
         let params = serde_json::json!({ "thread": thread, "body": body });
         self.run_review_call("review.reply", params, Some(thread), cx);
+    }
+
+    /// Shows a reply in its thread right away; the refresh after GitHub answers replaces it.
+    fn show_pending_reply(&mut self, thread: &str, body: &str) {
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return;
+        };
+        // Only the viewer can delete a comment, so such a comment names the viewer.
+        let viewer = snapshot
+            .threads
+            .iter()
+            .flat_map(|thread| &thread.comments)
+            .find(|comment| comment.viewer_can_delete)
+            .map(|comment| (comment.author.clone(), comment.author_avatar_url.clone()));
+        let Some(found) = snapshot.threads.iter_mut().find(|t| t.id == thread) else {
+            return;
+        };
+        let (author, author_avatar_url) = viewer.unwrap_or_default();
+        found.comments.push(ReviewThreadComment {
+            id: format!("pending-{}", found.comments.len()),
+            author,
+            author_avatar_url,
+            body: body.to_owned(),
+            ..ReviewThreadComment::default()
+        });
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {

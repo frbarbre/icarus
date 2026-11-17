@@ -2943,18 +2943,38 @@ impl Workspace {
         let dock_position = panel.position(window, cx);
         let dock = self.dock_at_position(dock_position);
         let any_panel = panel.to_any();
-        let persisted_size_state =
-            self.persisted_panel_size_state(T::panel_key(), cx)
-                .or_else(|| {
-                    load_legacy_panel_size(T::panel_key(), dock_position, self, cx).map(|size| {
-                        let state = dock::PanelSizeState {
-                            size: Some(size),
-                            flex: None,
-                        };
-                        self.persist_panel_size_state(T::panel_key(), state, cx);
-                        state
-                    })
-                });
+        let (shares_width, shared_key, has_shared_size) = {
+            let dock = dock.read(cx);
+            (
+                dock.shares_width(cx),
+                dock.shared_size_key(),
+                dock.shared_size().is_some(),
+            )
+        };
+        let persisted_shared_size = shares_width
+            .then(|| self.persisted_panel_size_state(shared_key, cx))
+            .flatten();
+        // A side dock that already has its width doesn't take a newly added panel's own.
+        let panel_size_applies = !shares_width || !has_shared_size;
+        let persisted_size_state = persisted_shared_size.or_else(|| {
+            panel_size_applies
+                .then(|| {
+                    self.persisted_panel_size_state(T::panel_key(), cx)
+                        .or_else(|| {
+                            load_legacy_panel_size(T::panel_key(), dock_position, self, cx).map(
+                                |size| {
+                                    let state = dock::PanelSizeState {
+                                        size: Some(size),
+                                        flex: None,
+                                    };
+                                    self.persist_panel_size_state(T::panel_key(), state, cx);
+                                    state
+                                },
+                            )
+                        })
+                })
+                .flatten()
+        });
 
         dock.update(cx, |dock, cx| {
             let index = dock.add_panel(panel.clone(), self.weak_self.clone(), window, cx);
@@ -16944,6 +16964,87 @@ mod tests {
             dock_size, None,
             "saved size should be cleared after default_size changes"
         );
+    }
+
+    #[gpui::test]
+    async fn test_shared_side_dock_width_survives_switching_panels(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| cx.set_global(dock::SharedSideDockWidth));
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.set_random_database_id();
+            workspace.bounds.size.width = px(1200.);
+        });
+
+        let (narrow, wide) = workspace.update_in(cx, |workspace, window, cx| {
+            let narrow = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 100, cx);
+                panel.default_size = px(240.);
+                panel
+            });
+            let wide = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 200, cx);
+                panel.default_size = px(480.);
+                panel
+            });
+            workspace.add_panel(narrow.clone(), window, cx);
+            workspace.add_panel(wide.clone(), window, cx);
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.set_open(true, window, cx);
+            });
+            (narrow, wide)
+        });
+
+        let dock_width = |workspace: &Workspace, window: &Window, cx: &App| {
+            workspace.dock_size(&workspace.right_dock().read(cx), window, cx)
+        };
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(dock_width(workspace, window, cx), Some(px(240.)));
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(1, window, cx);
+            });
+            assert_eq!(
+                dock_width(workspace, window, cx),
+                Some(px(240.)),
+                "a panel with another default opens at the dock's width"
+            );
+            workspace.resize_right_dock(px(420.), window, cx);
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+            });
+            assert_eq!(dock_width(workspace, window, cx), Some(px(420.)));
+            let dock = workspace.right_dock().read(cx);
+            assert_eq!(dock.stored_panel_size(&narrow, window, cx), Some(px(420.)));
+            assert_eq!(dock.stored_panel_size(&wide, window, cx), Some(px(420.)));
+        });
+        cx.run_until_parked();
+
+        let persisted = workspace.read_with(cx, |workspace, cx| {
+            workspace.persisted_panel_size_state("dock:right", cx)
+        });
+        assert_eq!(persisted.and_then(|state| state.size), Some(px(420.)));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.remove_panel(&wide, window, cx);
+            let wide = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 200, cx);
+                panel.default_size = px(480.);
+                panel
+            });
+            workspace.add_panel(wide.clone(), window, cx);
+            let dock = workspace.right_dock().read(cx);
+            assert_eq!(
+                dock.stored_panel_size(&wide, window, cx),
+                Some(px(420.)),
+                "a panel added later takes the dock's width"
+            );
+        });
     }
 
     #[gpui::test]

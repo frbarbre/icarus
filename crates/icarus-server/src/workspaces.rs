@@ -428,6 +428,7 @@ impl Server {
                 }
                 if let Some(issue) = p.issue {
                     workspace.issue = if issue.is_null() { None } else { Some(issue) };
+                    self.linear.wake_poll();
                 }
                 if let Some(pr) = p.pull_request {
                     workspace.pull_request = if pr.is_null() { None } else { Some(pr) };

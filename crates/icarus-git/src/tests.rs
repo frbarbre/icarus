@@ -63,6 +63,19 @@ fn row<'a>(changes: &'a Changes, path: &str) -> &'a ChangeRow {
 }
 
 #[test]
+fn a_process_git_leaves_holding_its_output_cannot_outlast_the_deadline() {
+    let repo = repo();
+    let started = std::time::Instant::now();
+    let _ = git_timeout(
+        &repo.root,
+        &["-c", "alias.hold=!sleep 30 &", "hold"],
+        std::time::Duration::from_secs(2),
+    );
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+}
+
+#[test]
 fn canonical_remote_normalizes_common_url_shapes() {
     for url in [
         "https://github.com/Acme/Widgets.git",
