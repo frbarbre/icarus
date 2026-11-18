@@ -4100,11 +4100,12 @@ impl Panel for GitHubPanel {
         Some(IconName::ListChecks)
     }
 
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         let became_active = active && !self.active;
         self.active = active;
         if became_active {
-            self.read_threads_if_stale(cx);
+            // Deferred: the workspace is mid-update while it activates a panel, and this reads it.
+            cx.defer_in(window, |this, _, cx| this.read_threads_if_stale(cx));
         }
     }
 

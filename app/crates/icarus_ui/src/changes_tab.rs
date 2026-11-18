@@ -3871,11 +3871,12 @@ impl Panel for SourceControlPanel {
         4
     }
 
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         let became_active = active && !self.active;
         self.active = active;
         if became_active {
-            self.refresh(cx);
+            // Deferred: the workspace is mid-update while it activates a panel.
+            cx.defer_in(window, |this, _, cx| this.refresh(cx));
         }
     }
 }
