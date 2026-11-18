@@ -767,7 +767,15 @@ async fn response_headers_update_budget_and_backoff() {
         error,
         GitHubError::Http { status: 429, retry_after: Some(wait), .. } if wait.as_secs() == 60
     ));
-    assert!(github.budget().backoff_until().is_some());
+    let now = 1_000;
+    assert!(github.budget().backoff_until("core", now).is_some());
+    assert_eq!(
+        github.budget().backoff_until("graphql", now),
+        None,
+        "a REST backoff doesn't hold back GraphQL"
+    );
+    assert!(github.budget().exhausted_at("core", now));
+    assert!(!github.budget().exhausted_at("graphql", now));
     assert_eq!(github.budget().tier(), PollTier::Stopped);
 }
 

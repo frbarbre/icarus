@@ -26,7 +26,8 @@ pub enum PollTier {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RateBudget {
     limits: BTreeMap<String, RateLimit>,
-    backoff_until: Option<u64>,
+    /// Per resource: hitting the 30-a-minute search limit mustn't stop GraphQL or REST calls.
+    backoff_until: BTreeMap<String, u64>,
 }
 
 impl RateBudget {
@@ -36,12 +37,12 @@ impl RateBudget {
 
     pub fn observe_response(&mut self, response: &HttpResponse) {
         let number = |name: &str| response.header(name).and_then(|value| value.parse().ok());
+        let resource = response.header("x-ratelimit-resource").unwrap_or("core");
         if let (Some(limit), Some(remaining), Some(reset)) = (
             number("x-ratelimit-limit"),
             number("x-ratelimit-remaining"),
             number("x-ratelimit-reset"),
         ) {
-            let resource = response.header("x-ratelimit-resource").unwrap_or("core");
             self.observe(
                 resource,
                 RateLimit {
@@ -54,10 +55,11 @@ impl RateBudget {
         }
         if let Some(wait) = retry_after(response) {
             let until = now_epoch() + wait.as_secs();
-            self.backoff_until = Some(
-                self.backoff_until
-                    .map_or(until, |current| current.max(until)),
-            );
+            let entry = self
+                .backoff_until
+                .entry(resource.to_owned())
+                .or_insert(until);
+            *entry = (*entry).max(until);
         }
     }
 
@@ -65,12 +67,16 @@ impl RateBudget {
         self.limits.get(resource).copied()
     }
 
-    pub fn backoff_until(&self) -> Option<u64> {
+    /// When GitHub's requested wait for `resource` ends, if it hasn't yet.
+    pub fn backoff_until(&self, resource: &str, now: u64) -> Option<u64> {
         self.backoff_until
+            .get(resource)
+            .copied()
+            .filter(|until| *until > now)
     }
 
     pub fn tier_at(&self, now: u64) -> PollTier {
-        if self.backoff_until.is_some_and(|until| until > now) {
+        if self.backoff_until("graphql", now).is_some() {
             return PollTier::Stopped;
         }
         match self.live("graphql", now) {
@@ -85,7 +91,7 @@ impl RateBudget {
     }
 
     pub fn allows_at(&self, resource: &str, now: u64) -> bool {
-        if self.backoff_until.is_some_and(|until| until > now) {
+        if self.backoff_until(resource, now).is_some() {
             return false;
         }
         let floor = if resource == "search" {
@@ -100,7 +106,7 @@ impl RateBudget {
     /// Whether a call to `resource` could only be refused: GitHub asked to wait, or none are left
     /// before the reset. Failed calls still count against secondary limits, so they aren't sent.
     pub fn exhausted_at(&self, resource: &str, now: u64) -> bool {
-        self.backoff_until.is_some_and(|until| until > now)
+        self.backoff_until(resource, now).is_some()
             || self
                 .live(resource, now)
                 .is_some_and(|limit| limit.remaining == 0)
@@ -117,7 +123,7 @@ impl RateBudget {
     }
 
     pub fn resume_at_time(&self, resource: &str, now: u64) -> Option<u64> {
-        let backoff = self.backoff_until.filter(|until| *until > now);
+        let backoff = self.backoff_until(resource, now);
         let spent = self
             .live(resource, now)
             .filter(|limit| limit.remaining < STOP_FLOOR)

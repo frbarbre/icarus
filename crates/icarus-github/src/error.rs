@@ -30,7 +30,7 @@ pub enum GitHubError {
     StackMerge(String),
     #[error("This pull request can already be merged. Use Merge instead of auto-merge.")]
     AlreadyMergeable,
-    #[error("GitHub {resource} rate limit nearly exhausted")]
+    #[error("GitHub {resource} rate limit reached; waiting for it to reset")]
     RateLimited { resource: String },
 }
 
