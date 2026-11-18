@@ -187,6 +187,34 @@ async fn history_searches_past_sessions_and_resume_brings_one_back() {
     assert_eq!(entry["workspace"], ws_id.as_str());
     assert_eq!(entry["turns"], 1);
     assert_eq!(entry["resumable"], true);
+    assert_eq!(entry["title"], "Fix the login redirect", "{entry}");
+    assert_eq!(entry["model"], "fake-model");
+    assert!(
+        entry["messages"].as_u64().unwrap_or_default() >= 2,
+        "{entry}"
+    );
+    assert_eq!(entry["subagents"], 0);
+    assert!(
+        entry["last_message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("echo: Fix the login redirect"),
+        "{entry}"
+    );
+    let project = world
+        .request("project.add", json!({ "path": world.repo.path() }))
+        .await;
+    assert_eq!(entry["project"], project["name"]);
+    for key in [&project["id"], &json!(ws_id)] {
+        let by_project = world.history(json!({ "project": key })).await;
+        assert_eq!(ids(&by_project), [login.as_str()], "project {key}");
+    }
+    assert!(
+        world
+            .history(json!({ "project": "no-such-project" }))
+            .await
+            .is_empty()
+    );
     let removed = all
         .iter()
         .find(|e| e["id"] == other.as_str())

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use icarus_github::conversation::ConversationComment;
 use icarus_github::merge::MergeResult;
 use icarus_github::previews::{PrPreviews, PreviewConfig};
 use icarus_github::rate::PollTier;
@@ -31,10 +32,11 @@ use crate::server::{Server, params, rpc};
 use crate::state::{Project, Workspace};
 
 /// Longer than [`PR_POLL`], so requests between polls read what the poller fetched.
-const PR_TTL: Duration = Duration::from_secs(330);
+const PR_TTL: Duration = Duration::from_secs(90);
 const METADATA_TTL: Duration = Duration::from_secs(1800);
-/// Previews are cached per head commit, so a push shows its own at once; status changes wait a poll.
-const PREVIEW_TTL: Duration = PR_TTL;
+/// Previews are cached per head commit, so a push shows its own at once; a deployment's status
+/// change can wait a few minutes.
+const PREVIEW_TTL: Duration = Duration::from_secs(330);
 const USERS_TTL: Duration = Duration::from_secs(1800);
 /// Threads are never polled: they're refetched when the PR's `updated_at` moves, on a manual
 /// refresh or after a mutation; this only bounds how old a copy for an unchanged PR may get.
@@ -46,10 +48,11 @@ pub(crate) const STACK_INTENTS_KEY: &str = "rules.stack_auto_merge";
 const PR_CACHE_KEY: &str = "github.pr_cache";
 /// A `gh` call slower than this is logged with its route and duration.
 const SLOW_GH: Duration = Duration::from_millis(1500);
-/// How often cards' pull requests refresh while a client is connected; the panel's Refresh is for sooner.
-pub(crate) const PR_POLL: Duration = Duration::from_secs(300);
+/// How often cards' pull requests refresh while a client is connected, as Orca's status rules do:
+/// one batched query per repository costs about one GraphQL point.
+pub(crate) const PR_POLL: Duration = Duration::from_secs(60);
 /// Under 500 GraphQL points left the cards refresh rarely, keeping the rest for what the user does.
-const PR_POLL_LOW_QUOTA: Duration = Duration::from_secs(900);
+const PR_POLL_LOW_QUOTA: Duration = Duration::from_secs(300);
 /// Wake-ups closer together than this share one poll.
 const PR_POLL_GAP: Duration = Duration::from_secs(2);
 
@@ -327,6 +330,34 @@ fn fixture_response(fixtures: &Value, request: &GhRequest) -> (u16, Value) {
             data(json!({ "repository": { "pullRequest": { "reviewThreads": {
                 "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": nodes } } } }))
         }
+        "graphql PrConversation" => {
+            let number = variables["number"].to_string();
+            let connection = |key: &str, after: &Value| {
+                let start = after
+                    .as_str()
+                    .and_then(|cursor| cursor.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let nodes: Vec<Value> = fixtures[key][&number]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .skip(start)
+                    .take(100)
+                    .cloned()
+                    .collect();
+                let total = fixtures[key][&number].as_array().map_or(0, Vec::len);
+                let next = (start + 100 < total).then(|| (start + 100).to_string());
+                json!({ "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next }, "nodes": nodes })
+            };
+            let mut pull = json!({});
+            if variables["withComments"] == json!(true) {
+                pull["comments"] = connection("issue_comments", &variables["commentsAfter"]);
+            }
+            if variables["withReviews"] == json!(true) {
+                pull["reviews"] = connection("reviews", &variables["reviewsAfter"]);
+            }
+            data(json!({ "repository": { "pullRequest": pull } }))
+        }
         "graphql ReviewContext" => {
             let number = &variables["number"];
             let Some(pull) = fixture_pulls(fixtures).find(|p| p["number"] == *number) else {
@@ -485,6 +516,11 @@ fn rest_fixture(fixtures: &Value, request: &GhRequest) -> (u16, Value) {
             json!({ "id": 9001, "node_id": "PRRC_now",
                 "html_url": format!("https://github.com/{owner}/{name}/pull/{number}#discussion_r9001") }),
         ),
+        ("POST", ["repos", owner, name, "issues", number, "comments"]) => (
+            201,
+            json!({ "id": 9002, "node_id": "IC_now",
+                "html_url": format!("https://github.com/{owner}/{name}/pull/{number}#issuecomment-9002") }),
+        ),
         ("PATCH" | "DELETE", ["repos", _, _, "issues", "comments", _]) => (200, json!({})),
         ("POST" | "DELETE", ["repos", _, _, "pulls", number, "requested_reviewers"]) => {
             (200, json!({ "number": number.parse::<u64>().ok() }))
@@ -526,6 +562,7 @@ impl<T> PrCopy<T> {
 }
 
 type ThreadsCache = HashMap<String, PrCopy<Vec<PrThread>>>;
+type ConversationCache = HashMap<String, PrCopy<Vec<ConversationComment>>>;
 type TeamRoster = BTreeMap<String, Vec<String>>;
 
 pub struct GitHubService {
@@ -537,6 +574,7 @@ pub struct GitHubService {
     users: Mutex<HashMap<String, (Instant, Vec<GitHubUser>)>>,
     threads: Mutex<ThreadsCache>,
     threads_loading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    conversations: Mutex<ConversationCache>,
     contexts: Mutex<HashMap<String, PrCopy<ReviewContext>>>,
     inbox: Mutex<Option<(Instant, Vec<String>, ReviewInbox)>>,
     teams: Mutex<HashMap<String, (Instant, TeamRoster)>>,
@@ -572,6 +610,7 @@ impl GitHubService {
             users: Mutex::new(HashMap::new()),
             threads: Mutex::new(HashMap::new()),
             threads_loading: Mutex::new(HashMap::new()),
+            conversations: Mutex::new(HashMap::new()),
             contexts: Mutex::new(HashMap::new()),
             inbox: Mutex::new(None),
             teams: Mutex::new(HashMap::new()),
@@ -725,10 +764,51 @@ impl GitHubService {
         }
     }
 
-    /// Marks every cached PR's threads and review context stale, keeping them to fall back on if
-    /// the refetch fails.
+    /// The PR's issue comments and review summaries, cached like [`Self::review_threads`]; only the
+    /// PR panel's Comments section asks, and each refetch is conditional.
+    pub(crate) async fn conversation(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Vec<ConversationComment>, GitHubError> {
+        let key = repo.match_key(number);
+        let updated_at = self.cached_updated_at(repo, number);
+        if let Some(copy) = lock(&self.conversations).get(&key)
+            && copy.current(updated_at.as_deref(), THREADS_MAX_AGE)
+        {
+            return Ok(copy.value.clone());
+        }
+        match self.client.pr_conversation(repo, number).await {
+            Ok(entries) => {
+                lock(&self.conversations).insert(
+                    key,
+                    PrCopy {
+                        at: Some(Instant::now()),
+                        updated_at,
+                        value: entries.clone(),
+                    },
+                );
+                Ok(entries)
+            }
+            Err(error) => match lock(&self.conversations).get_mut(&key) {
+                Some(copy) => {
+                    tracing::warn!("PR conversation kept from cache: {error}");
+                    copy.at = Some(Instant::now());
+                    copy.updated_at = updated_at;
+                    Ok(copy.value.clone())
+                }
+                None => Err(error),
+            },
+        }
+    }
+
+    /// Marks every cached PR's threads, conversation and review context stale, keeping them to
+    /// fall back on if the refetch fails.
     pub(crate) fn forget_review_threads(&self) {
         for copy in lock(&self.threads).values_mut() {
+            copy.at = None;
+        }
+        for copy in lock(&self.conversations).values_mut() {
             copy.at = None;
         }
         for copy in lock(&self.contexts).values_mut() {
@@ -747,6 +827,33 @@ impl GitHubService {
         match found {
             Some(thread) => {
                 patch(thread);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Applies a confirmed mutation to the cached conversation that `patch` finds its entry in
+    /// (it answers true), so the panel's next read shows it without asking GitHub again.
+    pub(crate) fn patch_conversation(
+        &self,
+        mut patch: impl FnMut(&mut Vec<ConversationComment>) -> bool,
+    ) -> bool {
+        lock(&self.conversations)
+            .values_mut()
+            .any(|copy| patch(&mut copy.value))
+    }
+
+    /// Adds a comment GitHub just accepted to the PR's cached conversation, if one is cached.
+    pub(crate) fn push_conversation(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        comment: ConversationComment,
+    ) -> bool {
+        match lock(&self.conversations).get_mut(&repo.match_key(number)) {
+            Some(copy) => {
+                copy.value.push(comment);
                 true
             }
             None => false,
@@ -1980,7 +2087,9 @@ mod tests {
         let counts = calls(&log);
 
         let repos = 2;
-        let polls = 30 / 5 + 1;
+        let minutes = 30;
+        let polls = (minutes * 60 / PR_POLL.as_secs()) as usize + 1;
+        let preview_reads = (minutes * 60 / PREVIEW_TTL.as_secs()) as usize + 1;
         let at_most = |route: &str, limit: usize| {
             let made = counts.get(route).copied().unwrap_or_default();
             assert!(
@@ -1989,7 +2098,7 @@ mod tests {
             );
         };
         at_most("graphql PrSnapshot", repos * polls);
-        at_most("graphql PrPreviews", polls);
+        at_most("graphql PrPreviews", preview_reads);
         at_most("graphql RepoMergeMetadata", 1);
         at_most("GET repos", polls);
         assert_eq!(

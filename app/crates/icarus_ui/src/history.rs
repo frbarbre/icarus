@@ -14,7 +14,7 @@ use gpui::{
 };
 use gpui_tokio::Tokio;
 use picker::{Picker, PickerDelegate};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use ui::{ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt as _;
@@ -34,32 +34,55 @@ const LIMIT: usize = 50;
 /// Typing pauses this long before the server is asked, so each keystroke doesn't search.
 const SEARCH_DELAY: Duration = Duration::from_millis(150);
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
 pub struct HistoryEntry {
     pub id: String,
-    #[serde(default)]
     pub title: Option<String>,
     pub provider: String,
-    #[serde(default)]
     pub workspace: Option<String>,
-    #[serde(default)]
+    /// The workspace's project, by name.
+    pub project: Option<String>,
     pub first_prompt: Option<String>,
-    #[serde(default)]
+    pub last_message: Option<String>,
+    pub created_at_ms: u64,
     pub last_activity_ms: u64,
-    #[serde(default)]
     pub turns: u64,
-    #[serde(default)]
+    pub messages: u64,
+    pub subagents: u64,
+    pub model: Option<String>,
     pub state: String,
-    #[serde(default)]
     pub resumable: bool,
-    #[serde(default)]
     pub snippet: Option<String>,
+}
+
+/// An `agent.history` request: words to find, narrowed to a workspace or a project (id, name, or any
+/// of its workspaces).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct HistoryQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    pub limit: usize,
+}
+
+impl HistoryQuery {
+    pub fn text(query: String) -> Self {
+        Self {
+            query: Some(query),
+            limit: LIMIT,
+            ..Self::default()
+        }
+    }
 }
 
 /// Where the palette gets sessions and how it resumes one; tests swap in a stub.
 #[derive(Clone)]
 pub struct HistorySource {
-    pub search: Rc<dyn Fn(Option<String>, &mut App) -> Task<Result<Vec<HistoryEntry>>>>,
+    pub search: Rc<dyn Fn(HistoryQuery, &mut App) -> Task<Result<Vec<HistoryEntry>>>>,
     /// Workspace id → (name, path), for row labels and for opening the right window.
     pub workspaces: Rc<dyn Fn(&mut App) -> Task<Result<HashMap<String, (String, PathBuf)>>>>,
     pub resume: Rc<dyn Fn(HistoryEntry, Option<PathBuf>, &mut App)>,
@@ -74,7 +97,7 @@ impl HistorySource {
                 };
                 Tokio::spawn_result(cx, async move {
                     let value = client
-                        .request("agent.history", json!({ "query": query, "limit": LIMIT }))
+                        .request("agent.history", serde_json::to_value(query)?)
                         .await?;
                     Ok(serde_json::from_value(value)?)
                 })
@@ -210,7 +233,7 @@ impl HistoryDelegate {
     }
 }
 
-fn relative_time(at_ms: u64) -> String {
+pub(crate) fn relative_time(at_ms: u64) -> String {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -224,7 +247,7 @@ fn relative_time(at_ms: u64) -> String {
     }
 }
 
-fn one_line(text: &str, max: usize) -> String {
+pub(crate) fn one_line(text: &str, max: usize) -> String {
     let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() <= max {
         return line;
@@ -274,6 +297,10 @@ impl PickerDelegate for HistoryDelegate {
             if delay {
                 cx.background_executor().timer(SEARCH_DELAY).await;
             }
+            let query = HistoryQuery {
+                limit: LIMIT,
+                ..query.map(HistoryQuery::text).unwrap_or_default()
+            };
             let Ok(found) = this.update(cx, |_, cx| search(query, cx)) else {
                 return;
             };
@@ -332,10 +359,20 @@ impl PickerDelegate for HistoryDelegate {
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let entry = self.entries.get(index)?;
-        let session_title = entry
-            .title
-            .clone()
-            .filter(|title| !title.is_empty() && title != "Agent");
+        let prompt_line = entry
+            .first_prompt
+            .as_deref()
+            .and_then(|prompt| prompt.lines().find(|line| !line.trim().is_empty()))
+            .map(|line| one_line(line, usize::MAX))
+            .unwrap_or_default();
+        // The server titles untitled sessions after their first prompt's first line; those show the prompt once.
+        let session_title = entry.title.clone().filter(|title| {
+            let from_prompt = *title == prompt_line
+                || title
+                    .strip_suffix('…')
+                    .is_some_and(|cut| prompt_line.starts_with(cut));
+            !title.is_empty() && title != "Agent" && !from_prompt
+        });
         let titled = session_title.is_some();
         let title = session_title
             .or_else(|| {
@@ -440,15 +477,13 @@ mod tests {
     fn entry(id: &str, workspace: &str, prompt: &str) -> HistoryEntry {
         HistoryEntry {
             id: id.into(),
-            title: None,
             provider: "claude".into(),
             workspace: Some(workspace.into()),
             first_prompt: Some(prompt.into()),
-            last_activity_ms: 0,
             turns: 2,
             state: "sleeping".into(),
             resumable: true,
-            snippet: None,
+            ..HistoryEntry::default()
         }
     }
 
@@ -466,7 +501,8 @@ mod tests {
         let source = HistorySource {
             search: Rc::new({
                 let queries = queries.clone();
-                move |query, _| {
+                move |query: HistoryQuery, _| {
+                    let query = query.query;
                     queries.borrow_mut().push(query.clone());
                     let found = all
                         .iter()

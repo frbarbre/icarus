@@ -531,7 +531,12 @@ impl Project {
             };
             let shell_program = remote_shell.as_ref().map(Shell::program).unwrap_or(shell);
             let shell_kind = ShellKind::new(&shell_program, path_style.is_windows());
-            let mut env = env_task.await.unwrap_or_default();
+            // A local login shell loads the user's environment itself; waiting on the slow probe only delays it.
+            let mut env = if remote_client.is_some() {
+                env_task.await.unwrap_or_default()
+            } else {
+                env_task.now_or_never().flatten().unwrap_or_default()
+            };
             env.extend(settings.env);
 
             let activation_script = maybe!(async {
@@ -1044,6 +1049,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["-T", "sh", "-c", "echo hello"],
         );
+    }
+
+    #[gpui::test]
+    async fn first_local_shell_does_not_wait_for_directory_environment(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        let worktree_dir = util::test::TempTree::new(serde_json::json!({}));
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(worktree_dir.path(), serde_json::json!({}))
+            .await;
+        let project = Project::test(fs, [worktree_dir.path()], cx).await;
+
+        let never_resolving_probe = cx
+            .background_spawn(futures::future::pending::<Option<HashMap<String, String>>>())
+            .shared();
+        project.update(cx, |project, cx| {
+            project.environment.update(cx, |environment, _| {
+                environment.set_local_directory_environment(
+                    Shell::Program(get_system_shell()),
+                    Arc::from(worktree_dir.path()),
+                    never_resolving_probe,
+                );
+            });
+        });
+
+        let create_terminal = project.update(cx, |project, cx| {
+            project.create_terminal_shell(Some(worktree_dir.path().to_path_buf()), cx)
+        });
+        // Real time, since the PTY spawn runs outside the test scheduler's fake clock.
+        let (timeout_tx, timeout) = futures::channel::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(30));
+            timeout_tx.send(()).ok();
+        });
+        let terminal = match futures::future::select(create_terminal, timeout).await {
+            futures::future::Either::Left((terminal, _)) => terminal.unwrap(),
+            futures::future::Either::Right(_) => {
+                panic!("the shell waited for the directory environment probe")
+            }
+        };
+
+        project.read_with(cx, |project, _| {
+            let handles = project.local_terminal_handles();
+            assert_eq!(handles.len(), 1);
+            assert_eq!(handles[0].entity_id(), terminal.entity_id());
+        });
     }
 
     #[gpui::test]

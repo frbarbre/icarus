@@ -3038,6 +3038,17 @@ impl Pane {
                 this.handle_external_paths_drop(paths, window, cx)
             }))
             .start_slot::<Indicator>(indicator)
+            .when(item.tab_marked(cx), |tab| {
+                tab.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(2.))
+                        .bg(cx.theme().colors().text),
+                )
+            })
             .map(|this| {
                 let end_slot_action: &'static dyn Action;
                 let end_slot_tooltip_text: &'static str;
@@ -4351,6 +4362,13 @@ impl Pane {
 }
 
 /// Replaces the tab bar's "+" menu (Icarus sets it).
+/// What an empty pane shows instead of the blank placeholder; `None` keeps the default.
+pub struct EmptyPaneContent(
+    pub Rc<dyn Fn(&mut Pane, &mut Window, &mut Context<Pane>) -> Option<AnyElement>>,
+);
+
+impl gpui::Global for EmptyPaneContent {}
+
 pub struct NewItemMenu {
     pub render: Rc<dyn Fn(&mut Pane, &mut Window, &mut Context<Pane>) -> AnyElement>,
     /// Whether the pane's menu has focus, which keeps the pane's buttons shown.
@@ -4710,7 +4728,13 @@ impl Render for Pane {
                                         }
                                     },
                                 ));
-                            if has_worktrees || !self.should_display_welcome_page {
+                            let empty_content = cx
+                                .try_global::<EmptyPaneContent>()
+                                .map(|content| content.0.clone())
+                                .and_then(|render| render(self, window, cx));
+                            if let Some(empty_content) = empty_content {
+                                placeholder.child(empty_content)
+                            } else if has_worktrees || !self.should_display_welcome_page {
                                 placeholder
                             } else {
                                 if self.welcome_page.is_none() {

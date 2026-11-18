@@ -2,9 +2,13 @@
 mod file_finder_tests;
 #[cfg(test)]
 mod multi_select_tests;
+mod quick_open_modes;
+#[cfg(test)]
+mod quick_open_modes_tests;
 
-use futures::future::join_all;
+use futures::{StreamExt as _, future::join_all};
 pub use open_path_prompt::OpenPathDelegate;
+use quick_open_modes::{LineTarget, MatchPreview, QueryMode, parse_query_mode};
 
 use anyhow::Context as _;
 use channel::ChannelStore;
@@ -19,11 +23,13 @@ use gpui::{
     KeyContext, Modifiers, ModifiersChangedEvent, ParentElement, Render, Styled, Task, TaskExt,
     WeakEntity, Window, actions,
 };
-use language::{BufferSnapshot, Point};
+use language::{Anchor, Bias, Buffer, BufferSnapshot, Point};
 use open_path_prompt::{OpenPathPrompt, file_finder_settings::FileFinderSettings};
 use picker::{Picker, PickerDelegate};
 use project::{
-    PathMatchCandidateSet, Project, ProjectPath, Worktree, WorktreeId, WorktreeSettings,
+    PathMatchCandidateSet, Project, ProjectPath, SearchResults, Worktree, WorktreeId,
+    WorktreeSettings,
+    search::{SearchQuery, SearchResult},
     worktree_store::WorktreeStore,
 };
 
@@ -42,7 +48,7 @@ use std::{
 use ui::{Checkbox, HighlightedLabel, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::{
     ResultExt, maybe,
-    paths::{PathStyle, PathWithPosition},
+    paths::{PathMatcher, PathStyle, PathWithPosition},
     post_inc,
     rel_path::RelPath,
 };
@@ -83,30 +89,35 @@ impl FileFinder {
         _window: Option<&mut Window>,
         _: &mut Context<Workspace>,
     ) {
-        workspace.register_action(
-            |workspace, action: &workspace::ToggleFileFinder, window, cx| {
-                let Some(file_finder) = workspace.active_modal::<Self>(cx) else {
-                    let seed_query = Self::seed_query(workspace, window, cx);
-                    Self::open(
-                        workspace,
-                        action.separate_history,
-                        action.include_ignored,
-                        seed_query,
-                        window,
-                        cx,
-                    )
-                    .detach();
-                    return;
-                };
+        workspace.register_action(Self::toggle);
+    }
 
-                file_finder.update(cx, |file_finder, cx| {
-                    file_finder.init_modifiers = Some(window.modifiers());
-                    file_finder.picker.update(cx, |picker, cx| {
-                        picker.cycle_selection(window, cx);
-                    });
-                });
-            },
-        );
+    pub fn toggle(
+        workspace: &mut Workspace,
+        action: &workspace::ToggleFileFinder,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(file_finder) = workspace.active_modal::<Self>(cx) else {
+            let seed_query = Self::seed_query(workspace, window, cx);
+            Self::open(
+                workspace,
+                action.separate_history,
+                action.include_ignored,
+                seed_query,
+                window,
+                cx,
+            )
+            .detach();
+            return;
+        };
+
+        file_finder.update(cx, |file_finder, cx| {
+            file_finder.init_modifiers = Some(window.modifiers());
+            file_finder.picker.update(cx, |picker, cx| {
+                picker.cycle_selection(window, cx);
+            });
+        });
     }
 
     fn open(
@@ -127,6 +138,14 @@ impl FileFinder {
                 .absolutize(&project_path.path);
             Some(FoundPath::new(project_path, abs_path))
         });
+        let active_editor = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx))
+            .map(|editor| editor.downgrade());
+        let changed_files = cx
+            .try_global::<GlobalChangedFilesSource>()
+            .map(|source| source.0.changed_files(workspace, cx))
+            .unwrap_or_default();
 
         let history_items = workspace
             .recent_navigation_history(Some(MAX_RECENT_SELECTIONS), cx)
@@ -145,7 +164,7 @@ impl FileFinder {
                     let project = workspace.project().clone();
                     let weak_workspace = cx.entity().downgrade();
                     workspace.toggle_modal(window, cx, |window, cx| {
-                        let delegate = FileFinderDelegate::new(
+                        let mut delegate = FileFinderDelegate::new(
                             cx.entity().downgrade(),
                             weak_workspace,
                             project,
@@ -156,6 +175,8 @@ impl FileFinder {
                             window,
                             cx,
                         );
+                        delegate.active_editor = active_editor;
+                        delegate.changed_files = changed_files;
 
                         FileFinder::new(delegate, seed_query, window, cx)
                     });
@@ -270,6 +291,7 @@ impl FileFinder {
                 Some(false) => Some(true),
                 None => Some(true),
             };
+            picker.delegate.text_search.query = None;
             picker.delegate.include_ignored_refresh =
                 picker.delegate.update_matches(picker.query(cx), window, cx);
         });
@@ -319,6 +341,14 @@ impl FileFinder {
     ) {
         self.picker.update(cx, |picker, cx| {
             let delegate = &mut picker.delegate;
+            match delegate.mode {
+                QueryMode::Files => {}
+                QueryMode::Text(_) => {
+                    delegate.open_text_row(Some(split_direction), false, window, cx);
+                    return;
+                }
+                QueryMode::GoToLine(_) => return,
+            }
             if !delegate.selected_matches.is_empty() {
                 delegate.open_selected_in_one_split(split_direction, window, cx);
                 return;
@@ -355,6 +385,10 @@ impl FileFinder {
         self.picker.update(cx, |picker, cx| {
             picker.delegate.confirm_without_dismiss(window, cx);
         });
+    }
+
+    pub fn picker(&self) -> &Entity<Picker<FileFinderDelegate>> {
+        &self.picker
     }
 
     pub fn modal_max_width(width_setting: ModalWidthContent, window: &mut Window) -> Pixels {
@@ -422,6 +456,140 @@ pub struct FileFinderDelegate {
     include_ignored: Option<bool>,
     include_ignored_refresh: Task<()>,
     debounce_next_refresh: bool,
+    mode: QueryMode,
+    text_search: TextSearch,
+    active_editor: Option<WeakEntity<Editor>>,
+    changed_files: HashMap<PathBuf, ChangedFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub status: SharedString,
+    pub status_color: Color,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+}
+
+/// Lets the host app show changed files with their line counts and open them as its diff.
+pub trait ChangedFilesSource: 'static {
+    /// Must be cheap: it is read each time the finder opens.
+    fn changed_files(&self, workspace: &Workspace, cx: &App) -> HashMap<PathBuf, ChangedFile>;
+
+    fn open_diff(
+        &self,
+        abs_path: PathBuf,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<Task<anyhow::Result<Entity<Editor>>>>;
+}
+
+struct GlobalChangedFilesSource(std::rc::Rc<dyn ChangedFilesSource>);
+
+impl gpui::Global for GlobalChangedFilesSource {}
+
+pub fn set_changed_files_source(source: impl ChangedFilesSource, cx: &mut App) {
+    cx.set_global(GlobalChangedFilesSource(std::rc::Rc::new(source)));
+}
+
+const TEXT_SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+const TEXT_SEARCH_MAX_MATCHES: usize = 300;
+const TEXT_SEARCH_BATCH_SIZE: usize = 64;
+const TEXT_PREVIEW_CONTEXT_BYTES: usize = 256;
+
+#[derive(Default)]
+struct TextSearch {
+    query: Option<String>,
+    rows: Vec<TextRow>,
+    match_rows: usize,
+    searching: bool,
+    truncated: bool,
+    error: Option<SharedString>,
+    replace_on_next_results: bool,
+    max_line_number: u32,
+    _task: Option<Task<()>>,
+}
+
+enum TextRow {
+    File {
+        path: ProjectPath,
+        match_count: usize,
+    },
+    Match(TextMatch),
+}
+
+struct TextMatch {
+    path: ProjectPath,
+    buffer: Entity<Buffer>,
+    anchor_range: Range<Anchor>,
+    offset_range: Range<usize>,
+    point_range: Range<Point>,
+    preview: MatchPreview,
+}
+
+impl TextSearch {
+    fn clear_rows(&mut self) {
+        self.rows.clear();
+        self.match_rows = 0;
+        self.truncated = false;
+        self.max_line_number = 0;
+    }
+
+    fn push_buffer(&mut self, buffer: &Entity<Buffer>, ranges: &[Range<Anchor>], cx: &App) {
+        let remaining = TEXT_SEARCH_MAX_MATCHES.saturating_sub(self.match_rows);
+        if ranges.is_empty() || remaining == 0 {
+            return;
+        }
+        let snapshot = buffer.read(cx).snapshot();
+        let Some(file) = snapshot.file() else {
+            return;
+        };
+        let path = ProjectPath {
+            worktree_id: file.worktree_id(cx),
+            path: Arc::clone(file.path()),
+        };
+        self.rows.push(TextRow::File {
+            path: path.clone(),
+            match_count: ranges.len(),
+        });
+        for anchor_range in ranges.iter().take(remaining) {
+            let start: usize = snapshot.summary_for_anchor(&anchor_range.start);
+            let end: usize = snapshot.summary_for_anchor(&anchor_range.end);
+            let start_point = snapshot.offset_to_point(start);
+            let row = start_point.row;
+            let line_start = snapshot.point_to_offset(Point::new(row, 0));
+            let line_end = snapshot.point_to_offset(Point::new(row, snapshot.line_len(row)));
+            let match_end = end.clamp(start, line_end.max(start));
+            // A bounded window keeps minified single-line files cheap to preview.
+            let window_start = snapshot.clip_offset(
+                start
+                    .saturating_sub(TEXT_PREVIEW_CONTEXT_BYTES)
+                    .max(line_start),
+                Bias::Left,
+            );
+            let window_end = snapshot.clip_offset(
+                (match_end + TEXT_PREVIEW_CONTEXT_BYTES).min(line_end.max(match_end)),
+                Bias::Right,
+            );
+            let line = snapshot
+                .text_for_range(window_start..window_end)
+                .collect::<String>();
+            let preview = MatchPreview::new(&line, start - window_start..match_end - window_start);
+            self.max_line_number = self.max_line_number.max(row + 1);
+            self.rows.push(TextRow::Match(TextMatch {
+                path: path.clone(),
+                buffer: buffer.clone(),
+                anchor_range: anchor_range.clone(),
+                offset_range: start..end,
+                point_range: start_point..snapshot.offset_to_point(end),
+                preview,
+            }));
+            self.match_rows += 1;
+        }
+        if ranges.len() > remaining {
+            self.truncated = true;
+        }
+    }
 }
 
 /// Use a custom ordering for file finder: the regular one
@@ -769,6 +937,7 @@ fn matching_history_items<'a>(
     path_style: PathStyle,
 ) -> HashMap<ProjectPath, Match> {
     let mut candidates_paths = HashMap::default();
+    let name_queries = quick_open_modes::file_name_queries(query.path_query());
 
     let history_items_by_worktrees = history_items
         .into_iter()
@@ -827,7 +996,8 @@ fn matching_history_items<'a>(
                     true
                 }
             })
-            .filter_map(|path_match| {
+            .filter_map(|mut path_match| {
+                quick_open_modes::apply_rank_tier(&name_queries, false, &mut path_match);
                 let worktree_id = WorktreeId::from_usize(path_match.worktree_id);
                 let project_path = ProjectPath {
                     worktree_id,
@@ -1101,6 +1271,10 @@ impl FileFinderDelegate {
             include_ignored: include_ignored.or(FileFinderSettings::get_global(cx).include_ignored),
             include_ignored_refresh: Task::ready(()),
             debounce_next_refresh: false,
+            mode: QueryMode::Files,
+            text_search: TextSearch::default(),
+            active_editor: None,
+            changed_files: HashMap::default(),
         }
     }
 
@@ -1351,6 +1525,7 @@ impl FileFinderDelegate {
         self.cancel_flag.store(true, atomic::Ordering::Release);
         self.cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = self.cancel_flag.clone();
+        let name_queries = quick_open_modes::file_name_queries(query.path_query());
         cx.spawn_in(window, async move |picker, cx| {
             let matches = fuzzy_nucleo::match_path_sets(
                 candidate_sets.as_slice(),
@@ -1365,7 +1540,16 @@ impl FileFinderDelegate {
             )
             .await
             .into_iter()
-            .map(ProjectPanelOrdMatch);
+            .map(|mut path_match| {
+                let ignored = candidate_sets
+                    .iter()
+                    .find(|set| set.snapshot.id().to_usize() == path_match.worktree_id)
+                    .and_then(|set| set.snapshot.entry_for_path(&path_match.path))
+                    .is_some_and(|entry| entry.is_ignored);
+                quick_open_modes::apply_rank_tier(&name_queries, ignored, &mut path_match);
+                ProjectPanelOrdMatch(path_match)
+            })
+            .collect::<Vec<_>>();
             let exact_matches = join_all(exact_matches)
                 .await
                 .into_iter()
@@ -1909,6 +2093,21 @@ impl FileFinderDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<FileFinderDelegate>>,
     ) {
+        match self.mode {
+            QueryMode::Files => {}
+            QueryMode::Text(_) => {
+                if dismiss_after_open {
+                    self.open_text_row(None, secondary, window, cx);
+                }
+                return;
+            }
+            QueryMode::GoToLine(target) => {
+                if dismiss_after_open {
+                    self.confirm_go_to_line(target, window, cx);
+                }
+                return;
+            }
+        }
         let Some(m) = self.matches.get(self.selected_index()).cloned() else {
             return;
         };
@@ -1937,6 +2136,19 @@ impl FileFinderDelegate {
             let finder = self.file_finder.clone();
             window.dispatch_action(OpenChannelNotesById { channel_id }.boxed_clone(), cx);
             finder.update(cx, |_, cx| cx.emit(DismissEvent)).log_err();
+            return;
+        }
+
+        if !secondary
+            && !matches!(m, Match::CreateNew(_))
+            && self.open_changed_file_diff(
+                m.abs_path(&self.project, cx),
+                None,
+                dismiss_after_open,
+                window,
+                cx,
+            )
+        {
             return;
         }
 
@@ -2098,6 +2310,482 @@ impl FileFinderDelegate {
             finder.update(cx, |_, cx| cx.emit(DismissEvent)).log_err();
         });
     }
+
+    fn enter_mode(&mut self, mode: QueryMode) {
+        let changed_kind = mem::discriminant(&self.mode) != mem::discriminant(&mode);
+        if changed_kind {
+            self.selected_index = 0;
+            if !matches!(mode, QueryMode::Text(_)) {
+                self.text_search = TextSearch::default();
+            }
+        }
+        self.mode = mode;
+    }
+
+    fn update_text_matches(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        self.enter_mode(QueryMode::Text(text.clone()));
+        if text.trim().is_empty() {
+            self.text_search = TextSearch::default();
+            cx.notify();
+            return Task::ready(());
+        }
+        // Worktree refreshes re-run the same query; restarting would make the list flicker.
+        if self.text_search.query.as_deref() == Some(text.as_str()) {
+            return Task::ready(());
+        }
+        self.text_search.query = Some(text.clone());
+        self.text_search.error = None;
+        let search_query = match SearchQuery::text(
+            text,
+            false,
+            false,
+            self.include_ignored == Some(true),
+            PathMatcher::default(),
+            PathMatcher::default(),
+            false,
+            None,
+        ) {
+            Ok(search_query) => search_query,
+            Err(error) => {
+                self.text_search.clear_rows();
+                self.text_search.searching = false;
+                self.text_search._task = None;
+                self.text_search.error = Some(error.to_string().into());
+                cx.notify();
+                return Task::ready(());
+            }
+        };
+        self.text_search.searching = true;
+        // Keep the previous rows until new ones arrive so the list does not blink empty per key.
+        self.text_search.replace_on_next_results = true;
+
+        let (first_results_sender, first_results) = futures::channel::oneshot::channel::<()>();
+        self.text_search._task = Some(cx.spawn_in(window, async move |picker, cx| {
+            cx.background_executor().timer(TEXT_SEARCH_DEBOUNCE).await;
+            let Ok(SearchResults { task_handle, rx }) = picker.update(cx, |picker, cx| {
+                picker
+                    .delegate
+                    .project
+                    .update(cx, |project, cx| project.search(search_query, cx))
+            }) else {
+                return;
+            };
+            let _search = task_handle;
+            let mut first_results_sender = Some(first_results_sender);
+            let mut batches = std::pin::pin!(rx.ready_chunks(TEXT_SEARCH_BATCH_SIZE));
+            while let Some(batch) = batches.next().await {
+                let Ok((has_rows, finished)) = picker.update(cx, |picker, cx| {
+                    let finished = picker.delegate.push_text_results(batch, cx);
+                    cx.notify();
+                    (!picker.delegate.text_search.rows.is_empty(), finished)
+                }) else {
+                    return;
+                };
+                if has_rows && let Some(sender) = first_results_sender.take() {
+                    sender.send(()).ok();
+                }
+                if finished {
+                    break;
+                }
+            }
+            picker
+                .update(cx, |picker, cx| {
+                    let text_search = &mut picker.delegate.text_search;
+                    if mem::take(&mut text_search.replace_on_next_results) {
+                        text_search.clear_rows();
+                        picker.delegate.selected_index = 0;
+                    }
+                    picker.delegate.text_search.searching = false;
+                    cx.notify();
+                })
+                .log_err();
+        }));
+        cx.notify();
+        cx.background_spawn(async move {
+            first_results.await.ok();
+        })
+    }
+
+    /// Returns true once the match cap is reached and the search can stop.
+    fn push_text_results(&mut self, batch: Vec<SearchResult>, cx: &App) -> bool {
+        for result in batch {
+            match result {
+                SearchResult::Buffer { buffer, ranges } => {
+                    if mem::take(&mut self.text_search.replace_on_next_results) {
+                        self.text_search.clear_rows();
+                        self.selected_index = 0;
+                    }
+                    self.text_search.push_buffer(&buffer, &ranges, cx);
+                    if self.text_search.match_rows >= TEXT_SEARCH_MAX_MATCHES {
+                        self.text_search.truncated = true;
+                        return true;
+                    }
+                }
+                SearchResult::LimitReached => self.text_search.truncated = true,
+                SearchResult::WaitingForScan | SearchResult::Searching => {}
+            }
+        }
+        false
+    }
+
+    fn open_text_row(
+        &mut self,
+        split_direction: Option<SplitDirection>,
+        secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(row) = self.text_search.rows.get(self.selected_index) else {
+            return;
+        };
+        let (project_path, range) = match row {
+            TextRow::File { path, .. } => (path.clone(), None),
+            TextRow::Match(text_match) => (
+                text_match.path.clone(),
+                Some(text_match.point_range.clone()),
+            ),
+        };
+        if split_direction.is_none()
+            && !secondary
+            && self.open_changed_file_diff(
+                self.project.read(cx).absolute_path(&project_path, cx),
+                range.clone(),
+                true,
+                window,
+                cx,
+            )
+        {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let allow_preview = PreviewTabsSettings::get_global(cx).enable_preview_from_file_finder;
+        let open_task = workspace.update(cx, |workspace, cx| {
+            if split_direction.is_some() || secondary {
+                workspace.split_path_preview(
+                    project_path,
+                    allow_preview && split_direction.is_none(),
+                    split_direction,
+                    window,
+                    cx,
+                )
+            } else {
+                workspace.open_path_preview(
+                    project_path,
+                    None,
+                    true,
+                    allow_preview,
+                    true,
+                    window,
+                    cx,
+                )
+            }
+        });
+        let finder = self.file_finder.clone();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, mut cx| {
+            let item = open_task
+                .await
+                .notify_workspace_async_err(workspace, &mut cx)?;
+            if let Some(range) = range
+                && let Some(editor) = item.downcast::<Editor>()
+            {
+                editor
+                    .downgrade()
+                    .update_in(cx, |editor, window, cx| {
+                        editor.go_to_singleton_buffer_range(range, window, cx);
+                    })
+                    .log_err();
+            }
+            finder.update(cx, |_, cx| cx.emit(DismissEvent)).ok()?;
+            Some(())
+        })
+        .detach();
+    }
+
+    /// Opens a changed file as the host's diff, at `range` or the query's line; false when it is not changed.
+    fn open_changed_file_diff(
+        &self,
+        abs_path: Option<PathBuf>,
+        range: Option<Range<Point>>,
+        dismiss_after_open: bool,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> bool {
+        let Some(abs_path) = abs_path.filter(|path| self.changed_files.contains_key(path)) else {
+            return false;
+        };
+        let Some(source) = cx
+            .try_global::<GlobalChangedFilesSource>()
+            .map(|source| source.0.clone())
+        else {
+            return false;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        let Some(open) = workspace.update(cx, |workspace, cx| {
+            source.open_diff(abs_path, workspace, window, cx)
+        }) else {
+            return false;
+        };
+        let selection_query = self
+            .latest_search_query
+            .clone()
+            .filter(|_| self.mode == QueryMode::Files);
+        let finder = self.file_finder.clone();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, mut cx| {
+            let editor = open.await.notify_workspace_async_err(workspace, &mut cx)?;
+            editor
+                .downgrade()
+                .update_in(cx, |editor, window, cx| {
+                    let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
+                        return;
+                    };
+                    let snapshot = buffer.read(cx).snapshot();
+                    let range = range.or_else(|| selection_query?.selection_range(&snapshot));
+                    if let Some(range) = range {
+                        editor.go_to_singleton_buffer_range(range, window, cx);
+                    }
+                })
+                .log_err();
+            if dismiss_after_open {
+                finder.update(cx, |_, cx| cx.emit(DismissEvent)).ok()?;
+            }
+            Some(())
+        })
+        .detach();
+        true
+    }
+
+    fn confirm_go_to_line(
+        &mut self,
+        target: Option<LineTarget>,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(target) = target else {
+            return;
+        };
+        let Some(editor) = self.active_editor.as_ref().and_then(WeakEntity::upgrade) else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
+                return;
+            };
+            let snapshot = buffer.read(cx).snapshot();
+            let point = snapshot.point_from_external_input(
+                target.line.saturating_sub(1),
+                target.column.unwrap_or(1).saturating_sub(1),
+            );
+            editor.go_to_singleton_buffer_range(point..point, window, cx);
+        });
+        self.file_finder
+            .update(cx, |_, cx| cx.emit(DismissEvent))
+            .log_err();
+    }
+
+    fn render_change_stat(&self, abs_path: Option<PathBuf>) -> Option<AnyElement> {
+        let change = self.changed_files.get(&abs_path?)?;
+        Some(
+            h_flex()
+                .gap_1()
+                .when_some(change.added.filter(|added| *added > 0), |this, added| {
+                    this.child(
+                        Label::new(format!("+{added}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Created),
+                    )
+                })
+                .when_some(
+                    change.removed.filter(|removed| *removed > 0),
+                    |this, removed| {
+                        this.child(
+                            Label::new(format!("−{removed}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Deleted),
+                        )
+                    },
+                )
+                .child(
+                    Label::new(change.status.clone())
+                        .size(LabelSize::XSmall)
+                        .color(change.status_color),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_text_row(&self, ix: usize, selected: bool, cx: &App) -> Option<ListItem> {
+        let colors = cx.theme().colors();
+        match self.text_search.rows.get(ix)? {
+            TextRow::File { path, match_count } => {
+                let path_style = self.project.read(cx).path_style(cx);
+                let file_name = path.path.file_name().map(str::to_owned).unwrap_or_default();
+                let directory = path
+                    .path
+                    .parent()
+                    .filter(|parent| !parent.is_empty())
+                    .map(|parent| {
+                        format!(
+                            "{}{}",
+                            parent.display(path_style),
+                            path_style.primary_separator()
+                        )
+                    })
+                    .unwrap_or_default();
+                let icon = FileFinderSettings::get_global(cx)
+                    .file_icons
+                    .then(|| FileIcons::get_icon(path.path.as_std_path(), cx))
+                    .flatten()
+                    .map(|icon| {
+                        Icon::from_path(icon)
+                            .color(Color::Muted)
+                            .size(IconSize::Small)
+                    });
+                Some(
+                    ListItem::new(ix)
+                        .spacing(ListItemSpacing::Sparse)
+                        .inset(true)
+                        .toggle_state(selected)
+                        .start_slot::<Icon>(icon)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_1p5()
+                                .child(Label::new(file_name).flex_none())
+                                .child(
+                                    Label::new(directory)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate_start(),
+                                ),
+                        )
+                        .end_slot(
+                            h_flex()
+                                .gap_1p5()
+                                .children(self.render_change_stat(
+                                    self.project.read(cx).absolute_path(path, cx),
+                                ))
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .rounded_full()
+                                        .bg(colors.border_variant)
+                                        .child(
+                                            Label::new(match_count.to_string())
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                ),
+                        ),
+                )
+            }
+            TextRow::Match(text_match) => {
+                let (text, match_range) = text_match.preview.text_and_match_range();
+                let highlights = (!match_range.is_empty()).then(|| {
+                    (
+                        match_range,
+                        gpui::HighlightStyle {
+                            color: Some(colors.text),
+                            background_color: Some(colors.search_match_background),
+                            ..Default::default()
+                        },
+                    )
+                });
+                let number_width = (self.text_search.max_line_number.max(1).ilog10() + 1) as f32;
+                Some(
+                    ListItem::new(ix)
+                        .spacing(ListItemSpacing::Sparse)
+                        .inset(true)
+                        .toggle_state(selected)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .pl_4()
+                                .child(
+                                    h_flex()
+                                        .flex_none()
+                                        .w(rems(number_width * 0.5 + 0.25))
+                                        .justify_end()
+                                        .child(
+                                            Label::new(
+                                                (text_match.point_range.start.row + 1).to_string(),
+                                            )
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .text_color(colors.text_muted)
+                                        .truncate()
+                                        .child(
+                                            gpui::StyledText::new(text).with_highlights(highlights),
+                                        ),
+                                ),
+                        ),
+                )
+            }
+        }
+    }
+
+    fn render_go_to_line_row(
+        &self,
+        ix: usize,
+        selected: bool,
+        target: LineTarget,
+        cx: &App,
+    ) -> Option<ListItem> {
+        let label = match target.column {
+            Some(column) => format!("Go to line {}, column {column}", target.line),
+            None => format!("Go to line {}", target.line),
+        };
+        let path_style = self.project.read(cx).path_style(cx);
+        let path = self
+            .currently_opened_path
+            .as_ref()
+            .map(|path| path.project.path.display(path_style).to_string())
+            .unwrap_or_default();
+        Some(
+            ListItem::new(ix)
+                .spacing(ListItemSpacing::Sparse)
+                .inset(true)
+                .toggle_state(selected)
+                .start_slot(
+                    Icon::new(IconName::ArrowRight)
+                        .color(Color::Muted)
+                        .size(IconSize::Small),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(Label::new(label).flex_none())
+                        .child(
+                            Label::new(path)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate_start(),
+                        ),
+                ),
+        )
+    }
 }
 
 fn full_path_budget(
@@ -2117,7 +2805,54 @@ impl PickerDelegate for FileFinderDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search project files...".into()
+        "Go to file... (% search text, : go to line)".into()
+    }
+
+    fn render_header(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
+        if !matches!(self.mode, QueryMode::Text(_)) || !self.text_search.truncated {
+            return None;
+        }
+        Some(
+            div()
+                .px_3()
+                .pt_1()
+                .child(
+                    Label::new(format!(
+                        "Showing the first {TEXT_SEARCH_MAX_MATCHES} matches"
+                    ))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
+        let text = match &self.mode {
+            QueryMode::Files => "No matches",
+            QueryMode::Text(text) if text.trim().is_empty() => {
+                "Type text to search for in every file."
+            }
+            QueryMode::Text(_) => {
+                if let Some(error) = &self.text_search.error {
+                    return Some(error.clone());
+                }
+                if self.text_search.searching {
+                    "Searching..."
+                } else {
+                    "No matching text."
+                }
+            }
+            QueryMode::GoToLine(_) if self.active_editor.is_none() => {
+                "Open a file to go to a line."
+            }
+            QueryMode::GoToLine(_) => "Type a line number to go to in the current file.",
+        };
+        Some(text.into())
     }
 
     fn searchbar_trailer(
@@ -2158,7 +2893,13 @@ impl PickerDelegate for FileFinderDelegate {
     }
 
     fn match_count(&self) -> usize {
-        self.matches.len()
+        match &self.mode {
+            QueryMode::Files => self.matches.len(),
+            QueryMode::Text(_) => self.text_search.rows.len(),
+            QueryMode::GoToLine(target) => {
+                usize::from(target.is_some() && self.active_editor.is_some())
+            }
+        }
     }
 
     fn selected_index(&self) -> usize {
@@ -2177,7 +2918,7 @@ impl PickerDelegate for FileFinderDelegate {
     }
 
     fn separators_after_indices(&self) -> Vec<usize> {
-        if self.separate_history {
+        if self.separate_history && self.mode == QueryMode::Files {
             let first_non_history_index = self
                 .matches
                 .matches
@@ -2201,6 +2942,15 @@ impl PickerDelegate for FileFinderDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
         let debounce_refresh = mem::take(&mut self.debounce_next_refresh);
+        match parse_query_mode(&raw_query) {
+            QueryMode::Files => self.enter_mode(QueryMode::Files),
+            QueryMode::Text(text) => return self.update_text_matches(text, window, cx),
+            mode @ QueryMode::GoToLine(_) => {
+                self.enter_mode(mode);
+                cx.notify();
+                return Task::ready(());
+            }
+        }
         let raw_query = raw_query.trim();
 
         let (raw_query, diff_prefix) = match raw_query.split_once(['/', '\\']) {
@@ -2329,6 +3079,9 @@ impl PickerDelegate for FileFinderDelegate {
     }
 
     fn is_item_selected(&self, ix: usize) -> bool {
+        if self.mode != QueryMode::Files {
+            return false;
+        }
         let Some(m) = self.matches.get(ix) else {
             return false;
         };
@@ -2341,6 +3094,9 @@ impl PickerDelegate for FileFinderDelegate {
         _window: &mut Window,
         cx: &mut Context<Picker<FileFinderDelegate>>,
     ) {
+        if self.mode != QueryMode::Files {
+            return;
+        }
         let Some(m) = self.matches.get(ix).cloned() else {
             return;
         };
@@ -2361,7 +3117,11 @@ impl PickerDelegate for FileFinderDelegate {
     }
 
     fn selected_item_count(&self) -> usize {
-        self.selected_matches.len()
+        if self.mode == QueryMode::Files {
+            self.selected_matches.len()
+        } else {
+            0
+        }
     }
 
     fn clear_selection(&mut self, _cx: &mut Context<Picker<FileFinderDelegate>>) {
@@ -2389,6 +3149,24 @@ impl PickerDelegate for FileFinderDelegate {
     }
 
     fn try_get_preview_data_for_match(&self, cx: &App) -> Option<picker::PreviewUpdate> {
+        match self.mode {
+            QueryMode::Files => {}
+            QueryMode::Text(_) => {
+                return match self.text_search.rows.get(self.selected_index)? {
+                    TextRow::File { path, .. } => Some(picker::PreviewUpdate::from_path(
+                        self.project.read(cx).absolute_path(path, cx)?,
+                    )),
+                    TextRow::Match(text_match) => Some(picker::PreviewUpdate::from_buffer(
+                        text_match.buffer.clone(),
+                        picker::MatchLocation {
+                            anchor_range: text_match.anchor_range.clone(),
+                            range: text_match.offset_range.clone(),
+                        },
+                    )),
+                };
+            }
+            QueryMode::GoToLine(_) => return None,
+        }
         let m = self.matches.get(self.selected_index)?;
         match m {
             Match::CreateNew(project_path) => {
@@ -2461,6 +3239,13 @@ impl FileFinderDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<ListItem> {
+        match self.mode {
+            QueryMode::Files => {}
+            QueryMode::Text(_) => return self.render_text_row(ix, selected, cx),
+            QueryMode::GoToLine(target) => {
+                return self.render_go_to_line_row(ix, selected, target?, cx);
+            }
+        }
         let settings = FileFinderSettings::get_global(cx);
 
         let path_match = self.matches.get(ix)?;
@@ -2517,6 +3302,16 @@ impl FileFinderDelegate {
                     .into_any_element(),
             ),
             Match::CreateNew(_) => None,
+        };
+        let end_slot = match self.render_change_stat(path_match.abs_path(&self.project, cx)) {
+            Some(stat) => Some(
+                h_flex()
+                    .gap_1p5()
+                    .child(stat)
+                    .children(end_slot)
+                    .into_any_element(),
+            ),
+            None => end_slot,
         };
 
         Some(

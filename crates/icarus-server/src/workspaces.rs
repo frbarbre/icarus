@@ -180,7 +180,12 @@ impl Server {
             .list()
             .into_iter()
             .filter(|a| a.workspace.as_deref() == Some(workspace.id.as_str()))
-            .map(|a| json!({ "id": a.id, "title": a.title, "state": a.state, "provider": a.provider }))
+            .map(|a| {
+                json!({
+                    "id": a.id, "title": a.title, "state": a.state, "provider": a.provider,
+                    "turns": a.turns, "last_activity_ms": a.last_activity_ms,
+                })
+            })
             .collect();
         let terminals: Vec<Value> = self
             .terminals

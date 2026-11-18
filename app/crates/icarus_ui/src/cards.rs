@@ -343,7 +343,6 @@ pub fn render_unread_dot(workspace_id: &str, unread: &Unread, cx: &App) -> impl 
 
 pub const MOON_ICON: &str = "icons/icarus/moon.svg";
 const STACK_ICON: &str = "icons/icarus/layers.svg";
-const FINISHED_ICON: &str = "icons/icarus/circle_check.svg";
 const CLAUDE_ORANGE: u32 = 0xd97757;
 
 /// How far a card's rows below the title are indented, so they line up with the title text.
@@ -409,16 +408,26 @@ pub fn stack_icon() -> Icon {
         .color(Color::Muted)
 }
 
-pub fn agent_state_icon(agent: &AgentSummary) -> Icon {
-    let icon = match agent.state.as_str() {
-        "working" => Icon::new(IconName::LoadCircle).color(Color::Accent),
-        "idle" if agent.turns > 0 => Icon::from_path(FINISHED_ICON).color(Color::Success),
-        "sleeping" => Icon::from_path(MOON_ICON).color(Color::Muted),
-        "exited" => Icon::new(IconName::XCircle).color(Color::Muted),
-        _ => Icon::from_path(crate::status_style::icon_path("", Some("circle-dashed")))
-            .color(Color::Muted),
-    };
-    icon.size(IconSize::XSmall)
+pub fn agent_state_icon(agent: &AgentSummary) -> ui::AgentStateIndicator {
+    ui::AgentStateIndicator::new(agent.dot_state())
+}
+
+/// How many state groups, and agent logos in each, a collapsed card's agent pill shows (as Orca).
+const SUMMARY_GROUPS: usize = 3;
+const SUMMARY_GROUP_ICONS: usize = 3;
+
+/// A card's agents grouped by state, the state that needs the most attention first, newest first within.
+pub fn summary_groups(agents: &[AgentSummary]) -> Vec<(ui::AgentDotState, Vec<&AgentSummary>)> {
+    let mut groups: Vec<(ui::AgentDotState, Vec<&AgentSummary>)> = Vec::new();
+    for agent in agents.iter().rev() {
+        let state = agent.dot_state();
+        match groups.iter_mut().find(|(group, _)| *group == state) {
+            Some((_, members)) => members.push(agent),
+            None => groups.push((state, vec![agent])),
+        }
+    }
+    groups.sort_by_key(|(state, _)| state.summary_rank());
+    groups
 }
 
 pub fn agent_provider_icon(provider: &str) -> Icon {
@@ -536,17 +545,72 @@ pub fn open_agent(path: std::path::PathBuf, agent_id: String, cx: &mut App) {
     });
 }
 
+// Each worktree has its own panel, so a window's panels share this to survive switching worktrees.
+#[derive(Default)]
+pub struct CardList {
+    pub scroll: gpui::ScrollHandle,
+    expanded_agents: collections::HashSet<String>,
+    shown_workspace: Option<gpui::EntityId>,
+}
+
+impl CardList {
+    pub fn show_workspace(&mut self, workspace: gpui::EntityId) -> bool {
+        self.shown_workspace.replace(workspace) != Some(workspace)
+    }
+
+    pub fn reveal(&self, card: gpui::Bounds<Pixels>) -> bool {
+        let viewport = self.scroll.bounds();
+        if viewport.size.height <= Pixels::ZERO
+            || (card.bottom() > viewport.top() && card.top() < viewport.bottom())
+        {
+            return false;
+        }
+        // Inset by the list's padding, which also covers the card's border outside the measured box.
+        let viewport = viewport.dilate(-px(4.));
+        let shift = (card.top() - viewport.top()).min(card.bottom() - viewport.bottom());
+        let mut offset = self.scroll.offset();
+        offset.y -= shift;
+        self.scroll.set_offset(offset);
+        true
+    }
+}
+
+#[derive(Default)]
+struct CardLists(collections::HashMap<gpui::WindowId, gpui::WeakEntity<CardList>>);
+
+impl gpui::Global for CardLists {}
+
+pub fn window_card_list(
+    window: gpui::WindowId,
+    own: &Entity<CardList>,
+    cx: &mut App,
+) -> Entity<CardList> {
+    let lists = &mut cx.default_global::<CardLists>().0;
+    if let Some(list) = lists.get(&window).and_then(gpui::WeakEntity::upgrade) {
+        return list;
+    }
+    lists.retain(|_, list| list.upgrade().is_some());
+    lists.insert(window, own.downgrade());
+    own.clone()
+}
+
 struct SortChangedToast;
 
 impl WorkspacesPanel {
-    pub fn agents_expanded(&self, workspace_id: &str) -> bool {
-        self.expanded_agents.contains(workspace_id)
+    pub fn agents_expanded(&self, workspace_id: &str, cx: &App) -> bool {
+        self.card_list
+            .read(cx)
+            .expanded_agents
+            .contains(workspace_id)
     }
 
     pub fn toggle_agents(&mut self, workspace_id: &str, cx: &mut Context<Self>) {
-        if !self.expanded_agents.remove(workspace_id) {
-            self.expanded_agents.insert(workspace_id.to_owned());
-        }
+        self.card_list.update(cx, |list, cx| {
+            if !list.expanded_agents.remove(workspace_id) {
+                list.expanded_agents.insert(workspace_id.to_owned());
+            }
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -565,7 +629,7 @@ impl WorkspacesPanel {
             .iter()
             .rev()
             .max_by_key(|agent| agent.last_activity_ms)?;
-        let expanded = self.agents_expanded(&workspace.id);
+        let expanded = self.agents_expanded(&workspace.id, cx);
         let toggle = {
             let workspace_id = workspace.id.clone();
             cx.listener(move |panel, _: &gpui::ClickEvent, _, cx| {
@@ -606,12 +670,13 @@ impl WorkspacesPanel {
                     .on_click(toggle)
             }
             None => {
-                let lead = workspace
-                    .agents
+                let groups = summary_groups(&workspace.agents);
+                let hidden: usize = groups
                     .iter()
-                    .find(|agent| agent.state == "working")
-                    .unwrap_or(latest);
-                let more = workspace.agents.len() - 1;
+                    .skip(SUMMARY_GROUPS)
+                    .map(|(_, agents)| agents.len())
+                    .sum();
+                let group_bg = colors.surface_background.opacity(0.7);
                 h_flex()
                     .id(row_id.clone())
                     .debug_selector(|| row_id.to_string())
@@ -624,16 +689,43 @@ impl WorkspacesPanel {
                     .bg(colors.element_background.opacity(0.5))
                     .cursor_pointer()
                     .hover(|style| style.bg(colors.element_hover))
-                    .child(agent_state_icon(lead))
-                    .child(agent_provider_icon(&lead.provider))
-                    .when(more > 0, |pill| {
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .overflow_hidden()
+                            .children(groups.iter().take(SUMMARY_GROUPS).map(|(state, agents)| {
+                                let more = agents.len().saturating_sub(SUMMARY_GROUP_ICONS);
+                                h_flex()
+                                    .flex_none()
+                                    .gap_0p5()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(group_bg)
+                                    .child(ui::AgentStateIndicator::new(*state).size(px(10.)))
+                                    .children(
+                                        agents
+                                            .iter()
+                                            .take(SUMMARY_GROUP_ICONS)
+                                            .map(|agent| agent_provider_icon(&agent.provider)),
+                                    )
+                                    .when(more > 0, |group| {
+                                        group.child(
+                                            Label::new(format!("+{more}"))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                    })
+                            })),
+                    )
+                    .when(hidden > 0, |pill| {
                         pill.child(
-                            Label::new(format!("+{more}"))
+                            Label::new(format!("+{hidden}"))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         )
                     })
-                    .child(div().flex_1())
                     .child(
                         Icon::new(if expanded {
                             IconName::ChevronDown
@@ -652,13 +744,7 @@ impl WorkspacesPanel {
                 .pl_1p5()
                 .gap_0p5()
                 .children(workspace.agents.iter().map(|agent| {
-                    let title = agent
-                        .title
-                        .clone()
-                        .filter(|title| !title.trim().is_empty())
-                        .unwrap_or_else(|| {
-                            crate::accounts::provider_name(&agent.provider).to_owned()
-                        });
+                    let title = agent.display_title();
                     let agent_row_id =
                         SharedString::from(format!("icarus-agent-{}-{}", workspace.id, agent.id));
                     let open = {
@@ -687,7 +773,7 @@ impl WorkspacesPanel {
                                 .child(Label::new(title).size(LabelSize::XSmall).truncate()),
                         )
                         .child(
-                            Label::new(agent.state.clone())
+                            Label::new(agent.dot_state().summary_label())
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         )
@@ -1501,6 +1587,51 @@ mod tests {
             "nothing finished yet"
         );
         assert_eq!(agent("idle", 1, Some("  ")).finished_summary(), None);
+
+        let titled = |title: Option<&str>, provider: &str| AgentSummary {
+            provider: provider.into(),
+            ..agent("idle", 0, title)
+        };
+        assert_eq!(
+            titled(Some("Fix the login bug"), "claude").display_title(),
+            "Fix the login bug"
+        );
+        assert_eq!(titled(Some("Agent"), "claude").display_title(), "Claude");
+        assert_eq!(titled(None, "codex").display_title(), "Codex");
+        assert_eq!(titled(Some(" "), "codex").display_title(), "Codex");
+
+        use ui::AgentDotState as Dot;
+        assert_eq!(agent("working", 1, None).dot_state(), Dot::Working);
+        assert_eq!(agent("idle", 1, None).dot_state(), Dot::Done);
+        assert_eq!(agent("idle", 0, None).dot_state(), Dot::Idle);
+        assert_eq!(agent("starting", 0, None).dot_state(), Dot::Idle);
+        assert_eq!(agent("sleeping", 3, None).dot_state(), Dot::Sleeping);
+        assert_eq!(agent("exited", 3, None).dot_state(), Dot::Interrupted);
+        assert_eq!(agent("idle", 1, None).dot_state().summary_label(), "done");
+
+        let named = |id: &str, state: &str, turns: u64| AgentSummary {
+            id: id.into(),
+            ..agent(state, turns, None)
+        };
+        let agents = [
+            named("a", "idle", 1),
+            named("b", "idle", 0),
+            named("c", "working", 1),
+            named("d", "idle", 2),
+        ];
+        let groups: Vec<(Dot, Vec<&str>)> = summary_groups(&agents)
+            .into_iter()
+            .map(|(state, agents)| (state, agents.iter().map(|a| a.id.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                (Dot::Working, vec!["c"]),
+                (Dot::Done, vec!["d", "a"]),
+                (Dot::Idle, vec!["b"]),
+            ],
+            "work leads, newest first within a state"
+        );
         let pr = PrSummary {
             number: 4143,
             state: "open".into(),
@@ -1579,7 +1710,7 @@ mod tests {
             .expect("the agent pill is drawn");
         cx.simulate_click(pill.center(), Modifiers::none());
         cx.run_until_parked();
-        assert!(panel.read_with(cx, |panel, _| panel.agents_expanded("ws-busy")));
+        assert!(panel.read_with(cx, |panel, cx| panel.agents_expanded("ws-busy", cx)));
         assert!(
             cx.update(|_, cx| cx
                 .try_global::<crate::OpeningWorkspaces>()
@@ -1591,7 +1722,7 @@ mod tests {
             .expect("still drawn");
         cx.simulate_click(pill.center(), Modifiers::none());
         cx.run_until_parked();
-        assert!(!panel.read_with(cx, |panel, _| panel.agents_expanded("ws-busy")));
+        assert!(!panel.read_with(cx, |panel, cx| panel.agents_expanded("ws-busy", cx)));
     }
 
     #[gpui::test]
@@ -1647,7 +1778,7 @@ mod tests {
             "the click opens that agent's tab in the card's worktree"
         );
         assert!(
-            panel.read_with(cx, |panel, _| panel.agents_expanded("ws-open")),
+            panel.read_with(cx, |panel, cx| panel.agents_expanded("ws-open", cx)),
             "the click doesn't fold the list"
         );
     }

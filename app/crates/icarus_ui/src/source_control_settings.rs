@@ -27,6 +27,7 @@ pub fn default_open_in() -> Vec<OpenInApp> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
+    Review,
     Changes,
     AgentTurns,
     Commits,
@@ -34,11 +35,17 @@ pub enum Section {
 
 impl Section {
     /// The default order.
-    pub const ALL: [Section; 3] = [Section::Changes, Section::AgentTurns, Section::Commits];
+    pub const ALL: [Section; 4] = [
+        Section::Review,
+        Section::Changes,
+        Section::AgentTurns,
+        Section::Commits,
+    ];
 
     /// Orca's section ids.
     pub fn id(self) -> &'static str {
         match self {
+            Section::Review => "pending-review",
             Section::Changes => "changes",
             Section::AgentTurns => "agent-turns",
             Section::Commits => "commits",
@@ -47,6 +54,7 @@ impl Section {
 
     pub fn label(self) -> &'static str {
         match self {
+            Section::Review => "Review",
             Section::Changes => "Changes",
             Section::AgentTurns => "Agent turns",
             Section::Commits => "Commits",
@@ -93,7 +101,8 @@ impl SectionLayout {
         value
     }
 
-    /// Saved ids first, then the sections the save doesn't name, in the default order.
+    /// Saved ids first; a section the save doesn't name goes right after its default predecessor, so
+    /// Review lands on top of a layout saved before it existed.
     fn full_order(&self) -> Vec<String> {
         let mut order: Vec<String> = Vec::new();
         for id in &self.order {
@@ -101,10 +110,16 @@ impl SectionLayout {
                 order.push(id.clone());
             }
         }
-        for section in Section::ALL {
-            if !order.iter().any(|id| id == section.id()) {
-                order.push(section.id().to_owned());
+        for (index, section) in Section::ALL.iter().enumerate() {
+            if order.iter().any(|id| id == section.id()) {
+                continue;
             }
+            let at = Section::ALL[..index]
+                .iter()
+                .rev()
+                .find_map(|previous| order.iter().position(|id| id == previous.id()))
+                .map_or(0, |position| position + 1);
+            order.insert(at, section.id().to_owned());
         }
         order
     }
@@ -301,9 +316,26 @@ mod tests {
         }));
         assert_eq!(
             layout.ordered(),
-            [Section::Commits, Section::AgentTurns, Section::Changes]
+            [
+                Section::Review,
+                Section::Changes,
+                Section::Commits,
+                Section::AgentTurns
+            ],
+            "a section the save doesn't name follows its default predecessor"
         );
-        assert_eq!(layout.visible(), [Section::Commits, Section::Changes]);
+        assert_eq!(
+            layout.visible(),
+            [Section::Review, Section::Changes, Section::Commits]
+        );
+        assert_eq!(
+            SectionLayout::from_settings(
+                &json!({ "order": ["changes", "agent-turns", "commits"] })
+            )
+            .ordered(),
+            Section::ALL,
+            "a layout saved before Review existed gets it on top"
+        );
 
         let moved = layout.moved(Section::Changes, Some(Section::Commits));
         assert_eq!(
@@ -314,7 +346,12 @@ mod tests {
         let last = layout.moved(Section::Commits, None);
         assert_eq!(
             last.ordered(),
-            [Section::AgentTurns, Section::Changes, Section::Commits]
+            [
+                Section::Review,
+                Section::Changes,
+                Section::AgentTurns,
+                Section::Commits
+            ]
         );
 
         let shown = layout.toggled_hidden(Section::AgentTurns);
@@ -342,6 +379,7 @@ mod tests {
                 .moved_by_one(Section::Commits, true)
                 .map(|layout| layout.ordered()),
             Some(vec![
+                Section::Review,
                 Section::Changes,
                 Section::Commits,
                 Section::AgentTurns
@@ -352,32 +390,47 @@ mod tests {
                 .moved_by_one(Section::Changes, false)
                 .map(|layout| layout.ordered()),
             Some(vec![
+                Section::Review,
                 Section::AgentTurns,
                 Section::Changes,
                 Section::Commits
             ])
         );
-        assert_eq!(default.moved_by_one(Section::Changes, true), None);
+        assert_eq!(default.moved_by_one(Section::Review, true), None);
         assert_eq!(
             default
                 .dropped(Section::Changes, Section::Commits)
                 .ordered(),
-            [Section::AgentTurns, Section::Commits, Section::Changes],
+            [
+                Section::Review,
+                Section::AgentTurns,
+                Section::Commits,
+                Section::Changes
+            ],
             "dragged down onto the last section, it goes last"
         );
         assert_eq!(
             default
                 .dropped(Section::Commits, Section::Changes)
                 .ordered(),
-            [Section::Commits, Section::Changes, Section::AgentTurns],
+            [
+                Section::Review,
+                Section::Commits,
+                Section::Changes,
+                Section::AgentTurns
+            ],
             "dragged up, it goes before the target"
         );
         assert_eq!(default.dropped(Section::Commits, Section::Commits), default);
+        let gapped = SectionLayout::from_settings(&json!({
+            "order": ["pending-review", "commits", "agent-turns", "changes"],
+            "hidden": ["agent-turns"],
+        }));
         assert_eq!(
-            layout
+            gapped
                 .moved_by_one(Section::Changes, true)
                 .map(|layout| layout.visible()),
-            Some(vec![Section::Changes, Section::Commits]),
+            Some(vec![Section::Review, Section::Changes, Section::Commits]),
             "hidden sections are skipped"
         );
     }

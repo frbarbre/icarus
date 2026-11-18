@@ -203,6 +203,12 @@ impl ProjectEnvironment {
         abs_path: Arc<Path>,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        if let Some(environment) = self
+            .local_environments
+            .get(&(shell.clone(), abs_path.clone()))
+        {
+            return environment.clone();
+        }
         if let Some(cli_environment) = self.get_cli_environment() {
             log::debug!("using project environment variables from CLI");
             return Task::ready(Some(cli_environment)).shared();
@@ -252,6 +258,17 @@ impl ProjectEnvironment {
                 .shared()
             })
             .clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_local_directory_environment(
+        &mut self,
+        shell: Shell,
+        abs_path: Arc<Path>,
+        environment: Shared<Task<Option<HashMap<String, String>>>>,
+    ) {
+        self.local_environments
+            .insert((shell, abs_path), environment);
     }
 
     pub fn remote_directory_environment(

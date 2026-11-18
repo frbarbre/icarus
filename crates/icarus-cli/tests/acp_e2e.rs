@@ -226,6 +226,89 @@ fn editor_threads_live_on_the_server_and_reload_after_the_editor_quits() {
     assert_eq!(result["stopReason"], "end_turn");
 }
 
+fn user_texts(updates: &[Value]) -> Vec<String> {
+    updates
+        .iter()
+        .filter(|u| u["params"]["update"]["sessionUpdate"] == "user_message_chunk")
+        .filter_map(|u| u["params"]["update"]["content"]["text"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn prompts_sent_from_elsewhere_show_in_the_editor_and_its_own_show_once() {
+    let home = tempfile::tempdir().expect("home");
+    let work = tempfile::tempdir().expect("work");
+    let _server = start_server(home.path());
+    let fake = sibling("icarus-fake-agent");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let (client, _events) = runtime.block_on(async {
+        icarus_client::Client::connect(home.path(), "test")
+            .await
+            .expect("connect")
+    });
+    let agent_id = runtime
+        .block_on(client.request(
+            "agent.create",
+            json!({ "cwd": work.path(), "command": [fake] }),
+        ))
+        .expect("create fake agent")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let mut editor = Editor::start(home.path());
+    editor.call(
+        "initialize",
+        json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+    );
+    editor.call(
+        "session/new",
+        json!({ "cwd": work.path(), "mcpServers": [] }),
+    );
+    let (_, updates) = editor.call(
+        "session/prompt",
+        json!({ "sessionId": agent_id, "prompt": [{ "type": "text", "text": "typed here" }] }),
+    );
+    assert_eq!(
+        user_texts(&updates),
+        Vec::<String>::new(),
+        "the editor already shows what it typed"
+    );
+
+    runtime
+        .block_on(client.request(
+            "agent.send",
+            json!({ "id": agent_id, "text": "Ready for review" }),
+        ))
+        .expect("send from another client");
+    let shown = editor.update("user_message_chunk");
+    assert_eq!(shown["content"]["text"], "Ready for review");
+    assert!(shown["messageId"].is_string(), "{shown}");
+    assert!(
+        editor.update("agent_message_chunk")["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("echo")),
+        "the agent's answer follows the prompt"
+    );
+
+    drop(editor);
+    let mut editor = Editor::start(home.path());
+    editor.call(
+        "initialize",
+        json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+    );
+    let (_, replay) = editor.call(
+        "session/load",
+        json!({ "sessionId": agent_id, "cwd": work.path(), "mcpServers": [] }),
+    );
+    assert_eq!(
+        user_texts(&replay),
+        ["typed here", "Ready for review"],
+        "every prompt replays once, whoever sent it"
+    );
+}
+
 #[test]
 fn each_new_editor_tab_gets_its_own_warm_agent() {
     let home = tempfile::tempdir().expect("home");

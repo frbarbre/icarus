@@ -206,7 +206,8 @@ impl SectionHeader {
             .id(self.id.clone())
             .h(px(28.))
             .flex_none()
-            .px_2()
+            .pl(px(6.))
+            .pr(px(16.))
             .gap_1()
             .cursor_pointer()
             .on_click(move |_: &ClickEvent, window, cx| on_toggle(window, cx))
@@ -224,7 +225,7 @@ impl SectionHeader {
             )
             .child(
                 Label::new(self.label)
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Custom(rems_from_px(11_f32)))
                     .weight(FontWeight::SEMIBOLD)
                     .color(Color::Muted),
             )
@@ -232,6 +233,7 @@ impl SectionHeader {
                 header.child(
                     Label::new(count)
                         .size(LabelSize::XSmall)
+                        .weight(FontWeight::MEDIUM)
                         .color(Color::Muted),
                 )
             })

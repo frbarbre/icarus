@@ -1,4 +1,4 @@
-//! GitHub review mode (github-review.md): the Review section in the GitHub panel, and draft comments,
+//! GitHub review mode (github-review.md): the Review section in Source Control, and draft comments,
 //! inline PR threads and the comment composer inside diff tabs. Everything goes through `review.*` RPCs.
 
 use std::cell::RefCell;
@@ -14,15 +14,17 @@ use editor::display_map::{
 };
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    PathPromptOptions, Render, SharedString, Subscription, Task, WeakEntity, Window, actions, px,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, PathPromptOptions, Render, SharedString, Subscription, Task, WeakEntity, Window,
+    actions, px,
 };
 use gpui_tokio::Tokio;
 use icarus_client::Client;
 use language::{Buffer, Point};
+use picker::{Picker, PickerDelegate};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
+use ui::{ButtonLike, ContextMenu, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use util::ResultExt as _;
 
 use crate::AppConnection;
@@ -42,8 +44,6 @@ actions!(
         SubmitReviewComment,
         /// Closes the open review comment box (Escape).
         CancelReviewComment,
-        /// Requests the reviewers typed into the Review section.
-        RequestTypedReviewers,
     ]
 );
 
@@ -121,6 +121,7 @@ pub struct ReviewThread {
     pub id: String,
     pub path: String,
     pub line: Option<u32>,
+    pub original_line: Option<u32>,
     pub is_resolved: bool,
     pub viewer_can_resolve: bool,
     pub viewer_can_unresolve: bool,
@@ -665,6 +666,8 @@ pub struct ReviewerCandidate {
     pub login: String,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
     /// GitHub's suggestion for this PR, or a frequent reviewer in the repository.
     #[serde(skip)]
     pub suggested: bool,
@@ -730,7 +733,7 @@ pub(crate) fn request(
 }
 
 // ---------------------------------------------------------------------------------------------
-// The Review section in the GitHub panel
+// The Review section in Source Control
 // ---------------------------------------------------------------------------------------------
 
 pub struct ReviewSection {
@@ -744,9 +747,10 @@ pub struct ReviewSection {
     load_error: Option<String>,
     busy: Option<String>,
     summary_editor: Entity<Editor>,
-    reviewer_input: Entity<Editor>,
     candidates: Vec<ReviewerCandidate>,
+    candidates_loaded: bool,
     candidates_error: Option<String>,
+    picker_menu: PopoverMenuHandle<Picker<ReviewerPickerDelegate>>,
     applying_summary: bool,
     reload_requested: bool,
     _save_summary: Task<()>,
@@ -776,14 +780,9 @@ impl ReviewSection {
             let mut editor = Editor::auto_height(2, 10, window, cx);
             editor.set_placeholder_text("Add review summary…", window, cx);
             editor.set_soft_wrap();
+            editor.set_show_gutter(false, cx);
+            editor.set_text_style_refinement(ui_text_style(SUMMARY_TEXT, cx));
             enable_completions(&mut editor, people.clone(), false, cx);
-            editor
-        });
-        let reviewer_input = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Request a review: login or org/team", window, cx);
-            // The assignable users, offered as you type a login.
-            enable_completions(&mut editor, people.clone(), true, cx);
             editor
         });
         if let Some(call) = request(
@@ -817,9 +816,10 @@ impl ReviewSection {
             load_error: None,
             busy: None,
             summary_editor,
-            reviewer_input,
             candidates: Vec::new(),
+            candidates_loaded: false,
             candidates_error: None,
+            picker_menu: PopoverMenuHandle::default(),
             applying_summary: false,
             reload_requested: false,
             _save_summary: Task::ready(()),
@@ -845,6 +845,7 @@ impl ReviewSection {
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |this, cx| {
+                this.candidates_loaded = true;
                 match result {
                     Ok(value) => {
                         this.candidates = reviewer_candidates_from(&value);
@@ -859,48 +860,52 @@ impl ReviewSection {
         .detach();
     }
 
-    /// What the reviewer picker lists: suggestions first, without anyone already asked or who
-    /// reviewed (their row offers re-request), as in Orca.
+    /// What the reviewer picker lists, as Orca's: suggestions first, without anyone who already
+    /// reviewed (their row offers re-request). Someone asked but not yet reviewing stays, ticked, and
+    /// picking them again takes the request back.
     pub fn picker_candidates(&self) -> Vec<ReviewerCandidate> {
         self.candidates
             .iter()
             .filter(|candidate| {
-                !self
-                    .rows
-                    .iter()
-                    .any(|row| !row.team && row.name.eq_ignore_ascii_case(&candidate.login))
+                !self.rows.iter().any(|row| {
+                    !row.team && !row.can_remove && row.name.eq_ignore_ascii_case(&candidate.login)
+                })
             })
             .cloned()
             .collect()
     }
 
+    /// Whether `login` is asked and can still be taken off, which the picker shows as a tick.
+    pub fn is_requested(&self, login: &str) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.can_remove && row.name.eq_ignore_ascii_case(login))
+    }
+
     /// Shows fixed picker candidates without a server (previews, tests).
     pub fn set_preview_candidates(&mut self, candidates: Vec<ReviewerCandidate>) {
         self.candidates = candidates;
+        self.candidates_loaded = true;
     }
 
-    fn render_reviewer_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let this = cx.entity().downgrade();
-        let candidates = self.picker_candidates();
-        let empty = candidates.is_empty();
-        let tooltip: SharedString = match (&self.candidates_error, empty) {
-            (Some(error), true) => format!("No suggestions: {error}").into(),
-            (_, true) => "No one to suggest".into(),
-            _ => "Pick a reviewer".into(),
-        };
-        PopoverMenu::new("icarus-reviewer-picker")
-            .trigger(
-                IconButton::new("icarus-reviewer-picker-button", IconName::UserGroup)
-                    .icon_size(IconSize::Small)
-                    .disabled(empty || self.busy.is_some())
-                    .tooltip(Tooltip::text(tooltip)),
-            )
-            .anchor(gpui::Anchor::TopRight)
-            .menu(move |window, cx| {
-                let this = this.clone();
-                let candidates = candidates.clone();
-                Some(cx.new(|cx| reviewer_palette(this, candidates, window, cx)))
-            })
+    /// Opens the reviewer picker under the Review header's pencil.
+    /// Takes the entity, not `&self`: building the picker reads the section, which can't be mid-update.
+    pub fn open_reviewer_picker(this: &Entity<Self>, window: &mut Window, cx: &mut App) {
+        let menu = this.read(cx).picker_menu.clone();
+        menu.show(window, cx);
+    }
+
+    pub fn close_reviewer_picker(&self, cx: &mut App) {
+        self.picker_menu.hide(cx);
+    }
+
+    /// Requests `login`, or takes the request back when they're already asked (Orca's picker toggle).
+    pub fn toggle_reviewer(&mut self, login: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_requested(&login) {
+            self.remove_reviewer(login, window, cx);
+        } else {
+            self.request_reviewers(vec![login], window, cx);
+        }
     }
 
     /// A section that never talks to a server, for previews and visual tests.
@@ -1120,10 +1125,7 @@ impl ReviewSection {
             params,
             window,
             cx,
-            |this, window, cx| {
-                this.reviewer_input
-                    .update(cx, |editor, cx| editor.set_text("", window, cx));
-            },
+            |_, _, _| {},
         );
     }
 
@@ -1139,14 +1141,6 @@ impl ReviewSection {
         );
     }
 
-    fn request_typed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let typed = self.reviewer_input.read(cx).text(cx);
-        if typed.trim().is_empty() {
-            return;
-        }
-        self.request_reviewers(vec![typed], window, cx);
-    }
-
     fn render_reviewer(&self, row: &ReviewerRow, cx: &mut Context<Self>) -> impl IntoElement {
         let (dot, icon, color) = match row.state {
             ReviewerState::Pending | ReviewerState::ReRequested => {
@@ -1157,11 +1151,7 @@ impl ReviewSection {
             ReviewerState::Commented => (false, IconName::Chat, Color::Muted),
             ReviewerState::Dismissed => (false, IconName::Close, Color::Muted),
         };
-        let display = if row.team {
-            row.name.clone()
-        } else {
-            format!("@{}", row.name)
-        };
+        let display = row.name.clone();
         let blocked = self.uncommitted > 0;
         let rerequest_tooltip: SharedString = if blocked {
             format!(
@@ -1175,11 +1165,10 @@ impl ReviewSection {
         let name = row.name.clone();
         let remove_name = row.name.clone();
         let state_label = row.state.label();
-        let group = SharedString::from(format!("icarus-reviewer-{}", row.name));
+        let warning = cx.theme().status().warning;
         h_flex()
-            .group(group.clone())
-            .h_7()
-            .gap_1p5()
+            .h(px(28.))
+            .gap(px(8.))
             .child(render_avatar(
                 row.avatar_url.as_deref(),
                 &row.name,
@@ -1188,7 +1177,7 @@ impl ReviewSection {
                 } else {
                     AvatarKind::Person
                 },
-                px(16.),
+                REVIEWER_SLOT,
                 cx,
             ))
             .child(
@@ -1200,15 +1189,14 @@ impl ReviewSection {
             .child(
                 h_flex()
                     .flex_none()
-                    .gap_0p5()
-                    .visible_on_hover(group)
                     .when(row.can_rerequest, |actions| {
                         actions.child(
                             IconButton::new(
                                 SharedString::from(format!("rerequest-{name}")),
                                 IconName::RotateCw,
                             )
-                            .icon_size(IconSize::XSmall)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
                             .disabled(blocked || self.busy.is_some())
                             .tooltip(Tooltip::text(rerequest_tooltip))
                             .on_click(cx.listener(
@@ -1224,7 +1212,8 @@ impl ReviewSection {
                                 SharedString::from(format!("remove-{remove_name}")),
                                 IconName::Close,
                             )
-                            .icon_size(IconSize::XSmall)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
                             .disabled(self.busy.is_some())
                             .tooltip(Tooltip::text(format!("Remove {remove_name}")))
                             .on_click(cx.listener(
@@ -1235,19 +1224,22 @@ impl ReviewSection {
                         )
                     }),
             )
-            // Every row has a state, so it alone holds the right edge, under the header's verdict.
             .child(
                 h_flex()
                     .id(SharedString::from(format!("state-{}", row.name)))
-                    .w(REVIEWER_SLOT)
+                    .size(REVIEWER_SLOT)
                     .flex_none()
-                    .justify_end()
+                    .justify_center()
                     .tooltip(Tooltip::text(state_label))
                     .child(if dot {
-                        ui::Indicator::dot().color(color).into_any_element()
+                        div()
+                            .size(px(8.))
+                            .rounded_full()
+                            .bg(warning)
+                            .into_any_element()
                     } else {
                         Icon::new(icon)
-                            .size(IconSize::XSmall)
+                            .size(IconSize::Small)
                             .color(color)
                             .into_any_element()
                     }),
@@ -1278,15 +1270,30 @@ impl ReviewSection {
                     PopoverMenu::new("icarus-review-base")
                         .full_width(true)
                         .trigger(
-                            Button::new("icarus-review-base-trigger", current.clone())
-                                .full_width()
-                                .truncate(true)
+                            ButtonLike::new("icarus-review-base-trigger")
                                 .style(ButtonStyle::Outlined)
-                                .label_size(LabelSize::Small)
-                                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                                .tooltip(Tooltip::text(format!(
-                                    "The diff compares against: {current}"
-                                ))),
+                                .size(ButtonSize::Medium)
+                                .full_width()
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .px(px(4.))
+                                        .gap(px(8.))
+                                        .justify_between()
+                                        .text_left()
+                                        .child(
+                                            div().flex_1().min_w_0().child(
+                                                Label::new(current).single_line().truncate(),
+                                            ),
+                                        )
+                                        .child(
+                                            Icon::new(IconName::ChevronDown)
+                                                .size(IconSize::Medium)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .tooltip(Tooltip::text("What the diff compares against")),
                         )
                         .menu(move |window, cx| {
                             let options = options.clone();
@@ -1334,41 +1341,357 @@ impl ReviewSection {
     }
 }
 
-/// The reviewer picker: a fuzzy list of `candidates`; confirming one asks them for a review.
-pub fn reviewer_palette(
+/// Orca's `parseGitHubReviewerInputLogins`: logins or `org/team`s split on commas and spaces, `@` dropped.
+pub fn typed_reviewers(input: &str) -> Vec<String> {
+    input
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .map(|login| login.trim().trim_start_matches('@'))
+        .filter(|login| !login.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Orca's reviewer picker: a search field over the people who can review, suggestions first.
+/// Picking someone asks them for a review and ticks them; picking a ticked one takes it back. It
+/// stays open for more, and Enter on text that matches nobody requests what was typed (a team too).
+pub struct ReviewerPickerDelegate {
     section: WeakEntity<ReviewSection>,
     candidates: Vec<ReviewerCandidate>,
+    matches: Vec<fuzzy::StringMatch>,
+    selected_index: usize,
+    query: String,
+    loaded: bool,
+    error: Option<String>,
+    _observe: Option<Subscription>,
+}
+
+impl ReviewerPickerDelegate {
+    fn all_matches(&self) -> Vec<fuzzy::StringMatch> {
+        self.candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| fuzzy::StringMatch {
+                candidate_id: index,
+                score: 0.0,
+                positions: Vec::new(),
+                string: candidate.login.clone(),
+            })
+            .collect()
+    }
+
+    fn refresh_candidates(&mut self, cx: &App) {
+        if let Some(section) = self.section.upgrade() {
+            let section = section.read(cx);
+            self.candidates = section.picker_candidates();
+            self.loaded = section.candidates_loaded;
+            self.error = section.candidates_error.clone();
+        }
+    }
+
+    /// The visible logins in order, for tests.
+    pub fn visible(&self) -> Vec<String> {
+        self.matches
+            .iter()
+            .filter_map(|found| self.candidates.get(found.candidate_id))
+            .map(|candidate| candidate.login.clone())
+            .collect()
+    }
+}
+
+pub fn reviewer_picker(
+    section: WeakEntity<ReviewSection>,
     window: &mut Window,
-    cx: &mut Context<crate::palettes::Palette>,
-) -> crate::palettes::Palette {
-    let items = candidates
-        .iter()
-        .map(|candidate| crate::palettes::PaletteItem {
-            label: format!("@{}", candidate.login),
-            detail: if candidate.suggested {
-                Some("Suggested".to_owned())
-            } else {
-                candidate.name.clone()
-            },
-            keywords: candidate.name.clone().unwrap_or_default(),
+    cx: &mut Context<Picker<ReviewerPickerDelegate>>,
+) -> Picker<ReviewerPickerDelegate> {
+    let mut delegate = ReviewerPickerDelegate {
+        section: section.clone(),
+        candidates: Vec::new(),
+        matches: Vec::new(),
+        selected_index: 0,
+        query: String::new(),
+        loaded: false,
+        error: None,
+        _observe: None,
+    };
+    delegate.refresh_candidates(cx);
+    delegate.matches = delegate.all_matches();
+    if let Some(section) = section.upgrade() {
+        delegate._observe = Some(cx.observe_in(&section, window, |picker, _, window, cx| {
+            let query = picker.delegate.query.clone();
+            picker.delegate.refresh_candidates(cx);
+            picker.update_matches(query, window, cx);
+        }));
+    }
+    Picker::list(delegate, window, cx)
+        .initial_width(rems_from_px(330_f32))
+        .max_height(rems_from_px(420_f32))
+        .popover()
+}
+
+impl PickerDelegate for ReviewerPickerDelegate {
+    type ListItem = AnyElement;
+
+    fn name() -> &'static str {
+        "icarus reviewer picker"
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        index: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = index;
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Type or choose a user".into()
+    }
+
+    fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
+        Some(if !self.loaded {
+            "Loading…".into()
+        } else if let Some(error) = &self.error {
+            error.clone().into()
+        } else {
+            "No matching reviewers.".into()
         })
-        .collect();
-    crate::palettes::Palette::new(
-        "Request a review from…",
-        items,
-        move |index, window, cx| {
-            let Some(login) = candidates.get(index).map(|c| c.login.clone()) else {
-                return;
-            };
-            section
-                .update(cx, |section, cx| {
-                    section.request_reviewers(vec![login], window, cx)
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        self.query = query.clone();
+        let query = query.trim().trim_start_matches('@').to_owned();
+        if query.is_empty() {
+            self.matches = self.all_matches();
+            self.selected_index = self
+                .selected_index
+                .min(self.matches.len().saturating_sub(1));
+            return Task::ready(());
+        }
+        let candidates: Vec<fuzzy::StringMatchCandidate> = self
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let haystack = match &candidate.name {
+                    Some(name) => format!("{} {name}", candidate.login),
+                    None => candidate.login.clone(),
+                };
+                fuzzy::StringMatchCandidate::new(index, &haystack)
+            })
+            .collect();
+        let background = cx.background_executor().clone();
+        cx.spawn_in(window, async move |picker, cx| {
+            let matches = fuzzy::match_strings(
+                &candidates,
+                &query,
+                false,
+                true,
+                100,
+                &Default::default(),
+                background,
+            )
+            .await;
+            picker
+                .update(cx, |picker, cx| {
+                    picker.delegate.matches = matches;
+                    picker.delegate.selected_index = 0;
+                    cx.notify();
                 })
                 .log_err();
-        },
-        window,
-        cx,
-    )
+        })
+    }
+
+    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let picked = self
+            .matches
+            .get(self.selected_index)
+            .and_then(|found| self.candidates.get(found.candidate_id))
+            .map(|candidate| candidate.login.clone());
+        let section = self.section.clone();
+        match picked {
+            Some(login) => section
+                .update(cx, |section, cx| section.toggle_reviewer(login, window, cx))
+                .log_err(),
+            None => {
+                let typed = typed_reviewers(&self.query);
+                if typed.is_empty() {
+                    return;
+                }
+                section
+                    .update(cx, |section, cx| {
+                        section.request_reviewers(typed, window, cx)
+                    })
+                    .log_err()
+            }
+        };
+    }
+
+    fn dismissed(&mut self, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        cx.emit(gpui::DismissEvent);
+    }
+
+    fn render_match(
+        &self,
+        index: usize,
+        selected: bool,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let found = self.matches.get(index)?;
+        let candidate = self.candidates.get(found.candidate_id)?;
+        let requested = self
+            .section
+            .upgrade()
+            .is_some_and(|section| section.read(cx).is_requested(&candidate.login));
+        let previous = index
+            .checked_sub(1)
+            .and_then(|previous| self.matches.get(previous))
+            .and_then(|found| self.candidates.get(found.candidate_id));
+        let any_suggested = self.candidates.iter().any(|candidate| candidate.suggested);
+        let heading = if !self.query.trim().is_empty() || !any_suggested {
+            None
+        } else if previous.is_none() && candidate.suggested {
+            Some("Suggestions")
+        } else if !candidate.suggested && previous.is_none_or(|previous| previous.suggested) {
+            Some("Everyone else")
+        } else {
+            None
+        };
+        let colors = cx.theme().colors();
+        let row = h_flex()
+            .id(("icarus-reviewer-option", index))
+            .w_full()
+            .min_h(px(40.))
+            .px(px(12.))
+            .py(px(8.))
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .when(selected, |row| row.bg(colors.element_hover))
+            .child(
+                h_flex()
+                    .size(px(16.))
+                    .flex_none()
+                    .justify_center()
+                    .when(requested, |slot| {
+                        slot.child(Icon::new(IconName::Check).size(IconSize::Small))
+                    }),
+            )
+            .child(render_avatar(
+                candidate.avatar_url.as_deref(),
+                &candidate.login,
+                AvatarKind::Person,
+                REVIEWER_SLOT,
+                cx,
+            ))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                Label::new(candidate.login.clone())
+                                    .size(LabelSize::Custom(rems_from_px(13_f32)))
+                                    .weight(gpui::FontWeight::SEMIBOLD)
+                                    .single_line(),
+                            )
+                            .when_some(candidate.name.clone(), |line, name| {
+                                line.child(
+                                    Label::new(name)
+                                        .size(LabelSize::Custom(rems_from_px(13_f32)))
+                                        .color(Color::Muted)
+                                        .single_line()
+                                        .truncate(),
+                                )
+                            }),
+                    )
+                    .when(candidate.suggested, |column| {
+                        column.child(
+                            Label::new("Recently edited these files")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line()
+                                .truncate(),
+                        )
+                    }),
+            );
+        Some(
+            v_flex()
+                .w_full()
+                .when_some(heading, |column, heading| {
+                    column.child(
+                        div()
+                            .w_full()
+                            .px(px(12.))
+                            .py(px(6.))
+                            .border_b_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.element_background)
+                            .child(
+                                Label::new(heading)
+                                    .size(LabelSize::Small)
+                                    .weight(gpui::FontWeight::SEMIBOLD),
+                            ),
+                    )
+                })
+                .child(row)
+                .into_any_element(),
+        )
+    }
+}
+
+/// The Review header's pencil, which opens the reviewer picker under it.
+pub fn reviewer_picker_button(section: &Entity<ReviewSection>, cx: &App) -> AnyElement {
+    let busy = section.read(cx).busy.is_some();
+    let handle = section.read(cx).picker_menu.clone();
+    let weak = section.downgrade();
+    PopoverMenu::new("icarus-reviewer-picker")
+        .with_handle(handle)
+        .trigger(
+            IconButton::new("icarus-reviewer-picker-button", IconName::Pencil)
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .disabled(busy)
+                .tooltip(Tooltip::text("Reviewer")),
+        )
+        .anchor(gpui::Anchor::TopRight)
+        .offset(gpui::Point {
+            x: px(0.),
+            y: px(6.),
+        })
+        .menu(move |window, cx| {
+            let weak = weak.clone();
+            Some(cx.new(|cx| reviewer_picker(weak, window, cx)))
+        })
+        .into_any_element()
+}
+
+/// The Review section's text: Orca's 14px in the UI font, not the buffer's.
+const SUMMARY_TEXT: f32 = 14.;
+
+fn ui_text_style(size: f32, cx: &App) -> gpui::TextStyleRefinement {
+    gpui::TextStyleRefinement {
+        font_family: Some(theme::theme_settings(cx).ui_font(cx).family.clone()),
+        font_size: Some(rems_from_px(size).into()),
+        ..Default::default()
+    }
 }
 
 impl Render for ReviewSection {
@@ -1376,110 +1699,82 @@ impl Render for ReviewSection {
         if std::mem::take(&mut self.reload_requested) {
             self.reload(window, cx);
         }
+        let border = cx.theme().colors().border;
+        let drop_bg = cx.theme().colors().drop_target_background;
+        let input_background = cx.theme().colors().editor_background;
         let mut section = v_flex()
             .key_context("IcarusReviewSection")
-            .gap_1p5()
-            .on_action(cx.listener(|this, _: &RequestTypedReviewers, window, cx| {
-                this.request_typed(window, cx)
-            }));
-        for row in self.rows.clone() {
-            section = section.child(self.render_reviewer(&row, cx));
+            .debug_selector(|| "review-section".into());
+        if !self.rows.is_empty() {
+            section = section.child(
+                v_flex().px(px(12.)).pt(px(4.)).gap(px(2.)).children(
+                    self.rows
+                        .clone()
+                        .iter()
+                        .map(|row| self.render_reviewer(row, cx).into_any_element())
+                        .collect::<Vec<_>>(),
+                ),
+            );
         }
-        section = section.child(
-            h_flex()
-                .gap_1()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .key_context("IcarusReviewerInput")
-                        .px_1()
-                        .py_0p5()
-                        .border_1()
-                        .rounded_sm()
-                        .border_color(cx.theme().colors().border_variant)
-                        .child(self.reviewer_input.clone()),
-                )
-                .child(self.render_reviewer_picker(cx)),
-        );
         let Some(view) = self.view.clone() else {
             let problem = self.load_error.clone().or_else(|| self.error.clone());
             return section.child(
-                Label::new(
-                    problem
-                        .clone()
-                        .unwrap_or_else(|| "Loading review…".to_owned()),
-                )
-                .size(LabelSize::XSmall)
-                .color(if problem.is_some() {
-                    Color::Error
-                } else {
-                    Color::Muted
-                }),
+                div().px(px(12.)).py(px(8.)).child(
+                    Label::new(
+                        problem
+                            .clone()
+                            .unwrap_or_else(|| "Loading review…".to_owned()),
+                    )
+                    .size(LabelSize::Small)
+                    .color(if problem.is_some() {
+                        Color::Error
+                    } else {
+                        Color::Muted
+                    }),
+                ),
             );
         };
         if let Some(picker) = self.render_base_picker(&view, cx) {
-            section = section.child(picker);
+            section = section.child(div().px(px(12.)).pt(px(8.)).child(picker));
         }
         if let Some((label, color, icon)) = standing_pill(view.standing.as_deref()) {
             section = section.child(
-                h_flex()
-                    .gap_1()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(Icon::new(icon).size(IconSize::XSmall).color(color))
-                    .child(Label::new(label).size(LabelSize::XSmall).color(color)),
+                div().px(px(12.)).pt(px(8.)).child(
+                    h_flex()
+                        .gap(px(6.))
+                        .px(px(8.))
+                        .py(px(4.))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                        .child(
+                            Label::new(label)
+                                .size(LabelSize::Custom(rems_from_px(11_f32)))
+                                .weight(gpui::FontWeight::MEDIUM)
+                                .color(color),
+                        ),
+                ),
             );
         }
-        let drop_bg = cx.theme().colors().drop_target_background;
-        section = section.child(
-            div()
-                .p_1()
-                .border_1()
-                .rounded_sm()
-                .border_color(cx.theme().colors().border_variant)
-                .capture_action(cx.listener(|this, _: &editor::actions::Paste, window, cx| {
-                    let images = clipboard_images(cx);
-                    if images.is_empty() {
-                        cx.propagate();
-                        return;
-                    }
-                    this.upload_to_summary(images, window, cx);
-                }))
-                .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
-                .on_drop(
-                    cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
-                        let sources = paths
-                            .paths()
-                            .iter()
-                            .cloned()
-                            .map(UploadSource::Path)
-                            .collect();
-                        this.upload_to_summary(sources, window, cx);
-                    }),
-                )
-                .child(self.summary_editor.clone()),
-        );
-        let (_, summary_media) = crate::media::split_media(&self.summary_editor.read(cx).text(cx));
-        section = section.children(crate::media::render_media_strip(
-            "icarus-review-summary",
-            &summary_media,
-            &summary_media,
-            cx,
-        ));
         let drafts = view.drafts.len();
-        let mut buttons = h_flex().gap_1().justify_end().flex_wrap();
+        let mut buttons = h_flex()
+            .flex_wrap()
+            .items_center()
+            .justify_end()
+            .gap(px(2.))
+            .px(px(6.))
+            .pb(px(6.));
         if drafts > 0 {
             buttons = buttons.child(
-                Label::new(format!(
-                    "{drafts} comment{} queued",
-                    if drafts == 1 { "" } else { "s" }
-                ))
-                .size(LabelSize::XSmall)
-                .color(Color::Warning),
+                div().pr_1().child(
+                    Label::new(format!(
+                        "{drafts} comment{} queued",
+                        if drafts == 1 { "" } else { "s" }
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Warning),
+                ),
             );
         }
         for verdict in view.verdicts.clone() {
@@ -1487,7 +1782,7 @@ impl Render for ReviewSection {
             let sending = self.busy.as_deref() == Some(verdict.as_str());
             let (icon, color) = match verdict.as_str() {
                 "approve" => (IconName::Check, Color::Success),
-                "request-changes" => (IconName::Close, Color::Error),
+                "request-changes" => (IconName::Diff, Color::Error),
                 _ => (IconName::Chat, Color::Muted),
             };
             let label = if sending {
@@ -1498,7 +1793,9 @@ impl Render for ReviewSection {
             buttons = buttons.child(
                 Button::new(SharedString::from(format!("verdict-{verdict}")), label)
                     .style(ButtonStyle::Subtle)
+                    .size(ButtonSize::Default)
                     .label_size(LabelSize::Small)
+                    .color(Color::Muted)
                     .start_icon(Icon::new(icon).size(IconSize::XSmall).color(color))
                     .disabled(!enabled || self.busy.is_some())
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -1506,15 +1803,60 @@ impl Render for ReviewSection {
                     })),
             );
         }
-        section = section.child(buttons);
+        let (_, summary_media) = crate::media::split_media(&self.summary_editor.read(cx).text(cx));
+        let media = crate::media::render_media_strip(
+            "icarus-review-summary",
+            &summary_media,
+            &summary_media,
+            cx,
+        );
+        section = section.child(
+            div().px(px(12.)).pt(px(8.)).pb(px(8.)).child(
+                v_flex()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(input_background)
+                    .capture_action(cx.listener(|this, _: &editor::actions::Paste, window, cx| {
+                        let images = clipboard_images(cx);
+                        if images.is_empty() {
+                            cx.propagate();
+                            return;
+                        }
+                        this.upload_to_summary(images, window, cx);
+                    }))
+                    .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
+                    .on_drop(
+                        cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                            let sources = paths
+                                .paths()
+                                .iter()
+                                .cloned()
+                                .map(UploadSource::Path)
+                                .collect();
+                            this.upload_to_summary(sources, window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .px(px(12.))
+                            .pt(px(8.))
+                            .pb(px(4.))
+                            .child(self.summary_editor.clone()),
+                    )
+                    .children(media)
+                    .child(buttons),
+            ),
+        );
         for error in [self.error.clone(), self.load_error.clone()]
             .into_iter()
             .flatten()
         {
             section = section.child(
-                Label::new(error)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Error),
+                div()
+                    .px(px(12.))
+                    .pb(px(8.))
+                    .child(Label::new(error).size(LabelSize::Small).color(Color::Error)),
             );
         }
         section
@@ -4097,29 +4439,52 @@ pub(crate) mod tests {
             listed,
             [
                 ("carol".to_owned(), true),
+                ("bob".to_owned(), true),
                 ("alice".to_owned(), false),
                 ("dave".to_owned(), false)
             ],
-            "suggestions first; someone already asked is left out"
+            "suggestions first; someone asked but not yet reviewing stays, to be taken back"
         );
+        assert!(section.read_with(window, |section, _| section.is_requested("bob")));
 
-        let palette = window.update(|window, cx| {
-            let candidates = section.read(cx).picker_candidates();
+        let picker = window.update(|window, cx| {
             let section = section.downgrade();
-            cx.new(|cx| reviewer_palette(section, candidates, window, cx))
+            cx.new(|cx| reviewer_picker(section, window, cx))
         });
-        let picker = palette.read_with(window, |palette, _| palette.picker().clone());
-        picker.update_in(window, |picker, window, cx| {
-            picker.set_query("ali", window, cx)
-        });
-        window.run_until_parked();
-        picker.update_in(window, |picker, window, cx| {
-            picker::PickerDelegate::confirm(&mut picker.delegate, false, window, cx)
-        });
-        window.run_until_parked();
+        let pick = |query: &str, window: &mut gpui::VisualTestContext| {
+            picker.update_in(window, |picker, window, cx| {
+                picker.set_query(query, window, cx)
+            });
+            window.run_until_parked();
+            picker.update_in(window, |picker, window, cx| {
+                PickerDelegate::confirm(&mut picker.delegate, false, window, cx)
+            });
+            window.run_until_parked();
+        };
+        pick("ali", window);
         assert_eq!(
             calls_to(&calls, "review.request_reviewers")[0]["reviewers"],
             json!(["alice"])
+        );
+        pick("bob", window);
+        assert_eq!(
+            calls_to(&calls, "review.remove_reviewers")[0]["reviewers"],
+            json!(["bob"]),
+            "picking someone already asked takes the request back"
+        );
+        pick("@acme/backend", window);
+        assert_eq!(
+            calls_to(&calls, "review.request_reviewers")[1]["reviewers"],
+            json!(["acme/backend"]),
+            "text that matches nobody is requested as typed, teams too"
+        );
+    }
+
+    #[test]
+    fn typed_reviewers_split_like_orca() {
+        assert_eq!(
+            typed_reviewers(" @alice, acme/backend  bob,"),
+            ["alice", "acme/backend", "bob"]
         );
     }
 

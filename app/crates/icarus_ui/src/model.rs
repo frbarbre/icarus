@@ -18,6 +18,28 @@ pub struct AgentSummary {
 }
 
 impl AgentSummary {
+    pub fn dot_state(&self) -> ui::AgentDotState {
+        match self.state.as_str() {
+            "working" => ui::AgentDotState::Working,
+            "idle" if self.turns > 0 => ui::AgentDotState::Done,
+            "sleeping" => ui::AgentDotState::Sleeping,
+            "exited" => ui::AgentDotState::Interrupted,
+            _ => ui::AgentDotState::Idle,
+        }
+    }
+
+    /// The session's title, else the harness running it; untitled sessions report "Agent".
+    pub fn display_title(&self) -> String {
+        self.title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty() && *title != "Agent")
+            .map_or_else(
+                || crate::accounts::provider_name(&self.provider).to_owned(),
+                str::to_owned,
+            )
+    }
+
     /// The agent's title, when it finished a turn and said something worth a line on the card.
     pub fn finished_summary(&self) -> Option<&str> {
         (self.state == "idle" && self.turns > 0)

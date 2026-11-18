@@ -1,4 +1,5 @@
 use collections::HashMap;
+use editor::Editor;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,11 +25,13 @@ use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
 
 use crate::AppConnection;
 use crate::diff_tab::{DiffBase, DiffTabMode, ReadyDiff, open_diff_tab};
+use crate::github_panel::{GitHubPanel, PrLifecycle, PullRequest};
+use crate::review::ReviewSection;
 use crate::source_control_settings::{
     OpenInApp, Section, SectionLayout, SourceControlSettings, reveal_label,
 };
 
-/// Shows or hides a Source Control section (`changes`, `agent-turns` or `commits`).
+/// Shows or hides a Source Control section (`pending-review`, `changes`, `agent-turns` or `commits`).
 #[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
 #[action(namespace = icarus)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +151,11 @@ pub struct Compare {
     pub status: String,
     #[serde(default)]
     pub base: Option<String>,
+    /// Commits on the branch the base doesn't have, and the other way round.
+    #[serde(default)]
+    pub ahead: Option<u64>,
+    #[serde(default)]
+    pub behind: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -797,6 +805,14 @@ pub struct SourceControlPanel {
     /// Commits expanded to list their files, by oid.
     expanded_commits: HashMap<String, CommitFiles>,
     changes_collapsed: bool,
+    review_collapsed: bool,
+    /// Where the PR header and Review section read the pull request; the workspace's Checks panel
+    /// unless a preview names one.
+    pull_request_panel: Option<WeakEntity<GitHubPanel>>,
+    /// The header's file search while it's open, and the rows it leaves.
+    file_filter: Option<Entity<Editor>>,
+    filtered_rows: Option<Vec<Row>>,
+    _file_filter_edits: Option<gpui::Subscription>,
     /// The user's `sourceControl` settings, from the app's own server.
     settings: SourceControlSettings,
     sync: Option<SyncInfo>,
@@ -884,6 +900,11 @@ impl SourceControlPanel {
             commits_collapsed: true,
             expanded_commits: HashMap::default(),
             changes_collapsed: false,
+            review_collapsed: false,
+            pull_request_panel: None,
+            file_filter: None,
+            filtered_rows: None,
+            _file_filter_edits: None,
             settings: SourceControlSettings::default(),
             sync: None,
             git_busy: None,
@@ -936,6 +957,11 @@ impl SourceControlPanel {
             commits_collapsed: true,
             expanded_commits: HashMap::default(),
             changes_collapsed: false,
+            review_collapsed: false,
+            pull_request_panel: None,
+            file_filter: None,
+            filtered_rows: None,
+            _file_filter_edits: None,
             settings: SourceControlSettings::default(),
             sync: None,
             git_busy: None,
@@ -953,6 +979,7 @@ impl SourceControlPanel {
     #[cfg(test)]
     pub(crate) fn show_listing_for_tests(&mut self, listing: Listing, cx: &mut Context<Self>) {
         self.listing = Some(listing);
+        self.refilter(cx);
         self.refreshing = Some(Task::ready(()));
         self.warm_diffs(cx);
         cx.notify();
@@ -1220,6 +1247,9 @@ impl SourceControlPanel {
     }
 
     fn rows(&self) -> &[Row] {
+        if let Some(rows) = &self.filtered_rows {
+            return rows;
+        }
         self.listing
             .as_ref()
             .map(|listing| listing.rows.as_slice())
@@ -1312,19 +1342,69 @@ impl SourceControlPanel {
                 .get(path)
                 .is_some_and(|kind| previous_kinds.get(path) == Some(kind))
         });
-        if let Some(selected) = self.selected {
-            self.selected = selected_path
-                .and_then(|path| listing.rows.iter().position(|row| row.path == path))
-                .or_else(|| {
-                    listing
-                        .rows
-                        .len()
-                        .checked_sub(1)
-                        .map(|last| selected.min(last))
-                });
-        }
         self.listing = Some(listing);
+        self.refilter(cx);
+        if let Some(selected) = self.selected {
+            let rows = self.rows();
+            self.selected = selected_path
+                .and_then(|path| rows.iter().position(|row| row.path == path))
+                .or_else(|| rows.len().checked_sub(1).map(|last| selected.min(last)));
+        }
         self.warm_diffs(cx);
+        cx.notify();
+    }
+
+    /// Orca's header search: narrows the listed files to those whose path holds the typed text.
+    fn refilter(&mut self, cx: &App) {
+        let query = self
+            .file_filter
+            .as_ref()
+            .map(|editor| editor.read(cx).text(cx).trim().to_lowercase())
+            .unwrap_or_default();
+        self.filtered_rows = (!query.is_empty()).then(|| {
+            self.listing
+                .iter()
+                .flat_map(|listing| listing.rows.iter())
+                .filter(|row| row.path.to_lowercase().contains(&query))
+                .cloned()
+                .collect()
+        });
+        let count = self.rows().len();
+        self.selected = self
+            .selected
+            .and_then(|selected| count.checked_sub(1).map(|last| selected.min(last)));
+    }
+
+    pub fn open_file_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = match &self.file_filter {
+            Some(editor) => editor.clone(),
+            None => {
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text("Filter files…", window, cx);
+                    editor
+                });
+                self._file_filter_edits = Some(cx.subscribe(
+                    &editor,
+                    |this, _, event: &editor::EditorEvent, cx| {
+                        if matches!(event, editor::EditorEvent::BufferEdited) {
+                            this.refilter(cx);
+                            cx.notify();
+                        }
+                    },
+                ));
+                self.file_filter = Some(editor.clone());
+                editor
+            }
+        };
+        window.focus(&editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    pub fn close_file_filter(&mut self, cx: &mut Context<Self>) {
+        self.file_filter = None;
+        self._file_filter_edits = None;
+        self.refilter(cx);
         cx.notify();
     }
 
@@ -1923,7 +2003,8 @@ impl SourceControlPanel {
         });
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The Changes header's controls: the line totals, unstage all, the scope chip and the filter.
+    fn render_changes_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         let listing = self.listing.as_ref();
         let totals = listing.map(|listing| listing.totals).unwrap_or_default();
         let unfiltered = listing
@@ -1958,29 +2039,13 @@ impl SourceControlPanel {
         let idle = self.git_busy.is_none();
 
         h_flex()
-            .h(px(32.))
-            .px_2()
+            .id("changes-count")
+            .min_w_0()
+            .overflow_hidden()
             .gap_1p5()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                Label::new("CHANGES")
-                    .size(LabelSize::XSmall)
-                    .weight(FontWeight::SEMIBOLD)
-                    .color(Color::Muted),
-            )
-            .child(
-                div()
-                    .id("changes-count")
-                    .child(
-                        Label::new(totals.files.to_string())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .when_some(count_tooltip, |this, tooltip| {
-                        this.tooltip(Tooltip::text(tooltip))
-                    }),
-            )
+            .when_some(count_tooltip, |this, tooltip| {
+                this.tooltip(Tooltip::text(tooltip))
+            })
             .when(totals.added > 0 || totals.removed > 0, |this| {
                 this.child(
                     h_flex()
@@ -2002,7 +2067,6 @@ impl SourceControlPanel {
                         ))),
                 )
             })
-            .child(div().flex_1())
             .when(any_unstageable, |this| {
                 this.child(
                     IconButton::new("changes-unstage-all", IconName::Dash)
@@ -2014,25 +2078,6 @@ impl SourceControlPanel {
                             cx.listener(|this, _: &ClickEvent, _, cx| this.stage_all(false, cx)),
                         ),
                 )
-            })
-            .child({
-                let tree = self.tree_view(cx);
-                IconButton::new(
-                    "changes-tree-view",
-                    if tree {
-                        IconName::ListTree
-                    } else {
-                        IconName::FileTree
-                    },
-                )
-                .icon_size(IconSize::XSmall)
-                .icon_color(Color::Muted)
-                .tooltip(Tooltip::text(if tree {
-                    "Show as list"
-                } else {
-                    "Show as tree"
-                }))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_tree_view(cx)))
             })
             .when_some(badge, |this, (text, tooltip)| {
                 this.child(
@@ -2089,6 +2134,256 @@ impl SourceControlPanel {
                                 move |menu, _, cx| filter_menu(menu, &weak, cx),
                             ))
                         }),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The panel's Checks panel, where the PR header and Review section read the pull request.
+    fn pull_request_panel(&self, cx: &App) -> Option<Entity<GitHubPanel>> {
+        if let Some(panel) = &self.pull_request_panel {
+            return panel.upgrade();
+        }
+        self.workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<GitHubPanel>(cx))
+    }
+
+    /// Previews and visual tests read the pull request from a standalone Checks panel.
+    pub fn set_pull_request_panel(&mut self, panel: &Entity<GitHubPanel>) {
+        self.pull_request_panel = Some(panel.downgrade());
+    }
+
+    /// The Review section's view, kept on the current PR by the Checks panel that owns it.
+    fn review_section(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ReviewSection>> {
+        let panel = self.pull_request_panel(cx)?;
+        panel.update(cx, |panel, cx| {
+            panel.sync_review_section(window, cx);
+            panel.review_section().cloned()
+        })
+    }
+
+    /// Orca's Source Control header: the PR with search and more, then the branch and where it merges.
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let pull_request: Option<PullRequest> = self
+            .pull_request_panel(cx)
+            .and_then(|panel| panel.read(cx).pull_request().cloned());
+        let branch = self.sync.as_ref().and_then(|sync| sync.branch.clone());
+        let compare = self.listing.as_ref().map(|listing| listing.compare.clone());
+        let base = compare.as_ref().and_then(|compare| compare.base.clone());
+        let weak = cx.entity().downgrade();
+        let layout = self.settings.sections.clone();
+        let tree = self.tree_view(cx);
+        let mono = |text: String| {
+            Label::new(text)
+                .size(LabelSize::Custom(rems_from_px(10.5_f32)))
+                .weight(FontWeight::MEDIUM)
+                .buffer_font(cx)
+                .single_line()
+                .truncate()
+        };
+        let pr_row = h_flex()
+            .h(px(28.))
+            .gap_1()
+            .child(match &pull_request {
+                Some(pull_request) => {
+                    let color = match pull_request.lifecycle() {
+                        PrLifecycle::Open => Color::Success,
+                        PrLifecycle::Merged => Color::Custom(gpui::rgb(0xa371f7).into()),
+                        PrLifecycle::Closed => Color::Error,
+                        PrLifecycle::Draft | PrLifecycle::Unknown => Color::Muted,
+                    };
+                    h_flex()
+                        .id("scm-pr-link")
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .cursor_pointer()
+                        .child(
+                            Icon::new(IconName::PullRequest)
+                                .size(IconSize::XSmall)
+                                .color(color),
+                        )
+                        .child(
+                            Label::new(format!("PR #{}", pull_request.number))
+                                .size(LabelSize::Custom(rems_from_px(11.5_f32)))
+                                .single_line(),
+                        )
+                        .tooltip(Tooltip::text(pull_request.title.clone()))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            if let Some(workspace) = this.workspace.upgrade() {
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.open_panel::<GitHubPanel>(window, cx);
+                                });
+                            }
+                        }))
+                        .into_any_element()
+                }
+                None => div().flex_1().into_any_element(),
+            })
+            .child(
+                IconButton::new("scm-filter-files", IconName::MagnifyingGlass)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Filter files by name"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_file_filter(window, cx)
+                    })),
+            )
+            .child(
+                PopoverMenu::new("scm-header-more")
+                    .anchor(gpui::Anchor::TopRight)
+                    .trigger(
+                        IconButton::new("scm-header-more-trigger", IconName::Ellipsis)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("More actions")),
+                    )
+                    .menu(move |window, cx| {
+                        let weak = weak.clone();
+                        let layout = layout.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            let toggle = weak.clone();
+                            let menu = menu.entry(
+                                if tree { "View as List" } else { "View as Tree" },
+                                None,
+                                move |_, cx| {
+                                    toggle
+                                        .update(cx, |this, cx| this.toggle_tree_view(cx))
+                                        .log_err();
+                                },
+                            );
+                            let sections = weak.clone();
+                            menu.separator().header("Sections").map(|mut menu| {
+                                for item in layout.ordered() {
+                                    let sections = sections.clone();
+                                    menu = menu.toggleable_entry(
+                                        item.label(),
+                                        !layout.is_hidden(item),
+                                        IconPosition::Start,
+                                        None,
+                                        move |_, cx| {
+                                            sections
+                                                .update(cx, |this, cx| {
+                                                    this.toggle_section(item, cx)
+                                                })
+                                                .log_err();
+                                        },
+                                    );
+                                }
+                                menu
+                            })
+                        }))
+                    }),
+            );
+        let ahead = compare.as_ref().and_then(|compare| compare.ahead);
+        let behind = compare.as_ref().and_then(|compare| compare.behind);
+        let base_row = base.map(|base| {
+            h_flex()
+                .min_w_0()
+                .gap(px(6.))
+                .child(
+                    Label::new("→")
+                        .size(LabelSize::Custom(rems_from_px(10.5_f32)))
+                        .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(mono(base.clone()).underline()),
+                )
+                .when_some(ahead, |row, ahead| {
+                    row.child(
+                        div()
+                            .id("scm-ahead")
+                            .child(
+                                Label::new(format!("↑{ahead}"))
+                                    .size(LabelSize::Custom(rems_from_px(10.5_f32)))
+                                    .color(Color::Muted),
+                            )
+                            .tooltip(Tooltip::text(format!(
+                                "{ahead} commit{} ahead of {base}",
+                                if ahead == 1 { "" } else { "s" }
+                            ))),
+                    )
+                })
+                .when_some(behind, |row, behind| {
+                    row.child(
+                        div()
+                            .id("scm-behind")
+                            .child(
+                                Label::new(format!("↓{behind}"))
+                                    .size(LabelSize::Custom(rems_from_px(10.5_f32)))
+                                    .color(Color::Muted),
+                            )
+                            .tooltip(Tooltip::text(format!(
+                                "{behind} commit{} behind {base}",
+                                if behind == 1 { "" } else { "s" }
+                            ))),
+                    )
+                })
+                .when_some(
+                    pull_request
+                        .as_ref()
+                        .map(|pull_request| pull_request.url.clone()),
+                    |row, url| {
+                        row.child(
+                            IconButton::new("scm-open-review", IconName::ArrowUpRight)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Open review page in browser"))
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        )
+                    },
+                )
+        });
+        v_flex()
+            .flex_none()
+            .px(px(12.))
+            .pt(px(6.))
+            .pb(px(4.))
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(match self.file_filter.clone() {
+                // The search takes the whole row while it's open, as in Orca.
+                Some(editor) => h_flex()
+                    .h(px(28.))
+                    .gap(px(6.))
+                    .on_action(
+                        cx.listener(|this, _: &menu::Cancel, _, cx| this.close_file_filter(cx)),
+                    )
+                    .child(
+                        Icon::new(IconName::MagnifyingGlass)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1().min_w_0().child(editor))
+                    .child(
+                        IconButton::new("scm-filter-files-close", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Clear and close filter"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.close_file_filter(cx)
+                            })),
+                    )
+                    .into_any_element(),
+                None => pr_row.into_any_element(),
+            })
+            .when(branch.is_some() || base_row.is_some(), |column| {
+                column.child(
+                    v_flex()
+                        .mt_1()
+                        .gap(px(2.))
+                        .when_some(branch, |column, branch| {
+                            column.child(h_flex().min_h(px(18.)).child(mono(branch)))
+                        })
+                        .children(base_row),
                 )
             })
     }
@@ -2315,6 +2610,27 @@ impl SourceControlPanel {
             .into_any_element()
     }
 
+    /// Orca's Review section: the reviewers, the diff base, and the summary with its verdicts.
+    fn render_review(
+        &self,
+        review: &Entity<ReviewSection>,
+        first: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let collapsed = self.review_collapsed;
+        let pencil = crate::review::reviewer_picker_button(review, cx);
+        v_flex()
+            .debug_selector(|| "scm-section:review".into())
+            .w_full()
+            .when(!first, |this| {
+                this.border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+            })
+            .child(self.render_section_header(Section::Review, None, collapsed, vec![pencil], cx))
+            .when(!collapsed, |this| this.child(review.clone()))
+            .into_any_element()
+    }
+
     fn render_turns(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2332,8 +2648,9 @@ impl SourceControlPanel {
             .border_color(cx.theme().colors().border_variant)
             .child(self.render_section_header(
                 Section::AgentTurns,
-                self.turns.len().to_string(),
+                Some(self.turns.len().to_string()),
                 collapsed,
+                Vec::new(),
                 cx,
             ))
             .when(!collapsed, |this| {
@@ -2397,6 +2714,7 @@ impl SourceControlPanel {
 
     fn collapsed(&self, section: Section) -> bool {
         match section {
+            Section::Review => self.review_collapsed,
             Section::Changes => self.changes_collapsed,
             Section::AgentTurns => self.turns_collapsed,
             Section::Commits => self.commits_collapsed,
@@ -2405,6 +2723,7 @@ impl SourceControlPanel {
 
     pub fn toggle_collapsed(&mut self, section: Section, cx: &mut Context<Self>) {
         let collapsed = match section {
+            Section::Review => &mut self.review_collapsed,
             Section::Changes => &mut self.changes_collapsed,
             Section::AgentTurns => &mut self.turns_collapsed,
             Section::Commits => &mut self.commits_collapsed,
@@ -2418,21 +2737,27 @@ impl SourceControlPanel {
     fn render_section_header(
         &self,
         section: Section,
-        count: String,
+        count: Option<String>,
         collapsed: bool,
+        trailing: Vec<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let toggle = cx.entity().downgrade();
         let target = toggle.clone();
         let weak = toggle.clone();
         let layout = self.settings.sections.clone();
-        crate::sections::SectionHeader::new(
+        let mut header = crate::sections::SectionHeader::new(
             format!("changes-{}-header", section.id()),
             section.label(),
             collapsed,
-        )
-        .count(count)
-        .render(
+        );
+        if let Some(count) = count {
+            header = header.count(count);
+        }
+        for element in trailing {
+            header = header.trailing(element);
+        }
+        header.render(
             DraggedSection(section),
             move |_, cx| {
                 toggle
@@ -2465,7 +2790,16 @@ impl SourceControlPanel {
                 this.border_t_1()
                     .border_color(cx.theme().colors().border_variant)
             })
-            .child(self.render_section_header(Section::Changes, count.to_string(), collapsed, cx))
+            .child({
+                let controls = vec![self.render_changes_controls(cx)];
+                self.render_section_header(
+                    Section::Changes,
+                    Some(count.to_string()),
+                    collapsed,
+                    controls,
+                    cx,
+                )
+            })
             .when(!collapsed, |this| {
                 if count == 0 {
                     this.child(self.render_empty(cx))
@@ -2509,7 +2843,13 @@ impl SourceControlPanel {
             .w_full()
             .border_t_1()
             .border_color(cx.theme().colors().border_variant)
-            .child(self.render_section_header(Section::Commits, count, collapsed, cx))
+            .child(self.render_section_header(
+                Section::Commits,
+                Some(count),
+                collapsed,
+                Vec::new(),
+                cx,
+            ))
             .when(!collapsed && self.commits.is_empty(), |this| {
                 this.child(
                     div().px_2().pb_1().child(
@@ -3202,6 +3542,64 @@ async fn workspace_id_for_root(client: Arc<Client>, root: &Path) -> anyhow::Resu
         .and_then(|workspace| workspace["id"].as_str().map(str::to_string)))
 }
 
+/// Quick Open's changed files: the Source Control panel's scoped rows as already listed, so no git runs.
+pub struct SourceControlChanges;
+
+impl file_finder::ChangedFilesSource for SourceControlChanges {
+    fn changed_files(
+        &self,
+        workspace: &Workspace,
+        cx: &App,
+    ) -> HashMap<PathBuf, file_finder::ChangedFile> {
+        let Some(panel) = workspace.panel::<SourceControlPanel>(cx) else {
+            return HashMap::default();
+        };
+        let panel = panel.read(cx);
+        panel
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    panel.root.join(&row.path),
+                    file_finder::ChangedFile {
+                        status: status_letter(&row.status).into(),
+                        status_color: status_color(&row.status),
+                        added: row.added,
+                        removed: row.removed,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn open_diff(
+        &self,
+        abs_path: PathBuf,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<Task<anyhow::Result<Entity<Editor>>>> {
+        let panel = workspace.panel::<SourceControlPanel>(cx)?;
+        let base = {
+            let panel = panel.read(cx);
+            diff_base_for(&panel.scope, panel.listing.as_ref()?)?
+        };
+        let open = crate::diff_tab::open_diff_preview(
+            abs_path,
+            base,
+            DiffTabMode::Diff,
+            None,
+            workspace,
+            window,
+            cx,
+        );
+        Some(cx.spawn(async move |_, cx| {
+            let tab = open.await?;
+            Ok(tab.read_with(cx, |tab, _| tab.editor().clone()))
+        }))
+    }
+}
+
 /// The workspace's Source Control panel, revealed in the sidebar (Orca's shortcuts open it at once, PR 77).
 pub fn reveal_source_control(
     workspace: &mut Workspace,
@@ -3466,7 +3864,7 @@ impl Panel for SourceControlPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        8
+        4
     }
 
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3482,7 +3880,8 @@ impl Panel for SourceControlPanel {
 pub const SOURCE_CONTROL_PANEL: &str = "IcarusSourceControlPanel";
 
 impl Render for SourceControlPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let review = self.review_section(window, cx);
         v_flex()
             .key_context("IcarusChanges")
             .debug_selector(|| "scm-panel".into())
@@ -3524,6 +3923,11 @@ impl Render for SourceControlPanel {
                         Section::Changes => {
                             list_fills = !self.changes_collapsed;
                             this = this.child(self.render_changes_section(first, cx));
+                        }
+                        Section::Review if review.is_some() => {
+                            if let Some(review) = &review {
+                                this = this.child(self.render_review(review, first, cx));
+                            }
                         }
                         Section::AgentTurns if !self.turns.is_empty() => {
                             this = this.child(self.render_turns(cx));
@@ -3628,6 +4032,95 @@ mod tests {
         assert_eq!(counts.get("src/app.rs"), Some(&2));
         assert_eq!(counts.get("README.md"), Some(&1));
         assert!(note_counts(&json!({ "error": "no notes" })).is_empty());
+    }
+
+    #[gpui::test]
+    async fn review_renders_inside_source_control_under_the_pr_header(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let fixture = json!({
+            "current": "ws-1",
+            "workspaces": [{ "id": "ws-1", "path": "/project", "branch": "feature" }],
+            "pr_status": {
+                "known": true,
+                "pull_request": {
+                    "number": 4209, "title": "Feature", "url": "https://github.com/acme/app/pull/4209",
+                    "base_ref_name": "main", "head_ref_name": "feature",
+                    "latest_reviews": [{ "login": "vitaliy", "state": "APPROVED" }],
+                },
+            },
+            "review": {
+                "workspace": "ws-1",
+                "pr": { "repo": "acme/app", "number": 4209, "base_ref_name": "main", "author": "me" },
+                "verdicts": ["comment"],
+                "can_submit": { "comment": false },
+                "base": { "selected": "whole", "options": [
+                    { "value": "whole", "label": "main · target branch", "available": true },
+                ] },
+            },
+        });
+        let checks = cx.new(|cx| GitHubPanel::preview(WeakEntity::new_invalid(), fixture, cx));
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let mut panel =
+                SourceControlPanel::preview(sample_listing(), ChangesScope::Base, None, cx);
+            panel.set_pull_request_panel(&checks);
+            panel
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        assert!(
+            checks.read_with(cx, |checks, _| checks.review_section().is_some()),
+            "Source Control asks the Checks panel for the PR's review"
+        );
+        let review = cx.debug_bounds("scm-section:review").expect("Review drawn");
+        let changes = cx
+            .debug_bounds("scm-section:changes")
+            .expect("Changes drawn");
+        assert!(
+            review.origin.y < changes.origin.y,
+            "Review sits above Changes, as in Orca"
+        );
+        assert!(cx.debug_bounds("review-section").is_some());
+        panel.update(cx, |panel, cx| panel.toggle_collapsed(Section::Review, cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("review-section").is_none(),
+            "the header collapses it like any section"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_header_search_narrows_the_files_by_path(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            SourceControlPanel::preview(sample_listing(), ChangesScope::Base, Some(2), cx)
+        });
+        panel.update_in(cx, |panel, window, cx| panel.open_file_filter(window, cx));
+        let editor = panel
+            .read_with(cx, |panel, _| panel.file_filter.clone())
+            .expect("the search opens");
+        editor.update_in(cx, |editor, window, cx| editor.set_text("SRC/", window, cx));
+        cx.run_until_parked();
+        let paths = |panel: &SourceControlPanel| -> Vec<String> {
+            panel.rows().iter().map(|row| row.path.clone()).collect()
+        };
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(paths(panel), ["src/app.rs", "src/new.rs"]);
+            assert_eq!(panel.selected, Some(1), "the selection stays in the list");
+        });
+        panel.update(cx, |panel, cx| panel.close_file_filter(cx));
+        panel.read_with(cx, |panel, _| assert_eq!(paths(panel).len(), 3));
     }
 
     pub(crate) fn sample_listing() -> Listing {
@@ -4077,6 +4570,44 @@ mod tests {
         })
     }
 
+    #[gpui::test]
+    async fn quick_open_reads_the_listing_and_opens_the_diff(cx: &mut gpui::TestAppContext) {
+        use file_finder::ChangedFilesSource as _;
+
+        let (workspace, _panel, _calls, mut cx) =
+            git_panel(cx, |_, _| Ok(json!({ "ok": true }))).await;
+        let cx = &mut cx;
+        let changed = workspace.read_with(cx, |workspace, cx| {
+            SourceControlChanges.changed_files(workspace, cx)
+        });
+        assert_eq!(changed.len(), 3);
+        let app = &changed[&PathBuf::from("/project/src/app.rs")];
+        assert_eq!(
+            (app.status.as_ref(), app.added, app.removed),
+            ("M", Some(12), Some(3))
+        );
+
+        let open = workspace.update_in(cx, |workspace, window, cx| {
+            SourceControlChanges.open_diff(
+                PathBuf::from("/project/src/app.rs"),
+                workspace,
+                window,
+                cx,
+            )
+        });
+        let editor = open.expect("the listing has a base").await.expect("opens");
+        cx.run_until_parked();
+        let active = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<crate::DiffTab>())
+                .map(|tab| (tab.read(cx).base().clone(), tab.read(cx).editor().clone()))
+        });
+        let (base, tab_editor) = active.expect("a diff tab is active");
+        assert_eq!(base, DiffBase::MergeBase("origin/main".into()));
+        assert_eq!(tab_editor, editor);
+    }
+
     #[test]
     fn row_menus_offer_what_the_file_allows() {
         let row = |status: &str, staged: bool, unstaged: bool, untracked: bool| Row {
@@ -4424,7 +4955,7 @@ mod tests {
         );
         assert_eq!(
             panel.read_with(cx, |panel, _| panel.settings().sections.visible()),
-            [Section::Changes, Section::Commits]
+            [Section::Review, Section::Changes, Section::Commits]
         );
 
         panel.update(cx, |panel, cx| {
@@ -4433,12 +4964,17 @@ mod tests {
         });
         assert_eq!(
             panel.read_with(cx, |panel, _| panel.settings().sections.visible()),
-            [Section::Commits, Section::Changes, Section::AgentTurns],
+            [
+                Section::Review,
+                Section::Commits,
+                Section::Changes,
+                Section::AgentTurns
+            ],
             "moving up skips the hidden section, and showing it again keeps its place"
         );
         assert_eq!(
             saved(&calls)["value"],
-            json!({ "order": ["commits", "changes", "agent-turns"], "hidden": [] })
+            json!({ "order": ["pending-review", "commits", "changes", "agent-turns"], "hidden": [] })
         );
 
         panel.update(cx, |panel, cx| {

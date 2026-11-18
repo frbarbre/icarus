@@ -7,13 +7,15 @@ use collections::HashMap;
 use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use gpui::{AnyElement, App, Context, Entity, Task, Window};
 use language::Point;
+use serde::Deserialize;
 use serde_json::Value;
 use ui::{Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::Workspace;
 
 use crate::diff_tab::{DiffBase, DiffTab, DiffTabMode, open_diff_tab};
-use crate::review::{ReviewDraft, ReviewThread};
+use crate::github_panel::Tone;
+use crate::review::{ReactionSummary, ReviewDraft, ReviewThread, ThreadComment};
 
 /// Unresolved threads per file, from a `review.threads` reply.
 pub fn open_thread_counts(reply: &Value) -> HashMap<String, usize> {
@@ -67,9 +69,15 @@ pub fn thread_line(thread: &ReviewThread) -> Option<u32> {
     thread.placement.line.or(thread.line)
 }
 
-/// Orca's path badge: `export.rs:L42`, or the bare file name for a file or outdated thread.
+/// Orca's path badge: `export.rs:L42`; an outdated thread keeps the line it was left on, and a
+/// file thread shows the bare file name.
 pub fn thread_location(thread: &ReviewThread) -> String {
-    match thread_line(thread) {
+    let line = if thread.placement.file {
+        None
+    } else {
+        thread_line(thread).or(thread.line).or(thread.original_line)
+    };
+    match line {
         Some(line) => format!("{}:L{line}", file_name(&thread.path)),
         None => file_name(&thread.path).to_owned(),
     }
@@ -118,10 +126,10 @@ impl Audience {
 
     pub fn icon(self) -> IconName {
         match self {
-            Self::All => IconName::Chat,
+            Self::All => IconName::MessagesSquare,
             Self::Humans => IconName::Person,
-            Self::Bots => IconName::ZedAgent,
-            Self::Unresolved => IconName::Circle,
+            Self::Bots => IconName::Bot,
+            Self::Unresolved => IconName::MessageSquareDot,
         }
     }
 
@@ -134,19 +142,33 @@ impl Audience {
         }
     }
 
-    fn includes(self, thread: &ReviewThread, comment: &crate::review::ThreadComment) -> bool {
+    fn includes(self, thread: &ReviewThread, comment: &ThreadComment) -> bool {
         match self {
             Self::All => true,
-            Self::Humans => !comment.is_bot,
-            Self::Bots => comment.is_bot,
+            Self::Humans => !is_bot(comment.is_bot, comment.author.as_deref()),
+            Self::Bots => is_bot(comment.is_bot, comment.author.as_deref()),
             Self::Unresolved => !thread.is_resolved,
+        }
+    }
+
+    fn includes_conversation(self, comment: &ConversationComment) -> bool {
+        match self {
+            Self::All => true,
+            Self::Humans => !comment.is_automated(),
+            Self::Bots => comment.is_automated(),
+            Self::Unresolved => false,
         }
     }
 }
 
-/// Comments in the tab, counted per comment as Orca counts them.
-pub fn audience_count(threads: &[ReviewThread], audience: Audience) -> usize {
-    threads
+/// Comments in the tab, counted per comment as Orca counts them; `threads` are the open ones,
+/// since resolved threads have their own section.
+pub fn audience_count(
+    threads: &[ReviewThread],
+    conversation: &[ConversationComment],
+    audience: Audience,
+) -> usize {
+    let in_threads = threads
         .iter()
         .flat_map(|thread| {
             thread
@@ -154,7 +176,246 @@ pub fn audience_count(threads: &[ReviewThread], audience: Audience) -> usize {
                 .iter()
                 .filter(move |comment| audience.includes(thread, comment))
         })
-        .count()
+        .count();
+    in_threads
+        + conversation
+            .iter()
+            .filter(|comment| audience.includes_conversation(comment))
+            .count()
+}
+
+// GitHub reports some review services as ordinary users, so Orca also goes by the login.
+const AUTOMATION_LOGINS: [&str; 16] = [
+    "chatgpt-codex-connector",
+    "codex-connector",
+    "qodo",
+    "coderabbit",
+    "codium",
+    "sonarcloud",
+    "sonarqube",
+    "sourcery-ai",
+    "deepsource",
+    "snyk",
+    "codecov",
+    "greptile",
+    "ellipsis",
+    "graphite-app",
+    "reviewer-gpt",
+    "-reviewer",
+];
+
+/// Orca's bot test: GitHub's own flag, a `[bot]` login, or a login that reads as automation.
+pub fn is_bot(flagged: bool, author: Option<&str>) -> bool {
+    if flagged {
+        return true;
+    }
+    let Some(login) = author.map(|login| login.trim().to_lowercase()) else {
+        return false;
+    };
+    let has_word_bot = login
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .any(|word| word == "bot");
+    login.ends_with("bot")
+        || login.ends_with("[bot]")
+        || has_word_bot
+        || ["automation", "actions", "renovate", "dependabot"]
+            .iter()
+            .chain(AUTOMATION_LOGINS.iter())
+            .any(|needle| login.contains(needle))
+}
+
+/// A submitted review's verdict, shown on its summary like Orca's review badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+    Pending,
+}
+
+impl ReviewState {
+    pub fn parse(state: &str) -> Option<Self> {
+        match state {
+            "APPROVED" => Some(Self::Approved),
+            "CHANGES_REQUESTED" => Some(Self::ChangesRequested),
+            "COMMENTED" => Some(Self::Commented),
+            "DISMISSED" => Some(Self::Dismissed),
+            "PENDING" => Some(Self::Pending),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approved => "Approved",
+            Self::ChangesRequested => "Changes requested",
+            Self::Commented => "Commented",
+            Self::Dismissed => "Dismissed",
+            Self::Pending => "Pending",
+        }
+    }
+
+    pub fn icon(self) -> IconName {
+        match self {
+            Self::Approved => IconName::Check,
+            Self::ChangesRequested => IconName::Close,
+            Self::Commented => IconName::Chat,
+            Self::Dismissed => IconName::Undo,
+            Self::Pending => IconName::Clock,
+        }
+    }
+
+    /// Orca's colours: green for an approval, red for changes requested, muted for plain comments
+    /// and dismissals. The panel's own pill palette, since some themes' diff colours are too dim on a tint.
+    pub fn tone(self) -> Tone {
+        match self {
+            Self::Approved => Tone::Ready,
+            Self::ChangesRequested => Tone::Blocked,
+            Self::Pending => Tone::Pending,
+            Self::Commented | Self::Dismissed => Tone::Neutral,
+        }
+    }
+
+    pub fn color(self, cx: &App) -> Option<gpui::Hsla> {
+        crate::github_panel::tone_color(self.tone(), cx)
+    }
+}
+
+pub fn render_review_state_badge(state: ReviewState, cx: &App) -> AnyElement {
+    let (text, background) = match state.color(cx) {
+        Some(color) => (Color::Custom(color), color.opacity(0.15)),
+        None => (Color::Muted, cx.theme().colors().element_background),
+    };
+    h_flex()
+        .flex_none()
+        .gap_0p5()
+        .px_1p5()
+        .rounded_full()
+        .bg(background)
+        .child(Icon::new(state.icon()).size(IconSize::XSmall).color(text))
+        .child(
+            Label::new(state.label())
+                .size(LabelSize::XSmall)
+                .weight(gpui::FontWeight::MEDIUM)
+                .color(text)
+                .single_line(),
+        )
+        .into_any_element()
+}
+
+/// An issue comment or a review summary from `review.threads`' `conversation`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct ConversationComment {
+    pub id: String,
+    /// `comment` or `review`.
+    pub kind: String,
+    pub author: Option<String>,
+    pub author_avatar_url: Option<String>,
+    pub is_bot: bool,
+    pub body: String,
+    pub url: Option<String>,
+    pub created_at: Option<String>,
+    pub review_state: Option<String>,
+    pub reactions: Vec<ReactionSummary>,
+    /// The REST id issue comment edits and deletes address.
+    pub database_id: Option<u64>,
+    pub viewer_can_update: bool,
+    pub viewer_can_delete: bool,
+}
+
+impl ConversationComment {
+    pub fn is_automated(&self) -> bool {
+        is_bot(self.is_bot, self.author.as_deref())
+    }
+
+    pub fn is_review(&self) -> bool {
+        self.kind == "review"
+    }
+
+    /// Not yet confirmed by GitHub, so there is nothing to act on.
+    pub fn is_pending(&self) -> bool {
+        self.id.starts_with("pending-")
+    }
+
+    pub fn can_edit(&self) -> bool {
+        self.viewer_can_update && !self.is_pending()
+    }
+
+    /// GitHub can't delete a submitted review, only edit its summary.
+    pub fn can_delete(&self) -> bool {
+        self.viewer_can_delete && !self.is_review() && !self.is_pending()
+    }
+
+    /// The `kind` and id `review.comment.edit_published` and `delete_published` address it by.
+    pub fn published_ref(&self) -> Value {
+        if self.is_review() {
+            serde_json::json!({ "kind": "review_summary", "node_id": self.id })
+        } else {
+            serde_json::json!({ "kind": "issue_comment", "id": self.database_id })
+        }
+    }
+
+    pub fn review_state(&self) -> Option<ReviewState> {
+        self.review_state.as_deref().and_then(ReviewState::parse)
+    }
+
+    /// The same comment as a thread comment, so the card's header, body and reactions draw alike.
+    pub fn as_thread_comment(&self) -> ThreadComment {
+        ThreadComment {
+            id: self.id.clone(),
+            author: self.author.clone(),
+            author_avatar_url: self.author_avatar_url.clone(),
+            is_bot: self.is_automated(),
+            body: self.body.clone(),
+            url: self.url.clone(),
+            created_at: self.created_at.clone(),
+            reactions: self.reactions.clone(),
+            viewer_can_update: self.viewer_can_update,
+            viewer_can_delete: self.viewer_can_delete,
+        }
+    }
+}
+
+/// One card in the Comments section.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CommentItem<'a> {
+    Thread(&'a ReviewThread),
+    Conversation(&'a ConversationComment),
+}
+
+impl CommentItem<'_> {
+    fn latest_activity(&self) -> Option<i64> {
+        match self {
+            Self::Thread(thread) => latest_activity(thread),
+            Self::Conversation(comment) => comment
+                .created_at
+                .as_deref()
+                .and_then(crate::github_panel::parse_timestamp),
+        }
+    }
+}
+
+/// The open threads and conversation comments under a tab, newest activity first.
+pub fn comment_items<'a>(
+    threads: &'a [ReviewThread],
+    conversation: &'a [ConversationComment],
+    audience: Audience,
+) -> Vec<CommentItem<'a>> {
+    let mut items: Vec<CommentItem<'a>> = threads
+        .iter()
+        .filter(|thread| thread_in_audience(thread, audience))
+        .map(CommentItem::Thread)
+        .chain(
+            conversation
+                .iter()
+                .filter(|comment| audience.includes_conversation(comment))
+                .map(CommentItem::Conversation),
+        )
+        .collect();
+    items.sort_by_key(|item| std::cmp::Reverse(item.latest_activity()));
+    items
 }
 
 /// A thread shows under a tab when any of its comments counts there.
@@ -317,5 +578,121 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(draft_location(&draft), "export.rs:L3-L5");
+    }
+
+    #[test]
+    fn tabs_count_threads_issue_comments_and_reviews_like_orca() {
+        let threads = vec![
+            thread(
+                json!({ "id": "t1", "path": "ci.yml", "line": null, "original_line": 206,
+                "placement": { "outdated": true },
+                "comments": [
+                    { "id": "c1", "author": "farm-bot", "is_bot": true, "created_at": "2026-11-15T09:00:00Z" },
+                    { "id": "c2", "author": "maria", "created_at": "2026-11-15T09:30:00Z" },
+                ] }),
+            ),
+            thread(json!({ "id": "t2", "path": "a.rs", "comments": [
+                { "id": "c3", "author": "coderabbitai", "created_at": "2026-11-15T08:00:00Z" } ] })),
+        ];
+        let conversation: Vec<ConversationComment> = serde_json::from_value(json!([
+            { "id": "i1", "kind": "comment", "author": "deploy-bot", "created_at": "2026-11-15T11:00:00Z" },
+            { "id": "i2", "kind": "comment", "author": "github-actions", "created_at": "2026-11-15T07:00:00Z" },
+            { "id": "r1", "kind": "review", "author": "devon", "review_state": "CHANGES_REQUESTED",
+              "created_at": "2026-11-15T10:00:00Z" },
+        ]))
+        .expect("conversation");
+
+        let counts =
+            Audience::ALL.map(|audience| audience_count(&threads, &conversation, audience));
+        assert_eq!(
+            counts,
+            [6, 2, 4, 3],
+            "all, humans, bots, comments in open threads"
+        );
+
+        let ids = |audience| -> Vec<String> {
+            comment_items(&threads, &conversation, audience)
+                .into_iter()
+                .map(|item| match item {
+                    CommentItem::Thread(thread) => thread.id.clone(),
+                    CommentItem::Conversation(comment) => comment.id.clone(),
+                })
+                .collect()
+        };
+        assert_eq!(ids(Audience::All), ["i1", "r1", "t1", "t2", "i2"]);
+        assert_eq!(ids(Audience::Humans), ["r1", "t1"]);
+        assert_eq!(ids(Audience::Unresolved), ["t1", "t2"]);
+        assert_eq!(thread_location(&threads[0]), "ci.yml:L206");
+
+        assert!(is_bot(false, Some("renovate")));
+        assert!(is_bot(false, Some("lint[bot]")));
+        assert!(is_bot(false, Some("my-bot-account")));
+        assert!(!is_bot(false, Some("abbott")));
+        assert!(!is_bot(false, Some("maria")));
+    }
+
+    #[test]
+    fn review_states_map_to_orcas_badges() {
+        let cases = [
+            (
+                "APPROVED",
+                ReviewState::Approved,
+                "Approved",
+                IconName::Check,
+            ),
+            (
+                "CHANGES_REQUESTED",
+                ReviewState::ChangesRequested,
+                "Changes requested",
+                IconName::Close,
+            ),
+            (
+                "COMMENTED",
+                ReviewState::Commented,
+                "Commented",
+                IconName::Chat,
+            ),
+            (
+                "DISMISSED",
+                ReviewState::Dismissed,
+                "Dismissed",
+                IconName::Undo,
+            ),
+            ("PENDING", ReviewState::Pending, "Pending", IconName::Clock),
+        ];
+        for (raw, state, label, icon) in cases {
+            assert_eq!(ReviewState::parse(raw), Some(state));
+            assert_eq!(state.label(), label);
+            assert_eq!(state.icon(), icon);
+        }
+        assert_eq!(ReviewState::parse("approved"), None);
+        let comment = ConversationComment {
+            review_state: Some("APPROVED".into()),
+            ..Default::default()
+        };
+        assert_eq!(comment.review_state(), Some(ReviewState::Approved));
+        assert_eq!(ConversationComment::default().review_state(), None);
+    }
+
+    #[gpui::test]
+    fn badge_colors_follow_the_theme(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let dark = !cx.theme().appearance().is_light();
+            let green = if dark { 0x34d399 } else { 0x059669 };
+            let red = if dark { 0xfb7185 } else { 0xe11d48 };
+            assert_eq!(
+                ReviewState::Approved.color(cx),
+                Some(gpui::rgb(green).into())
+            );
+            assert_eq!(
+                ReviewState::ChangesRequested.color(cx),
+                Some(gpui::rgb(red).into())
+            );
+            assert_eq!(ReviewState::Commented.color(cx), None);
+            assert_eq!(ReviewState::Dismissed.color(cx), None);
+        });
     }
 }

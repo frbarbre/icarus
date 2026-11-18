@@ -319,10 +319,10 @@ mod tests {
             "priority": 2,
             "priorityLabel": "High",
             "url": format!("https://linear.app/acme/issue/{}", identifier.to_lowercase()),
-            "branchName": format!("frederik/{}-fix-login", identifier.to_lowercase()),
+            "branchName": format!("maya/{}-fix-login", identifier.to_lowercase()),
             "updatedAt": "2026-11-14T10:00:00.000Z",
             "state": { "name": "In Progress", "type": "started", "color": "#f2c94c" },
-            "assignee": { "name": "Frederik B", "displayName": "frederik", "avatarUrl": "https://a/f.png" },
+            "assignee": { "name": "Maya K", "displayName": "maya", "avatarUrl": "https://a/f.png" },
             "labels": { "nodes": [{ "name": "Bug", "color": "#eb5757" }] },
             "team": { "key": identifier.split('-').next() },
         })
@@ -349,13 +349,10 @@ mod tests {
         );
         assert_eq!(issue.priority, Some(2));
         let assignee = issue.assignee.as_ref().expect("assignee");
-        assert_eq!(assignee.name, "frederik");
+        assert_eq!(assignee.name, "maya");
         assert_eq!(assignee.avatar_url.as_deref(), Some("https://a/f.png"));
         assert_eq!(issue.labels[0].name, "Bug");
-        assert_eq!(
-            issue.branch_name.as_deref(),
-            Some("frederik/abc-12-fix-login")
-        );
+        assert_eq!(issue.branch_name.as_deref(), Some("maya/abc-12-fix-login"));
         assert_eq!(issue.team_key.as_deref(), Some("ABC"));
         assert_eq!(issue.url, "https://linear.app/acme/issue/abc-12");
 
@@ -406,7 +403,7 @@ mod tests {
         let found = linear.search("abc-12", 10).await.expect("lookup");
         assert_eq!(
             found[0].branch_name.as_deref(),
-            Some("frederik/abc-12-fix-login")
+            Some("maya/abc-12-fix-login")
         );
         assert_eq!(
             linear.transport().requests()[1]

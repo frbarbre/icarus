@@ -8479,7 +8479,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-client"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -8495,7 +8495,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-protocol"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -8504,7 +8504,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-settings"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "indexmap 2.14.2",
  "serde",
@@ -8526,6 +8526,7 @@ dependencies = [
  "db",
  "editor",
  "extension_host",
+ "file_finder",
  "file_icons",
  "fs",
  "futures 0.3.34",

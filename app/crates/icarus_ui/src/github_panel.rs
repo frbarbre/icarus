@@ -14,7 +14,7 @@ use icarus_client::Client;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use ui::{Avatar, CommonAnimationExt as _, Indicator, Tooltip, prelude::*};
+use ui::{Avatar, CommonAnimationExt as _, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
@@ -31,11 +31,11 @@ use crate::status_style;
 actions!(
     icarus,
     [
-        /// Shows or hides the Icarus GitHub panel.
+        /// Shows or hides the Checks panel: the pull request's checks and comments.
         ToggleGitHubPanel,
         /// Reloads this workspace's pull request from the Icarus server.
         RefreshGitHubPanel,
-        /// Reveals the GitHub panel and puts the cursor in the review summary.
+        /// Reveals Source Control and puts the cursor in the review summary.
         FocusReviewSummary,
     ]
 );
@@ -48,13 +48,13 @@ const THREADS_STALE: Duration = Duration::from_secs(300);
 /// The trailing action slots of every row list, so icons line up whichever ones a row shows.
 const SLOT: Pixels = px(20.);
 
-/// The PR panel's sections (github-review.md §9). Orca's ids, plus Icarus's Previews and Review.
+/// The Checks panel's sections (github-review.md §9). Orca's ids, plus Icarus's Previews; Review
+/// lives in Source Control, as in Orca.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrSection {
     Attention,
     Previews,
     Checks,
-    Review,
     PendingReview,
     Comments,
     Resolved,
@@ -66,7 +66,6 @@ impl SectionKind for PrSection {
             Self::Attention,
             Self::Previews,
             Self::Checks,
-            Self::Review,
             Self::PendingReview,
             Self::Comments,
             Self::Resolved,
@@ -78,7 +77,6 @@ impl SectionKind for PrSection {
             Self::Attention => "pr-attention",
             Self::Previews => "pr-previews",
             Self::Checks => "pr-checks",
-            Self::Review => "pr-review",
             Self::PendingReview => "pr-pending-review",
             Self::Comments => "pr-comments",
             Self::Resolved => "pr-resolved",
@@ -90,7 +88,6 @@ impl SectionKind for PrSection {
             Self::Attention => "Needs attention",
             Self::Previews => "Previews",
             Self::Checks => "Checks",
-            Self::Review => "Review",
             Self::PendingReview => "Pending review",
             Self::Comments => "Comments",
             Self::Resolved => "Resolved",
@@ -883,7 +880,7 @@ pub fn stack_rows(stack: &StackView, pull_request: &PullRequest) -> Vec<StackEnt
     entries
 }
 
-fn tone_color(tone: Tone, cx: &App) -> Option<Hsla> {
+pub(crate) fn tone_color(tone: Tone, cx: &App) -> Option<Hsla> {
     let (light, dark) = match tone {
         Tone::Ready => (0x059669, 0x34d399),
         Tone::Queued => (0xea580c, 0xfb923c),
@@ -951,6 +948,7 @@ pub fn initials(name: &str) -> String {
 pub enum AvatarKind {
     Person,
     Team,
+    Bot,
 }
 
 /// A GitHub avatar, or a letter or icon in its place when there is no image URL.
@@ -967,6 +965,11 @@ pub fn render_avatar(
     let initials = initials(name);
     let content = if kind == AvatarKind::Team {
         Icon::new(IconName::UserGroup)
+            .size(IconSize::XSmall)
+            .color(Color::Muted)
+            .into_any_element()
+    } else if kind == AvatarKind::Bot {
+        Icon::new(IconName::Bot)
             .size(IconSize::XSmall)
             .color(Color::Muted)
             .into_any_element()
@@ -1040,6 +1043,8 @@ struct Snapshot {
     status: Option<PrStatus>,
     /// The PR's review threads, from the same server cache the diff gutters read.
     threads: Vec<ReviewThread>,
+    /// Issue comments and review summaries, read with the threads.
+    conversation: Vec<pr_comments::ConversationComment>,
     /// The workspace and PR `updated_at` the threads were read for; None when this snapshot skipped them.
     threads_for: Option<(String, Option<String>)>,
 }
@@ -1056,18 +1061,25 @@ enum ThreadsFetch {
     },
 }
 
-async fn fetch_threads(client: &Client, workspace: &str, refresh: bool) -> Vec<ReviewThread> {
+async fn fetch_threads(
+    client: &Client,
+    workspace: &str,
+    refresh: bool,
+) -> (Vec<ReviewThread>, Vec<pr_comments::ConversationComment>) {
     let reply = client
         .request(
             "review.threads",
-            serde_json::json!({ "workspace": workspace, "refresh": refresh }),
+            serde_json::json!({ "workspace": workspace, "refresh": refresh, "conversation": true }),
         )
         .await;
     match reply {
-        Ok(reply) => serde_json::from_value(reply["threads"].clone()).unwrap_or_default(),
+        Ok(reply) => (
+            serde_json::from_value(reply["threads"].clone()).unwrap_or_default(),
+            serde_json::from_value(reply["conversation"].clone()).unwrap_or_default(),
+        ),
         Err(error) => {
             log::warn!("loading PR threads failed: {error:#}");
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     }
 }
@@ -1097,7 +1109,7 @@ async fn fetch_snapshot(
     let pull_request = status
         .as_ref()
         .and_then(|status| status.pull_request.as_ref());
-    let (threads, threads_for) = match (&current, pull_request) {
+    let ((threads, conversation), threads_for) = match (&current, pull_request) {
         (Some(current), Some(pull_request)) => {
             let key = (current.id.clone(), pull_request.updated_at.clone());
             let wanted = match &threads_fetch {
@@ -1111,17 +1123,18 @@ async fn fetch_snapshot(
                     Some(key),
                 )
             } else {
-                (Vec::new(), None)
+                (Default::default(), None)
             }
         }
-        (Some(current), None) => (Vec::new(), Some((current.id.clone(), None))),
-        (None, _) => (Vec::new(), None),
+        (Some(current), None) => (Default::default(), Some((current.id.clone(), None))),
+        (None, _) => (Default::default(), None),
     };
     Ok(Snapshot {
         workspaces,
         current,
         status,
         threads,
+        conversation,
         threads_for,
     })
 }
@@ -1141,6 +1154,8 @@ struct PreviewFixture {
     uncommitted: usize,
     /// `review.threads`' threads.
     threads: Vec<ReviewThread>,
+    /// `review.threads`' conversation: issue comments and review summaries.
+    conversation: Vec<pr_comments::ConversationComment>,
     /// The `sourceControl.sections.pr` layout.
     layout: Option<serde_json::Value>,
     /// Sections drawn collapsed or expanded regardless of their default, by id.
@@ -1178,6 +1193,8 @@ pub struct GitHubPanel {
     checks_expanded: HashSet<String>,
     /// The thread a reply is being written in, and its editor.
     reply: Option<(String, Entity<Editor>)>,
+    /// The conversation comment or review summary being rewritten, by node id.
+    editing: Option<(String, Entity<Editor>)>,
     /// Threads with a resolve, unresolve or reply on its way.
     busy_threads: HashSet<String>,
     action_error: Option<String>,
@@ -1330,6 +1347,7 @@ impl GitHubPanel {
             collapsed: HashMap::default(),
             checks_expanded: HashSet::default(),
             reply: None,
+            editing: None,
             busy_threads: HashSet::default(),
             action_error: None,
             audiences: HashMap::default(),
@@ -1365,6 +1383,12 @@ impl GitHubPanel {
             .iter()
             .flat_map(|thread| thread.comments.iter())
             .map(|comment| (comment.id.clone(), comment.body.clone()))
+            .chain(
+                snapshot
+                    .conversation
+                    .iter()
+                    .map(|comment| (comment.id.clone(), comment.body.clone())),
+            )
             .chain(description);
         for (id, body) in bodies {
             let current = self
@@ -1391,18 +1415,143 @@ impl GitHubPanel {
         reacted: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(comment) = self.snapshot.as_mut().and_then(|snapshot| {
-            snapshot
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            let reactions = snapshot
                 .threads
                 .iter_mut()
                 .flat_map(|thread| thread.comments.iter_mut())
                 .find(|comment| comment.id == subject)
-        }) {
-            crate::review::toggle_reaction_locally(&mut comment.reactions, &reaction, !reacted);
+                .map(|comment| &mut comment.reactions)
+                .or_else(|| {
+                    snapshot
+                        .conversation
+                        .iter_mut()
+                        .find(|comment| comment.id == subject)
+                        .map(|comment| &mut comment.reactions)
+                });
+            if let Some(reactions) = reactions {
+                crate::review::toggle_reaction_locally(reactions, &reaction, !reacted);
+            }
         }
         let params =
             serde_json::json!({ "subject": subject, "reaction": reaction, "remove": reacted });
-        self.run_review_call("review.react", params, None, cx);
+        self.run_conversation_call("review.react", params, cx);
+    }
+
+    /// Adds a conversation comment or review summary to the workspace composer's attachments.
+    pub fn send_conversation_to_agent(&mut self, id: String, cx: &mut Context<Self>) {
+        let params = serde_json::json!({ "ids": [id] });
+        self.run_conversation_call("attach.pr_comments", params, cx);
+    }
+
+    /// Runs a comment RPC whose result the server writes into its cached comments, then reads that
+    /// cache back: the optimistic change is confirmed without asking GitHub for the list again.
+    fn run_conversation_call(
+        &mut self,
+        method: &'static str,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.current_workspace_id().map(str::to_owned) else {
+            return;
+        };
+        let mut params = params;
+        params["workspace"] = workspace.into();
+        let Some(call) = crate::review::request(self.client.clone(), method, params, cx) else {
+            return;
+        };
+        self.action_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = call.await;
+            let reread = this.update(cx, |panel, cx| {
+                if let Err(error) = &result {
+                    panel.action_error = Some(format!("{error:#}"));
+                }
+                crate::review::review_changed(cx);
+                panel
+                    .client
+                    .clone()
+                    .map(|client| (client, panel.project_paths(cx)))
+            })?;
+            let Some((client, paths)) = reread else {
+                return anyhow::Ok(());
+            };
+            let fetch = ThreadsFetch::IfChanged {
+                known: None,
+                due: true,
+            };
+            let snapshot = Tokio::spawn_result(cx, fetch_snapshot(client, paths, fetch)).await;
+            this.update(cx, |panel, cx| match snapshot {
+                Ok(snapshot) => panel.apply_snapshot(snapshot, cx),
+                Err(error) => panel.set_offline(error, cx),
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Opens the editor over a conversation comment or review summary the viewer may rewrite.
+    pub fn start_edit(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(body) = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .conversation
+                .iter()
+                .find(|comment| comment.id == id)
+                .map(|comment| comment.body.clone())
+        }) else {
+            return;
+        };
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, 12, window, cx);
+            editor.set_text(body, window, cx);
+            editor
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        self.editing = Some((id, editor));
+        cx.notify();
+    }
+
+    pub fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        cx.notify();
+    }
+
+    pub fn save_edit(&mut self, cx: &mut Context<Self>) {
+        let Some((id, editor)) = self.editing.take() else {
+            return;
+        };
+        let body = editor.read(cx).text(cx).trim().to_owned();
+        let Some(comment) = self.snapshot.as_mut().and_then(|snapshot| {
+            snapshot
+                .conversation
+                .iter_mut()
+                .find(|comment| comment.id == id)
+        }) else {
+            return;
+        };
+        if body.is_empty() || body == comment.body {
+            cx.notify();
+            return;
+        }
+        comment.body = body.clone();
+        let mut params = comment.published_ref();
+        params["body"] = body.into();
+        self.run_conversation_call("review.comment.edit_published", params, cx);
+    }
+
+    pub fn delete_conversation_comment(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return;
+        };
+        let Some(index) = snapshot
+            .conversation
+            .iter()
+            .position(|comment| comment.id == id)
+        else {
+            return;
+        };
+        let params = snapshot.conversation.remove(index).published_ref();
+        self.run_conversation_call("review.comment.delete_published", params, cx);
     }
 
     /// Adds the thread to the workspace composer's attachments, as the diff thread's footer does.
@@ -1536,8 +1685,30 @@ impl GitHubPanel {
         self.review.as_ref()
     }
 
+    pub fn pull_request(&self) -> Option<&PullRequest> {
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.status.as_ref())
+            .and_then(|status| status.pull_request.as_ref())
+    }
+
+    /// The Checks tab's dot, as Orca's: the rollup of the open PR's checks.
+    pub fn checks_state(&self) -> Option<CheckState> {
+        let pull_request = self.pull_request()?;
+        if pull_request.checks.is_empty() {
+            return None;
+        }
+        pull_request
+            .checks_rollup
+            .filter(|state| !matches!(state, CheckState::Neutral | CheckState::Unknown))
+    }
+
     /// Keeps the Review section on the current workspace's PR, reloading it when the PR changes.
-    fn sync_review_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The Source Control panel shows the section, so it calls this as it renders.
+    pub fn sync_review_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::enabled(cx) && self.preview_review.is_none() {
+            return;
+        }
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1636,6 +1807,7 @@ impl GitHubPanel {
                     current,
                     status: fixture.pr_status,
                     threads: fixture.threads,
+                    conversation: fixture.conversation,
                     threads_for: None,
                 });
                 panel.preview_review = fixture.review.map(|review| (review, fixture.uncommitted));
@@ -1684,6 +1856,7 @@ impl GitHubPanel {
                 == snapshot.current.as_ref().map(|current| &current.id)
         {
             snapshot.threads = previous.threads;
+            snapshot.conversation = previous.conversation;
             snapshot.threads_for = previous.threads_for;
         }
         self.snapshot = Some(snapshot);
@@ -2060,10 +2233,58 @@ impl GitHubPanel {
             return;
         }
         let thread = thread.clone();
-        self.show_pending_reply(&thread, &body);
         self.reply = None;
+        let answered = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .conversation
+                .iter()
+                .find(|comment| comment.id == thread)
+                .map(|comment| comment.author.clone())
+        });
+        if let Some(author) = answered {
+            self.show_pending_conversation_reply(author.as_deref(), &body);
+            let params = serde_json::json!({ "body": body, "reply_to": author });
+            self.run_conversation_call("review.conversation.post", params, cx);
+            return;
+        }
+        self.show_pending_reply(&thread, &body);
         let params = serde_json::json!({ "thread": thread, "body": body });
         self.run_review_call("review.reply", params, Some(thread), cx);
+    }
+
+    /// GitHub has no replies on the conversation, so like Orca an answer is a new comment that
+    /// mentions the author; it shows at once and the server's copy replaces it.
+    fn show_pending_conversation_reply(&mut self, author: Option<&str>, body: &str) {
+        let created_at = OffsetDateTime::from_unix_timestamp(self.now())
+            .ok()
+            .and_then(|now| {
+                now.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            });
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return;
+        };
+        let viewer = snapshot
+            .conversation
+            .iter()
+            .find(|comment| comment.viewer_can_delete)
+            .map(|comment| (comment.author.clone(), comment.author_avatar_url.clone()));
+        let (viewer, viewer_avatar_url) = viewer.unwrap_or_default();
+        let body = match author.map(|author| author.trim_end_matches("[bot]")) {
+            Some(author) if !author.is_empty() => format!("@{author} {body}"),
+            _ => body.to_owned(),
+        };
+        snapshot
+            .conversation
+            .push(pr_comments::ConversationComment {
+                id: format!("pending-{}", snapshot.conversation.len()),
+                kind: "comment".into(),
+                author: viewer,
+                author_avatar_url: viewer_avatar_url,
+                body,
+                created_at,
+                ..Default::default()
+            });
     }
 
     /// Shows a reply in its thread right away; the refresh after GitHub answers replaces it.
@@ -2755,105 +2976,6 @@ impl GitHubPanel {
             )
     }
 
-    fn render_reviews(&self, pull_request: &PullRequest, cx: &mut Context<Self>) -> AnyElement {
-        let mut section = v_flex().gap_0p5().px_2();
-        let reviews = latest_reviews(pull_request);
-        if pull_request.requested_reviewers.is_empty() && reviews.is_empty() {
-            section = section.child(
-                Label::new("No reviews yet.")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
-        }
-        for reviewer in &pull_request.requested_reviewers {
-            let (avatar_kind, name, avatar_url) = match reviewer {
-                RequestedReviewer::User { login, avatar_url } => {
-                    (AvatarKind::Person, format!("@{login}"), avatar_url)
-                }
-                RequestedReviewer::Team { slug, avatar_url } => {
-                    (AvatarKind::Team, slug.clone(), avatar_url)
-                }
-                RequestedReviewer::Other => continue,
-            };
-            section = section.child(
-                h_flex()
-                    .gap_1p5()
-                    .py_0p5()
-                    .child(render_avatar(
-                        avatar_url.as_deref(),
-                        &name,
-                        avatar_kind,
-                        px(16.),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Label::new(name).size(LabelSize::Small).truncate()),
-                    )
-                    .child(Indicator::dot().color(Color::Warning))
-                    .child(
-                        Label::new("Awaiting review")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            );
-        }
-        for review in reviews {
-            let (icon, verdict, color) = match review.state {
-                ReviewState::Approved => (IconName::Check, "Approved", Color::Success),
-                ReviewState::ChangesRequested => {
-                    (IconName::XCircle, "Changes requested", Color::Error)
-                }
-                ReviewState::Dismissed => (IconName::Dash, "Dismissed", Color::Muted),
-                ReviewState::Commented | ReviewState::Pending | ReviewState::Unknown => {
-                    (IconName::Chat, "Commented", Color::Muted)
-                }
-            };
-            section = section.child(
-                h_flex()
-                    .gap_1p5()
-                    .py_0p5()
-                    .child(render_avatar(
-                        review.author_avatar_url.as_deref(),
-                        &review.login,
-                        AvatarKind::Person,
-                        px(16.),
-                        cx,
-                    ))
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Label::new(format!("@{}", review.login))
-                                .size(LabelSize::Small)
-                                .truncate(),
-                        ),
-                    )
-                    .child(Icon::new(icon).size(IconSize::XSmall).color(color))
-                    .child(Label::new(verdict).size(LabelSize::XSmall).color(color)),
-            );
-        }
-        section.into_any_element()
-    }
-
-    fn review_decision_label(pull_request: &PullRequest, cx: &App) -> Option<AnyElement> {
-        let (label, tone) = match pull_request.review_decision? {
-            ReviewDecision::Approved => ("Approved", Tone::Ready),
-            ReviewDecision::ChangesRequested => ("Changes requested", Tone::Blocked),
-            ReviewDecision::ReviewRequired => ("Review required", Tone::Pending),
-            ReviewDecision::Unknown => return None,
-        };
-        let color = tone_color(tone, cx)
-            .map(Color::Custom)
-            .unwrap_or(Color::Muted);
-        Some(
-            Label::new(label)
-                .size(LabelSize::XSmall)
-                .color(color)
-                .into_any_element(),
-        )
-    }
-
     fn render_pull_request(
         &self,
         status: &PrStatus,
@@ -2974,21 +3096,6 @@ impl GitHubPanel {
                         cx,
                     )
                 }
-                PrSection::Review => {
-                    let count = crate::review::reviewer_rows(pull_request).len();
-                    let decision = Self::review_decision_label(pull_request, cx);
-                    let review = self.review.clone();
-                    self.render_section(
-                        section,
-                        (count > 0).then(|| count.to_string()),
-                        decision.into_iter().collect(),
-                        move |panel, cx| match review {
-                            Some(review) => div().px_2().child(review).into_any_element(),
-                            None => panel.render_reviews(pull_request, cx),
-                        },
-                        cx,
-                    )
-                }
                 PrSection::PendingReview => {
                     if drafts.is_empty() {
                         continue;
@@ -3003,14 +3110,26 @@ impl GitHubPanel {
                     )
                 }
                 PrSection::Comments => {
-                    let open = pr_comments::threads_by_activity(&threads, false);
-                    let count = open.len().to_string();
-                    let open: Vec<ReviewThread> = open.into_iter().cloned().collect();
+                    let open: Vec<ReviewThread> = pr_comments::threads_by_activity(&threads, false)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    let conversation = self
+                        .snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.conversation.clone())
+                        .unwrap_or_default();
+                    let count = pr_comments::audience_count(
+                        &open,
+                        &conversation,
+                        pr_comments::Audience::All,
+                    )
+                    .to_string();
                     self.render_section(
                         section,
                         Some(count),
                         Vec::new(),
-                        move |panel, cx| panel.render_threads(open, false, cx),
+                        move |panel, cx| panel.render_comments(open, conversation, cx),
                         cx,
                     )
                 }
@@ -3025,7 +3144,7 @@ impl GitHubPanel {
                         section,
                         Some(count),
                         Vec::new(),
-                        move |panel, cx| panel.render_threads(resolved, true, cx),
+                        move |panel, cx| panel.render_resolved(resolved, cx),
                         cx,
                     )
                 }
@@ -3035,38 +3154,47 @@ impl GitHubPanel {
         sections
     }
 
-    /// Comments: the audience tabs, then one card per thread. Resolved: the cards alone.
-    fn render_threads(
+    /// The audience tabs, then a card per open thread, issue comment and review summary.
+    fn render_comments(
         &self,
         threads: Vec<ReviewThread>,
-        resolved: bool,
+        conversation: Vec<pr_comments::ConversationComment>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut list = v_flex().gap_1p5();
-        let shown: Vec<&ReviewThread> = if resolved {
-            threads.iter().collect()
-        } else {
-            let audience = self.audience();
-            list = list.child(self.render_audience_tabs(&threads, audience, cx));
-            threads
-                .iter()
-                .filter(|thread| pr_comments::thread_in_audience(thread, audience))
-                .collect()
-        };
-        if shown.is_empty() {
-            let empty = if resolved {
-                "No resolved threads."
-            } else {
-                self.audience().empty_text()
-            };
+        let audience = self.audience();
+        let list = v_flex().gap_1p5().child(self.render_audience_tabs(
+            &threads,
+            &conversation,
+            audience,
+            cx,
+        ));
+        let items = pr_comments::comment_items(&threads, &conversation, audience);
+        if items.is_empty() {
             return list
-                .child(Self::render_empty_line(empty))
+                .child(Self::render_empty_line(audience.empty_text()))
                 .into_any_element();
         }
-        for thread in shown {
-            list = list.child(self.render_thread_card(thread, cx));
+        list.children(items.into_iter().map(|item| match item {
+            pr_comments::CommentItem::Thread(thread) => self.render_thread_card(thread, cx),
+            pr_comments::CommentItem::Conversation(comment) => {
+                self.render_conversation_card(comment, cx)
+            }
+        }))
+        .into_any_element()
+    }
+
+    fn render_resolved(&self, threads: Vec<ReviewThread>, cx: &mut Context<Self>) -> AnyElement {
+        if threads.is_empty() {
+            return Self::render_empty_line("No resolved threads.").into_any_element();
         }
-        list.into_any_element()
+        v_flex()
+            .gap_1p5()
+            .children(
+                threads
+                    .iter()
+                    .map(|thread| self.render_thread_card(thread, cx)),
+            )
+            .into_any_element()
     }
 
     fn audience(&self) -> pr_comments::Audience {
@@ -3086,6 +3214,7 @@ impl GitHubPanel {
     fn render_audience_tabs(
         &self,
         threads: &[ReviewThread],
+        conversation: &[pr_comments::ConversationComment],
         selected: pr_comments::Audience,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -3095,9 +3224,11 @@ impl GitHubPanel {
             .p_0p5()
             .gap_0p5()
             .rounded_md()
-            .bg(colors.element_background);
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.editor_background);
         for audience in pr_comments::Audience::ALL {
-            let count = pr_comments::audience_count(threads, audience);
+            let count = pr_comments::audience_count(threads, conversation, audience);
             let active = audience == selected;
             tabs = tabs.child(
                 h_flex()
@@ -3166,107 +3297,363 @@ impl GitHubPanel {
         comment: &crate::review::ThreadComment,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let author = comment.author.clone().unwrap_or_else(|| "ghost".into());
-        let time = comment
-            .created_at
-            .as_deref()
-            .and_then(parse_timestamp)
-            .map(|created| format_relative(self.now() - created));
         let first = index == 0;
         let path = thread.path.clone();
         let line = pr_comments::thread_line(thread);
         let id_base = format!("{}-{index}", thread.id);
-        v_flex()
-            .px_2()
-            .py_1p5()
-            .gap_1()
-            .when(!first, |comment| {
-                comment
-                    .border_t_1()
-                    .border_color(cx.theme().colors().border_variant)
-            })
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .child(render_avatar(
-                        comment.author_avatar_url.as_deref(),
-                        &author,
-                        AvatarKind::Person,
-                        px(16.),
-                        cx,
-                    ))
-                    .child(
-                        Label::new(author)
-                            .size(LabelSize::Small)
-                            .weight(gpui::FontWeight::SEMIBOLD)
-                            .single_line(),
-                    )
-                    .when(comment.is_bot, |row| {
-                        row.child(render_pill("bot", Tone::Neutral, cx))
-                    })
-                    .when(!first, |row| {
-                        row.when_some(time.clone(), |row, time| {
-                            row.child(
-                                Label::new(format!("· {time}"))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .single_line(),
-                            )
-                        })
-                    }),
-            )
-            .when(first, |column| {
-                column.child(
-                    h_flex()
-                        .pl(px(22.))
-                        .gap_1()
-                        .when_some(time, |row, time| {
-                            row.child(
-                                Label::new(format!("{time} ·"))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .single_line(),
-                            )
-                        })
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("icarus-thread-link-{id_base}")))
-                                .min_w_0()
-                                .cursor_pointer()
-                                .tooltip(Tooltip::text("Open in the diff"))
-                                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-                                    panel.open_location(&path, line, window, cx)
-                                }))
-                                .child(
-                                    Label::new(pr_comments::thread_location(thread))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Accent)
-                                        .buffer_font(cx)
-                                        .truncate(),
-                                ),
-                        )
-                        .when(thread.placement.outdated, |row| {
-                            row.child(render_pill("Outdated", Tone::Neutral, cx))
-                        }),
+        let location = first.then(|| {
+            div()
+                .id(SharedString::from(format!("icarus-thread-link-{id_base}")))
+                .min_w_0()
+                .cursor_pointer()
+                .tooltip(Tooltip::text("Open in the diff"))
+                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                    panel.open_location(&path, line, window, cx)
+                }))
+                .child(
+                    Label::new(pr_comments::thread_location(thread))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .buffer_font(cx)
+                        .truncate(),
                 )
-            })
-            .child(self.render_comment_body(thread, comment, cx))
-            .child(self.render_reactions(comment, &id_base, cx))
-    }
-
-    /// The comment's Markdown, then its images and videos; the viewer steps through the whole thread's.
-    fn render_comment_body(
-        &self,
-        thread: &ReviewThread,
-        comment: &crate::review::ThreadComment,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let (text, media) = crate::media::split_media(&comment.body);
+                .into_any_element()
+        });
         let gallery: Vec<crate::media::MediaRef> = thread
             .comments
             .iter()
             .flat_map(|comment| crate::media::split_media(&comment.body).1)
             .collect();
+        v_flex()
+            .when(!first, |comment| {
+                comment
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+            })
+            .child(self.render_comment_header(
+                comment,
+                first,
+                None,
+                location,
+                first && thread.placement.outdated,
+                cx,
+            ))
+            .child(
+                v_flex()
+                    .px_2()
+                    .py_1p5()
+                    .gap_1()
+                    .child(self.render_comment_body(comment, &gallery, cx))
+                    .child(self.render_reactions(comment, &id_base, cx)),
+            )
+    }
+
+    /// An issue comment or review summary: one comment, no thread to reply in or resolve.
+    fn render_conversation_card(
+        &self,
+        conversation: &pr_comments::ConversationComment,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let border = cx.theme().colors().border_variant;
+        let background = cx.theme().colors().editor_background;
+        let comment = conversation.as_thread_comment();
+        let (_, gallery) = crate::media::split_media(&comment.body);
+        let editing = self
+            .editing
+            .as_ref()
+            .filter(|(id, _)| *id == conversation.id)
+            .map(|(_, editor)| editor.clone());
+        let replying = self
+            .reply
+            .as_ref()
+            .filter(|(id, _)| *id == conversation.id)
+            .map(|(_, editor)| editor.clone());
+        let body = match editing {
+            Some(editor) => self.render_edit_box(editor, cx).into_any_element(),
+            None => v_flex()
+                .px_2()
+                .py_1p5()
+                .gap_1()
+                .child(self.render_comment_body(&comment, &gallery, cx))
+                .when(!conversation.is_pending(), |body| {
+                    body.child(self.render_reactions(&comment, &conversation.id, cx))
+                })
+                .into_any_element(),
+        };
+        v_flex()
+            .id(SharedString::from(format!(
+                "icarus-conversation-{}",
+                conversation.id
+            )))
+            .mx_2()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(background)
+            .overflow_hidden()
+            .child(self.render_comment_header(
+                &comment,
+                true,
+                conversation.review_state(),
+                None,
+                false,
+                cx,
+            ))
+            .child(body)
+            .children(replying.map(|editor| self.render_reply_box(editor, false, cx)))
+            .when(!conversation.is_pending(), |card| {
+                card.child(self.render_conversation_footer(conversation, cx))
+            })
+            .into_any_element()
+    }
+
+    /// Orca's card actions for a conversation comment or review summary: send it to an agent,
+    /// answer it, and edit or delete the viewer's own.
+    fn render_conversation_footer(
+        &self,
+        comment: &pr_comments::ConversationComment,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = comment.id.clone();
+        let author = comment.author.clone();
+        let url = comment.url.clone();
+        let (agent_id, reply_id, edit_id, delete_id) =
+            (id.clone(), id.clone(), id.clone(), id.clone());
+        h_flex()
+            .px_1()
+            .py_0p5()
+            .gap_0p5()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                Button::new(
+                    SharedString::from(format!("icarus-conversation-agent-{id}")),
+                    "Send to an agent",
+                )
+                .label_size(LabelSize::XSmall)
+                .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
+                .tooltip(Tooltip::text(
+                    "Add this comment to the agent's next message",
+                ))
+                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
+                    panel.send_conversation_to_agent(agent_id.clone(), cx)
+                })),
+            )
+            .child(
+                Button::new(
+                    SharedString::from(format!("icarus-conversation-reply-{id}")),
+                    "Reply",
+                )
+                .label_size(LabelSize::XSmall)
+                .tooltip(Tooltip::text(
+                    "Comment on the pull request, mentioning the author",
+                ))
+                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                    panel.start_reply(reply_id.clone(), author.clone(), window, cx)
+                })),
+            )
+            .when(comment.can_edit(), |row| {
+                row.child(
+                    Button::new(
+                        SharedString::from(format!("icarus-conversation-edit-{id}")),
+                        "Edit",
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .on_click(cx.listener(
+                        move |panel, _: &ClickEvent, window, cx| {
+                            panel.start_edit(edit_id.clone(), window, cx)
+                        },
+                    )),
+                )
+            })
+            .when(comment.can_delete(), |row| {
+                row.child(
+                    Button::new(
+                        SharedString::from(format!("icarus-conversation-delete-{id}")),
+                        "Delete",
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .color(Color::Error)
+                    .on_click(cx.listener(
+                        move |panel, _: &ClickEvent, _, cx| {
+                            panel.delete_conversation_comment(delete_id.clone(), cx)
+                        },
+                    )),
+                )
+            })
+            .child(div().flex_1())
+            .child(div().w(SLOT).flex_none().when_some(url, |slot, url| {
+                slot.child(
+                    IconButton::new(
+                        SharedString::from(format!("icarus-conversation-open-{id}")),
+                        IconName::ArrowUpRight,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Open on GitHub"))
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+                )
+            }))
+    }
+
+    fn render_edit_box(&self, editor: Entity<Editor>, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        v_flex()
+            .m_1p5()
+            .p_1p5()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .key_context("IcarusReply")
+            .on_action(
+                cx.listener(|panel, _: &crate::review::CancelReviewComment, _, cx| {
+                    panel.cancel_edit(cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|panel, _: &crate::review::SubmitReviewComment, _, cx| {
+                    panel.save_edit(cx)
+                }),
+            )
+            .child(editor)
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        Button::new("icarus-edit-cancel", "Cancel")
+                            .label_size(LabelSize::Small)
+                            .on_click(
+                                cx.listener(|panel, _: &ClickEvent, _, cx| panel.cancel_edit(cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("icarus-edit-save", "Save")
+                            .style(ButtonStyle::Filled)
+                            .label_size(LabelSize::Small)
+                            .on_click(
+                                cx.listener(|panel, _: &ClickEvent, _, cx| panel.save_edit(cx)),
+                            ),
+                    ),
+            )
+    }
+
+    /// Orca's card header: avatar, author and a review's verdict; under them on a card's first
+    /// comment the age, BOT badge, `file:line` and Outdated badge. A reply keeps it to one row.
+    fn render_comment_header(
+        &self,
+        comment: &crate::review::ThreadComment,
+        first: bool,
+        review_state: Option<pr_comments::ReviewState>,
+        location: Option<AnyElement>,
+        outdated: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let author = comment.author.clone().unwrap_or_else(|| "ghost".into());
+        let is_bot = pr_comments::is_bot(comment.is_bot, comment.author.as_deref());
+        let time = comment
+            .created_at
+            .as_deref()
+            .and_then(parse_timestamp)
+            .map(|created| format_relative(self.now() - created));
+        let bot_badge = || {
+            div()
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.element_background)
+                .child(
+                    Label::new("BOT")
+                        .size(LabelSize::XSmall)
+                        .weight(gpui::FontWeight::SEMIBOLD)
+                        .color(Color::Muted)
+                        .single_line(),
+                )
+        };
+        let primary = h_flex()
+            .min_w_0()
+            .gap_1p5()
+            .child(render_avatar(
+                comment.author_avatar_url.as_deref(),
+                &author,
+                if is_bot {
+                    AvatarKind::Bot
+                } else {
+                    AvatarKind::Person
+                },
+                px(16.),
+                cx,
+            ))
+            .child(
+                Label::new(author)
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::SEMIBOLD)
+                    .single_line()
+                    .truncate(),
+            )
+            .children(review_state.map(|state| pr_comments::render_review_state_badge(state, cx)));
+        if !first {
+            return h_flex()
+                .px_2()
+                .pt_1p5()
+                .gap_1p5()
+                .child(primary)
+                .when_some(time, |row, time| {
+                    row.child(
+                        Label::new(format!("· {time}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line(),
+                    )
+                })
+                .when(is_bot, |row| row.child(bot_badge()))
+                .into_any_element();
+        }
+        v_flex()
+            .px_2()
+            .py_1p5()
+            .gap_1()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .child(primary)
+            .child(
+                h_flex()
+                    .pl(px(22.))
+                    .min_w_0()
+                    .gap_1()
+                    .when_some(time.clone(), |row, time| {
+                        row.child(
+                            Label::new(time)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        )
+                    })
+                    .when(time.is_some() && (is_bot || location.is_some()), |row| {
+                        row.child(Label::new("·").size(LabelSize::XSmall).color(Color::Muted))
+                    })
+                    .when(is_bot, |row| row.child(bot_badge()))
+                    .children(location)
+                    .when(outdated, |row| {
+                        row.child(render_pill("Outdated", Tone::Pending, cx))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The comment's Markdown, then its images and videos; the viewer steps through `gallery`.
+    fn render_comment_body(
+        &self,
+        comment: &crate::review::ThreadComment,
+        gallery: &[crate::media::MediaRef],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (text, media) = crate::media::split_media(&comment.body);
         let text = match self.markdown.get(&comment.id) {
             Some((_, markdown)) => div()
                 .text_sm()
@@ -3641,9 +4028,7 @@ impl GitHubPanel {
 
 impl Render for GitHubPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if crate::enabled(cx) || self.preview_review.is_some() {
-            self.sync_review_section(window, cx);
-        }
+        self.sync_review_section(window, cx);
         self.sync_markdown(window, cx);
         v_flex()
             .key_context("IcarusGitHubPanel")
@@ -3712,7 +4097,7 @@ impl Panel for GitHubPanel {
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::PullRequest)
+        Some(IconName::ListChecks)
     }
 
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3724,7 +4109,7 @@ impl Panel for GitHubPanel {
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Icarus GitHub")
+        Some("Checks")
     }
 
     fn toggle_action(&self) -> Box<dyn Action> {
@@ -3732,7 +4117,7 @@ impl Panel for GitHubPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        4
+        8
     }
 }
 
@@ -3758,10 +4143,14 @@ pub(crate) fn register(cx: &mut App) {
             toggle_panel::<GitHubPanel>(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &FocusReviewSummary, window, cx| {
-            workspace.open_panel::<GitHubPanel>(window, cx);
-            let section = workspace
-                .panel::<GitHubPanel>(cx)
-                .and_then(|panel| panel.read(cx).review_section().cloned());
+            crate::changes_tab::reveal_source_control(workspace, window, cx);
+            let Some(panel) = workspace.panel::<GitHubPanel>(cx) else {
+                return;
+            };
+            let section = panel.update(cx, |panel, cx| {
+                panel.sync_review_section(window, cx);
+                panel.review_section().cloned()
+            });
             if let Some(section) = section {
                 window.focus(&section.read(cx).summary_focus_handle(cx), cx);
             }
@@ -4131,12 +4520,15 @@ mod tests {
                 PrSection::Attention,
                 PrSection::Previews,
                 PrSection::Checks,
-                PrSection::Review,
                 PrSection::PendingReview,
                 PrSection::Comments,
                 PrSection::Resolved,
             ],
             "Icarus's own sections slot in after their default neighbours"
+        );
+        assert!(
+            PrSection::parse("pr-review").is_none(),
+            "Review moved to Source Control, as in Orca"
         );
     }
 
@@ -4209,7 +4601,7 @@ mod tests {
             Some(&serde_json::json!({
                 "key": "sourceControl.sections.pr",
                 "value": {
-                    "order": ["pr-comments", "pr-attention", "pr-previews", "pr-checks", "pr-review",
+                    "order": ["pr-comments", "pr-attention", "pr-previews", "pr-checks",
                               "pr-pending-review", "pr-resolved"],
                     "hidden": ["pr-previews"],
                 },
@@ -4251,8 +4643,11 @@ mod tests {
             panel.snapshot.as_ref().expect("fixture").threads.clone()
         });
         assert_eq!(
-            pr_comments::Audience::ALL
-                .map(|audience| pr_comments::audience_count(&threads[..1], audience)),
+            pr_comments::Audience::ALL.map(|audience| pr_comments::audience_count(
+                &threads[..1],
+                &[],
+                audience
+            )),
             [2, 1, 1, 2]
         );
         assert!(!pr_comments::thread_in_audience(
@@ -4302,6 +4697,102 @@ mod tests {
         assert_eq!(
             crate::review::tests::calls_to(&calls, "review.resolve"),
             [serde_json::json!({ "thread": "T1", "workspace": "ws-1" })]
+        );
+    }
+
+    #[gpui::test]
+    async fn conversation_cards_react_reply_edit_and_delete_like_orca(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_workspace, panel, calls, mut cx) = panel_in_workspace(cx).await;
+        let cx = &mut cx;
+        cx.run_until_parked();
+        let conversation = |panel: &GitHubPanel| {
+            panel
+                .snapshot
+                .as_ref()
+                .expect("fixture")
+                .conversation
+                .clone()
+        };
+        panel.update(cx, |panel, _| {
+            panel.snapshot.as_mut().expect("fixture").conversation =
+                serde_json::from_value(serde_json::json!([
+                    { "id": "IC_1", "kind": "comment", "database_id": 5, "author": "me", "body": "old",
+                      "viewer_can_update": true, "viewer_can_delete": true,
+                      "reactions": [{ "content": "heart", "count": 1, "viewer_has_reacted": true }] },
+                    { "id": "PRR_1", "kind": "review", "author": "carol", "review_state": "CHANGES_REQUESTED",
+                      "body": "Needs tests", "viewer_can_update": true, "viewer_can_delete": true },
+                    { "id": "IC_2", "kind": "comment", "database_id": 6, "author": "farm-bot", "body": "ci" },
+                ]))
+                .expect("conversation");
+        });
+        panel.read_with(cx, |panel, _| {
+            let all = conversation(panel);
+            assert!(all[0].can_edit() && all[0].can_delete());
+            assert!(
+                all[1].can_edit() && !all[1].can_delete(),
+                "a review can't be deleted"
+            );
+            assert!(!all[2].can_edit() && !all[2].can_delete());
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.react("IC_1".into(), "heart".into(), true, cx);
+            panel.react("PRR_1".into(), "+1".into(), false, cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            let all = conversation(panel);
+            assert!(all[0].reactions.is_empty(), "removed at once");
+            assert!(all[1].reactions[0].viewer_has_reacted);
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_reply("PRR_1".into(), Some("carol".into()), window, cx);
+            let (_, editor) = panel.reply.clone().expect("reply box");
+            editor.update(cx, |editor, cx| editor.set_text("Added them.", window, cx));
+            panel.send_reply(cx);
+
+            panel.start_edit("IC_1".into(), window, cx);
+            let (_, editor) = panel.editing.clone().expect("edit box");
+            editor.update(cx, |editor, cx| editor.set_text("new", window, cx));
+            panel.save_edit(cx);
+            panel.delete_conversation_comment("IC_2".into(), cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            let all = conversation(panel);
+            let bodies: Vec<&str> = all.iter().map(|c| c.body.as_str()).collect();
+            assert_eq!(bodies, ["new", "Needs tests", "@carol Added them."]);
+            assert!(all[2].is_pending());
+        });
+        cx.run_until_parked();
+
+        let reacted = crate::review::tests::calls_to(&calls, "review.react");
+        assert_eq!(reacted[0]["remove"], true);
+        assert_eq!(reacted[1]["subject"], "PRR_1");
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "review.conversation.post"),
+            [
+                serde_json::json!({ "body": "Added them.", "reply_to": "carol", "workspace": "ws-1" })
+            ]
+        );
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "review.comment.edit_published"),
+            [
+                serde_json::json!({ "kind": "issue_comment", "id": 5, "body": "new", "workspace": "ws-1" })
+            ]
+        );
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "review.comment.delete_published"),
+            [serde_json::json!({ "kind": "issue_comment", "id": 6, "workspace": "ws-1" })]
+        );
+        panel.update(cx, |panel, cx| {
+            panel.send_conversation_to_agent("PRR_1".into(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "attach.pr_comments"),
+            [serde_json::json!({ "ids": ["PRR_1"], "workspace": "ws-1" })]
         );
     }
 

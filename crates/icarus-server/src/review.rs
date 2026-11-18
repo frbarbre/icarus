@@ -13,6 +13,7 @@ use icarus_github::attachment::{
     MAX_IMAGE_BYTES, MAX_VIDEO_BYTES, attachment_markdown, check_attachment, content_type_for,
     is_video,
 };
+use icarus_github::conversation::{ConversationComment, ConversationKind};
 use icarus_github::diff_lines::{Placement, file_comment_body};
 use icarus_github::review::{CommentRef, CommentTarget, DraftComment, Reaction, Side, Verdict};
 use icarus_github::review_context::ReviewContext;
@@ -414,6 +415,28 @@ pub fn thread_placement(thread: &PrThread, line_count: Option<usize>) -> Value {
     })
 }
 
+fn toggle_reaction(reactions: &mut Vec<ReactionSummary>, content: &str, reacted: bool) {
+    match reactions.iter_mut().find(|r| r.content == content) {
+        Some(summary) if summary.viewer_has_reacted != reacted => {
+            summary.viewer_has_reacted = reacted;
+            summary.count = if reacted {
+                summary.count + 1
+            } else {
+                summary.count.saturating_sub(1)
+            };
+        }
+        Some(_) => {}
+        None if reacted => reactions.push(ReactionSummary {
+            content: content.to_owned(),
+            count: 1,
+            viewer_has_reacted: true,
+            reactors: Vec::new(),
+        }),
+        None => {}
+    }
+    reactions.retain(|r| r.count > 0);
+}
+
 fn thread_json(thread: &PrThread, line_count: Option<usize>) -> Value {
     let mut value = serde_json::to_value(thread).unwrap_or(Value::Null);
     value["placement"] = thread_placement(thread, line_count);
@@ -491,6 +514,14 @@ impl Published {
 }
 
 #[derive(Deserialize)]
+struct PostConversation {
+    body: String,
+    /// The author of the comment this answers.
+    #[serde(default)]
+    reply_to: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct EditComment {
     id: String,
     body: String,
@@ -528,6 +559,9 @@ struct ThreadsQuery {
     path: Option<String>,
     #[serde(default)]
     unresolved: bool,
+    /// Also the PR's issue comments and review summaries, which only the PR panel lists.
+    #[serde(default)]
+    conversation: bool,
 }
 
 #[derive(Deserialize)]
@@ -652,24 +686,45 @@ impl Server {
                 let (workspace, target) = self.review_target(&at).await?;
                 self.post_comment_now(&workspace, &target, add).await
             }
+            "review.conversation.post" => {
+                let at: At = params(p.clone())?;
+                let post: PostConversation = params(p)?;
+                let (workspace, target) = self.review_target(&at).await?;
+                self.post_conversation_comment(&workspace, &target, post)
+                    .await
+            }
             "review.comment.edit_published" | "review.comment.delete_published" => {
                 let at: At = params(p.clone())?;
                 let published: Published = params(p)?;
                 let comment = published.comment_ref()?;
                 let (workspace, target) = self.review_target(&at).await?;
                 let client = &self.github.client;
-                if method == "review.comment.edit_published" {
+                let edited = if method == "review.comment.edit_published" {
                     let body = published
                         .body
                         .as_deref()
                         .ok_or_else(|| rpc("invalid", "body is required"))?;
                     check_body(body, false)?;
-                    client.edit_comment(&target.repo, &comment, body).await
+                    client
+                        .edit_comment(&target.repo, &comment, body)
+                        .await
+                        .map_err(github_error)?;
+                    Some(body.to_owned())
                 } else {
-                    client.delete_comment(&target.repo, &comment).await
+                    client
+                        .delete_comment(&target.repo, &comment)
+                        .await
+                        .map_err(github_error)?;
+                    None
+                };
+                if self.patch_published(&comment, edited) {
+                    self.broadcast(
+                        REVIEW_CHANGED_TOPIC,
+                        json!({ "workspace": workspace.id, "thread": null }),
+                    );
+                } else {
+                    self.review_changed(Some(&workspace.id), None);
                 }
-                .map_err(github_error)?;
-                self.review_changed(Some(&workspace.id), None);
                 Ok(json!({
                     "edited": method == "review.comment.edit_published",
                     "deleted": method == "review.comment.delete_published",
@@ -830,10 +885,21 @@ impl Server {
                         thread_json(t, count)
                     })
                     .collect();
-                Ok(json!({
+                let mut reply = json!({
                     "pr": { "repo": target.repo.slug(), "number": target.number },
                     "threads": threads,
-                }))
+                });
+                if query.conversation {
+                    // The threads still count when the other sources fail, as in Orca.
+                    let entries = self
+                        .github
+                        .conversation(&target.repo, target.number)
+                        .await
+                        .inspect_err(|error| tracing::warn!("PR conversation failed: {error}"))
+                        .unwrap_or_default();
+                    reply["conversation"] = json!(entries);
+                }
+                Ok(reply)
             }
             "review.reply" => {
                 let reply: Reply = params(p)?;
@@ -894,27 +960,17 @@ impl Server {
                     .await
                     .map_err(github_error)?;
                 let content = reaction.short();
+                let reacted = !react.remove;
                 let patched = self.github.patch_comment(&react.subject, |comment| {
-                    let reacted = !react.remove;
-                    match comment.reactions.iter_mut().find(|r| r.content == content) {
-                        Some(summary) if summary.viewer_has_reacted != reacted => {
-                            summary.viewer_has_reacted = reacted;
-                            summary.count = if reacted {
-                                summary.count + 1
-                            } else {
-                                summary.count.saturating_sub(1)
-                            };
+                    toggle_reaction(&mut comment.reactions, content, reacted)
+                }) || self.github.patch_conversation(|entries| {
+                    match entries.iter_mut().find(|entry| entry.id == react.subject) {
+                        Some(entry) => {
+                            toggle_reaction(&mut entry.reactions, content, reacted);
+                            true
                         }
-                        Some(_) => {}
-                        None if reacted => comment.reactions.push(ReactionSummary {
-                            content: content.to_owned(),
-                            count: 1,
-                            viewer_has_reacted: true,
-                            reactors: Vec::new(),
-                        }),
-                        None => {}
+                        None => false,
                     }
-                    comment.reactions.retain(|r| r.count > 0);
                 });
                 if !patched {
                     self.github.forget_review_threads();
@@ -1057,6 +1113,89 @@ impl Server {
             REVIEW_CHANGED_TOPIC,
             json!({ "workspace": workspace, "thread": thread }),
         );
+    }
+
+    /// Applies an edit (`Some(body)`) or delete GitHub confirmed to the cached comment; false when
+    /// no cache holds it and it must be read again.
+    fn patch_published(&self, comment: &CommentRef, edited: Option<String>) -> bool {
+        let matches = |entry: &ConversationComment| match comment {
+            CommentRef::IssueComment { id } => entry.database_id == Some(*id),
+            CommentRef::ReviewSummary { node_id } => entry.id == *node_id,
+            CommentRef::ReviewComment { .. } => false,
+        };
+        if let CommentRef::ReviewComment { node_id } = comment {
+            return match edited {
+                Some(body) => self
+                    .github
+                    .patch_comment(node_id, |cached| cached.body = body),
+                None => false,
+            };
+        }
+        self.github.patch_conversation(|entries| {
+            let Some(index) = entries.iter().position(&matches) else {
+                return false;
+            };
+            match &edited {
+                Some(body) => entries[index].body = body.clone(),
+                None => {
+                    entries.remove(index);
+                }
+            }
+            true
+        })
+    }
+
+    /// Posts a comment on the PR's conversation, `@author`-addressed when it answers one, as Orca
+    /// does: GitHub has no replies to conversation comments.
+    async fn post_conversation_comment(
+        &self,
+        workspace: &Workspace,
+        target: &Target,
+        post: PostConversation,
+    ) -> Result<Value, RpcError> {
+        check_body(&post.body, false)?;
+        let handle = post
+            .reply_to
+            .as_deref()
+            .map(|author| author.trim().trim_end_matches("[bot]").trim())
+            .filter(|author| !author.is_empty());
+        let body = match handle {
+            Some(handle) => format!("@{handle} {}", post.body.trim()),
+            None => post.body.trim().to_owned(),
+        };
+        let posted = self
+            .github
+            .client
+            .add_issue_comment(&target.repo, target.number, &body)
+            .await
+            .map_err(github_error)?;
+        let comment = ConversationComment {
+            id: posted.node_id.clone().unwrap_or_default(),
+            database_id: Some(posted.id),
+            kind: ConversationKind::Comment,
+            author: self.github.viewer(),
+            author_avatar_url: None,
+            is_bot: false,
+            body,
+            url: posted.html_url.clone(),
+            created_at: Some(now_rfc3339()),
+            review_state: None,
+            viewer_can_update: true,
+            viewer_can_delete: true,
+            reactions: Vec::new(),
+        };
+        if self
+            .github
+            .push_conversation(&target.repo, target.number, comment.clone())
+        {
+            self.broadcast(
+                REVIEW_CHANGED_TOPIC,
+                json!({ "workspace": workspace.id, "thread": null }),
+            );
+        } else {
+            self.review_changed(Some(&workspace.id), None);
+        }
+        Ok(json!({ "comment": comment }))
     }
 
     fn review_changed(&self, workspace: Option<&str>, thread: Option<&str>) {

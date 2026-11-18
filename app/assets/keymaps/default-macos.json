@@ -312,7 +312,6 @@
       "ctrl-alt-pagedown": "agent::ScrollOutputToNextMessage",
       "cmd-f": "agent::ToggleSearch",
       "cmd-g": "agent::SelectNextThreadMatch",
-      "cmd-shift-g": "agent::SelectPreviousThreadMatch",
       "alt-cmd-c": "search::ToggleCaseSensitive",
       "alt-cmd-w": "search::ToggleWholeWord",
       "alt-cmd-x": "search::ToggleRegex",
@@ -555,7 +554,7 @@
       "cmd-k cmd-w": "workspace::CloseAllItemsAndPanes",
       "cmd-f": "project_search::ToggleFocus",
       "cmd-g": "search::SelectNextMatch",
-      "cmd-shift-g": "search::SelectPreviousMatch",
+      // Icarus: ⌘⇧G is Orca's Source Control tab; the search bar's shift-enter goes to the previous match.
       "cmd-shift-h": "search::ToggleReplace",
       // Icarus: ⌥⌘L is Orca's Open Linear issue; the search bar's own binding still toggles selection.
       "cmd-alt-l": "icarus::OpenLinearIssue",
@@ -578,7 +577,7 @@
       "cmd-alt-up": "icarus::FocusGroupUp",
       "cmd-ctrl-n": ["editor::AddSelectionBelow", { "skip_soft_wrap": false }], // Insert cursor below
       "cmd-alt-down": "icarus::FocusGroupDown",
-      "cmd-shift-k": "editor::DeleteLine",
+      // Icarus: ⌘⇧K is Orca's Checks tab; delete line stays in the palette.
       "alt-up": "editor::MoveLineUp",
       "alt-down": "editor::MoveLineDown",
       "alt-shift-up": "editor::DuplicateLineUp",
@@ -745,12 +744,6 @@
     },
   },
   {
-    "context": "IcarusReviewerInput > Editor",
-    "bindings": {
-      "enter": "icarus::RequestTypedReviewers",
-    },
-  },
-  {
     "context": "IcarusReply > Editor",
     "bindings": {
       "enter": "icarus::SubmitReviewComment",
@@ -841,10 +834,11 @@
       "ctrl-alt-_": ["workspace::DecreaseOpenDocksSize", { "px": 0 }],
       "ctrl-alt-+": ["workspace::IncreaseOpenDocksSize", { "px": 0 }],
       "cmd-shift-f": "pane::DeploySearch",
-      // Icarus: Orca's sidebar keys: ⌘⇧G Source Control, ⌘⇧H the PR panel, ⌘L the right dock.
-      // Search-and-replace stays in the palette; ⌘L selects a line inside text editors.
+      // Icarus: Orca's sidebar keys: ⌘⇧E Explorer, ⌘⇧G Source Control, ⌘⇧K Checks, ⌘L the right dock.
+      // ⌘L selects a line inside text editors.
       "cmd-shift-g": "icarus::ToggleSourceControlPanel",
-      "cmd-shift-h": "icarus::ToggleGitHubPanel",
+      "cmd-shift-k": "icarus::ToggleGitHubPanel",
+      "cmd-alt-j": "icarus::ToggleSessionHistory",
       "cmd-l": "workspace::ToggleRightDock",
       "cmd-shift-t": "pane::ReopenClosedItem",
       "cmd-k cmd-p": "workspace::ReopenLastPicker",
@@ -1102,7 +1096,6 @@
       "alt-enter": "editor::OpenExcerpts",
       "shift-enter": "editor::ExpandExcerpts",
       "cmd-alt-enter": "icarus::RunNextAction",
-      "cmd-shift-e": "pane::RevealInProjectPanel",
       "cmd-f8": "editor::GoToHunk",
       "cmd-shift-f8": "editor::GoToPreviousHunk",
       "ctrl-:": "editor::ToggleInlayHints",

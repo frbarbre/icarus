@@ -11,9 +11,9 @@ use gpui::{
     div,
 };
 use project::Project;
-use ui::{Color, Icon, IconName, Label, LabelSize, prelude::*};
+use ui::{AgentDotState, AgentStateIndicator, Color, Icon, IconName, Label, LabelSize, prelude::*};
 use workspace::item::{Item, ItemEvent, SerializableItem};
-use workspace::{ItemId, Pane, SaveIntent, Workspace, WorkspaceId};
+use workspace::{ItemId, Pane, SaveIntent, Workspace, WorkspaceId, pane};
 
 use crate::conversation_view::ThreadView;
 use crate::thread_metadata_store::ThreadId;
@@ -177,6 +177,19 @@ impl AgentTab {
         cx.notify();
     }
 
+    /// Whether the tab can't show its conversation: it failed to load, or connected without one.
+    fn unavailable(&self, cx: &App) -> bool {
+        let conversation_view = self.conversation_view.read(cx);
+        conversation_view.failed_to_load() || conversation_view.connected_without_thread()
+    }
+
+    /// Loads this tab's agent session again in place.
+    fn retry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.conversation_view.update(cx, |conversation_view, cx| {
+            conversation_view.retry_load(window, cx)
+        });
+    }
+
     /// Whether the conversation has anything in it; a restore that loses an empty one loses nothing.
     fn has_messages(&self, cx: &App) -> bool {
         self.thread_view(cx)
@@ -209,9 +222,24 @@ impl AgentTab {
         }));
     }
 
-    fn is_working(&self, cx: &App) -> bool {
-        self.thread_view(cx)
-            .is_some_and(|view| view.read(cx).thread.read(cx).status() != ThreadStatus::Idle)
+    /// What the tab's state glyph shows; an idle agent shows only its logo, as in Orca.
+    fn dot_state(&self, cx: &App) -> Option<AgentDotState> {
+        let view = self.thread_view(cx)?;
+        let thread = view.read(cx).thread.read(cx);
+        if thread.is_waiting_for_confirmation() {
+            Some(AgentDotState::Permission)
+        } else if thread.status() != ThreadStatus::Idle {
+            Some(AgentDotState::Working)
+        } else {
+            None
+        }
+    }
+
+    fn identity_icon(&self, cx: &App) -> Icon {
+        let icon = self
+            .harness(cx)
+            .map_or(IconName::ZedAgent, |harness| harness.icon);
+        Icon::new(icon).color(Color::Muted)
     }
 
     pub fn harness(&self, cx: &App) -> Option<&'static Harness> {
@@ -241,14 +269,23 @@ impl Item for AgentTab {
         cx: &App,
     ) -> gpui::AnyElement {
         let color = if self.marked_as_target {
-            Color::Accent
+            Color::Default
         } else {
             params.text_color()
         };
         let title = self.tab_content_text(params.detail.unwrap_or_default(), cx);
-        Label::new(util::truncate_and_trailoff(&title, TAB_TITLE_LIMIT))
+        let label = Label::new(util::truncate_and_trailoff(&title, TAB_TITLE_LIMIT))
             .single_line()
-            .color(color)
+            .color(color);
+        let Some(state) = self.dot_state(cx) else {
+            return label.into_any_element();
+        };
+        // Orca puts the state before the agent's logo; the pane draws `tab_icon` first, so both live here.
+        h_flex()
+            .gap_1()
+            .child(AgentStateIndicator::new(state))
+            .child(self.identity_icon(cx).size(IconSize::Small))
+            .child(label)
             .into_any_element()
     }
 
@@ -257,13 +294,11 @@ impl Item for AgentTab {
     }
 
     fn tab_icon(&self, _window: &Window, cx: &App) -> Option<Icon> {
-        if self.is_working(cx) {
-            return Some(Icon::new(IconName::ArrowCircle).color(Color::Accent));
-        }
-        let icon = self
-            .harness(cx)
-            .map_or(IconName::ZedAgent, |harness| harness.icon);
-        Some(Icon::new(icon).color(Color::Muted))
+        self.dot_state(cx).is_none().then(|| self.identity_icon(cx))
+    }
+
+    fn tab_marked(&self, _cx: &App) -> bool {
+        self.marked_as_target
     }
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
@@ -277,6 +312,44 @@ impl Item for AgentTab {
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
         f(*event)
     }
+
+    fn on_removed(&self, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.agent_id(cx) else {
+            return;
+        };
+        let tab = cx.entity().downgrade();
+        let workspace = self.workspace.clone();
+        // Deferred: a tab moved between panes is removed before it is added again.
+        cx.defer(move |cx| {
+            let Some(tab) = tab.upgrade() else {
+                end_closed_agent(agent_id, cx);
+                return;
+            };
+            let still_open = workspace.upgrade().is_some_and(|workspace| {
+                workspace
+                    .read(cx)
+                    .items_of_type::<AgentTab>(cx)
+                    .any(|open| open == tab)
+            });
+            if !still_open {
+                end_closed_agent(agent_id, cx);
+            }
+        });
+    }
+}
+
+/// Ends the session behind a closed agent tab; Icarus sets it, as Orca kills a closed tab's agent.
+pub struct TabAgentClosed(pub std::rc::Rc<dyn Fn(String, &mut App)>);
+
+impl gpui::Global for TabAgentClosed {}
+
+fn end_closed_agent(agent_id: String, cx: &mut App) {
+    if let Some(handler) = cx
+        .try_global::<TabAgentClosed>()
+        .map(|handler| handler.0.clone())
+    {
+        handler(agent_id, cx);
+    }
 }
 
 impl Render for AgentTab {
@@ -287,15 +360,35 @@ impl Render for AgentTab {
             .relative()
             .size_full()
             .child(self.conversation_view.clone())
-            .when(self.marked_as_target, |this| {
+            .when(self.unavailable(cx), |this| {
+                let blank = self.conversation_view.read(cx).connected_without_thread();
                 this.child(
-                    div()
+                    v_flex()
+                        .id("agent-tab-unavailable")
+                        .debug_selector(|| "agent-tab-unavailable".into())
                         .absolute()
                         .top_0()
                         .left_0()
                         .right_0()
-                        .h(gpui::px(2.))
-                        .bg(cx.theme().colors().text_accent),
+                        .when(blank, |this| this.bottom_0().justify_center())
+                        .when(!blank, |this| this.pt_8())
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::Medium)
+                                .color(Color::Warning),
+                        )
+                        .child(Label::new("This agent's conversation couldn't be loaded."))
+                        .child(
+                            div().debug_selector(|| "agent-tab-retry".into()).child(
+                                Button::new("retry-agent", "Retry")
+                                    .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
+                                    .on_click(
+                                        cx.listener(|tab, _, window, cx| tab.retry(window, cx)),
+                                    ),
+                            ),
+                        ),
                 )
             })
     }
@@ -515,8 +608,9 @@ pub struct AgentComposer {
     recent: Vec<EntityId>,
     observed_target: Option<EntityId>,
     ensure_scheduled: bool,
-    /// Focus asked for before the target's conversation loaded; given once it has.
-    pending_focus: bool,
+    /// Focus asked for before the target's conversation loaded, with what had focus then; given once
+    /// it has loaded, unless focus has moved on since.
+    pending_focus: Option<Option<FocusHandle>>,
     _target_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -541,7 +635,7 @@ impl AgentComposer {
             recent: Vec::new(),
             observed_target: None,
             ensure_scheduled: false,
-            pending_focus: false,
+            pending_focus: None,
             _target_subscriptions: Vec::new(),
             _subscriptions: vec![subscription],
         }
@@ -561,28 +655,17 @@ impl AgentComposer {
         }
         self.ensure_scheduled = true;
         // Deferred so an item moved between panes (removed, then added) never looks like the last tab closing.
-        cx.defer_in(window, |composer, window, cx| {
+        cx.defer_in(window, |composer, _, cx| {
             composer.ensure_scheduled = false;
-            composer.ensure_agent(window, cx);
+            composer.update_target(cx);
         });
     }
 
-    /// Keeps a target agent, opening a fresh agent tab when the workspace has none.
-    fn ensure_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Targets the active or most recent agent tab; with none open there is no composer.
+    fn update_target(&mut self, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        if workspace.read(cx).is_restoring() {
-            // Restored agent tabs may still be on their way; a fresh agent now would be one too many.
-            cx.spawn_in(window, async move |composer, cx| {
-                cx.background_executor().timer(PANEL_WAIT_STEP * 4).await;
-                composer.update_in(cx, |composer, window, cx| {
-                    composer.schedule_ensure(window, cx)
-                })
-            })
-            .detach_and_log_err(cx);
-            return;
-        }
         let (open_tabs, active) = {
             let workspace = workspace.read(cx);
             let open_tabs: Vec<Entity<AgentTab>> =
@@ -594,12 +677,12 @@ impl AgentComposer {
             (open_tabs, active)
         };
         if open_tabs.is_empty() {
-            if !workspace_can_host_agents(&workspace, cx) {
-                return;
+            if self.target.take().is_some() || self.observed_target.is_some() {
+                self.observed_target = None;
+                self.pending_focus = None;
+                self._target_subscriptions.clear();
+                cx.notify();
             }
-            workspace.update(cx, |workspace, cx| {
-                open_agent_tab(workspace, None, None, false, window, cx);
-            });
             return;
         }
         let open_ids: Vec<EntityId> = open_tabs.iter().map(|tab| tab.entity_id()).collect();
@@ -632,7 +715,7 @@ impl AgentComposer {
         self.recent.retain(|recent| *recent != id);
         self.recent.push(id);
         if self.observed_target != Some(id) {
-            self.pending_focus = false;
+            self.pending_focus = None;
             self.observed_target = Some(id);
             let conversation_view = tab.read(cx).conversation_view.clone();
             self._target_subscriptions = vec![
@@ -669,10 +752,13 @@ impl AgentComposer {
             .map(|thread_view| thread_view.read(cx).message_editor.focus_handle(cx));
         match focus_handle {
             Some(focus_handle) => focus_handle.focus(window, cx),
-            None => composer.update(cx, |composer, cx| {
-                composer.pending_focus = true;
-                cx.notify();
-            }),
+            None => {
+                let focused = window.focused(cx);
+                composer.update(cx, |composer, cx| {
+                    composer.pending_focus = Some(focused);
+                    cx.notify();
+                })
+            }
         }
     }
 
@@ -722,14 +808,38 @@ impl AgentComposer {
             conversation_view.insert_attachment(id, kind, title, window, cx);
         });
     }
+
+    // The composer sits outside every pane, so tab keys pressed in it would find no pane to act on
+    // and fall through to the draft's own bindings (fold, delete word, typed characters).
+    fn forward_to_active_pane<A: gpui::Action>(
+        &mut self,
+        action: &A,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).active_pane().clone())
+        else {
+            cx.propagate();
+            return;
+        };
+        let pane_focus = pane.focus_handle(cx);
+        let action = action.boxed_clone();
+        window.defer(cx, move |window, cx| {
+            pane_focus.dispatch_action(action.as_ref(), window, cx)
+        });
+    }
 }
 
 impl Render for AgentComposer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.pending_focus
+        if self.pending_focus.is_some()
             && let Some(thread_view) = self.target_thread_view(cx)
+            && let Some(focused_at_request) = self.pending_focus.take()
+            && window.focused(cx) == focused_at_request
         {
-            self.pending_focus = false;
             let focus_handle = thread_view.read(cx).message_editor.focus_handle(cx);
             window.defer(cx, move |window, cx| focus_handle.focus(window, cx));
         }
@@ -740,12 +850,22 @@ impl Render for AgentComposer {
                 })
                 .into_any_element()
         });
+        let has_target = self.target().is_some();
         let failed = self
             .target()
             .is_some_and(|tab| tab.read(cx).conversation_view.read(cx).failed_to_load());
         div()
             .id("icarus-agent-composer")
             .debug_selector(|| "composer".into())
+            .on_action(cx.listener(Self::forward_to_active_pane::<pane::ActivateItem>))
+            .on_action(cx.listener(Self::forward_to_active_pane::<pane::ActivateNextItem>))
+            .on_action(cx.listener(Self::forward_to_active_pane::<pane::ActivatePreviousItem>))
+            .on_action(cx.listener(Self::forward_to_active_pane::<pane::ActivateLastItem>))
+            .on_action(cx.listener(Self::forward_to_active_pane::<pane::CloseActiveItem>))
+            .on_action(cx.listener(Self::forward_to_active_pane::<pane::CloseOtherItems>))
+            .on_action(cx.listener(Self::forward_to_active_pane::<pane::CloseAllItems>))
+            .on_action(cx.listener(Self::forward_to_active_pane::<pane::GoBack>))
+            .on_action(cx.listener(Self::forward_to_active_pane::<pane::GoForward>))
             .w_full()
             .flex_none()
             .map(|this| match composer {
@@ -753,6 +873,7 @@ impl Render for AgentComposer {
                     .border_t_1()
                     .border_color(cx.theme().colors().border)
                     .child(composer),
+                None if !has_target => this,
                 None => this
                     .border_t_1()
                     .border_color(cx.theme().colors().border)
@@ -783,14 +904,6 @@ impl Render for AgentComposer {
                     ),
             })
     }
-}
-
-fn workspace_can_host_agents(workspace: &Entity<Workspace>, cx: &App) -> bool {
-    let workspace = workspace.read(cx);
-    let project = workspace.project().read(cx);
-    !project.is_via_collab()
-        && project.visible_worktrees(cx).next().is_some()
-        && workspace.panel::<AgentPanel>(cx).is_some()
 }
 
 /// Opens an agent tab in `pane` (default: the active pane). `agent_id` loads that existing server agent
@@ -1105,7 +1218,9 @@ mod tests {
         tab: &Entity<AgentTab>,
         cx: &mut VisualTestContext,
     ) {
-        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let pane = workspace
+            .read_with(cx, |workspace, _| workspace.pane_for(tab))
+            .expect("the tab is open");
         pane.update_in(cx, |pane, window, cx| {
             pane.close_item_by_id(tab.entity_id(), SaveIntent::Skip, window, cx)
                 .detach_and_log_err(cx);
@@ -1143,6 +1258,7 @@ mod tests {
                 panel.select_agent(crate::Agent::Stub, window, cx)
             });
             workspace.add_panel(panel, window, cx);
+            open_agent_tab(workspace, None, None, false, window, cx);
         });
         cx.run_until_parked();
         let first = agent_tabs(&workspace, cx)[0].clone();
@@ -1240,6 +1356,7 @@ mod tests {
                 panel.select_agent(crate::Agent::Stub, window, cx)
             });
             workspace.add_panel(panel, window, cx);
+            open_agent_tab(workspace, None, None, false, window, cx);
         });
         cx.run_until_parked();
         let tab = agent_tabs(&workspace, cx)[0].clone();
@@ -1319,9 +1436,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn each_agent_keeps_its_draft_and_closing_the_last_opens_a_fresh_one(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_tab_shows_its_agents_state_before_its_logo(cx: &mut TestAppContext) {
         crate::test_support::init_test(cx);
         let fs = FakeFs::new(cx.executor());
         cx.update(|cx| {
@@ -1348,11 +1463,115 @@ mod tests {
                 panel.select_agent(crate::Agent::Stub, window, cx)
             });
             workspace.add_panel(panel, window, cx);
+            open_agent_tab(workspace, None, None, false, window, cx);
+            open_agent_tab(workspace, None, None, false, window, cx);
         });
         cx.run_until_parked();
+        let tabs = agent_tabs(&workspace, cx);
+        let state = |tab: &Entity<AgentTab>, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let tab = tab.read(cx);
+                (tab.dot_state(cx), tab.tab_icon(window, cx).is_some())
+            })
+        };
+        assert_eq!(
+            state(&tabs[0], cx),
+            (None, true),
+            "idle shows only the logo"
+        );
 
+        let thread = |tab: &Entity<AgentTab>, cx: &mut VisualTestContext| {
+            tab.read_with(cx, |tab, cx| {
+                tab.thread_view(cx)
+                    .expect("connected agent")
+                    .read(cx)
+                    .thread
+                    .clone()
+            })
+        };
+        let working = thread(&tabs[0], cx).update(cx, |thread, cx| {
+            thread.send(vec!["Fix the login bug".into()], cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            state(&tabs[0], cx),
+            (Some(AgentDotState::Working), false),
+            "the state glyph and logo are drawn by the tab's content, state first"
+        );
+
+        let asking_thread = thread(&tabs[1], cx);
+        let asking = asking_thread.update(cx, |thread, cx| {
+            thread.send(vec!["Edit the login page".into()], cx)
+        });
+        cx.run_until_parked();
+        asking_thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::RequiresAction(acp_v2::RequiresActionStateUpdate::new()),
+                    cx,
+                )
+                .expect("requires action");
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            state(&tabs[1], cx),
+            (Some(AgentDotState::Permission), false),
+            "an agent waiting for a permission answer asks for attention"
+        );
+        drop((working, asking));
+    }
+
+    #[gpui::test]
+    async fn each_agent_keeps_its_draft_and_closing_one_ends_its_agent(cx: &mut TestAppContext) {
+        crate::test_support::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let ended = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            crate::thread_metadata_store::init(cx);
+            init(cx);
+            let ended = ended.clone();
+            cx.set_global(TabAgentClosed(std::rc::Rc::new(move |agent_id, _| {
+                ended.borrow_mut().push(agent_id)
+            })));
+        });
+        let _connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        fs.insert_tree("/project", serde_json::json!({ "a.txt": "" }))
+            .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            panel.update(cx, |panel, cx| {
+                panel.select_agent(crate::Agent::Stub, window, cx)
+            });
+            workspace.add_panel(panel, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            agent_tabs(&workspace, cx).is_empty(),
+            "a new workspace starts without an agent"
+        );
+        assert_eq!(
+            composer_target(&workspace, cx),
+            None,
+            "and so without a composer"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_agent_tab(workspace, None, None, false, window, cx);
+        });
+        cx.run_until_parked();
         let first = agent_tabs(&workspace, cx);
-        assert_eq!(first.len(), 1, "a workspace always has an agent");
+        assert_eq!(first.len(), 1);
         let first = first[0].clone();
         assert_eq!(composer_target(&workspace, cx), Some(first.clone()));
         let first_draft = draft(&first, cx);
@@ -1393,7 +1612,33 @@ mod tests {
             "second draft"
         );
 
+        let agent_id = |tab: &Entity<AgentTab>, cx: &mut VisualTestContext| {
+            tab.read_with(cx, |tab, cx| tab.agent_id(cx))
+                .expect("agent id")
+        };
+        let (first_id, second_id) = (agent_id(&first, cx), agent_id(&second, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.split_and_move(
+                workspace.active_pane().clone(),
+                workspace::SplitDirection::Right,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(agent_tabs(&workspace, cx).len(), 2);
+        assert!(
+            ended.borrow().is_empty(),
+            "moving a tab to another pane keeps its agent"
+        );
+
         close_tab(&workspace, &first, cx);
+        assert_eq!(
+            ended.borrow().as_slice(),
+            std::slice::from_ref(&first_id),
+            "closing a tab ends its agent"
+        );
         assert_eq!(
             composer_target(&workspace, cx),
             Some(second.clone()),
@@ -1401,13 +1646,349 @@ mod tests {
         );
 
         close_tab(&workspace, &second, cx);
-        let remaining = agent_tabs(&workspace, cx);
-        assert_eq!(
-            remaining.len(),
-            1,
-            "closing the last agent opens a fresh one"
+        assert_eq!(*ended.borrow(), [first_id, second_id]);
+        assert!(
+            agent_tabs(&workspace, cx).is_empty(),
+            "every agent tab can be closed; none is opened in its place"
         );
-        assert!(remaining[0] != first && remaining[0] != second);
-        assert_eq!(composer_target(&workspace, cx), Some(remaining[0].clone()));
+        assert_eq!(composer_target(&workspace, cx), None);
+        assert!(
+            cx.debug_bounds("composer")
+                .is_none_or(|bounds| bounds.size.height == gpui::px(0.)),
+            "no composer without an agent tab"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_tab_whose_agent_cannot_load_says_so_and_retries_the_same_session(
+        cx: &mut TestAppContext,
+    ) {
+        let connection = crate::test_support::set_stub_agent_connection(
+            StubAgentConnection::new().with_supports_load_session(true),
+        );
+        let (workspace, _project, mut cx) = workspace_with_agent(cx).await;
+        let cx = &mut cx;
+        connection.set_next_load_error(anyhow::anyhow!("session not found"));
+        let server: std::rc::Rc<dyn agent_servers::AgentServer> = std::rc::Rc::new(
+            crate::test_support::StubAgentServer::new(connection.clone()),
+        );
+        let tab = workspace
+            .update_in(cx, |workspace, window, cx| {
+                open_tab(
+                    workspace,
+                    Some(server),
+                    Some("agent-restored".into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .expect("tab");
+        cx.run_until_parked();
+        assert!(tab.read_with(cx, |tab, cx| tab.unavailable(cx)));
+        assert!(
+            cx.debug_bounds("agent-tab-unavailable").is_some(),
+            "the tab explains itself instead of staying blank"
+        );
+
+        let retry = cx.debug_bounds("agent-tab-retry").expect("retry button");
+        cx.simulate_click(retry.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let (agent_id, unavailable) =
+            tab.read_with(cx, |tab, cx| (tab.agent_id(cx), tab.unavailable(cx)));
+        assert_eq!(
+            agent_id.as_deref(),
+            Some("agent-restored"),
+            "the same session"
+        );
+        assert!(!unavailable, "retry loads it and shows the conversation");
+        assert!(cx.debug_bounds("agent-tab-unavailable").is_none());
+    }
+
+    gpui::actions!(agent_tab_test, [WorkspaceShortcut]);
+
+    async fn workspace_with_agent(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, Entity<Project>, VisualTestContext) {
+        crate::test_support::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            crate::thread_metadata_store::init(cx);
+            init(cx);
+        });
+        fs.insert_tree("/project", serde_json::json!({ "a.txt": "" }))
+            .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            panel.update(cx, |panel, cx| {
+                panel.select_agent(crate::Agent::Stub, window, cx)
+            });
+            workspace.add_panel(panel, window, cx);
+            open_agent_tab(workspace, None, None, false, window, cx);
+        });
+        cx.run_until_parked();
+        (workspace, project, cx)
+    }
+
+    fn add_editor(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> FocusHandle {
+        workspace.update_in(cx, |workspace, window, cx| {
+            let editor = cx.new(|cx| editor::Editor::multi_line(window, cx));
+            let focus = editor.focus_handle(cx);
+            workspace.add_item_to_active_pane(Box::new(editor), None, false, window, cx);
+            focus
+        })
+    }
+
+    fn add_terminal(
+        workspace: &Entity<Workspace>,
+        project: &Entity<Project>,
+        cx: &mut VisualTestContext,
+    ) -> FocusHandle {
+        let project = project.downgrade();
+        workspace.update_in(cx, |workspace, window, cx| {
+            let terminal = cx.new(|cx| {
+                terminal::TerminalBuilder::new_display_only(
+                    terminal::terminal_settings::CursorShape::default(),
+                    terminal::terminal_settings::AlternateScroll::On,
+                    None,
+                    0,
+                    cx.background_executor(),
+                    util::paths::PathStyle::local(),
+                )
+                .subscribe(cx)
+            });
+            let weak_workspace = cx.entity().downgrade();
+            let database_id = workspace.database_id();
+            let view = cx.new(|cx| {
+                terminal_view::TerminalView::new(
+                    terminal,
+                    weak_workspace,
+                    database_id,
+                    project,
+                    window,
+                    cx,
+                )
+            });
+            let focus = view.focus_handle(cx);
+            workspace.add_item_to_active_pane(Box::new(view), None, false, window, cx);
+            focus
+        })
+    }
+
+    // Zed's editor keys first, then the imported Orca keys (Workspace/Editor/Terminal), which win as in the app.
+    fn bind_user_navigation_keys(cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("alt-cmd-[", editor::actions::Fold, Some("Editor")),
+                gpui::KeyBinding::new("alt-cmd-]", editor::actions::UnfoldLines, Some("Editor")),
+                gpui::KeyBinding::new(
+                    "ctrl-w",
+                    editor::actions::DeleteToPreviousWordStart::default(),
+                    Some("Editor"),
+                ),
+                gpui::KeyBinding::new("ctrl-t", editor::actions::Transpose, Some("Editor")),
+            ]);
+            for context in ["Workspace", "Editor", "Terminal"] {
+                cx.bind_keys([
+                    gpui::KeyBinding::new(
+                        "alt-cmd-]",
+                        pane::ActivateNextItem::default(),
+                        Some(context),
+                    ),
+                    gpui::KeyBinding::new(
+                        "alt-cmd-[",
+                        pane::ActivatePreviousItem::default(),
+                        Some(context),
+                    ),
+                    gpui::KeyBinding::new("alt-1", pane::ActivateItem(0), Some(context)),
+                    gpui::KeyBinding::new("alt-3", pane::ActivateItem(2), Some(context)),
+                    gpui::KeyBinding::new(
+                        "ctrl-w",
+                        pane::CloseOtherItems {
+                            save_intent: None,
+                            close_pinned: false,
+                        },
+                        Some(context),
+                    ),
+                    gpui::KeyBinding::new("ctrl-t", WorkspaceShortcut, Some(context)),
+                ]);
+            }
+        });
+    }
+
+    fn items(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> (usize, usize) {
+        workspace.read_with(cx, |workspace, cx| {
+            let pane = workspace.active_pane().read(cx);
+            (pane.items_len(), pane.active_item_index())
+        })
+    }
+
+    fn has_focus(focus: &FocusHandle, cx: &mut VisualTestContext) -> bool {
+        cx.update(|window, cx| focus.contains_focused(window, cx))
+    }
+
+    #[gpui::test]
+    async fn navigation_keys_pressed_in_the_composer_navigate_and_move_focus_to_the_destination(
+        cx: &mut TestAppContext,
+    ) {
+        let _connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        let (workspace, project, mut cx) = workspace_with_agent(cx).await;
+        let cx = &mut cx;
+        let agent = agent_tabs(&workspace, cx)[0].clone();
+        let file = add_editor(&workspace, cx);
+        let terminal = add_terminal(&workspace, &project, cx);
+        cx.run_until_parked();
+        bind_user_navigation_keys(cx);
+        let shortcut_runs = std::rc::Rc::new(std::cell::Cell::new(0));
+        workspace.update(cx, |workspace, _| {
+            let shortcut_runs = shortcut_runs.clone();
+            workspace.register_action(move |_, _: &WorkspaceShortcut, _, _| {
+                shortcut_runs.set(shortcut_runs.get() + 1)
+            });
+        });
+        let draft = draft(&agent, cx);
+        let draft_text =
+            |cx: &mut VisualTestContext| draft.read_with(cx, |draft, cx| draft.text(cx));
+        draft.update_in(cx, |draft, window, cx| {
+            draft.set_text("fix the bug", window, cx)
+        });
+        let composer = workspace
+            .read_with(cx, |workspace, _| AgentComposer::for_workspace(workspace))
+            .expect("composer");
+        let composer_focused = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| composer.read(cx).is_focused(window, cx))
+        };
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&agent, true, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(items(&workspace, cx), (3, 0));
+        assert!(
+            composer_focused(cx),
+            "moving to an agent tab focuses its draft"
+        );
+
+        cx.simulate_keystrokes("alt-cmd-]");
+        cx.run_until_parked();
+        assert_eq!(
+            items(&workspace, cx),
+            (3, 1),
+            "next tab, not the draft's unfold"
+        );
+        assert!(has_focus(&file, cx) && !composer_focused(cx));
+
+        cx.dispatch_action(FocusComposer);
+        cx.run_until_parked();
+        assert!(composer_focused(cx));
+        cx.simulate_keystrokes("alt-cmd-]");
+        cx.run_until_parked();
+        assert_eq!(items(&workspace, cx), (3, 2));
+        assert!(
+            has_focus(&terminal, cx) && !composer_focused(cx),
+            "a terminal tab reached from the composer takes the keys"
+        );
+
+        cx.dispatch_action(FocusComposer);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-cmd-[");
+        cx.run_until_parked();
+        assert_eq!(
+            items(&workspace, cx),
+            (3, 1),
+            "previous tab, not the draft's fold"
+        );
+        assert!(has_focus(&file, cx) && !composer_focused(cx));
+
+        cx.dispatch_action(FocusComposer);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-3");
+        cx.run_until_parked();
+        assert_eq!(items(&workspace, cx), (3, 2), "tab by index");
+        assert!(has_focus(&terminal, cx) && !composer_focused(cx));
+
+        cx.simulate_keystrokes("alt-1");
+        cx.run_until_parked();
+        assert_eq!(items(&workspace, cx), (3, 0));
+        assert!(
+            composer_focused(cx),
+            "moving to the agent tab from the keyboard focuses its draft"
+        );
+
+        cx.simulate_keystrokes("ctrl-t");
+        cx.run_until_parked();
+        assert_eq!(
+            shortcut_runs.get(),
+            1,
+            "workspace shortcuts run from the draft"
+        );
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.run_until_parked();
+        assert_eq!(items(&workspace, cx), (1, 0), "close other tabs");
+        assert_eq!(
+            draft_text(cx),
+            "fix the bug",
+            "no shortcut edited the draft or typed into it"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_late_loading_agent_takes_focus_only_if_nothing_else_took_it_meanwhile(
+        cx: &mut TestAppContext,
+    ) {
+        let _connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        let (workspace, _project, mut cx) = workspace_with_agent(cx).await;
+        let cx = &mut cx;
+        let file = add_editor(&workspace, cx);
+        cx.run_until_parked();
+        let composer = workspace
+            .read_with(cx, |workspace, _| AgentComposer::for_workspace(workspace))
+            .expect("composer");
+        let composer_focused = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| composer.read(cx).is_focused(window, cx))
+        };
+        let agent = composer_target(&workspace, cx).expect("agent");
+        let request_focus_while_loading = |cx: &mut VisualTestContext| {
+            composer.update(cx, |composer, _| composer.target = None);
+            cx.update(|window, cx| AgentComposer::focus(&composer, window, cx));
+            cx.run_until_parked();
+        };
+        let finish_loading = |cx: &mut VisualTestContext| {
+            composer.update(cx, |composer, cx| {
+                composer.target = Some(agent.downgrade());
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+
+        request_focus_while_loading(cx);
+        cx.update(|window, cx| file.focus(window, cx));
+        cx.run_until_parked();
+        finish_loading(cx);
+        assert!(
+            has_focus(&file, cx) && !composer_focused(cx),
+            "moving on while the agent loads keeps focus where the user went"
+        );
+
+        request_focus_while_loading(cx);
+        finish_loading(cx);
+        assert!(
+            composer_focused(cx),
+            "with focus still where it was asked from, the draft gets it"
+        );
     }
 }

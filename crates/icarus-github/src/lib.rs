@@ -1,5 +1,6 @@
 pub mod attachment;
 pub mod client;
+pub mod conversation;
 pub mod diff_lines;
 pub mod error;
 pub mod fake;

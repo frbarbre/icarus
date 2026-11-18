@@ -651,6 +651,35 @@ impl Server {
             delivered += sent;
             added.push(attachment);
         }
+        // Conversation comments and review summaries are attached only by id, from the panel's card.
+        if let Some(ids) = &ids {
+            let conversation = self
+                .github
+                .conversation(&repo, number)
+                .await
+                .map_err(|e| rpc("github_failed", e))?;
+            for entry in conversation.iter().filter(|entry| ids.contains(&entry.id)) {
+                let author = entry.author.as_deref().unwrap_or("ghost");
+                let title = match entry.review_state.as_deref() {
+                    Some(state) => format!(
+                        "@{author}'s review ({}) on #{number}",
+                        state.to_lowercase().replace('_', " ")
+                    ),
+                    None => format!("@{author} on #{number}"),
+                };
+                let source = json!({
+                    "type": "pr-comment",
+                    "url": entry.url,
+                    "comment_ids": [entry.id],
+                    "pr": number,
+                });
+                let text = format!("{title}:\n\n{}", entry.body.trim());
+                let (attachment, sent) =
+                    self.add_attachment(workspace, "pr-comment", &title, &text, Some(source))?;
+                delivered += sent;
+                added.push(attachment);
+            }
+        }
         Ok(json!({ "attachments": added, "delivered": delivered }))
     }
 }

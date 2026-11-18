@@ -134,6 +134,7 @@ pub struct DiffTab {
     /// Review drafts, PR threads and the comment box; only when Icarus runs.
     review: Option<Entity<DiffReview>>,
     _review_changes: Option<Vec<Subscription>>,
+    edited: bool,
     _editor_events: Subscription,
 }
 
@@ -203,7 +204,10 @@ impl DiffTab {
             editor.register_addon(crate::review::ReviewAttached::default());
             editor
         });
-        let editor_events = cx.subscribe(&editor, |_, _, event: &EditorEvent, cx| {
+        let editor_events = cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| {
+            if matches!(event, EditorEvent::Edited { .. }) {
+                this.edited = true;
+            }
             cx.emit(event.clone())
         });
         let root = project
@@ -235,6 +239,7 @@ impl DiffTab {
             editor,
             review,
             _review_changes: review_changes,
+            edited: false,
             _editor_events: editor_events,
         };
         tab.apply_mode(cx);
@@ -607,6 +612,25 @@ fn preview_slot(pane: &mut Pane) -> Option<usize> {
     }
 }
 
+/// The pane showing a diff preview, the active one first, so a click with an agent's pane
+/// focused replaces that diff instead of opening another beside the agent.
+fn diff_preview_pane(workspace: &Workspace, cx: &App) -> Option<Entity<Pane>> {
+    let shows_diff_preview = |pane: &Entity<Pane>| {
+        pane.read(cx)
+            .preview_item()
+            .is_some_and(|item| item.downcast::<DiffTab>().is_some())
+    };
+    let active = workspace.active_pane();
+    if shows_diff_preview(active) {
+        return Some(active.clone());
+    }
+    workspace
+        .panes()
+        .iter()
+        .find(|pane| shows_diff_preview(pane))
+        .cloned()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn open_diff_tab_as(
     path: PathBuf,
@@ -640,7 +664,9 @@ fn open_diff_tab_as(
         workspace.activate_item(&existing, true, true, window, cx);
         return Task::ready(Ok(existing));
     }
-    let pane = pane.unwrap_or_else(|| workspace.active_pane().clone());
+    let pane = pane
+        .or_else(|| preview.then(|| diff_preview_pane(workspace, cx)).flatten())
+        .unwrap_or_else(|| workspace.active_pane().clone());
     if let Some(ready) = ready {
         return Task::ready(Ok(add_diff_tab(
             path, base, mode, ready, pane, preview, workspace, window, cx,
@@ -801,12 +827,15 @@ impl Item for DiffTab {
     }
 
     fn to_item_events(event: &EditorEvent, f: &mut dyn FnMut(ItemEvent)) {
+        if matches!(event, EditorEvent::Edited { .. }) {
+            f(ItemEvent::Edit);
+        }
         Editor::to_item_events(event, f)
     }
 
-    // Laying out the diff's excerpts reports an edit too; only a change to the file ends the preview.
-    fn preserve_preview(&self, cx: &App) -> bool {
-        self.editor.read(cx).preserve_preview(cx)
+    // The buffer's own check counts reloads after an agent writes the file as edits; only typing here keeps the tab.
+    fn preserve_preview(&self, _cx: &App) -> bool {
+        !self.edited
     }
 
     fn deactivated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2266,5 +2295,186 @@ pub(crate) mod tests {
             let reaction = &thread.comments[0].reactions[0];
             assert_eq!((reaction.count, reaction.viewer_has_reacted), (3, true));
         });
+    }
+
+    fn preview(
+        workspace: &Entity<Workspace>,
+        path: &str,
+        ready: Option<ReadyDiff>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Task<Result<Entity<DiffTab>>> {
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_diff_preview(
+                PathBuf::from(path),
+                DiffBase::Uncommitted,
+                DiffTabMode::Diff,
+                ready,
+                workspace,
+                window,
+                cx,
+            )
+        })
+    }
+
+    /// Every diff tab's file, and whether its pane shows it as the preview.
+    fn diff_tabs(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<(PathBuf, bool)> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<DiffTab>(cx)
+                .map(|tab| {
+                    let preview = workspace
+                        .pane_for(&tab)
+                        .is_some_and(|pane| pane.read(cx).is_active_preview_item(tab.entity_id()));
+                    (tab.read(cx).path().to_path_buf(), preview)
+                })
+                .collect()
+        })
+    }
+
+    async fn write_on_disk(
+        workspace: &Entity<Workspace>,
+        path: &str,
+        text: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let fs = workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).fs().as_fake()
+        });
+        fs.insert_file(path, text.as_bytes().to_vec()).await;
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn a_diff_preview_stays_one_while_its_file_changes_on_disk(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, mut cx) = git_workspace(cx).await;
+        let cx = &mut cx;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        // Source Control loads the diff ahead, then the agent writes the file before the click.
+        let ready = cx.update(|_, cx| {
+            load_ready_diff(
+                &project,
+                Path::new("/project/src/app.rs"),
+                &DiffBase::Uncommitted,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let ready = ready.await.expect("ready diff");
+        write_on_disk(
+            &workspace,
+            "/project/src/app.rs",
+            "fn main() {}\nagent\n",
+            cx,
+        )
+        .await;
+
+        let tab = preview(&workspace, "/project/src/app.rs", Some(ready), cx);
+        cx.run_until_parked();
+        tab.await.expect("diff tab");
+        assert_eq!(
+            diff_tabs(&workspace, cx),
+            [(PathBuf::from("/project/src/app.rs"), true)]
+        );
+
+        write_on_disk(
+            &workspace,
+            "/project/src/app.rs",
+            "fn main() {}\nagain\n",
+            cx,
+        )
+        .await;
+        assert_eq!(
+            diff_tabs(&workspace, cx),
+            [(PathBuf::from("/project/src/app.rs"), true)],
+            "the agent writing the file isn't an edit that keeps the tab"
+        );
+
+        let next = preview(&workspace, "/project/src/new.rs", None, cx);
+        cx.run_until_parked();
+        next.await.expect("diff tab");
+        assert_eq!(
+            diff_tabs(&workspace, cx),
+            [(PathBuf::from("/project/src/new.rs"), true)],
+            "the next file replaces the preview"
+        );
+    }
+
+    #[gpui::test]
+    async fn viewing_a_diff_preview_does_not_keep_it(cx: &mut gpui::TestAppContext) {
+        let (workspace, mut cx) = git_workspace(cx).await;
+        let cx = &mut cx;
+        let tab = preview(&workspace, "/project/src/app.rs", None, cx);
+        cx.run_until_parked();
+        let tab = tab.await.expect("diff tab");
+
+        tab.update_in(cx, |tab, window, cx| {
+            tab.editor.update(cx, |editor, cx| {
+                editor.move_down(&Default::default(), window, cx);
+                editor.select_all(&Default::default(), window, cx);
+                editor.expand_all_diff_hunks(&Default::default(), window, cx);
+            });
+            tab.set_mode(DiffTabMode::Edit, cx);
+            tab.set_mode(DiffTabMode::Diff, cx);
+            tab.step_change(true, window, cx);
+        });
+        cx.run_until_parked();
+        let agent = cx.new(|cx| workspace::item::test::TestItem::new(cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(agent.clone()), None, true, window, cx);
+            workspace.activate_item(&tab, true, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            diff_tabs(&workspace, cx),
+            [(PathBuf::from("/project/src/app.rs"), true)]
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&agent, true, true, window, cx);
+        });
+        let next = preview(&workspace, "/project/src/new.rs", None, cx);
+        cx.run_until_parked();
+        next.await.expect("diff tab");
+        assert_eq!(
+            diff_tabs(&workspace, cx),
+            [(PathBuf::from("/project/src/new.rs"), true)],
+            "a click with the agent tab active still replaces the diff preview"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_diff_preview_in_another_pane_is_the_one_replaced(cx: &mut gpui::TestAppContext) {
+        let (workspace, mut cx) = git_workspace(cx).await;
+        let cx = &mut cx;
+        let tab = preview(&workspace, "/project/src/app.rs", None, cx);
+        cx.run_until_parked();
+        tab.await.expect("diff tab");
+        let diff_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let agent = cx.new(|cx| workspace::item::test::TestItem::new(cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let agent_pane = workspace.split_pane(
+                diff_pane.clone(),
+                workspace::SplitDirection::Right,
+                window,
+                cx,
+            );
+            workspace.add_item(agent_pane, Box::new(agent), None, true, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let next = preview(&workspace, "/project/src/new.rs", None, cx);
+        cx.run_until_parked();
+        let next = next.await.expect("diff tab");
+        assert_eq!(
+            diff_tabs(&workspace, cx),
+            [(PathBuf::from("/project/src/new.rs"), true)]
+        );
+        let shown_in = workspace.read_with(cx, |workspace, _| workspace.pane_for(&next));
+        assert_eq!(shown_in, Some(diff_pane));
     }
 }

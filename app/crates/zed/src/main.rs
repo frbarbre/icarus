@@ -819,6 +819,9 @@ fn main() {
         icarus_ui::new_tab_menu::set_open_harness_handler(cx, |harness, workspace, window, cx| {
             agent_ui::agent_tab::open_provider_agent_tab(workspace, harness, window, cx);
         });
+        cx.set_global(agent_ui::agent_tab::TabAgentClosed(std::rc::Rc::new(
+            icarus_ui::end_closed_agent,
+        )));
         cx.set_global(agent_ui::agent_tab::TabAgentServer(std::rc::Rc::new(
             icarus_ui::remote_agent::agent_server_for_project,
         )));

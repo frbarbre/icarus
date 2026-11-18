@@ -257,6 +257,8 @@ struct State {
     provider_session: Option<String>,
     model: Option<String>,
     turns: u64,
+    /// What the first named prompt asked, for agents nobody titled.
+    prompt_title: Option<String>,
     last_activity_ms: u64,
     rate_limits: Option<Value>,
     rate_limits_at_ms: Option<u64>,
@@ -270,6 +272,13 @@ struct State {
     chosen_model: Option<String>,
     /// What the provider said it offers: `{ commands, models }`.
     capabilities: Value,
+}
+
+fn note_prompt_title(state: &mut State, data: &Value) {
+    if state.prompt_title.is_none() {
+        state.prompt_title =
+            crate::history::title_from_prompt(data["text"].as_str().unwrap_or_default());
+    }
 }
 
 /// Applies the events that carry the agent's mode, model choice and capabilities.
@@ -555,6 +564,7 @@ impl AgentThread {
             provider_session: None,
             model: None,
             turns: 0,
+            prompt_title: None,
             last_activity_ms: created_at_ms,
             rate_limits: None,
             rate_limits_at_ms: None,
@@ -575,7 +585,10 @@ impl AgentThread {
                     state.provider_session = event.data["session_id"].as_str().map(str::to_string);
                     state.model = event.data["model"].as_str().map(str::to_string);
                 }
-                "user_message" => state.turns += 1,
+                "user_message" => {
+                    state.turns += 1;
+                    note_prompt_title(&mut state, &event.data);
+                }
                 "rate_limit" => {
                     state.rate_limits = Some(event.data.clone());
                     state.rate_limits_at_ms = Some(event.at_ms);
@@ -977,6 +990,7 @@ impl AgentThread {
             "user_message" => {
                 state.state = AgentState::Working;
                 state.turns += 1;
+                note_prompt_title(&mut state, &event.data);
             }
             "turn_end" => state.state = AgentState::Idle,
             "rate_limit" => {
@@ -1096,7 +1110,11 @@ impl AgentThread {
         AgentInfo {
             id: self.id.clone(),
             provider: self.options.provider.clone(),
-            title: self.options.title.clone(),
+            title: crate::history::session_title(
+                self.options.title.as_deref(),
+                &self.options.provider,
+                state.prompt_title.clone(),
+            ),
             workspace: self.options.workspace.clone(),
             cwd: self.options.cwd.clone(),
             state: state.state,
@@ -1753,5 +1771,61 @@ mod tests {
         );
         assert_eq!(limits[0].0, "rate_limit");
         assert!(normalize(&json!({ "type": "system", "subtype": "hook_started" })).is_empty());
+    }
+
+    #[test]
+    fn an_untitled_agent_is_named_by_its_first_prompt() {
+        let options = |title: Option<&str>| AgentOptions {
+            provider: "claude".into(),
+            cwd: PathBuf::from("/tmp"),
+            workspace: None,
+            title: title.map(str::to_owned),
+            model: None,
+            bypass_permissions: true,
+            resume: None,
+            command: None,
+            env: BTreeMap::new(),
+            account: None,
+            remote_control: false,
+            permission_mode: None,
+        };
+        let prompt = |seq, text: &str| AgentEvent {
+            seq,
+            at_ms: 1,
+            kind: "user_message".into(),
+            data: json!({ "text": text }),
+        };
+        let fresh = AgentThread::new("a".into(), options(Some("Agent")), 0, None, Vec::new());
+        assert_eq!(fresh.info().title, None, "the UI names it by its harness");
+
+        let asked = AgentThread::new(
+            "b".into(),
+            options(Some("Agent")),
+            0,
+            None,
+            vec![
+                prompt(0, "/clear"),
+                prompt(
+                    1,
+                    "<context kind=\"file\">\nx\n</context>\nFix the login bug\nmore",
+                ),
+            ],
+        );
+        assert_eq!(asked.info().title.as_deref(), Some("Fix the login bug"));
+        asked.record("user_message", json!({ "text": "Something else" }));
+        assert_eq!(asked.info().title.as_deref(), Some("Fix the login bug"));
+
+        let live = AgentThread::new("c".into(), options(None), 0, None, Vec::new());
+        live.record("user_message", json!({ "text": "Write the docs" }));
+        assert_eq!(live.info().title.as_deref(), Some("Write the docs"));
+
+        let chosen = AgentThread::new(
+            "d".into(),
+            options(Some("Review #7")),
+            0,
+            None,
+            vec![prompt(0, "Look at the PR")],
+        );
+        assert_eq!(chosen.info().title.as_deref(), Some("Review #7"));
     }
 }

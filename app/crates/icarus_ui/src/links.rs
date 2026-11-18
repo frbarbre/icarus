@@ -565,7 +565,7 @@ impl WorkspaceLinks {
         let previews = self.openable_previews();
         let (title, meta) = self.preview_tooltip()?;
         let behind_head = previews.first().is_some_and(|preview| !preview.is_head);
-        let button = IconButton::new("icarus-open-preview", IconName::Eye)
+        let button = IconButton::new("icarus-open-preview", IconName::Telescope)
             .icon_size(IconSize::Small)
             .icon_color(if behind_head {
                 Color::Warning
@@ -659,7 +659,7 @@ impl Render for WorkspaceLinks {
     }
 }
 
-fn links_for_window(window: &Window, cx: &App) -> Option<Entity<WorkspaceLinks>> {
+pub fn links_for_window(window: &Window, cx: &App) -> Option<Entity<WorkspaceLinks>> {
     cx.try_global::<WorkspaceLinksByWindow>()
         .and_then(|links| links.0.get(&window.window_handle()))
         .and_then(WeakEntity::upgrade)
@@ -784,7 +784,7 @@ pub(crate) fn register(cx: &mut App) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn port(json: serde_json::Value) -> PortEntry {
@@ -893,7 +893,7 @@ mod tests {
 
     /// Bindings that reach `key` in `keymap` outside search bars: the context and the bound action;
     /// a chord that starts with `key` counts too, since it leaves the key waiting for more.
-    fn reaching(keymap: &str, key: &str) -> Vec<(String, String)> {
+    pub(crate) fn reaching(keymap: &str, key: &str) -> Vec<(String, String)> {
         let normalized = |stroke: &str| {
             let mut parts: Vec<String> = stroke.split('-').map(str::to_owned).collect();
             parts.sort_unstable();

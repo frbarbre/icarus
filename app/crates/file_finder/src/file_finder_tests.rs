@@ -1497,15 +1497,15 @@ async fn test_ignored_root_with_file_inclusions(cx: &mut TestAppContext) {
         assert_eq!(
             matches.search,
             vec![
-                rel_path("ignored-root/hi").into(),
                 rel_path("tracked-root/hi").into(),
-                rel_path("ignored-root/hiccup").into(),
+                rel_path("ignored-root/hi").into(),
                 rel_path("tracked-root/hiccup").into(),
+                rel_path("ignored-root/hiccup").into(),
                 rel_path("tracked-root/height_demo/test_1/hi_bonjour").into(),
+                rel_path("tracked-root/happiness").into(),
                 rel_path("ignored-root/height").into(),
                 rel_path("tracked-root/heights/height_1").into(),
                 rel_path("ignored-root/happiness").into(),
-                rel_path("tracked-root/happiness").into(),
             ],
             "All ignored files that were indexed are found for default ignored mode"
         );
@@ -1657,15 +1657,15 @@ async fn test_ignored_root(cx: &mut TestAppContext) {
         assert_eq!(
             matches.search,
             vec![
-                rel_path("ignored-root/hi").into(),
                 rel_path("tracked-root/hi").into(),
-                rel_path("ignored-root/hiccup").into(),
+                rel_path("ignored-root/hi").into(),
                 rel_path("tracked-root/hiccup").into(),
+                rel_path("ignored-root/hiccup").into(),
+                rel_path("tracked-root/happiness").into(),
                 rel_path("ignored-root/height").into(),
                 rel_path("ignored-root/happiness").into(),
-                rel_path("tracked-root/happiness").into(),
             ],
-            "All ignored files that were indexed are found for default ignored mode"
+            "All ignored files that were indexed are found for default ignored mode; gitignored files rank second in each tier"
         );
     });
     cx.dispatch_action(ToggleIncludeIgnored);
@@ -1682,14 +1682,14 @@ async fn test_ignored_root(cx: &mut TestAppContext) {
         assert_eq!(
             matches.search,
             vec![
-                rel_path("ignored-root/hi").into(),
                 rel_path("tracked-root/hi").into(),
-                rel_path("ignored-root/hiccup").into(),
+                rel_path("ignored-root/hi").into(),
                 rel_path("tracked-root/hiccup").into(),
+                rel_path("ignored-root/hiccup").into(),
+                rel_path("tracked-root/happiness").into(),
                 rel_path("ignored-root/height").into(),
                 rel_path("tracked-root/height").into(),
                 rel_path("ignored-root/happiness").into(),
-                rel_path("tracked-root/happiness").into(),
             ],
             "All ignored files should be found, for the toggled on ignored mode"
         );
@@ -1756,13 +1756,13 @@ async fn test_ignored_root(cx: &mut TestAppContext) {
         assert_eq!(
             matches.search,
             vec![
-                rel_path("ignored-root/hi").into(),
                 rel_path("tracked-root/hi").into(),
-                rel_path("ignored-root/hiccup").into(),
+                rel_path("ignored-root/hi").into(),
                 rel_path("tracked-root/hiccup").into(),
+                rel_path("ignored-root/hiccup").into(),
+                rel_path("tracked-root/happiness").into(),
                 rel_path("ignored-root/height").into(),
                 rel_path("ignored-root/happiness").into(),
-                rel_path("tracked-root/happiness").into(),
             ],
             "Only for the worktree with the ignored root, all indexed ignored files are found in the auto ignored mode"
         );
@@ -1782,16 +1782,16 @@ async fn test_ignored_root(cx: &mut TestAppContext) {
         assert_eq!(
             matches.search,
             vec![
-                rel_path("ignored-root/hi").into(),
                 rel_path("tracked-root/hi").into(),
-                rel_path("ignored-root/hiccup").into(),
+                rel_path("ignored-root/hi").into(),
                 rel_path("tracked-root/hiccup").into(),
+                rel_path("ignored-root/hiccup").into(),
+                rel_path("tracked-root/happiness").into(),
                 rel_path("ignored-root/height").into(),
                 rel_path("tracked-root/height").into(),
                 rel_path("tracked-root/heights/height_1").into(),
                 rel_path("tracked-root/heights/height_2").into(),
                 rel_path("ignored-root/happiness").into(),
-                rel_path("tracked-root/happiness").into(),
             ],
             "All ignored files that were indexed are found in the turned on ignored mode"
         );

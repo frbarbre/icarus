@@ -78,12 +78,12 @@ pub struct PrThread {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawAuthor {
+pub(crate) struct RawAuthor {
     #[serde(default, rename = "__typename")]
-    typename: Option<String>,
-    login: String,
+    pub(crate) typename: Option<String>,
+    pub(crate) login: String,
     #[serde(default)]
-    avatar_url: Option<String>,
+    pub(crate) avatar_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -103,7 +103,7 @@ struct RawReactors {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawReactionGroup {
+pub(crate) struct RawReactionGroup {
     content: String,
     #[serde(default)]
     viewer_has_reacted: bool,
@@ -201,7 +201,7 @@ struct Data {
     repository: Option<RawRepository>,
 }
 
-fn reactions(groups: Option<Vec<RawReactionGroup>>) -> Vec<ReactionSummary> {
+pub(crate) fn reactions(groups: Option<Vec<RawReactionGroup>>) -> Vec<ReactionSummary> {
     let mut out: Vec<(usize, ReactionSummary)> = groups
         .into_iter()
         .flatten()

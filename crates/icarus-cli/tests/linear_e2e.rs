@@ -76,10 +76,10 @@ fn write_issue(dir: &Path, identifier: &str, title: &str, state: &str) {
         "priority": 2,
         "priorityLabel": "High",
         "url": format!("https://linear.app/acme/issue/{lower}/fix-login-redirect"),
-        "branchName": format!("frederik/{lower}-fix-login-redirect"),
+        "branchName": format!("maya/{lower}-fix-login-redirect"),
         "updatedAt": "2026-11-14T10:00:00.000Z",
         "state": { "name": state, "type": "started", "color": "#f2c94c" },
-        "assignee": { "name": "Frederik", "displayName": "frederik", "avatarUrl": "https://a/f.png" },
+        "assignee": { "name": "Maya", "displayName": "maya", "avatarUrl": "https://a/f.png" },
         "labels": { "nodes": [{ "name": "Bug", "color": "#eb5757" }] },
         "team": { "key": "ABC" },
     });
@@ -153,7 +153,7 @@ async fn a_workspace_from_a_linear_issue_is_named_from_it_and_its_card_stays_cur
         created["name"], "abc-12",
         "the lowercased identifier keeps dev URLs short"
     );
-    assert_eq!(created["branch"], "frederik/abc-12-fix-login-redirect");
+    assert_eq!(created["branch"], "maya/abc-12-fix-login-redirect");
     assert_eq!(created["issue"]["provider"], "linear");
     assert_eq!(created["issue"]["id"], "ABC-12");
     assert_eq!(created["issue"]["title"], "Fix login redirect");
@@ -176,12 +176,9 @@ async fn a_workspace_from_a_linear_issue_is_named_from_it_and_its_card_stays_cur
 
     let shown = env.ok(&["issue", "show", "ABC-12"]);
     assert!(shown.contains("ABC-12  Fix login redirect"), "{shown}");
+    assert!(shown.contains("In Progress  High  @maya  [Bug]"), "{shown}");
     assert!(
-        shown.contains("In Progress  High  @frederik  [Bug]"),
-        "{shown}"
-    );
-    assert!(
-        shown.contains("branch: frederik/abc-12-fix-login-redirect"),
+        shown.contains("branch: maya/abc-12-fix-login-redirect"),
         "{shown}"
     );
     assert!(shown.contains("Users land on /home"), "{shown}");
@@ -241,10 +238,7 @@ async fn issue_search_matches_text_and_identifiers_without_leaking_the_key() {
         .filter_map(|issue| issue["identifier"].as_str())
         .collect();
     assert_eq!(identifiers, ["ABC-12", "ABC-14"]);
-    assert_eq!(
-        found[0]["branch_name"],
-        "frederik/abc-12-fix-login-redirect"
-    );
+    assert_eq!(found[0]["branch_name"], "maya/abc-12-fix-login-redirect");
 
     let by_id = env.json(&["issue", "search", "xyz-3"]);
     assert_eq!(by_id[0]["title"], "Billing export");

@@ -540,7 +540,7 @@
       "ctrl-]": "editor::Indent",
       "shift-alt-up": ["editor::AddSelectionAbove", { "skip_soft_wrap": true }], // Insert Cursor Above
       "shift-alt-down": ["editor::AddSelectionBelow", { "skip_soft_wrap": true }], // Insert Cursor Below
-      "ctrl-shift-k": "editor::DeleteLine",
+      // Icarus: Ctrl+Shift+K is Orca's Checks tab; delete line stays in the palette.
       "alt-up": "editor::MoveLineUp",
       "alt-down": "editor::MoveLineDown",
       "ctrl-alt-shift-up": "editor::DuplicateLineUp",
@@ -676,12 +676,6 @@
     },
   },
   {
-    "context": "IcarusReviewerInput > Editor",
-    "bindings": {
-      "enter": "icarus::RequestTypedReviewers",
-    },
-  },
-  {
     "context": "IcarusReply > Editor",
     "bindings": {
       "enter": "icarus::SubmitReviewComment",
@@ -767,8 +761,9 @@
       "ctrl-alt-+": ["workspace::IncreaseOpenDocksSize", { "px": 0 }],
       "shift-find": "pane::DeploySearch",
       "ctrl-shift-f": "pane::DeploySearch",
-      // Icarus: Orca's sidebar key for the PR panel; search-and-replace stays in the palette.
-      "ctrl-shift-h": "icarus::ToggleGitHubPanel",
+      // Icarus: Orca's sidebar key for the Checks tab.
+      "ctrl-shift-k": "icarus::ToggleGitHubPanel",
+      "ctrl-alt-j": "icarus::ToggleSessionHistory",
       "ctrl-shift-t": "pane::ReopenClosedItem",
       "ctrl-k ctrl-p": "workspace::ReopenLastPicker",
       "ctrl-k ctrl-s": "zed::OpenKeymap",
@@ -1028,7 +1023,6 @@
       "alt-enter": "editor::OpenExcerpts",
       "shift-enter": "editor::ExpandExcerpts",
       "ctrl-alt-enter": "icarus::RunNextAction",
-      "ctrl-shift-e": "pane::RevealInProjectPanel",
       "ctrl-f8": "editor::GoToHunk",
       "ctrl-shift-f8": "editor::GoToPreviousHunk",
       "ctrl-:": "editor::ToggleInlayHints",

@@ -249,16 +249,6 @@ fn build_layout(
             workspace.panes().len()
         );
     }
-    let agent_type = cx
-        .try_global::<AgentItemType>()
-        .map(|agent_type| agent_type.0);
-    let mut leftover_agents: Vec<EntityId> = root
-        .read(cx)
-        .items()
-        .filter(|item| Some(item.to_any_view().entity_type()) == agent_type)
-        .map(|item| item.item_id())
-        .collect();
-
     let mut build = Build {
         worktree_root,
         placed: HashSet::default(),
@@ -266,17 +256,10 @@ fn build_layout(
         actives: Vec::new(),
     };
     build.node(layout, root, workspace, window, cx);
+    // Agent tabs the layout doesn't show stay open: closing one would end its agent.
     let Build {
-        placed,
-        pending,
-        actives,
-        ..
+        pending, actives, ..
     } = build;
-
-    leftover_agents.retain(|item_id| !placed.contains(item_id));
-    for pane in workspace.panes().to_vec() {
-        close_items(&pane, &leftover_agents, window, cx);
-    }
 
     let first = workspace.center_pane_group().first_pane();
     window.focus(&first.focus_handle(cx), cx);
@@ -310,17 +293,6 @@ struct Build<'a> {
 pub struct AgentItemType(pub std::any::TypeId);
 
 impl gpui::Global for AgentItemType {}
-
-fn close_items(pane: &Entity<Pane>, item_ids: &[EntityId], window: &mut Window, cx: &mut App) {
-    pane.update(cx, |pane, cx| {
-        for item_id in item_ids {
-            if pane.items().any(|item| item.item_id() == *item_id) {
-                pane.close_item_by_id(*item_id, SaveIntent::Skip, window, cx)
-                    .detach_and_log_err(cx);
-            }
-        }
-    });
-}
 
 impl Build<'_> {
     fn node(

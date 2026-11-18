@@ -622,6 +622,15 @@ async fn workspace_lifecycle_creates_a_worktree_with_an_agent_and_lists_changes(
         .await
         .expect("list");
     assert_eq!(listed[0]["pinned"], true);
+    assert_eq!(
+        listed[0]["agents"][0]["title"],
+        format!("write:{note} hi"),
+        "an untitled agent is named by its first prompt: {listed}"
+    );
+    assert_eq!(
+        listed[0]["agents"][0]["turns"], 1,
+        "cards tell done from idle"
+    );
 
     let refused = client
         .request("workspace.remove", json!({ "id": workspace["id"] }))

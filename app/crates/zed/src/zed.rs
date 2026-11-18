@@ -788,6 +788,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
                 icarus_ui::WorkspacesPanel::load(workspace_handle.clone(), cx.clone()),
                 icarus_ui::GitHubPanel::load(workspace_handle.clone(), cx.clone()),
                 icarus_ui::SourceControlPanel::load(workspace_handle.clone(), cx.clone()),
+                icarus_ui::SessionHistoryPanel::load(workspace_handle.clone(), cx.clone()),
             )
         });
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
@@ -815,8 +816,12 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         futures::join!(
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
             async {
-                if let Some((icarus_panel, icarus_github_panel, icarus_source_control)) =
-                    icarus_panels
+                if let Some((
+                    icarus_panel,
+                    icarus_github_panel,
+                    icarus_source_control,
+                    icarus_session_history,
+                )) = icarus_panels
                 {
                     futures::join!(
                         add_panel_when_ready(icarus_panel, workspace_handle.clone(), cx.clone()),
@@ -827,6 +832,11 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
                         ),
                         add_panel_when_ready(
                             icarus_source_control,
+                            workspace_handle.clone(),
+                            cx.clone()
+                        ),
+                        add_panel_when_ready(
+                            icarus_session_history,
                             workspace_handle.clone(),
                             cx.clone()
                         ),

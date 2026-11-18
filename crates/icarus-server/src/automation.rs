@@ -377,9 +377,11 @@ impl Server {
                 ci_triage.push((project.id.clone(), triage.clone()));
             }
             let owned: Vec<Workspace> = match self.store.workspaces(Some(&project.id)) {
+                // Every listed worktree, as Orca does, adopted and discovered ones included; removing one
+                // Icarus didn't create only hides it. The main checkout has no pull request of its own.
                 Ok(list) => list
                     .into_iter()
-                    .filter(|w| w.path.starts_with(&self.workspace_root))
+                    .filter(|w| w.discovery.origin != crate::discovery::ORIGIN_PRIMARY)
                     .collect(),
                 Err(error) => {
                     errors.push(error.to_string());

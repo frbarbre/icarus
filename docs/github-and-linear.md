@@ -14,7 +14,7 @@ Settings → Integrations shows whether `gh` is signed in.
 
 A workspace's pull request is the open PR for its branch. Cards show it when the `pr` card field is on: the number, state, and a dot for its checks. The `pr-author`, `pr-diff` and `stack` fields add the author's avatar, +N −M and the stack position.
 
-The GitHub panel (right dock, ⌘⇧H; the action is `icarus::ToggleGitHubPanel`) shows the workspace's PR in full. At the top:
+The Checks panel (the right sidebar's last tab, ⌘⇧K; the action is `icarus::ToggleGitHubPanel`) shows the workspace's PR in full. At the top:
 
 - The state (Draft, Open, Queued, Merged, Closed), refresh, and a link to GitHub.
 - **Stack**: when the PR is part of a GitHub stack, every PR in it, with the current one highlighted, and a warning when the stack is out of date.
@@ -28,9 +28,8 @@ Then the sections, which work like Source Control's: click a header to collapse 
 - **Needs attention**: conflicts, failing checks, requested changes, a branch behind its base.
 - **Previews**: the PR's preview deployments.
 - **Checks**: a summary such as "1 failed · 24 passed · 18 skipped" in the header, failing and running checks listed, and the passed and skipped ones behind a toggle. The section starts collapsed while everything is green.
-- **Review**: reviewers and the review form. See [Review a pull request](review.md#review-a-pull-request).
 - **Pending review**: your queued draft comments; click one to open its line.
-- **Comments**: the open review threads, filtered by All, Humans, Bots or Unresolved. Each card shows the comments in Markdown with their reactions; `file:L42` opens the line in the diff tab. Reply, resolve, react and send the thread to an agent from the card.
+- **Comments**: the open review threads, the PR's conversation comments and the summaries of submitted reviews, newest first, filtered by All, Humans, Bots or Unresolved (comments in open threads). A review summary carries its verdict: Approved, Changes requested, Commented, Dismissed or Pending. Each card shows the comments in Markdown with their reactions; `file:L42` opens the line in the diff tab. Reply, resolve, react and send a thread to an agent from its card. A conversation comment or review summary can be reacted to, sent to an agent, and answered (a new PR comment that mentions its author, since GitHub has no replies there); your own can be edited, and your own comments deleted.
 - **Resolved**: resolved threads, collapsed at first.
 
 Files with open review threads show a comment count in the Changes list, and the diff marks their lines in the gutter.

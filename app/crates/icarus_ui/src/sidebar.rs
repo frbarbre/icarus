@@ -1,26 +1,60 @@
-//! The right sidebar as Orca has it: Explorer, Source Control and GitHub, one at a time, switched by the
-//! icons on top. It follows the active tab (FORK §29): Source Control for a diff, the Explorer for a file.
+//! The right sidebar as Orca has it: Explorer, Agents, Source Control and Checks, one at a time,
+//! switched by the icons on top, with the workspace's links and next step at the strip's right end.
+//! It follows the active tab (FORK §29): Source Control for a diff, the Explorer for a file.
 
 use std::sync::Arc;
 
 use editor::Editor;
 use gpui::{AnyElement, App, Context, Window};
-use ui::{IconButton, Tab, Tooltip, prelude::*};
+use ui::{IconButton, Indicator, Tab, Tooltip, prelude::*};
 use workspace::Workspace;
 use workspace::dock::{Dock, RightDockHeader, SharedSideDockWidth};
 
 use crate::changes_tab::SOURCE_CONTROL_PANEL;
 use crate::diff_tab::DiffTab;
+use crate::github_panel::{CheckState, GitHubPanel};
 
 /// Zed's project panel, which is the sidebar's Explorer.
 pub const EXPLORER_PANEL: &str = "Project Panel";
+/// The Checks tab: the pull request's checks and comments.
 pub const GITHUB_PANEL: &str = "IcarusGitHubPanel";
+pub use crate::session_history::SESSION_HISTORY_PANEL;
 
-/// The sidebar's panels in Orca's order, with the icon and name each shows in the switcher.
-pub const SIDEBAR_PANELS: [(&str, IconName, &str); 3] = [
-    (EXPLORER_PANEL, IconName::FileTree, "Explorer"),
-    (SOURCE_CONTROL_PANEL, IconName::GitBranch, "Source Control"),
-    (GITHUB_PANEL, IconName::PullRequest, "GitHub"),
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SidebarTab {
+    pub panel: &'static str,
+    pub icon: IconName,
+    pub label: &'static str,
+    /// The action whose key the tooltip shows, by name, since the Explorer's lives in another crate.
+    pub action: Option<&'static str>,
+}
+
+/// The sidebar's tabs in Orca's order, with Orca's icons and names.
+pub const SIDEBAR_PANELS: [SidebarTab; 4] = [
+    SidebarTab {
+        panel: EXPLORER_PANEL,
+        icon: IconName::Files,
+        label: "Explorer",
+        action: Some("project_panel::ToggleFocus"),
+    },
+    SidebarTab {
+        panel: SESSION_HISTORY_PANEL,
+        icon: IconName::AgentSessionHistory,
+        label: "Agents",
+        action: Some("icarus::ToggleSessionHistory"),
+    },
+    SidebarTab {
+        panel: SOURCE_CONTROL_PANEL,
+        icon: IconName::GitBranch,
+        label: "Source Control",
+        action: Some("icarus::ToggleSourceControlPanel"),
+    },
+    SidebarTab {
+        panel: GITHUB_PANEL,
+        icon: IconName::ListChecks,
+        label: "Checks",
+        action: Some("icarus::ToggleGitHubPanel"),
+    },
 ];
 
 /// Puts the switcher above the right dock, whose width stays put as it switches panels.
@@ -52,40 +86,109 @@ pub fn register(cx: &mut App) {
     .detach();
 }
 
-/// The switcher above the right dock, shown only while one of the sidebar's panels is the active one.
-fn render_switcher(
-    dock: &Dock,
-    _window: &mut Window,
-    cx: &mut Context<Dock>,
-) -> Option<AnyElement> {
-    let active = dock.active_panel_index()?;
-    let entries: Vec<(usize, IconName, &'static str)> = SIDEBAR_PANELS
+/// The tabs the dock holds, in strip order, with each one's panel index.
+pub fn visible_tabs(dock: &Dock, cx: &App) -> Vec<(usize, SidebarTab)> {
+    SIDEBAR_PANELS
         .iter()
-        .filter_map(|(name, icon, label)| {
-            dock.panel_index_for_persistent_name(name, cx)
-                .map(|index| (index, *icon, *label))
+        .filter_map(|tab| {
+            dock.panel_index_for_persistent_name(tab.panel, cx)
+                .map(|index| (index, *tab))
         })
-        .collect();
-    if !entries.iter().any(|(index, _, _)| *index == active) {
+        .collect()
+}
+
+fn check_dot_color(state: CheckState) -> Option<Color> {
+    match state {
+        CheckState::Success => Some(Color::Success),
+        CheckState::Failure => Some(Color::Error),
+        CheckState::Pending => Some(Color::Warning),
+        CheckState::Neutral | CheckState::Unknown => None,
+    }
+}
+
+/// The strip above the right dock, shown only while one of the sidebar's panels is the active one.
+fn render_switcher(dock: &Dock, window: &mut Window, cx: &mut Context<Dock>) -> Option<AnyElement> {
+    let active = dock.active_panel_index()?;
+    let tabs = visible_tabs(dock, cx);
+    if !tabs.iter().any(|(index, _)| *index == active) {
         return None;
     }
+    let checks = dock
+        .panel::<GitHubPanel>()
+        .and_then(|panel| panel.read(cx).checks_state())
+        .and_then(check_dot_color);
+    let links = crate::links::links_for_window(window, cx);
+    let next_action = crate::NextActionButton::for_window(window, cx);
     Some(
         h_flex()
             .h(Tab::container_height(cx))
             .flex_none()
-            .px_1p5()
-            .gap_0p5()
+            .pl_1()
+            .pr_1p5()
+            .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .children(entries.into_iter().map(|(index, icon, label)| {
-                IconButton::new(("icarus-sidebar", index), icon)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(index == active)
-                    .tooltip(Tooltip::text(label))
-                    .on_click(cx.listener(move |dock, _, window, cx| {
-                        dock.activate_panel(index, window, cx);
-                    }))
-            }))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .children(tabs.into_iter().map(|(index, tab)| {
+                        let selected = index == active;
+                        let dot = (tab.panel == GITHUB_PANEL).then_some(checks).flatten();
+                        div()
+                            .relative()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .child(
+                                IconButton::new(("icarus-sidebar", index), tab.icon)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(if selected {
+                                        Color::Default
+                                    } else {
+                                        Color::Muted
+                                    })
+                                    .tooltip(move |_window, cx| {
+                                        match tab
+                                            .action
+                                            .and_then(|name| cx.build_action(name, None).ok())
+                                        {
+                                            Some(action) => {
+                                                Tooltip::for_action(tab.label, action.as_ref(), cx)
+                                            }
+                                            None => Tooltip::simple(tab.label, cx),
+                                        }
+                                    })
+                                    .on_click(cx.listener(move |dock, _, window, cx| {
+                                        dock.activate_panel(index, window, cx);
+                                    })),
+                            )
+                            .when_some(dot, |slot, color| {
+                                slot.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(6.))
+                                        .right(px(2.))
+                                        .child(Indicator::dot().color(color)),
+                                )
+                            })
+                            .when(selected, |slot| {
+                                slot.child(
+                                    div()
+                                        .absolute()
+                                        .bottom_0()
+                                        .left(relative(0.25))
+                                        .right(relative(0.25))
+                                        .h(px(2.))
+                                        .rounded_t_sm()
+                                        .bg(cx.theme().colors().text),
+                                )
+                            })
+                    })),
+            )
+            .children(links)
+            .children(next_action)
             .into_any_element(),
     )
 }
@@ -185,6 +288,87 @@ mod tests {
                 .active_panel()
                 .map(|panel| panel.persistent_name())
         })
+    }
+
+    #[test]
+    fn the_strip_lists_orcas_tabs_in_orcas_order() {
+        let tabs: Vec<(&str, IconName)> = SIDEBAR_PANELS
+            .iter()
+            .map(|tab| (tab.label, tab.icon))
+            .collect();
+        assert_eq!(
+            tabs,
+            [
+                ("Explorer", IconName::Files),
+                ("Agents", IconName::AgentSessionHistory),
+                ("Source Control", IconName::GitBranch),
+                ("Checks", IconName::ListChecks),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_tab_key_reaches_its_panel_from_editors_terminals_and_the_composer() {
+        let mac = include_str!("../../../assets/keymaps/default-macos.json");
+        let linux = include_str!("../../../assets/keymaps/default-linux.json");
+        for (keymap, key, action) in [
+            (mac, "cmd-shift-e", "project_panel::ToggleFocus"),
+            (mac, "cmd-shift-g", "icarus::ToggleSourceControlPanel"),
+            (mac, "cmd-shift-k", "icarus::ToggleGitHubPanel"),
+            (linux, "ctrl-shift-e", "project_panel::ToggleFocus"),
+            (linux, "ctrl-shift-g", "icarus::ToggleSourceControlPanel"),
+            (linux, "ctrl-shift-k", "icarus::ToggleGitHubPanel"),
+        ] {
+            assert!(
+                SIDEBAR_PANELS.iter().any(|tab| tab.action == Some(action)),
+                "{action} isn't a tab's action"
+            );
+            // The settings window is a window of its own, with no sidebar to reach.
+            let bindings: Vec<_> = crate::links::tests::reaching(keymap, key)
+                .into_iter()
+                .filter(|(context, _)| context != "SettingsWindow")
+                .collect();
+            assert!(
+                bindings
+                    .iter()
+                    .any(|(context, bound)| context == "Workspace" && bound == action),
+                "{key} isn't bound to {action}: {bindings:?}"
+            );
+            let shadows: Vec<_> = bindings
+                .iter()
+                .filter(|(_, bound)| bound != action)
+                .collect();
+            assert!(shadows.is_empty(), "{key} is taken by {shadows:?}");
+        }
+    }
+
+    #[gpui::test]
+    async fn the_strip_shows_the_docks_tabs_in_orcas_order(cx: &mut gpui::TestAppContext) {
+        let (workspace, mut cx) = crate::diff_tab::tests::git_workspace(cx).await;
+        let cx = &mut cx;
+        workspace.update_in(cx, |workspace, window, cx| {
+            let checks = cx
+                .new(|cx| GitHubPanel::preview(workspace.weak_handle(), serde_json::json!({}), cx));
+            workspace.add_panel(checks, window, cx);
+            let source_control =
+                cx.new(|cx| crate::changes_tab::SourceControlPanel::new(workspace, window, cx));
+            workspace.add_panel(source_control, window, cx);
+            let explorer = cx.new(|cx| StandInExplorer {
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.add_panel(explorer, window, cx);
+        });
+        let labels: Vec<&str> = workspace.read_with(cx, |workspace, cx| {
+            visible_tabs(workspace.right_dock().read(cx), cx)
+                .into_iter()
+                .map(|(_, tab)| tab.label)
+                .collect()
+        });
+        assert_eq!(
+            labels,
+            ["Explorer", "Source Control", "Checks"],
+            "a tab shows only when its panel is in the dock"
+        );
     }
 
     #[gpui::test]

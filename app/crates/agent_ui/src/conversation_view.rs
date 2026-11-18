@@ -917,6 +917,20 @@ impl ConversationView {
         matches!(self.server_state, ServerState::LoadError { .. })
     }
 
+    /// Connects to the same agent and session again.
+    pub(crate) fn retry_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset(window, cx);
+    }
+
+    /// Connected but with no conversation to draw, which would otherwise render as a blank tab.
+    pub(crate) fn connected_without_thread(&self) -> bool {
+        matches!(
+            &self.server_state,
+            ServerState::Connected(connected)
+                if matches!(connected.auth_state, AuthState::Ok) && connected.active_view().is_none()
+        )
+    }
+
     pub fn as_connected_mut(&mut self) -> Option<&mut ConnectedServerState> {
         match &mut self.server_state {
             ServerState::Connected(connected) => Some(connected),

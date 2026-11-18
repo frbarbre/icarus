@@ -3,7 +3,7 @@
 //! An editor such as Zed starts this as a custom agent server. Sessions live on the Icarus server, so
 //! when the editor quits only this bridge exits; the agent keeps working and can be loaded again.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -149,8 +149,13 @@ pub fn event_to_updates(event: &Value, mode: Mode, tools: &mut ToolState) -> Vec
     let data = &event["data"];
     let top_level = data["parent"].is_null();
     match event["kind"].as_str().unwrap_or_default() {
-        "user_message" if mode == Mode::Replay => {
-            vec![json!({ "sessionUpdate": "user_message_chunk", "content": text_block(data["text"].as_str().unwrap_or_default()) })]
+        "user_message" => {
+            let mut update = json!({ "sessionUpdate": "user_message_chunk", "content": text_block(data["text"].as_str().unwrap_or_default()) });
+            // Without an id, back-to-back prompts would merge into one message in the editor.
+            if let Some(seq) = event["seq"].as_u64() {
+                update["messageId"] = json!(format!("icarus-user-{seq}"));
+            }
+            vec![update]
         }
         "text_delta" if mode == Mode::Live && top_level => {
             vec![json!({ "sessionUpdate": "agent_message_chunk", "content": text_block(data["text"].as_str().unwrap_or_default()) })]
@@ -413,6 +418,8 @@ struct Bridge {
     provider: Option<String>,
     /// Prompts waiting for their turn to end, by session id.
     pending: Mutex<HashMap<String, (Value, bool)>>,
+    /// Prompts this editor sent and already shows, by session id, until the server logs them.
+    own_prompts: Mutex<HashMap<String, VecDeque<String>>>,
     tools: Mutex<HashMap<String, ToolState>>,
     /// Attached sessions and the next event each expects, to resume from after a reconnect.
     attached: Mutex<HashMap<String, u64>>,
@@ -715,6 +722,21 @@ impl Bridge {
             .await;
     }
 
+    async fn take_own_prompt(&self, session_id: &str, text: Option<&str>) -> bool {
+        let mut own = self.own_prompts.lock().await;
+        let Some(sent) = own.get_mut(session_id) else {
+            return false;
+        };
+        let Some(index) = sent.iter().position(|prompt| Some(prompt.as_str()) == text) else {
+            return false;
+        };
+        sent.remove(index);
+        if sent.is_empty() {
+            own.remove(session_id);
+        }
+        true
+    }
+
     async fn on_agent_event(&self, session_id: &str, agent_event: &Value) {
         let session_id = session_id.to_owned();
         if let Some(seq) = agent_event["seq"].as_u64()
@@ -725,7 +747,14 @@ impl Bridge {
             }
             *next = seq + 1;
         }
-        let updates = {
+        let kind = agent_event["kind"].as_str().unwrap_or_default();
+        let own_prompt = kind == "user_message"
+            && self
+                .take_own_prompt(&session_id, agent_event["data"]["text"].as_str())
+                .await;
+        let updates = if own_prompt {
+            Vec::new()
+        } else {
             let mut tools = self.tools.lock().await;
             let state = tools.entry(session_id.clone()).or_default();
             event_to_updates(agent_event, Mode::Live, state)
@@ -733,7 +762,6 @@ impl Bridge {
         for update in updates {
             self.notify(&session_id, update);
         }
-        let kind = agent_event["kind"].as_str().unwrap_or_default();
         if kind == "user_message"
             && let Some(text) = agent_event["data"]["text"].as_str()
         {
@@ -868,13 +896,22 @@ impl Bridge {
                         );
                         return Ok(Some(json!({ "stopReason": "end_turn" })));
                     }
+                    let text = text.join("\n\n");
                     self.pending.lock().await.insert(session_id.clone(), (id.clone(), false));
+                    // Registered before sending: the server logs the prompt before it answers.
+                    self.own_prompts
+                        .lock()
+                        .await
+                        .entry(session_id.clone())
+                        .or_default()
+                        .push_back(text.clone());
                     if let Err(error) = self
                         .client
-                        .request("agent.send", json!({ "id": session_id, "text": text.join("\n\n"), "images": images }))
+                        .request("agent.send", json!({ "id": session_id, "text": text, "images": images }))
                         .await
                     {
                         self.pending.lock().await.remove(&session_id);
+                        self.take_own_prompt(&session_id, Some(&text)).await;
                         return Err(error);
                     }
                     Ok(None)
@@ -916,6 +953,7 @@ where
         out,
         provider,
         pending: Mutex::default(),
+        own_prompts: Mutex::default(),
         tools: Mutex::default(),
         attached: Mutex::default(),
         claimed: Mutex::default(),
@@ -1028,6 +1066,19 @@ mod tests {
             parse(&user[0]),
             SessionUpdate::UserMessageChunk(_)
         ));
+        let live = event_to_updates(
+            &json!({ "seq": 7, "kind": "user_message", "data": { "text": "from a button" } }),
+            Mode::Live,
+            &mut tools,
+        );
+        let SessionUpdate::UserMessageChunk(chunk) = parse(&live[0]) else {
+            panic!("a prompt from elsewhere shows live: {live:?}");
+        };
+        assert_eq!(
+            chunk.message_id.map(|id| id.to_string()).as_deref(),
+            Some("icarus-user-7"),
+            "each prompt is its own message"
+        );
         let message = event_to_updates(
             &json!({ "kind": "message", "data": { "content": [{ "type": "thinking", "thinking": "plan" }, { "type": "text", "text": "done" }], "parent": null } }),
             Mode::Replay,

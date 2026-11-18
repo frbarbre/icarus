@@ -1,7 +1,7 @@
 //! Session history (plan D8): past agent threads from `threads/<id>.jsonl`, searchable over what the
 //! user asked and what the agent answered, and resumable as live agents.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,9 @@ use crate::server::{Server, params, rpc, to_value};
 const DEFAULT_LIMIT: usize = 50;
 const PROMPT_PREVIEW_CHARS: usize = 200;
 const SNIPPET_RADIUS: usize = 60;
+const LAST_MESSAGE_CHARS: usize = 300;
+/// As the agent bridge caps a title taken from a prompt.
+const TITLE_CHARS: usize = 200;
 
 /// One saved session, folded from its log as the log grows.
 #[derive(Debug, Clone, Default)]
@@ -32,6 +35,12 @@ struct Indexed {
     first_prompt: Option<String>,
     provider_session: Option<String>,
     killed: bool,
+    prompt_title: Option<String>,
+    last_message: Option<String>,
+    messages: u64,
+    /// The tool calls whose subagents wrote into this session.
+    subagents: BTreeSet<String>,
+    model: Option<String>,
     /// Lowercased user prompts and top-level assistant text, one entry per message.
     texts: Vec<String>,
     /// Bytes of the log already folded in.
@@ -46,21 +55,51 @@ impl Indexed {
                 if let Some(session) = event.data["session_id"].as_str() {
                     self.provider_session = Some(session.to_owned());
                 }
+                if let Some(model) = event.data["model"].as_str() {
+                    self.model = Some(model.to_owned());
+                }
+            }
+            "model_changed" => {
+                if let Some(model) = event.data["model"].as_str() {
+                    self.model = Some(model.to_owned());
+                }
             }
             "user_message" => {
                 self.turns += 1;
+                self.messages += 1;
                 let text = event.data["text"].as_str().unwrap_or_default();
                 if self.first_prompt.is_none() {
                     self.first_prompt = Some(text.chars().take(PROMPT_PREVIEW_CHARS).collect());
                 }
+                if self.prompt_title.is_none() {
+                    self.prompt_title = title_from_prompt(text);
+                }
                 self.texts.push(text.to_lowercase());
             }
             "message" if event.data["parent"].is_null() => {
+                self.messages += 1;
+                let mut said = Vec::new();
                 for block in event.data["content"].as_array().into_iter().flatten() {
                     if block["type"] == "text" {
-                        self.texts
-                            .push(block["text"].as_str().unwrap_or_default().to_lowercase());
+                        let text = block["text"].as_str().unwrap_or_default();
+                        self.texts.push(text.to_lowercase());
+                        if !text.trim().is_empty() {
+                            said.push(text.trim());
+                        }
                     }
+                }
+                if !said.is_empty() {
+                    let text = said.join(" ");
+                    let mut last: String = text.chars().take(LAST_MESSAGE_CHARS).collect();
+                    if last.len() < text.len() {
+                        last.push('…');
+                    }
+                    self.last_message = Some(last);
+                }
+            }
+            "message" | "tool_call" => {
+                if let Some(parent) = event.data["parent"].as_str() {
+                    self.subagents.insert(parent.to_owned());
                 }
             }
             "kill" => self.killed = true,
@@ -94,6 +133,59 @@ impl Indexed {
             .map_or(text.len(), |(i, _)| at + i);
         Some(text[start..end].replace('\n', " "))
     }
+
+    fn title(&self) -> Option<String> {
+        session_title(
+            self.title.as_deref(),
+            &self.provider,
+            self.prompt_title.clone(),
+        )
+    }
+}
+
+/// A title someone chose (an automation, a launch), else the one the agent tab takes from the
+/// first prompt; new sessions are all titled "Agent".
+pub(crate) fn session_title(
+    chosen: Option<&str>,
+    provider: &str,
+    prompt_title: Option<String>,
+) -> Option<String> {
+    let provider = match provider {
+        "claude" => "Claude",
+        "codex" => "Codex",
+        other => other,
+    };
+    chosen
+        .map(str::trim)
+        .filter(|title| !title.is_empty() && *title != "Agent" && *title != provider)
+        .map(str::to_owned)
+        .or(prompt_title)
+}
+
+/// The first line of what was asked, without attached context, as the agent bridge names a tab.
+/// Slash commands name nothing.
+pub(crate) fn title_from_prompt(text: &str) -> Option<String> {
+    let mut in_context = false;
+    let line = text.lines().map(str::trim).find(|line| {
+        if in_context {
+            in_context = *line != "</context>";
+            return false;
+        }
+        if line.starts_with("<context ") {
+            in_context = !line.ends_with("</context>");
+            return false;
+        }
+        !line.is_empty()
+    })?;
+    if line.starts_with('/') {
+        return None;
+    }
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= TITLE_CHARS {
+        return Some(collapsed);
+    }
+    let cut: String = collapsed.chars().take(TITLE_CHARS - 1).collect();
+    Some(format!("{}…", cut.trim_end()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,12 +194,20 @@ pub struct HistoryEntry {
     pub title: Option<String>,
     pub provider: String,
     pub workspace: Option<String>,
+    /// The workspace's project, by name.
+    pub project: Option<String>,
     pub account: Option<String>,
     pub cwd: String,
     pub first_prompt: Option<String>,
+    /// The agent's last top-level answer, cut short.
+    pub last_message: Option<String>,
     pub created_at_ms: u64,
     pub last_activity_ms: u64,
     pub turns: u64,
+    /// User prompts and top-level agent messages.
+    pub messages: u64,
+    pub subagents: u64,
+    pub model: Option<String>,
     /// `sleeping`, `exited` or `killed`.
     pub state: String,
     pub resumable: bool,
@@ -118,6 +218,11 @@ pub struct HistoryEntry {
 #[derive(Debug, Default, Deserialize)]
 pub struct HistoryQuery {
     pub workspace: Option<String>,
+    /// A project (id, name or remote), or any of its workspaces: sessions of all its workspaces.
+    pub project: Option<String>,
+    /// The project's workspace ids, resolved from `project`.
+    #[serde(skip)]
+    pub workspaces: Option<BTreeSet<String>>,
     pub query: Option<String>,
     pub limit: Option<usize>,
     /// Only sessions whose last activity is older than this (ms), for paging.
@@ -193,6 +298,13 @@ impl HistoryIndex {
             .filter(|e| e.turns > 0)
             .filter(|e| query.workspace.is_none() || e.workspace == query.workspace)
             .filter(|e| {
+                query.workspaces.as_ref().is_none_or(|workspaces| {
+                    e.workspace
+                        .as_ref()
+                        .is_some_and(|id| workspaces.contains(id))
+                })
+            })
+            .filter(|e| {
                 query
                     .before
                     .is_none_or(|before| e.last_activity_ms < before)
@@ -210,17 +322,22 @@ impl HistoryIndex {
                 let snippet = e.matching(&terms)?;
                 Some(HistoryEntry {
                     id: e.id.clone(),
-                    title: e.title.clone(),
+                    title: e.title(),
                     provider: e.provider.clone(),
                     workspace: e.workspace.clone(),
+                    project: None,
                     account: e.account.clone(),
                     cwd: e.cwd.clone(),
                     first_prompt: e.first_prompt.clone(),
+                    last_message: e.last_message.clone(),
                     created_at_ms: e.created_at_ms,
                     last_activity_ms: info.map_or(e.last_activity_ms, |i| {
                         i.last_activity_ms.max(e.last_activity_ms)
                     }),
                     turns: e.turns,
+                    messages: e.messages,
+                    subagents: e.subagents.len() as u64,
+                    model: e.model.clone(),
                     state: state.to_owned(),
                     resumable: e.provider_session.is_some(),
                     snippet: (!terms.is_empty()).then_some(snippet),
@@ -246,14 +363,17 @@ fn fold_log(entry: &mut Indexed, path: &Path) {
     };
     if len < entry.offset {
         // A log that shrank was rewritten; start over.
-        let fresh = Indexed {
-            texts: Vec::new(),
-            offset: 0,
-            turns: 0,
-            first_prompt: None,
-            ..entry.clone()
+        *entry = Indexed {
+            id: std::mem::take(&mut entry.id),
+            provider: std::mem::take(&mut entry.provider),
+            title: entry.title.take(),
+            workspace: entry.workspace.take(),
+            account: entry.account.take(),
+            cwd: std::mem::take(&mut entry.cwd),
+            created_at_ms: entry.created_at_ms,
+            last_activity_ms: entry.created_at_ms,
+            ..Indexed::default()
         };
-        *entry = fresh;
     }
     if len == entry.offset || file.seek(SeekFrom::Start(entry.offset)).is_err() {
         return;
@@ -288,6 +408,25 @@ impl Server {
                 {
                     query.workspace = Some(workspace.id);
                 }
+                if let Some(key) = &query.project {
+                    let project = match self.store.project(key) {
+                        Ok(Some(project)) => Some(project.id),
+                        _ => self
+                            .store
+                            .workspace(key)
+                            .ok()
+                            .flatten()
+                            .map(|w| w.project_id),
+                    };
+                    query.workspaces = Some(
+                        project
+                            .and_then(|id| self.store.all_workspaces(Some(&id)).ok())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|w| w.id)
+                            .collect(),
+                    );
+                }
                 let Some(dir) = self.agents.log_dir().map(Path::to_path_buf) else {
                     return Ok(json!([]));
                 };
@@ -298,12 +437,34 @@ impl Server {
                     .into_iter()
                     .map(|info| (info.id.clone(), info))
                     .collect();
-                let entries = tokio::task::spawn_blocking(move || {
+                let mut entries = tokio::task::spawn_blocking(move || {
                     index.refresh(&dir);
                     index.query(&query, &live)
                 })
                 .await
                 .map_err(|e| rpc("internal", e))?;
+                if entries.iter().any(|e| e.workspace.is_some()) {
+                    let projects: HashMap<String, String> = self
+                        .store
+                        .projects()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|p| (p.id, p.name))
+                        .collect();
+                    let names: HashMap<String, String> = self
+                        .store
+                        .all_workspaces(None)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|w| Some((w.id, projects.get(&w.project_id)?.clone())))
+                        .collect();
+                    for entry in &mut entries {
+                        entry.project = entry
+                            .workspace
+                            .as_ref()
+                            .and_then(|id| names.get(id).cloned());
+                    }
+                }
                 to_value(entries)
             }
             "agent.resume" => {
@@ -465,6 +626,85 @@ mod tests {
         );
         assert_eq!(page.len(), 1);
         assert!(page[0].last_activity_ms < all[0].last_activity_ms);
+    }
+
+    #[test]
+    fn entries_carry_title_last_answer_counts_and_model() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut events = vec![(
+            "session",
+            json!({ "session_id": "s1", "model": "claude-opus" }),
+        )];
+        events.extend(turn(
+            "<context path=\"a.rs\">\nfn a() {}\n</context>\nFix the login\nredirect please",
+            "Looking",
+        ));
+        events.extend([
+            (
+                "tool_call",
+                json!({ "id": "t1", "name": "Task", "input": {}, "parent": null }),
+            ),
+            (
+                "message",
+                json!({ "parent": "t1", "content": [{ "type": "text", "text": "sub" }] }),
+            ),
+            (
+                "tool_call",
+                json!({ "id": "t2", "name": "Read", "input": {}, "parent": "t1" }),
+            ),
+            (
+                "message",
+                json!({ "parent": "t3", "content": [{ "type": "text", "text": "other sub" }] }),
+            ),
+            ("model_changed", json!({ "model": "claude-sonnet" })),
+        ]);
+        let long = "word ".repeat(100);
+        events.extend(turn("/compact", &long));
+        write_session(dir.path(), "agent-a", Some("ws-1"), &events);
+        write_session(dir.path(), "agent-b", Some("ws-2"), &turn("Bump", "Done"));
+        write_session(dir.path(), "agent-c", Some("ws-3"), &turn("Other", "Done"));
+        let index = HistoryIndex::default();
+        index.refresh(dir.path());
+        let live = BTreeMap::new();
+        let all = index.query(&HistoryQuery::default(), &live);
+        let a = all.iter().find(|e| e.id == "agent-a").expect("agent-a");
+        assert_eq!(
+            a.title.as_deref(),
+            Some("Fix the login"),
+            "the first prompt's first line, without context, names an untitled session"
+        );
+        assert_eq!(a.messages, 4, "two prompts and two top-level answers");
+        assert_eq!(a.subagents, 2);
+        assert_eq!(a.model.as_deref(), Some("claude-sonnet"));
+        let last = a.last_message.as_deref().expect("last message");
+        assert!(last.starts_with("word word") && last.ends_with('…'));
+        assert_eq!(last.chars().count(), LAST_MESSAGE_CHARS + 1);
+
+        let project = index.query(
+            &HistoryQuery {
+                workspaces: Some(BTreeSet::from(["ws-1".to_owned(), "ws-2".to_owned()])),
+                ..HistoryQuery::default()
+            },
+            &live,
+        );
+        let mut found = ids(&project);
+        found.sort();
+        assert_eq!(found, ["agent-a", "agent-b"]);
+    }
+
+    #[test]
+    fn a_chosen_title_wins_over_the_prompt() {
+        let dir = tempfile::tempdir().expect("dir");
+        write_session(dir.path(), "agent-a", None, &turn("Fix it", "ok"));
+        let meta_path = dir.path().join("agent-a.meta.json");
+        let mut meta: Value =
+            serde_json::from_slice(&std::fs::read(&meta_path).expect("meta")).expect("json");
+        meta["options"]["title"] = json!("Nightly triage");
+        std::fs::write(&meta_path, meta.to_string()).expect("meta");
+        let index = HistoryIndex::default();
+        index.refresh(dir.path());
+        let entry = &index.query(&HistoryQuery::default(), &BTreeMap::new())[0];
+        assert_eq!(entry.title.as_deref(), Some("Nightly triage"));
     }
 
     #[test]

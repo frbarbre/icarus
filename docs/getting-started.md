@@ -100,7 +100,7 @@ See [Workspaces](workspaces.md) for start points, scripts and the sidebar.
 | Centre panes | Agent tabs, diff tabs, files, terminals and browser tabs. Split and drag them like any Zed tab. |
 | Composer (bottom of the centre) | Types into the active agent tab, or the last agent you used. See [Agents](using-agents.md). |
 | Source Control panel (right) | The workspace's changes against its base, agent turns and commits. See [Review](review.md#source-control). |
-| GitHub panel (right) | The pull request: status, stack, merge queue, checks, reviewers, previews and the Review section. See [GitHub and Linear](github-and-linear.md). |
+| Checks panel (right) | The pull request: status, stack, merge queue, checks, previews and comments. The Review section is in Source Control. See [GitHub and Linear](github-and-linear.md). |
 | Title bar | The next-action button (Create PR, Commit & push, Merge, …), and buttons for the running frontend and the PR's preview. |
 | Status bar | The notification bell, the agent account's usage meter, and the active agent's Remote Control state. |
 

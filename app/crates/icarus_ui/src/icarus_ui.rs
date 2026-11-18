@@ -30,6 +30,7 @@ pub mod review;
 pub mod routing;
 pub mod sections;
 pub mod servers;
+pub mod session_history;
 pub mod settings_view;
 pub mod sidebar;
 pub mod source_control_settings;
@@ -45,6 +46,7 @@ pub use diff_tab::DiffTab;
 pub use github_panel::GitHubPanel;
 pub use links::{PortEntry, PortsStore, PreviewDeployment, WorkspaceLinks};
 pub use next_action::{NextAction, NextActionButton};
+pub use session_history::SessionHistoryPanel;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -379,6 +381,19 @@ fn request_agent_tab(
     {
         Some(handler) => handler(agent_id, pane, focus, workspace, window, cx),
         None => log::error!("no open-agent handler registered"),
+    }
+}
+
+/// Ends the server session of an agent whose tab was closed, as Orca does; history can resume it.
+pub fn end_closed_agent(agent_id: String, cx: &mut App) {
+    let client = routing::client_for_agent(&agent_id, cx);
+    if let Some(kill) = review::request(
+        client,
+        "agent.kill",
+        serde_json::json!({ "id": agent_id, "remove": true }),
+        cx,
+    ) {
+        kill.detach_and_log_err(cx);
     }
 }
 
@@ -1098,6 +1113,7 @@ pub fn init(cx: &mut App) {
     github_panel::register(cx);
     browser::register(cx);
     changes_tab::register(cx);
+    file_finder::set_changed_files_source(changes_tab::SourceControlChanges, cx);
     diff_tab::register(cx);
     review::attach_notes_to_file_editors(cx);
     sidebar::register(cx);
@@ -1106,6 +1122,7 @@ pub fn init(cx: &mut App) {
     terminals::register(cx);
     notifications::register(cx);
     history::register(cx);
+    session_history::register(cx);
     accounts::register(cx);
     remote_control::register(cx);
     settings_view::register(cx);
@@ -1400,8 +1417,10 @@ pub struct WorkspacesPanel {
     filter: Option<Entity<editor::Editor>>,
     filter_query: String,
     selection: cards::CardSelection,
-    /// Cards whose agent row is opened into the full agent list.
-    expanded_agents: HashSet<String>,
+    card_list: Entity<cards::CardList>,
+    _card_list_observation: Subscription,
+    reveal_shown_card: bool,
+    revealing_shown_card: bool,
     _filter_subscription: Option<Subscription>,
     _poll: Task<()>,
     _ports_observation: Subscription,
@@ -1491,6 +1510,7 @@ impl WorkspacesPanel {
         let ports = PortsStore::global(cx);
         let watch = enabled(cx);
         let remote = servers::store(cx, watch);
+        let card_list = cx.new(|_| cards::CardList::default());
         Self {
             focus_handle: cx.focus_handle(),
             workspace,
@@ -1507,7 +1527,10 @@ impl WorkspacesPanel {
             filter: None,
             filter_query: String::new(),
             selection: cards::CardSelection::default(),
-            expanded_agents: HashSet::default(),
+            _card_list_observation: cx.observe(&card_list, |_, _, cx| cx.notify()),
+            card_list,
+            reveal_shown_card: false,
+            revealing_shown_card: false,
             _filter_subscription: None,
             _poll: Task::ready(()),
             _ports_observation: cx.observe(&ports, |_, _, cx| cx.notify()),
@@ -2581,6 +2604,9 @@ impl WorkspacesPanel {
             })
             .when_some(agents, |card, agents| {
                 card.child(div().pl(cards::CARD_INDENT).child(agents))
+            })
+            .when(shown && self.revealing_shown_card, |card| {
+                card.relative().child(self.render_reveal_probe())
             });
         self.with_card_menu(routing::ServerRef::Primary, workspace, card, cx)
     }
@@ -3072,8 +3098,55 @@ fn show_add_server_help(workspace: WeakEntity<Workspace>, cx: &mut App) {
         .log_err();
 }
 
+impl WorkspacesPanel {
+    fn join_window_card_list(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let list = cards::window_card_list(window.window_handle().window_id(), &self.card_list, cx);
+        if list != self.card_list {
+            self._card_list_observation = cx.observe(&list, |_, _, cx| cx.notify());
+            self.card_list = list;
+        }
+        let workspace = self.workspace.entity_id();
+        if self
+            .card_list
+            .update(cx, |list, _| list.show_workspace(workspace))
+        {
+            self.reveal_shown_card = true;
+        }
+        // The worktree may still be loading, so its card isn't marked as shown yet.
+        self.revealing_shown_card = self.reveal_shown_card
+            && self
+                .workspaces
+                .iter()
+                .any(|workspace| self.shows_workspace(&workspace.path, cx));
+        if self.revealing_shown_card {
+            self.reveal_shown_card = false;
+        }
+    }
+
+    fn render_reveal_probe(&self) -> impl IntoElement {
+        let list = self.card_list.downgrade();
+        gpui::canvas(
+            move |card, _, cx| {
+                let Some(list) = list.upgrade() else {
+                    return;
+                };
+                if list.read(cx).reveal(card) {
+                    // The new offset only applies to the next frame.
+                    cx.defer(move |cx| list.update(cx, |_, cx| cx.notify()));
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+}
+
 impl Render for WorkspacesPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.join_window_card_list(window, cx);
         let filter = self.render_filter(window, cx);
         // Same height as the centre's tab bar, so the two bottom borders line up across the window.
         let header = h_flex()
@@ -3105,8 +3178,13 @@ impl Render for WorkspacesPanel {
             });
         let mut body = v_flex()
             .id("icarus-workspaces")
+            .debug_selector(|| "icarus-workspaces".into())
             .size_full()
             .overflow_y_scroll()
+            // A panel that has no cards yet would clamp the shared position to the top.
+            .when(!self.workspaces.is_empty(), |body| {
+                body.track_scroll(&self.card_list.read(cx).scroll)
+            })
             .p_1()
             .gap_2();
         if let Connection::Unavailable(reason) = &self.connection {
@@ -3715,6 +3793,137 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn switching_worktrees_keeps_the_cards_list_where_it_was(cx: &mut gpui::TestAppContext) {
+        let app_state = cx.update(|cx| {
+            let app_state = AppState::test(cx);
+            AppState::set_global(app_state.clone(), cx);
+            <project::DisableAiSettings as settings::Settings>::register(cx);
+            editor::init(cx);
+            project::trusted_worktrees::init(Default::default(), cx);
+            worktree_trust::register(cx);
+            worktree_trust::add_icarus_workspace_path(Path::new("/project"), cx);
+            app_state
+        });
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree("/project", serde_json::json!({ "a.txt": "" }))
+            .await;
+        let mut summaries = vec![summary("main", "/project", None)];
+        for index in 0..16 {
+            let path = format!("/w/feature{index}");
+            fs.insert_tree(&path, serde_json::json!({ "b.txt": "" }))
+                .await;
+            summaries.push(summary(&format!("feature{index}"), &path, None));
+        }
+        cx.update(|cx| {
+            let summaries = summaries.clone();
+            cx.observe_new(move |workspace: &mut Workspace, window, cx| {
+                let Some(window) = window else {
+                    return;
+                };
+                let summaries = summaries.clone();
+                let handle = workspace.weak_handle();
+                let panel = cx.new(|cx| {
+                    let mut panel = WorkspacesPanel::preview(handle, cx);
+                    panel.set_workspaces(summaries, cx);
+                    panel
+                });
+                workspace.add_panel(panel, window, cx);
+                workspace.open_panel::<WorkspacesPanel>(window, cx);
+            })
+            .detach();
+        });
+        let project =
+            project::Project::test(app_state.fs.clone(), [Path::new("/project")], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(500.)));
+        cx.run_until_parked();
+
+        let list = cx
+            .debug_bounds("icarus-workspaces")
+            .expect("the cards list is drawn");
+        let card = |name: &str, cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds(format!("card:ws-{name}").leak())
+        };
+        let in_view = |bounds: gpui::Bounds<Pixels>| {
+            bounds.top() >= list.top() && bounds.bottom() <= list.bottom()
+        };
+        cx.simulate_event(gpui::ScrollEvent {
+            position: list.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-400.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        let names: Vec<String> = (0..16).map(|index| format!("feature{index}")).collect();
+        let clicked = names
+            .iter()
+            .find(|name| {
+                card(name, &mut cx)
+                    .is_some_and(|bounds| in_view(bounds) && bounds.center().y > list.center().y)
+            })
+            .cloned()
+            .expect("a card is in the lower half of the list after scrolling");
+        let before = card(&clicked, &mut cx).expect("drawn");
+        let scroll_offset = |cx: &mut gpui::VisualTestContext| {
+            window
+                .read_with(cx, |multi_workspace, cx| {
+                    let panel = multi_workspace
+                        .workspace()
+                        .read(cx)
+                        .panel::<WorkspacesPanel>(cx)
+                        .expect("the shown workspace has the panel");
+                    panel.read(cx).card_list.read(cx).scroll.offset()
+                })
+                .expect("window")
+        };
+        let offset_before = scroll_offset(&mut cx);
+        assert!(offset_before.y < px(0.), "the list scrolled");
+
+        cx.simulate_click(before.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let shown = window
+            .read_with(&cx, |multi_workspace, cx| {
+                multi_workspace.workspace().read(cx).root_paths(cx)[0].to_path_buf()
+            })
+            .expect("window");
+        assert_eq!(shown, PathBuf::from(format!("/w/{clicked}")));
+        assert_eq!(
+            scroll_offset(&mut cx),
+            offset_before,
+            "the list keeps its scroll"
+        );
+        assert_eq!(
+            card(&clicked, &mut cx),
+            Some(before),
+            "the clicked card stays where it was"
+        );
+
+        cx.simulate_event(gpui::ScrollEvent {
+            position: list.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(4000.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        let hidden = names
+            .iter()
+            .rev()
+            .filter(|name| **name != clicked)
+            .find(|name| card(name, &mut cx).is_some_and(|bounds| bounds.top() > list.bottom()))
+            .cloned()
+            .expect("a card is below the fold at the top of the list");
+        cx.update(|_, cx| show_workspace(PathBuf::from(format!("/w/{hidden}")), cx));
+        cx.run_until_parked();
+        // The test window draws only when it handles input.
+        for _ in 0..2 {
+            cx.simulate_mouse_move(list.center(), None, gpui::Modifiers::none());
+        }
+        assert!(
+            card(&hidden, &mut cx).is_some_and(in_view),
+            "a worktree switched to from elsewhere scrolls its card into view"
+        );
+    }
+
+    #[gpui::test]
     async fn a_clicked_workspace_shows_before_its_files_are_scanned(cx: &mut gpui::TestAppContext) {
         let app_state = cx.update(|cx| {
             let app_state = AppState::test(cx);
@@ -3842,5 +4051,19 @@ mod tests {
     fn rejects_composer_attach_payload_without_attachment() {
         let payload = serde_json::json!({ "workspace_path": "/w/feature" });
         assert!(serde_json::from_value::<ComposerAttachRequest>(payload).is_err());
+    }
+
+    #[gpui::test]
+    fn a_closed_agent_tab_ends_its_session_on_the_server(cx: &mut gpui::TestAppContext) {
+        let calls = cx.update(|cx| {
+            let calls = review::tests::stub_rpc(cx, |_, _| Ok(serde_json::Value::Null));
+            end_closed_agent("agent-1".into(), cx);
+            calls
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            review::tests::calls_to(&calls, "agent.kill"),
+            [serde_json::json!({ "id": "agent-1", "remove": true })]
+        );
     }
 }

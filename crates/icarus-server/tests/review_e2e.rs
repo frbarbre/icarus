@@ -1015,3 +1015,155 @@ async fn a_workspace_without_a_pull_request_says_so() {
         "a path inside the workspace resolves it: {by_path}"
     );
 }
+
+#[tokio::test]
+async fn the_panel_reads_threads_issue_comments_and_review_summaries() {
+    let world = World::new(json!({ "viewer": "me" })).await;
+    let (ws, _path, head) = world.workspace("rev").await;
+    let mut fx = fixtures(&head, "alice");
+    fx["review_threads"] = json!({ "5": [
+        { "id": "PRRT_1", "isResolved": false, "path": "src/a.rs", "line": 4, "subjectType": "LINE",
+          "comments": { "nodes": [
+            { "id": "PRRC_1", "body": "Inline", "createdAt": "2026-11-10T10:00:00Z",
+              "author": { "__typename": "Bot", "login": "farm-bot" } } ] } }
+    ] });
+    let mut comments: Vec<Value> = (1..=120)
+        .map(|id| {
+            json!({ "id": format!("IC_{id}"), "databaseId": id, "body": format!("ci {id}"),
+            "createdAt": "2026-11-11T10:00:00Z", "url": "u",
+            "author": { "__typename": "Bot", "login": "farm-bot" } })
+        })
+        .collect();
+    comments.push(json!({ "id": "IC_mine", "databaseId": 500, "body": "mine",
+        "createdAt": "2026-11-13T10:00:00Z", "viewerCanUpdate": true, "viewerCanDelete": true,
+        "author": { "__typename": "User", "login": "me" },
+        "reactionGroups": [{ "content": "HEART", "viewerHasReacted": true,
+            "reactors": { "totalCount": 1, "nodes": [{ "login": "me" }] } }] }));
+    fx["issue_comments"] = json!({ "5": comments });
+    fx["reviews"] = json!({ "5": [
+        { "id": "PRR_1", "databaseId": 1, "state": "APPROVED", "body": "", "submittedAt": "2026-11-12T10:00:00Z",
+          "author": { "__typename": "User", "login": "bob" } },
+        { "id": "PRR_2", "databaseId": 2, "state": "CHANGES_REQUESTED", "body": "Needs tests",
+          "submittedAt": "2026-11-09T10:00:00Z", "author": { "__typename": "User", "login": "carol" } }
+    ] });
+    world.set_fixtures(&fx);
+
+    let diff = world
+        .request("review.threads", json!({ "workspace": ws }))
+        .await;
+    assert!(diff.get("conversation").is_none());
+    assert!(
+        world.requests("graphql PrConversation").is_empty(),
+        "diff tabs don't pay for the conversation"
+    );
+
+    let panel = world
+        .request(
+            "review.threads",
+            json!({ "workspace": ws, "conversation": true }),
+        )
+        .await;
+    assert_eq!(panel["threads"].as_array().expect("threads").len(), 1);
+    let conversation = panel["conversation"].as_array().expect("conversation");
+    assert_eq!(
+        conversation.len(),
+        122,
+        "both comment pages and one review summary"
+    );
+    assert_eq!(conversation[0]["id"], "PRR_2");
+    assert_eq!(conversation[0]["kind"], "review");
+    assert_eq!(conversation[0]["review_state"], "CHANGES_REQUESTED");
+    assert_eq!(conversation[1]["author"], "farm-bot");
+    assert_eq!(conversation[1]["is_bot"], true);
+    let bots = conversation.iter().filter(|c| c["is_bot"] == true).count();
+    assert_eq!(bots, 120);
+    let mine = conversation.last().expect("mine");
+    assert_eq!(mine["reactions"][0]["viewer_has_reacted"], true);
+    assert_eq!(mine["viewer_can_delete"], true);
+    let pages = world.requests("graphql PrConversation");
+    assert_eq!(pages.len(), 2, "one request per page, both lists at once");
+    assert_eq!(pages[1]["variables"]["withReviews"], false);
+
+    let conversation_of = |reply: &Value, id: &str| -> Option<Value> {
+        reply["conversation"]
+            .as_array()
+            .and_then(|all| all.iter().find(|c| c["id"] == id).cloned())
+    };
+    let panel_again = || {
+        world.request(
+            "review.threads",
+            json!({ "workspace": ws, "conversation": true }),
+        )
+    };
+
+    world
+        .request(
+            "review.react",
+            json!({ "subject": "IC_mine", "reaction": "heart", "remove": true }),
+        )
+        .await;
+    world
+        .request(
+            "review.react",
+            json!({ "subject": "PRR_2", "reaction": "+1" }),
+        )
+        .await;
+    world
+        .request(
+            "review.conversation.post",
+            json!({ "workspace": ws, "body": "Added them.", "reply_to": "carol" }),
+        )
+        .await;
+    assert_eq!(
+        world.requests("POST repos/acme/widgets/issues/5/comments")[0]["body"]["body"],
+        "@carol Added them."
+    );
+    world
+        .request(
+            "review.comment.edit_published",
+            json!({ "workspace": ws, "kind": "issue_comment", "id": 500, "body": "mine, edited" }),
+        )
+        .await;
+    world
+        .request(
+            "review.comment.edit_published",
+            json!({ "workspace": ws, "kind": "review_summary", "node_id": "PRR_2", "body": "Needs more tests" }),
+        )
+        .await;
+    world
+        .request(
+            "review.comment.delete_published",
+            json!({ "workspace": ws, "kind": "issue_comment", "id": 1 }),
+        )
+        .await;
+
+    let after = panel_again().await;
+    assert_eq!(
+        world.requests("graphql PrConversation").len(),
+        2,
+        "mutations patch the cache instead of reading the conversation again"
+    );
+    let mine = conversation_of(&after, "IC_mine").expect("mine");
+    assert_eq!(mine["body"], "mine, edited");
+    assert_eq!(mine["reactions"], json!([]));
+    let review = conversation_of(&after, "PRR_2").expect("review");
+    assert_eq!(review["body"], "Needs more tests");
+    assert_eq!(review["reactions"][0]["viewer_has_reacted"], true);
+    assert!(conversation_of(&after, "IC_1").is_none(), "deleted");
+    let posted = conversation_of(&after, "IC_now").expect("posted");
+    assert_eq!(posted["body"], "@carol Added them.");
+    assert_eq!(posted["author"], "me");
+
+    let attached = world
+        .request(
+            "attach.pr_comments",
+            json!({ "workspace": ws, "ids": ["PRR_2"] }),
+        )
+        .await;
+    let attachments = attached["attachments"].as_array().expect("attachments");
+    assert_eq!(attachments.len(), 1);
+    assert!(
+        attachments[0].to_string().contains("Needs more tests"),
+        "{attachments:?}"
+    );
+}

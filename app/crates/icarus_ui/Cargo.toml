@@ -33,6 +33,7 @@ icarus-protocol = { path = "../../../crates/icarus-protocol" }
 icarus-settings = { path = "../../../crates/icarus-settings" }
 editor.workspace = true
 extension_host.workspace = true
+file_finder.workspace = true
 git_ui.workspace = true
 language.workspace = true
 log.workspace = true
@@ -48,6 +49,7 @@ schemars.workspace = true
 task.workspace = true
 terminal.workspace = true
 terminal_view.workspace = true
+theme.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true

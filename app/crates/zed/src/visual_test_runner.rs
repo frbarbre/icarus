@@ -413,6 +413,8 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         return capture_icarus_docs_screenshots(app_state.clone(), &mut cx, PathBuf::from(dir));
     }
 
+    // Agent spinners rotate on the GPU by wall-clock time; hold them at their first frame.
+    cx.update(|cx| cx.set_reduce_motion(true));
     println!("\n--- Icarus: icarus_workspaces_panel ---");
     let icarus_result =
         run_icarus_workspaces_panel_test(workspace_window, &mut cx, update_baseline);
@@ -483,6 +485,19 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             }
         }
     }
+    println!("\n--- Icarus: icarus_card_agent_states ---");
+    for (name, result) in
+        run_icarus_card_agent_states_tests(workspace_window, &mut cx, update_baseline)
+    {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
     println!("\n--- Icarus: icarus_workspaces_stack ---");
     for (name, result) in
         run_icarus_workspaces_stack_tests(workspace_window, &mut cx, update_baseline)
@@ -509,6 +524,22 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     }
     println!("\n--- Icarus: icarus_quick_commands ---");
     for (name, result) in run_icarus_quick_commands_tests(&mut cx, update_baseline) {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\n--- Icarus: icarus_quick_open_text ---");
+    for (name, result) in run_icarus_quick_open_text_tests(
+        app_state.clone(),
+        workspace_window,
+        &mut cx,
+        update_baseline,
+    ) {
         match result {
             Ok(TestResult::Passed) => passed += 1,
             Ok(TestResult::BaselineUpdated(_)) => updated += 1,
@@ -547,6 +578,7 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             }
         }
     }
+    cx.update(|cx| cx.set_reduce_motion(false));
     if std::env::var("ICARUS_VISUAL_ONLY").is_ok() {
         println!("\nIcarus visual tests: {passed} passed, {updated} updated, {failed} failed");
         return if failed > 0 {
@@ -942,7 +974,7 @@ fn icarus_preview_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
                 None,
                 &["working", "idle"],
             ),
-            "frederik",
+            "maya",
         ),
         with_setup(
             card(
@@ -988,7 +1020,7 @@ fn icarus_github_fixture() -> serde_json::Value {
                 "number": 811,
                 "title": "Billing export API",
                 "url": "https://github.com/acme/billing/pull/811",
-                "author": "frederik",
+                "author": "maya",
                 "state": "OPEN",
                 "is_draft": false,
                 "head_ref_name": "billing-api",
@@ -1041,7 +1073,7 @@ fn icarus_github_fixture() -> serde_json::Value {
                     { "id": "C1", "author": "maria", "created_at": "2026-11-15T11:51:00Z",
                       "body": "**Rounding**: totals are summed before rounding, so `EUR` exports drift by a cent.\n\n- round each line first\n- then sum",
                       "reactions": [{ "content": "+1", "count": 2, "viewer_has_reacted": true }] },
-                    { "id": "C2", "author": "frederik", "created_at": "2026-11-15T11:58:00Z",
+                    { "id": "C2", "author": "maya", "created_at": "2026-11-15T11:58:00Z",
                       "body": "Good catch, fixing. Before and after:\n\n<img width=\"400\" alt=\"Rounded totals\" src=\"https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555\" />" },
                 ],
             },
@@ -1147,7 +1179,7 @@ fn icarus_review_fixture() -> serde_json::Value {
                 "merge_state_status": "CLEAN",
                 "review_decision": "REVIEW_REQUIRED",
                 "requested_reviewers": [
-                    { "kind": "user", "login": "frederik" },
+                    { "kind": "user", "login": "maya" },
                     { "kind": "team", "slug": "acme/payments" },
                 ],
                 "latest_reviews": [
@@ -1163,7 +1195,7 @@ fn icarus_review_fixture() -> serde_json::Value {
         "review": {
             "workspace": "ws-billing-api",
             "pr": { "repo": "acme/billing", "number": 811, "base_ref_name": "main", "author": "devon" },
-            "viewer": "frederik",
+            "viewer": "maya",
             "standing": "pending",
             "verdicts": ["comment", "request-changes", "approve"],
             "can_submit": { "comment": true, "request-changes": true, "approve": true },
@@ -1181,6 +1213,153 @@ fn icarus_review_fixture() -> serde_json::Value {
             "summary": "Two small things, otherwise good.",
         },
     })
+}
+
+/// The pull request in the user's Orca screenshot of Source Control, for a side-by-side comparison.
+fn icarus_orca_review_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "now": "2026-11-15T12:00:00Z",
+        "current": "ws-e-7154",
+        "workspaces": [
+            { "id": "ws-e-7154", "path": "/tmp/icarus-preview/e-7154", "branch": "feature/e-7154-renderfailederror-render_url" },
+        ],
+        "pr_status": {
+            "known": true,
+            "pull_request": {
+                "repo": { "owner": "acme", "name": "app" },
+                "number": 4209,
+                "title": "RenderFailedError render_url",
+                "url": "https://github.com/acme/app/pull/4209",
+                "author": "maya",
+                "state": "OPEN",
+                "head_ref_name": "feature/e-7154-renderfailederror-render_url",
+                "base_ref_name": "main",
+                "latest_reviews": [{ "login": "Vitaliy-Steffensen", "state": "APPROVED" }],
+                "checks": [],
+                "updated_at": "2026-11-15T11:48:00Z",
+            },
+        },
+        "review": {
+            "workspace": "ws-e-7154",
+            "pr": { "repo": "acme/app", "number": 4209, "base_ref_name": "main", "author": "maya" },
+            "viewer": "maya",
+            "verdicts": ["comment"],
+            "can_submit": { "comment": false },
+            "base": {
+                "selected": "whole", "default": "whole",
+                "options": [{ "value": "whole", "label": "main · target branch", "available": true }],
+            },
+            "drafts": [],
+            "summary": "",
+        },
+    })
+}
+
+/// Source Control with the PR header and Review section, reading the PR from a Checks panel that
+/// stays in the background. The dock is widened to the Orca screenshot's sidebar for the frame.
+fn show_icarus_review_in_source_control(
+    workspace_window: WindowHandle<Workspace>,
+    fixture: serde_json::Value,
+    cx: &mut VisualTestAppContext,
+) -> Result<(
+    Entity<icarus_ui::GitHubPanel>,
+    Entity<icarus_ui::changes_tab::SourceControlPanel>,
+    (
+        Option<workspace::dock::PanelSizeState>,
+        Entity<icarus_ui::NextActionButton>,
+    ),
+)> {
+    use icarus_ui::changes_tab::{ChangesScope, Listing, SourceControlPanel};
+
+    let listing: Listing = serde_json::from_value(serde_json::json!({
+        "compare": { "status": "ready", "base": "origin/main", "ahead": 1, "behind": 4 },
+        "rows": [
+            { "path": "apps/backend/domain/render_sample_broken_frames.py", "status": "modified",
+              "removed": 6, "committed": true },
+        ],
+        "totals": { "files": 1, "added": 0, "removed": 6 },
+        "unfiltered": { "files": 1, "added": 0, "removed": 6 },
+    }))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    let turns = serde_json::from_value(serde_json::json!([
+        { "name": "t1", "files": 1, "added": 0, "removed": 6,
+          "meta": { "prompt": "TO THE HARNESS CALL THE BRANCH THIS feature/e-7154-renderfailederror-render_url",
+                    "agentId": "a", "provider": "claude", "completedAt": now_ms.saturating_sub(4 * 3_600_000) } },
+    ]))?;
+    let branch = fixture["workspaces"][0]["branch"].clone();
+    let sync = serde_json::from_value(serde_json::json!({
+        "branch": branch, "upstream": null, "published": true, "ahead": 0, "behind": 0,
+    }))?;
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            let weak = workspace.weak_handle();
+            let checks = cx.new(|cx| icarus_ui::GitHubPanel::preview(weak, fixture, cx));
+            workspace.add_panel(checks.clone(), window, cx);
+            let source_control = cx.new(|cx| {
+                let mut panel = SourceControlPanel::preview(listing, ChangesScope::Base, None, cx);
+                panel.set_pull_request_panel(&checks);
+                panel.set_git_preview(turns, sync, cx);
+                panel
+            });
+            workspace.add_panel(source_control.clone(), window, cx);
+            workspace.open_panel::<SourceControlPanel>(window, cx);
+            // Orca's screenshot has the next step at the strip's right end.
+            let next = cx.new(|_| {
+                icarus_ui::NextActionButton::preview(icarus_ui::NextAction {
+                    kind: "merge".into(),
+                    label: "Merge when ready".into(),
+                    agent_step: false,
+                })
+            });
+            icarus_ui::NextActionButton::show_in_window(&next, window, cx);
+            let width = workspace.right_dock().read(cx).active_panel_size();
+            // On the dock alone, so the width isn't saved for later windows.
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.set_panel_size_state(
+                    &source_control,
+                    workspace::dock::PanelSizeState {
+                        size: Some(px(412.)),
+                        flex: None,
+                    },
+                    cx,
+                )
+            });
+            (checks, source_control, (width, next))
+        })
+        .and_then(|panels| {
+            cx.run_until_parked();
+            // The Review section is created on first render; draw once more so its editors fill in.
+            cx.update_window(workspace_window.into(), |_, window, _| window.refresh())?;
+            cx.run_until_parked();
+            Ok(panels)
+        })
+}
+
+fn hide_icarus_source_control(
+    workspace_window: WindowHandle<Workspace>,
+    checks: Entity<icarus_ui::GitHubPanel>,
+    source_control: Entity<icarus_ui::changes_tab::SourceControlPanel>,
+    (width, _next): (
+        Option<workspace::dock::PanelSizeState>,
+        Entity<icarus_ui::NextActionButton>,
+    ),
+    cx: &mut VisualTestAppContext,
+) {
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            if let Some(width) = width {
+                workspace.right_dock().update(cx, |dock, cx| {
+                    dock.set_panel_size_state(&source_control, width, cx)
+                });
+            }
+            workspace.remove_panel(&source_control, window, cx);
+            workspace.remove_panel(&checks, window, cx);
+        })
+        .log_err();
+    cx.run_until_parked();
 }
 
 fn icarus_github_empty_fixture() -> serde_json::Value {
@@ -1218,6 +1397,8 @@ fn run_icarus_github_panel_tests(
     update_baseline: bool,
 ) -> Vec<(&'static str, Result<TestResult>)> {
     let mut results = Vec::new();
+    // The right sidebar's tab strip, as the app draws it above Checks and Source Control.
+    cx.update(icarus_ui::sidebar::install_switcher);
     let show = |fixture: serde_json::Value, cx: &mut VisualTestAppContext| {
         workspace_window.update(cx, |workspace, window, cx| {
             let weak = workspace.weak_handle();
@@ -1302,6 +1483,17 @@ fn run_icarus_github_panel_tests(
     comments["collapsed"] = serde_json::json!({
         "pr-attention": true, "pr-previews": true, "pr-checks": true, "pr-review": true,
     });
+    comments["conversation"] = serde_json::json!([
+        { "id": "R1", "kind": "review", "author": "devon", "review_state": "CHANGES_REQUESTED",
+          "created_at": "2026-11-15T11:59:00Z", "body": "The CSV header still says `amount`; rename it to `total` before this ships." },
+        { "id": "I1", "kind": "comment", "author": "deploy-preview", "is_bot": true,
+          "created_at": "2026-11-15T11:55:00Z", "body": "Preview ready at **billing-api.preview.acme.dev**.",
+          "reactions": [{ "content": "rocket", "count": 1 }] },
+        { "id": "R2", "kind": "review", "author": "maria", "review_state": "APPROVED",
+          "created_at": "2026-11-15T11:30:00Z", "body": "Looks good once the rounding is fixed." },
+        { "id": "R3", "kind": "review", "author": "maya", "review_state": "COMMENTED",
+          "created_at": "2026-11-15T11:20:00Z", "body": "Answered inline." },
+    ]);
     match show(comments, cx) {
         Ok(panel) => {
             panel.update(cx, |panel, cx| panel.set_stack_expanded(false, cx));
@@ -1318,14 +1510,46 @@ fn run_icarus_github_panel_tests(
         Err(error) => results.push(("icarus_github_panel_comments", Err(error))),
     }
 
-    match show(icarus_review_fixture(), cx) {
+    let mut conversation = icarus_github_fixture();
+    conversation["collapsed"] = serde_json::json!({
+        "pr-attention": true, "pr-previews": true, "pr-checks": true, "pr-review": true,
+    });
+    conversation["threads"] = serde_json::json!([]);
+    conversation["conversation"] = serde_json::json!([
+        { "id": "V1", "kind": "comment", "author": "deploy-preview", "is_bot": true,
+          "created_at": "2026-11-15T11:58:00Z", "body": "Preview ready at **billing-api.preview.acme.dev**.",
+          "url": "https://github.com/acme/billing/pull/811#issuecomment-1",
+          "reactions": [{ "content": "rocket", "count": 2, "viewer_has_reacted": true }] },
+        { "id": "V6", "kind": "comment", "database_id": 6, "author": "maya",
+          "created_at": "2026-11-15T11:55:00Z", "body": "Rebased on the new schema.",
+          "viewer_can_update": true, "viewer_can_delete": true },
+        { "id": "V2", "kind": "review", "author": "maria", "review_state": "APPROVED",
+          "created_at": "2026-11-15T11:50:00Z", "body": "Ship it." },
+        { "id": "V3", "kind": "review", "author": "devon", "review_state": "COMMENTED",
+          "created_at": "2026-11-15T11:40:00Z", "body": "One question inline." },
+        { "id": "V4", "kind": "review", "author": "sam", "review_state": "DISMISSED",
+          "created_at": "2026-11-15T11:30:00Z", "body": "Superseded by the new schema." },
+        { "id": "V5", "kind": "review", "author": "maya", "review_state": "PENDING",
+          "created_at": "2026-11-15T11:20:00Z", "body": "Draft notes." },
+    ]);
+    match show(conversation, cx) {
         Ok(panel) => {
+            panel.update(cx, |panel, cx| panel.set_stack_expanded(false, cx));
             cx.run_until_parked();
-            // The Review section is created on first render; draw once more so its editors fill in.
-            workspace_window
-                .update(cx, |_, window, _| window.refresh())
-                .log_err();
-            cx.run_until_parked();
+            results.extend(run_icarus_dark_and_light(
+                "icarus_github_panel_conversation",
+                "icarus_github_panel_conversation_light",
+                workspace_window.into(),
+                cx,
+                update_baseline,
+            ));
+            hide(panel, cx);
+        }
+        Err(error) => results.push(("icarus_github_panel_conversation", Err(error))),
+    }
+
+    match show_icarus_review_in_source_control(workspace_window, icarus_review_fixture(), cx) {
+        Ok((checks, source_control, width)) => {
             results.extend(run_icarus_dark_and_light(
                 "icarus_review_section",
                 "icarus_review_section_light",
@@ -1333,9 +1557,52 @@ fn run_icarus_github_panel_tests(
                 cx,
                 update_baseline,
             ));
-            hide(panel, cx);
+            hide_icarus_source_control(workspace_window, checks, source_control, width, cx);
         }
         Err(error) => results.push(("icarus_review_section", Err(error))),
+    }
+
+    match show_icarus_review_in_source_control(workspace_window, icarus_orca_review_fixture(), cx) {
+        Ok((checks, source_control, width)) => {
+            results.extend(run_icarus_dark_and_light(
+                "icarus_source_control_review",
+                "icarus_source_control_review_light",
+                workspace_window.into(),
+                cx,
+                update_baseline,
+            ));
+            let section = checks.read_with(cx, |checks, _| checks.review_section().cloned());
+            if let Some(section) = section {
+                section.update(cx, |section, _| {
+                    section.set_preview_candidates(icarus_ui::review::reviewer_candidates_from(
+                        &serde_json::json!({
+                            "suggested": [{ "login": "martin-holm", "name": "Martin Holm" }],
+                            "everyone": [
+                                { "login": "tobias-monster", "name": "Tobias Mønster" },
+                                { "login": "ana-lind" },
+                            ],
+                        }),
+                    ))
+                });
+                workspace_window
+                    .update(cx, |_, window, cx| {
+                        icarus_ui::review::ReviewSection::open_reviewer_picker(&section, window, cx)
+                    })
+                    .log_err();
+                cx.run_until_parked();
+                results.extend(run_icarus_dark_and_light(
+                    "icarus_reviewer_picker",
+                    "icarus_reviewer_picker_light",
+                    workspace_window.into(),
+                    cx,
+                    update_baseline,
+                ));
+                section.update(cx, |section, cx| section.close_reviewer_picker(cx));
+                cx.run_until_parked();
+            }
+            hide_icarus_source_control(workspace_window, checks, source_control, width, cx);
+        }
+        Err(error) => results.push(("icarus_source_control_review", Err(error))),
     }
 
     match show(icarus_github_empty_fixture(), cx) {
@@ -1354,6 +1621,10 @@ fn run_icarus_github_panel_tests(
         }
         Err(error) => results.push(("icarus_github_panel_empty", Err(error))),
     }
+    // The strip's shared dock width is app-wide; later windows start from their own panels' sizes.
+    cx.update(|cx| {
+        cx.remove_global::<workspace::dock::SharedSideDockWidth>();
+    });
     results
 }
 
@@ -1572,7 +1843,7 @@ fn run_icarus_notifications_and_history_tests(
         turns,
         state: "sleeping".into(),
         resumable: true,
-        snippet: None,
+        ..HistoryEntry::default()
     };
     let mut entries = vec![
         entry(
@@ -1636,7 +1907,117 @@ fn run_icarus_notifications_and_history_tests(
         }
         Err(error) => results.push(("icarus_agent_history", Err(error))),
     }
+    results.extend(run_icarus_session_history_tests(cx, update_baseline));
     results
+}
+
+fn run_icarus_session_history_tests(
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    use icarus_ui::history::{HistoryEntry, HistorySource};
+    use icarus_ui::session_history::SessionHistoryPanel;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    let hours_ago = |hours: u64| now_ms.saturating_sub(hours * 3_600_000);
+    let entries = vec![
+        HistoryEntry {
+            id: "agent-1".into(),
+            title: Some("E-7287 browser-cancel render failures".into()),
+            provider: "claude".into(),
+            workspace: Some("ws-1".into()),
+            project: Some("flowbase".into()),
+            last_message: Some(
+                "I opened the draft PR: https://github.com/acme/flowbase/pull/4211 It has one \
+                 commit with the cancel handling and a regression test for the render queue."
+                    .into(),
+            ),
+            created_at_ms: hours_ago(5),
+            last_activity_ms: hours_ago(2),
+            messages: 33,
+            model: Some("claude-opus-5-5".into()),
+            state: "sleeping".into(),
+            resumable: true,
+            ..HistoryEntry::default()
+        },
+        HistoryEntry {
+            id: "agent-2".into(),
+            title: Some("E-7287 renders fail on browser cancel".into()),
+            provider: "claude".into(),
+            workspace: Some("ws-1".into()),
+            project: Some("flowbase".into()),
+            last_message: Some(
+                "The fix is in and tested. Nothing is committed: the changes are in the working \
+                 tree for you to review. ## What changed"
+                    .into(),
+            ),
+            created_at_ms: hours_ago(6),
+            last_activity_ms: hours_ago(3),
+            messages: 105,
+            subagents: 2,
+            model: Some("claude-opus-5-5".into()),
+            state: "exited".into(),
+            resumable: true,
+            ..HistoryEntry::default()
+        },
+        HistoryEntry {
+            id: "agent-3".into(),
+            title: Some("Bump the render worker's dependencies".into()),
+            provider: "codex".into(),
+            workspace: Some("ws-1".into()),
+            project: Some("flowbase".into()),
+            last_message: Some("Updated serde and tokio; the test suite passes.".into()),
+            created_at_ms: hours_ago(30),
+            last_activity_ms: hours_ago(26),
+            messages: 6,
+            model: Some("gpt-5.5".into()),
+            state: "killed".into(),
+            resumable: true,
+            ..HistoryEntry::default()
+        },
+    ];
+    let source = HistorySource {
+        search: std::rc::Rc::new(move |_, _| gpui::Task::ready(Ok(entries.clone()))),
+        workspaces: std::rc::Rc::new(|_| {
+            let mut names = collections::HashMap::default();
+            names.insert("ws-1".into(), ("E-7287".into(), PathBuf::from("/w/e-7287")));
+            gpui::Task::ready(Ok(names))
+        }),
+        resume: std::rc::Rc::new(|_, _, _| {}),
+    };
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(360.0), px(560.0)),
+        })),
+        focus: false,
+        show: false,
+        ..Default::default()
+    };
+    match cx.update(|cx| {
+        cx.open_window(options, |window, cx| {
+            cx.new(|cx| {
+                SessionHistoryPanel::preview(source, PathBuf::from("/w/e-7287"), window, cx)
+            })
+        })
+    }) {
+        Ok(panel) => {
+            cx.run_until_parked();
+            let results = run_icarus_dark_and_light(
+                "icarus_session_history",
+                "icarus_session_history_light",
+                panel.into(),
+                cx,
+                update_baseline,
+            );
+            cx.update_window(panel.into(), |_, window, _cx| window.remove_window())
+                .log_err();
+            results
+        }
+        Err(error) => vec![("icarus_session_history", Err(error))],
+    }
 }
 
 fn run_icarus_workspace_ports_tests(
@@ -1739,6 +2120,132 @@ impl gpui::Render for IcarusQuickCommandsPreview {
                 .child(self.button.clone()),
         )
     }
+}
+
+/// Quick Open in `%` mode: each matching file, then its matches with the hit highlighted.
+fn run_icarus_quick_open_text_tests(
+    app_state: Arc<AppState>,
+    main_window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    use picker::PickerDelegate as _;
+
+    let project = match main_window.read_with(cx, |workspace, _| workspace.project().clone()) {
+        Ok(project) => project,
+        Err(error) => return vec![("icarus_quick_open_text", Err(error))],
+    };
+    // Only a MultiWorkspace draws the modal layer, so the finder gets a window of its own.
+    let window = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(960.0), px(600.0)),
+                })),
+                focus: false,
+                show: false,
+                ..Default::default()
+            },
+            |window, cx| {
+                let workspace =
+                    cx.new(|cx| Workspace::new(None, project, app_state.clone(), window, cx));
+                cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+            },
+        )
+    });
+    let window: WindowHandle<MultiWorkspace> = match window {
+        Ok(window) => window,
+        Err(error) => return vec![("icarus_quick_open_text", Err(error))],
+    };
+    let workspace = match window.read_with(cx, |multi, _| multi.workspace().clone()) {
+        Ok(workspace) => workspace,
+        Err(error) => return vec![("icarus_quick_open_text", Err(error))],
+    };
+
+    let finder = |cx: &mut VisualTestAppContext| {
+        cx.update(|cx| {
+            workspace
+                .read(cx)
+                .active_modal::<file_finder::FileFinder>(cx)
+        })
+    };
+    let settle = |cx: &mut VisualTestAppContext| {
+        cx.background_executor.allow_parking();
+        std::thread::sleep(Duration::from_millis(20));
+        cx.advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+        cx.background_executor.forbid_parking();
+    };
+
+    // A hidden window has no focused dispatch path, so call the action handler directly.
+    if let Err(error) = window.update(cx, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            file_finder::FileFinder::toggle(
+                workspace,
+                &workspace::ToggleFileFinder::default(),
+                window,
+                cx,
+            );
+        });
+    }) {
+        return vec![("icarus_quick_open_text", Err(error))];
+    }
+    let mut opened = None;
+    for _ in 0..40 {
+        settle(cx);
+        opened = finder(cx);
+        if opened.is_some() {
+            break;
+        }
+    }
+    let Some(opened) = opened else {
+        return vec![(
+            "icarus_quick_open_text",
+            Err(anyhow::anyhow!("Quick Open did not open")),
+        )];
+    };
+    let picker = cx.update(|cx| opened.read(cx).picker().clone());
+    if let Err(error) = window.update(cx, |_, window, cx| {
+        picker.update(cx, |picker, cx| picker.set_query("%hello", window, cx));
+    }) {
+        return vec![("icarus_quick_open_text", Err(error))];
+    }
+    let mut stable_rounds = 0;
+    let mut last_count = 0;
+    for _ in 0..80 {
+        settle(cx);
+        let count = cx.update(|cx| picker.read(cx).delegate.match_count());
+        if count > 0 && count == last_count {
+            stable_rounds += 1;
+            if stable_rounds >= 5 {
+                break;
+            }
+        } else {
+            stable_rounds = 0;
+        }
+        last_count = count;
+    }
+    if last_count == 0 {
+        return vec![(
+            "icarus_quick_open_text",
+            Err(anyhow::anyhow!("text search found no matches")),
+        )];
+    }
+
+    let results = run_icarus_dark_and_light(
+        "icarus_quick_open_text",
+        "icarus_quick_open_text_light",
+        window.into(),
+        cx,
+        update_baseline,
+    );
+    cx.update(|cx| opened.update(cx, |_, cx| cx.emit(gpui::DismissEvent)));
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _cx| window.remove_window())
+        .log_err();
+    cx.run_until_parked();
+    results
 }
 
 /// The title bar's Run split button with its quick commands menu open: search, the project's
@@ -2053,6 +2560,87 @@ fn run_icarus_current_card_tests(
     let results = run_icarus_dark_and_light(
         "icarus_workspace_card_current",
         "icarus_workspace_card_current_light",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            workspace.remove_panel(&panel, window, cx);
+        })
+        .log_err();
+    results
+}
+
+/// Cards with an agent in every state the server reports: one listing them by session title, one
+/// collapsed to Orca's state-grouped summary pill.
+#[cfg(target_os = "macos")]
+fn run_icarus_card_agent_states_tests(
+    workspace_window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    let agent =
+        |id: &str, state: &str, turns: u64, provider: &str, title: &str| icarus_ui::AgentSummary {
+            id: id.into(),
+            title: Some(title.into()),
+            state: state.into(),
+            provider: provider.into(),
+            turns,
+            last_activity_ms: 0,
+        };
+    let panel = workspace_window.update(cx, |workspace, window, cx| {
+        if let Some(previous) = workspace.panel::<icarus_ui::WorkspacesPanel>(cx) {
+            workspace.remove_panel(&previous, window, cx);
+        }
+        let mut workspaces: Vec<_> = icarus_preview_workspaces()
+            .into_iter()
+            .filter(|workspace| matches!(workspace.name.as_str(), "abc-101" | "abc-77"))
+            .collect();
+        for card in &mut workspaces {
+            card.status = None;
+            card.agents = if card.name == "abc-101" {
+                vec![
+                    agent(
+                        "a1",
+                        "working",
+                        1,
+                        "claude",
+                        "Fix the login redirect after the session expires",
+                    ),
+                    agent("a2", "idle", 2, "claude", "Ready for review"),
+                    agent("a3", "idle", 0, "codex", "Agent"),
+                    agent("a4", "sleeping", 3, "claude", "Nightly triage"),
+                    agent("a5", "exited", 1, "claude", "Spike the cache layer"),
+                ]
+            } else {
+                vec![
+                    agent("b1", "working", 1, "claude", "Agent"),
+                    agent("b2", "working", 1, "codex", "Agent"),
+                    agent("b3", "idle", 1, "claude", "Agent"),
+                    agent("b4", "idle", 0, "claude", "Agent"),
+                    agent("b5", "sleeping", 2, "claude", "Agent"),
+                ]
+            };
+        }
+        let weak = workspace.weak_handle();
+        let panel = cx.new(|cx| icarus_ui::WorkspacesPanel::preview(weak, cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_workspaces(workspaces, cx);
+            panel.toggle_agents("ws-abc-101", cx);
+        });
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<icarus_ui::WorkspacesPanel>(window, cx);
+        panel
+    });
+    let panel = match panel {
+        Ok(panel) => panel,
+        Err(error) => return vec![("icarus_card_agent_states", Err(error))],
+    };
+    cx.run_until_parked();
+    let results = run_icarus_dark_and_light(
+        "icarus_card_agent_states",
+        "icarus_card_agent_states_light",
         workspace_window.into(),
         cx,
         update_baseline,
@@ -3709,6 +4297,26 @@ fn run_icarus_agent_tabs_screens(
                 )),
                 Err(error) => results.push(("icarus_new_tab_menu_search", Err(error))),
             }
+            match show_icarus_agent_tab_states(window, cx) {
+                Ok(()) => results.extend(run_icarus_dark_and_light(
+                    "icarus_agent_tab_states",
+                    "icarus_agent_tab_states_light",
+                    window.into(),
+                    cx,
+                    update_baseline,
+                )),
+                Err(error) => results.push(("icarus_agent_tab_states", Err(error))),
+            }
+            match show_icarus_empty_pane(window, cx) {
+                Ok(()) => results.extend(run_icarus_dark_and_light(
+                    "icarus_empty_pane",
+                    "icarus_empty_pane_light",
+                    window.into(),
+                    cx,
+                    update_baseline,
+                )),
+                Err(error) => results.push(("icarus_empty_pane", Err(error))),
+            }
             window
                 .update(cx, |workspace, _window, cx| {
                     let project = workspace.project().clone();
@@ -3728,6 +4336,96 @@ fn run_icarus_agent_tabs_screens(
         }
         Err(error) => vec![("icarus_agent_tabs", Err(error))],
     }
+}
+
+/// The first agent waiting on a permission answer and the second one working, with the menu closed.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn show_icarus_agent_tab_states(
+    window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+) -> Result<()> {
+    use agent_ui::agent_tab::AgentTab;
+
+    let pane = window.update(cx, |workspace, _, _| workspace.active_pane().clone())?;
+    if let Some(picker) = cx.read(|cx| icarus_ui::new_tab_menu::open_menu(&pane, cx)) {
+        picker.update(cx, |_, cx| cx.emit(gpui::DismissEvent));
+        cx.run_until_parked();
+    }
+    let tabs: Vec<_> = window.update(cx, |workspace, _, cx| {
+        workspace.items_of_type::<AgentTab>(cx).collect()
+    })?;
+    let threads = tabs
+        .iter()
+        .map(|tab| {
+            cx.read(|cx| {
+                tab.read(cx)
+                    .thread_view(cx)
+                    .map(|view| view.read(cx).thread.clone())
+            })
+            .context("agent tab did not connect")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let [asking, working] = threads.as_slice() else {
+        anyhow::bail!("expected two agent tabs");
+    };
+    for (thread, prompt) in [
+        (working, "Write the docs for the redirect"),
+        (asking, "Also cover the expired-token case"),
+    ] {
+        let submission = thread.update(cx, |thread, cx| thread.send(vec![prompt.into()], cx));
+        cx.foreground_executor
+            .spawn(async move { submission.response.await.log_err() })
+            .detach();
+    }
+    cx.run_until_parked();
+    let permission = asking.update(cx, |thread, cx| {
+        use agent_client_protocol::v1::schema as acp_v1;
+        use agent_client_protocol::v2::schema as acp_v2;
+        thread.request_tool_call_authorization(
+            acp_v1::ToolCall::new(acp_v1::ToolCallId::new("edit"), "Edit src/login.rs")
+                .kind(acp_v1::ToolKind::Edit)
+                .into(),
+            acp_thread::PermissionOptions::Flat(vec![acp_v2::PermissionOption::new(
+                "allow",
+                "Allow",
+                acp_v2::PermissionOptionKind::AllowOnce,
+            )]),
+            acp_thread::AuthorizationKind::PermissionGrant,
+            cx,
+        )
+    })?;
+    permission.detach();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _| window.refresh())?;
+    cx.run_until_parked();
+    Ok(())
+}
+
+/// Every tab closed: the pane offers what its "+" would, and there is no composer.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn show_icarus_empty_pane(
+    window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+) -> Result<()> {
+    let pane = window.update(cx, |workspace, _, _| workspace.active_pane().clone())?;
+    if let Some(picker) = cx.read(|cx| icarus_ui::new_tab_menu::open_menu(&pane, cx)) {
+        picker.update(cx, |_, cx| cx.emit(gpui::DismissEvent));
+        cx.run_until_parked();
+    }
+    let closing = cx.update_window(window.into(), |_, window, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.close_all_items(&Default::default(), window, cx)
+        })
+    })?;
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(closing)
+        .context("Failed to close the tabs")?;
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _| window.refresh())?;
+    cx.run_until_parked();
+    Ok(())
 }
 
 /// The pane's "+" menu, open, with `query` typed into its search.

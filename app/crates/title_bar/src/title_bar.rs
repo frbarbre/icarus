@@ -229,8 +229,9 @@ pub struct TitleBar {
     _subscriptions: Vec<Subscription>,
     banner: Option<Entity<OnboardingBanner>>,
     update_version: Entity<UpdateVersion>,
-    icarus_next_action: Entity<icarus_ui::NextActionButton>,
-    icarus_links: Entity<icarus_ui::WorkspaceLinks>,
+    // Owned here so they live as long as the window; the right sidebar's tab strip shows them, as Orca's does.
+    _icarus_next_action: Entity<icarus_ui::NextActionButton>,
+    _icarus_links: Entity<icarus_ui::WorkspaceLinks>,
     icarus_quick_commands: Entity<icarus_ui::quick_commands::QuickCommandsButton>,
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
@@ -395,8 +396,6 @@ impl Render for TitleBar {
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(self.icarus_quick_commands.clone())
-                .child(self.icarus_links.clone())
-                .child(self.icarus_next_action.clone())
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
@@ -561,8 +560,8 @@ impl TitleBar {
             _subscriptions: subscriptions,
             banner,
             update_version,
-            icarus_next_action,
-            icarus_links,
+            _icarus_next_action: icarus_next_action,
+            _icarus_links: icarus_links,
             icarus_quick_commands,
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,

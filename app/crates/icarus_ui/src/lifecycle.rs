@@ -2566,7 +2566,7 @@ mod tests {
         json!({
             "identifier": identifier, "title": title, "team_key": "ABC",
             "state": { "name": "Todo" },
-            "branch_name": format!("frederik/{}-{}", identifier.to_lowercase(), "fix-login-redirect"),
+            "branch_name": format!("maya/{}-{}", identifier.to_lowercase(), "fix-login-redirect"),
         })
     }
 
@@ -2736,7 +2736,7 @@ mod tests {
         let picked = modal.read_with(cx, |modal, _| modal.issue_results()[0].clone());
         modal.update_in(cx, |modal, window, cx| modal.pick_issue(picked, window, cx));
         assert_eq!(text_of(&name, cx), "abc-12");
-        assert_eq!(text_of(&branch, cx), "frederik/abc-12-fix-login-redirect");
+        assert_eq!(text_of(&branch, cx), "maya/abc-12-fix-login-redirect");
         assert_eq!(text_of(&issue, cx), "");
         assert!(modal.read_with(cx, |modal, _| modal.issue_results().is_empty()));
 

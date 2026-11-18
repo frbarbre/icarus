@@ -28,14 +28,15 @@ Each key focuses its panel, opening the dock; pressed again while the panel has 
 
 | Action | macOS | Linux | Action name |
 |---|---|---|---|
-| Source Control panel | ⌘⇧G | Ctrl+Shift+G | `icarus::ToggleSourceControlPanel` |
-| PR panel | ⌘⇧H | Ctrl+Shift+H | `icarus::ToggleGitHubPanel` |
 | Explorer | ⌘⇧E | Ctrl+Shift+E | `project_panel::ToggleFocus` |
+| Source Control panel | ⌘⇧G | Ctrl+Shift+G | `icarus::ToggleSourceControlPanel` |
+| Checks panel | ⌘⇧K | Ctrl+Shift+K | `icarus::ToggleGitHubPanel` |
 | Search | ⌘⇧F | Ctrl+Shift+F | `pane::DeploySearch` |
+| Quick Open: go to a file, `%text` searches file contents, `:line` or `:line:column` jumps in the active file | ⌘P | Ctrl+P | `file_finder::Toggle` |
 | Left dock | ⌘B | Ctrl+B | `workspace::ToggleLeftDock` |
 | Right dock | ⌘L (outside text editors), ⌘R, ⌥⌘B | Ctrl+Alt+B | `workspace::ToggleRightDock` |
 
-Orca puts its PR panel on Mod+Shift+K, which Zed's editors use to delete a line, so Icarus uses Mod+Shift+H; search-and-replace stays in the command palette. Inside a text editor ⌘L still selects the line.
+The right sidebar's tabs follow Orca's order: Explorer, Agents, Source Control, Checks. Their keys are Orca's and work from editors, terminals and the agent composer too, so Zed's bindings that took them are gone: delete line (⌘⇧K) and reveal in project panel (⌘⇧E) stay in the command palette, and previous search match (⌘⇧G) is Shift+Enter in the search bar. Inside a text editor ⌘L still selects the line.
 
 ## Diffs, review and Source Control
 

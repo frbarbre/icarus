@@ -42,10 +42,10 @@ Comments on lines outside the PR's diff become file comments that quote the code
 
 ### The Review section
 
-The GitHub panel's Review section holds the rest of the review:
+The Review section, at the top of Source Control under the PR header as in Orca, holds the rest of the review:
 
 - **Reviewers**: everyone requested and everyone who reviewed, with their verdicts. Remove an unanswered request, or re-request someone who already reviewed.
-- **Request a review**: type a login or `org/team` and press Enter, or use the people button to pick from suggestions (GitHub's suggested reviewers, then frequent reviewers in the repository).
+- **Request a review**: the pencil in the section's header opens a picker: type to search, suggestions first (GitHub's suggested reviewers, then frequent reviewers in the repository), then everyone else. Pick someone to ask them; pick a ticked one to take the request back. The picker stays open for more; Enter on text that matches nobody requests what you typed, `org/team` included.
 - **Diff base**: what the diffs compare against. "Since your last review" shows only what changed since you last reviewed, even after a rebase. You can also pick a commit or the whole PR.
 - **Summary**: the review's body, saved as you type.
 - **Verdict**: **Only comment**, **Approve** or **Request changes**, with the number of queued comments. On your own PR only "Only comment" is offered.

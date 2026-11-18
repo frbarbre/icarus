@@ -595,6 +595,40 @@ async fn automation_tick_moves_a_status_and_creates_a_review_workspace() {
 }
 
 #[tokio::test]
+async fn automation_moves_worktrees_made_outside_icarus_too() {
+    let world = World::new(rules_settings(Some(true)), json!({ "viewer": "me" })).await;
+    let outside = world.repo.parent().expect("repos").join("elsewhere-feat-b");
+    git(
+        &world.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat-b",
+            outside.to_str().expect("utf8"),
+        ],
+    );
+    let adopted = world
+        .request("workspace.adopt", json!({ "path": outside }))
+        .await;
+    let id = adopted["id"].as_str().expect("id").to_owned();
+    let head = git(&outside, &["rev-parse", "HEAD"]);
+    world.set_fixtures(json!({
+        "viewer": "me",
+        "pulls": [pull(9, "feat-b", &head, json!({ "isDraft": true }))],
+    }));
+
+    let tick = world.request("rules.tick", json!({})).await;
+    assert_eq!(tick["errors"], json!([]), "{tick}");
+    let info = world.request("workspace.info", json!({ "id": id })).await;
+    assert_eq!(
+        info["status"], "in-progress",
+        "a draft outside the workspace root moves too: {tick}"
+    );
+}
+
+#[tokio::test]
 async fn deleting_a_merged_workspace_runs_the_archive_script_and_a_failure_keeps_it() {
     let markers = tempfile::tempdir().expect("markers");
     let marker = markers.path().join("archived.txt");

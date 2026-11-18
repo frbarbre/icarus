@@ -21,7 +21,7 @@ use ui::{
     PopoverMenuHandle, Tooltip, prelude::*,
 };
 use util::ResultExt as _;
-use workspace::{ItemHandle, NewCenterTerminal, NewItemMenu, Pane, Workspace};
+use workspace::{EmptyPaneContent, ItemHandle, NewCenterTerminal, NewItemMenu, Pane, Workspace};
 
 use crate::history::{HistoryEntry, HistorySource};
 
@@ -466,6 +466,7 @@ pub fn register(cx: &mut App) {
                 .is_some_and(|menu| menu.handle.is_deployed())
         }),
     });
+    cx.set_global(EmptyPaneContent(Rc::new(render_empty_pane)));
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &NewMarkdown, window, cx| {
             let pane = workspace.active_pane().clone();
@@ -590,6 +591,7 @@ fn build_menu(
                 let default = default.await?;
                 weak_picker.update_in(cx, |picker, window, cx| {
                     if let Some(default) = default.as_str() {
+                        remember_default_harness(default, cx);
                         picker.delegate.set_default_harness(default);
                         picker.refresh(window, cx);
                     }
@@ -686,14 +688,7 @@ impl NewTabMenu {
     }
 
     fn shortcut(&self, action: &MenuAction, cx: &App) -> Option<Box<dyn Action>> {
-        match action {
-            MenuAction::NewTerminal => Some(NewCenterTerminal::default().boxed_clone()),
-            MenuAction::NewMarkdown => Some(NewMarkdown.boxed_clone()),
-            MenuAction::Agent(id) if Some(*id) == self.default_harness => {
-                cx.build_action("icarus::NewAgent", None).ok()
-            }
-            _ => None,
-        }
+        shortcut_for(action, self.default_harness, cx)
     }
 
     fn run(&self, action: MenuAction, window: &mut Window, cx: &mut App) {
@@ -723,40 +718,7 @@ impl NewTabMenu {
             MenuAction::OpenFile(index) => self.files.get(*index).map(|(_, path)| path.clone()),
             _ => None,
         };
-        workspace.update(cx, |workspace, cx| match action {
-            MenuAction::NewTerminal => {
-                TerminalView::deploy(workspace, &NewCenterTerminal::default(), window, cx)
-            }
-            MenuAction::NewBrowser => {
-                crate::browser::open_browser_tab(String::new(), &pane, true, workspace, window, cx);
-            }
-            MenuAction::NewMarkdown => open_markdown(workspace, pane, window, cx),
-            MenuAction::Agent(id) => match cx
-                .try_global::<GlobalOpenHarnessHandler>()
-                .map(|handler| handler.0.clone())
-            {
-                Some(handler) => handler(id, workspace, window, cx),
-                None => log::error!("no handler opens {id} agents"),
-            },
-            MenuAction::AgentSettings => {
-                crate::settings_view::open_agent_settings(workspace, window, cx)
-            }
-            MenuAction::OpenUrl(url) => {
-                crate::browser::open_browser_tab(url, &pane, true, workspace, window, cx);
-            }
-            MenuAction::WebSearch(query) => {
-                let url = format!("{SEARCH_URL}{}", urlencoding::encode(&query));
-                crate::browser::open_browser_tab(url, &pane, true, workspace, window, cx);
-            }
-            MenuAction::OpenFile(_) => {
-                if let Some(path) = file {
-                    workspace
-                        .open_path(path, Some(pane.downgrade()), true, window, cx)
-                        .detach_and_log_err(cx);
-                }
-            }
-            MenuAction::OpenTab(_) | MenuAction::ResumeAgent(_) => {}
-        });
+        run_action(action, file, &workspace, pane, window, cx);
     }
 
     fn row_icon(&self, row: &MenuRow, cx: &App) -> Icon {
@@ -785,6 +747,196 @@ fn history_title(entry: &HistoryEntry) -> SharedString {
         .map(|title| title.lines().next().unwrap_or(title).trim().to_string())
         .unwrap_or_else(|| entry.id.clone())
         .into()
+}
+
+fn shortcut_for(
+    action: &MenuAction,
+    default_harness: Option<&str>,
+    cx: &App,
+) -> Option<Box<dyn Action>> {
+    match action {
+        MenuAction::NewTerminal => Some(NewCenterTerminal::default().boxed_clone()),
+        MenuAction::NewMarkdown => Some(NewMarkdown.boxed_clone()),
+        MenuAction::Agent(id) if Some(*id) == default_harness => {
+            cx.build_action("icarus::NewAgent", None).ok()
+        }
+        _ => None,
+    }
+}
+
+fn run_action(
+    action: MenuAction,
+    file: Option<ProjectPath>,
+    workspace: &Entity<Workspace>,
+    pane: Entity<Pane>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    workspace.update(cx, |workspace, cx| match action {
+        MenuAction::NewTerminal => {
+            TerminalView::deploy(workspace, &NewCenterTerminal::default(), window, cx)
+        }
+        MenuAction::NewBrowser => {
+            crate::browser::open_browser_tab(String::new(), &pane, true, workspace, window, cx);
+        }
+        MenuAction::NewMarkdown => open_markdown(workspace, pane, window, cx),
+        MenuAction::Agent(id) => match cx
+            .try_global::<GlobalOpenHarnessHandler>()
+            .map(|handler| handler.0.clone())
+        {
+            Some(handler) => handler(id, workspace, window, cx),
+            None => log::error!("no handler opens {id} agents"),
+        },
+        MenuAction::AgentSettings => {
+            crate::settings_view::open_agent_settings(workspace, window, cx)
+        }
+        MenuAction::OpenUrl(url) => {
+            crate::browser::open_browser_tab(url, &pane, true, workspace, window, cx);
+        }
+        MenuAction::WebSearch(query) => {
+            let url = format!("{SEARCH_URL}{}", urlencoding::encode(&query));
+            crate::browser::open_browser_tab(url, &pane, true, workspace, window, cx);
+        }
+        MenuAction::OpenFile(_) => {
+            if let Some(path) = file {
+                workspace
+                    .open_path(path, Some(pane.downgrade()), true, window, cx)
+                    .detach_and_log_err(cx);
+            }
+        }
+        MenuAction::OpenTab(_) | MenuAction::ResumeAgent(_) => {}
+    });
+}
+
+/// The server's default agent harness, which the menu and empty panes list first with ⌘⌥T.
+#[derive(Default)]
+struct DefaultHarness {
+    id: Option<&'static str>,
+    requested: bool,
+}
+
+impl gpui::Global for DefaultHarness {}
+
+fn default_harness(cx: &App) -> Option<&'static str> {
+    cx.try_global::<DefaultHarness>()
+        .and_then(|default| default.id)
+}
+
+fn remember_default_harness(id: &str, cx: &mut App) {
+    if let Some(harness) = agent_servers::harness::harness(id) {
+        cx.default_global::<DefaultHarness>().id = Some(harness.id);
+    }
+}
+
+/// The rows an empty pane offers: the "+" menu's own rows, with the default agent first.
+pub fn empty_pane_rows(default_harness: Option<&str>) -> Vec<MenuRow> {
+    let default = default_harness.and_then(agent_servers::harness::harness);
+    let harnesses: Vec<&'static Harness> = default
+        .into_iter()
+        .chain(
+            HARNESSES
+                .iter()
+                .filter(|harness| Some(harness.id) != default.map(|default| default.id)),
+        )
+        .collect();
+    menu_rows("", &harnesses, SearchSources::default())
+}
+
+/// What a center pane without tabs shows: the "+" menu's options with their shortcuts, centered.
+fn render_empty_pane(
+    pane: &mut Pane,
+    _window: &mut Window,
+    cx: &mut Context<Pane>,
+) -> Option<AnyElement> {
+    let workspace = pane.workspace().upgrade()?;
+    let pane_entity = cx.entity();
+    {
+        let workspace = workspace.read(cx);
+        let is_center = workspace
+            .center_pane_group()
+            .panes()
+            .contains(&&pane_entity);
+        let has_worktrees = workspace
+            .project()
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .is_some();
+        if !is_center || !has_worktrees {
+            return None;
+        }
+    }
+    if !cx.default_global::<DefaultHarness>().requested {
+        cx.global_mut::<DefaultHarness>().requested = true;
+        let client = crate::routing::client_for_project(workspace.read(cx).project().read(cx), cx);
+        if let Some(default) =
+            crate::review::request(client, "config.get", json!({ "key": "agents.default" }), cx)
+        {
+            cx.spawn(async move |pane, cx| {
+                let default = default.await?;
+                pane.update(cx, |_, cx| {
+                    if let Some(default) = default.as_str() {
+                        remember_default_harness(default, cx);
+                    }
+                    cx.notify();
+                })
+            })
+            .detach_and_log_err(cx);
+        }
+    }
+    let default = default_harness(cx);
+    let rows = empty_pane_rows(default);
+    let weak_workspace = workspace.downgrade();
+    let weak_pane = pane_entity.downgrade();
+    let mut list = v_flex()
+        .debug_selector(|| "empty-pane-options".into())
+        .w(rems(22.))
+        .gap_0p5();
+    for (index, row) in rows.into_iter().enumerate() {
+        let shortcut = shortcut_for(&row.action, default, cx)
+            .map(|action| KeyBinding::for_action(action.as_ref(), cx));
+        let muted = row.action == MenuAction::AgentSettings;
+        let action = row.action.clone();
+        let workspace = weak_workspace.clone();
+        let pane = weak_pane.clone();
+        let selector = format!("empty-pane-option:{}", row.label);
+        list = list.child(
+            div().debug_selector(move || selector).child(
+                ListItem::new(("empty-pane-option", index))
+                    .inset(true)
+                    .spacing(ListItemSpacing::Sparse)
+                    .start_slot(
+                        Icon::new(row.icon)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(row.label.clone()).truncate().color(if muted {
+                        Color::Muted
+                    } else {
+                        Color::Default
+                    }))
+                    .end_slot::<KeyBinding>(shortcut)
+                    .on_click(move |_, window, cx| {
+                        let (Some(workspace), Some(pane)) = (workspace.upgrade(), pane.upgrade())
+                        else {
+                            return;
+                        };
+                        run_action(action.clone(), None, &workspace, pane, window, cx);
+                    }),
+            ),
+        );
+        if row.separator_after {
+            list = list.child(div().py_1().child(ui::Divider::horizontal()));
+        }
+    }
+    Some(
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .child(list)
+            .into_any_element(),
+    )
 }
 
 impl PickerDelegate for NewTabMenu {
@@ -838,8 +990,9 @@ impl PickerDelegate for NewTabMenu {
         };
         cx.spawn(async move |picker, cx| {
             cx.background_executor().timer(HISTORY_DELAY).await;
-            let Ok(search) = picker.update(cx, |_, cx| (source.search)(Some(query.clone()), cx))
-            else {
+            let Ok(search) = picker.update(cx, |_, cx| {
+                (source.search)(crate::history::HistoryQuery::text(query.clone()), cx)
+            }) else {
                 return;
             };
             let Some(found) = search.await.log_err() else {
@@ -1121,6 +1274,84 @@ mod tests {
         assert!(
             cx.update(|_, cx| open_menu(&pane, cx)).is_none(),
             "choosing a row closes the menu"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_pane_without_tabs_offers_the_menus_options_with_their_shortcuts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, _panel, mut cx) = crate::tests::panel_window(Vec::new(), cx).await;
+        let opened: Rc<std::cell::RefCell<Vec<&'static str>>> = Rc::default();
+        cx.update(|_, cx| {
+            register(cx);
+            crate::review::tests::stub_rpc(cx, |method, params| match method {
+                "config.get" if params["key"] == "agents.default" => Ok(json!("codex")),
+                _ => Ok(serde_json::Value::Null),
+            });
+            let opened = opened.clone();
+            set_open_harness_handler(cx, move |harness, _, _, _| {
+                opened.borrow_mut().push(harness)
+            });
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("empty-pane-options").is_some(),
+            "a new worktree's empty pane offers what its + would"
+        );
+        assert_eq!(cx.update(|_, cx| default_harness(cx)), Some("codex"));
+        let labels: Vec<String> = empty_pane_rows(Some("codex"))
+            .iter()
+            .map(|row| row.label.to_string())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "New Terminal",
+                "New Browser Tab",
+                "New Markdown",
+                "Codex",
+                "Claude",
+                "Agent settings…"
+            ]
+        );
+        for selector in [
+            "empty-pane-option:New Terminal",
+            "empty-pane-option:New Browser Tab",
+            "empty-pane-option:New Markdown",
+            "empty-pane-option:Codex",
+            "empty-pane-option:Claude",
+            "empty-pane-option:Agent settings…",
+        ] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
+        }
+        cx.update(|_, cx| {
+            assert!(shortcut_for(&MenuAction::NewTerminal, Some("codex"), cx).is_some());
+            assert!(shortcut_for(&MenuAction::NewMarkdown, Some("codex"), cx).is_some());
+            assert!(
+                shortcut_for(&MenuAction::Agent("claude"), Some("codex"), cx).is_none(),
+                "only the default agent has a shortcut, as in the menu"
+            );
+        });
+
+        let claude = cx
+            .debug_bounds("empty-pane-option:Claude")
+            .expect("claude row");
+        cx.simulate_click(claude.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(*opened.borrow(), ["claude"]);
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let item = cx.new(workspace::item::test::TestItem::new);
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("empty-pane-options").is_none(),
+            "a pane with a tab shows the tab"
         );
     }
 

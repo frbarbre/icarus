@@ -158,6 +158,19 @@ impl NextActionButton {
         self.action.as_ref()
     }
 
+    /// Makes `button` the one the sidebar strip shows in `window` (previews and visual tests).
+    pub fn show_in_window(button: &Entity<Self>, window: &Window, cx: &mut App) {
+        cx.default_global::<NextActionButtons>()
+            .0
+            .insert(window.window_handle(), button.downgrade());
+    }
+
+    pub fn for_window(window: &Window, cx: &App) -> Option<Entity<Self>> {
+        cx.try_global::<NextActionButtons>()
+            .and_then(|buttons| buttons.0.get(&window.window_handle()))
+            .and_then(WeakEntity::upgrade)
+    }
+
     /// Runs the current step; agent steps start a new agent session on the server, shown as a new agent tab.
     pub fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(client), Some(id)) = (self.client.clone(), self.workspace_id.clone()) else {
@@ -195,19 +208,31 @@ impl NextActionButton {
     }
 }
 
+/// Orca's icon per step: merge steps a merge, commit & push an upload, ready for review a check.
+fn next_action_icon(kind: &str) -> IconName {
+    match kind.replace('_', "-").as_str() {
+        "commit-and-push" => IconName::Upload,
+        "ready-for-review" => IconName::CircleCheck,
+        "create-pull-request" => IconName::PullRequest,
+        _ => IconName::GitMerge,
+    }
+}
+
 impl Render for NextActionButton {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(action) = self.action.clone() else {
             return div().into_any_element();
         };
+        let icon = next_action_icon(&action.kind);
         let label = if self.running {
             format!("{}…", action.label)
         } else {
             action.label
         };
         Button::new("icarus-next-action", label)
-            .style(ButtonStyle::Filled)
+            .style(ButtonStyle::Outlined)
             .label_size(LabelSize::Small)
+            .start_icon(Icon::new(icon).size(IconSize::Small))
             .disabled(self.running)
             .tooltip(Tooltip::for_action_title(
                 "Run the next step for this workspace",
