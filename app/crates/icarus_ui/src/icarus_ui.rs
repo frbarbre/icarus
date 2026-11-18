@@ -10,6 +10,7 @@ mod driver;
 mod focus;
 pub mod github_panel;
 pub mod history;
+pub mod hover_card;
 pub mod layout;
 pub mod lifecycle;
 pub mod links;
@@ -23,6 +24,7 @@ pub mod pane_nav;
 #[cfg(test)]
 mod perf_tests;
 pub mod pr_comments;
+pub mod pr_store;
 pub mod quick_commands;
 pub mod remote_agent;
 pub mod remote_control;
@@ -74,8 +76,8 @@ use crate::github_panel::{AvatarKind, render_avatar};
 
 pub use model::{
     AgentSummary, IssueLabel, PrAuthor, PrGroup, PrSummary, SetupBadge, SetupSummary, StackGroup,
-    StackLane, StackPlace, StatusColumn, StatusGroup, Unread, UnreadKind, WorkspaceSummary,
-    group_by_pr, group_by_stack, group_by_status, pinned_first,
+    StackLane, StackPlace, StatusColumn, StatusGroup, SubagentSummary, Unread, UnreadKind,
+    WorkspaceSummary, group_by_pr, group_by_stack, group_by_status, pinned_first,
 };
 
 actions!(
@@ -850,6 +852,10 @@ pub(crate) fn handle_view_event(topic: &str, payload: serde_json::Value, cx: &mu
         "ports.changed" => links::ports_changed(payload, cx),
         "config.changed" => settings_view::config_changed(cx),
         "account.usage" => accounts::usage_changed(cx),
+        "workspace.next_action" | "workspace.changed" => {
+            next_action::server_event(topic, &payload, cx)
+        }
+        "agent.state" => model::agent_state_pushed(payload, cx),
         _ => {}
     }
 }
@@ -876,6 +882,9 @@ pub fn fetch_attachment_text(id: String, cx: &mut App) -> Task<Result<String>> {
         text: String,
     }
 
+    if let Some(text) = pr_store::local_attachment_text(&id, cx) {
+        return Task::ready(Ok(text));
+    }
     let shared = app_client(cx);
     Tokio::spawn_result(cx, async move {
         let client = match shared {
@@ -1032,8 +1041,15 @@ fn start_app_connection(cx: &mut App) {
                         };
                         cx.update(|cx| driver::handle_request(request, cx));
                     }
-                    "review.changed" | "note.changed" | "git.changed" | "ports.changed"
-                    | "config.changed" | "account.usage" => {
+                    "review.changed"
+                    | "note.changed"
+                    | "git.changed"
+                    | "ports.changed"
+                    | "config.changed"
+                    | "account.usage"
+                    | "workspace.next_action"
+                    | "workspace.changed"
+                    | "agent.state" => {
                         cx.update(|cx| handle_view_event(&event.topic, event.payload, cx));
                     }
                     "terminal.keyboard" | "terminal.label" => cx.update(|cx| {
@@ -1462,6 +1478,7 @@ pub struct WorkspacesPanel {
     _ports_observation: Subscription,
     remote: Entity<servers::RemoteServers>,
     _remote_observation: Subscription,
+    _live_agents: Subscription,
 }
 
 impl WorkspacesPanel {
@@ -1572,6 +1589,15 @@ impl WorkspacesPanel {
             _ports_observation: cx.observe(&ports, |_, _, cx| cx.notify()),
             remote: remote.clone(),
             _remote_observation: cx.observe(&remote, |_, _, cx| cx.notify()),
+            _live_agents: cx.observe_global::<model::LiveAgents>(|panel, cx| {
+                let agents = panel
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|w| w.agents.iter_mut());
+                if model::merge_live_agents(agents, cx) {
+                    cx.notify();
+                }
+            }),
         }
     }
 
@@ -1588,6 +1614,11 @@ impl WorkspacesPanel {
 
     fn apply_snapshot(&mut self, mut snapshot: Snapshot, cx: &mut Context<Self>) {
         snapshot.view.local_fields = client_settings::card_fields(cx);
+        let agents = snapshot
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.agents.iter_mut());
+        model::merge_live_agents(agents, cx);
         if self.discovered != snapshot.discovered {
             self.discovered = snapshot.discovered;
             cx.notify();
@@ -2545,6 +2576,13 @@ impl WorkspacesPanel {
                         .hover(|style| style.bg(colors.element_hover))
                 }
             });
+        let unread_ring = if shown {
+            colors
+                .panel_background
+                .blend(cards::current_card_colors(cx).0)
+        } else {
+            colors.panel_background
+        };
         let key = cards::CardKey {
             server: routing::ServerRef::Primary,
             id: workspace.id.clone(),
@@ -2563,13 +2601,12 @@ impl WorkspacesPanel {
                     .child(div().relative().flex_none().child(lead_icon).when_some(
                         unread,
                         |icon, unread| {
-                            icon.child(
-                                div()
-                                    .absolute()
-                                    .left(px(-9.))
-                                    .top(px(3.))
-                                    .child(cards::render_unread_dot(&workspace.id, unread, cx)),
-                            )
+                            icon.child(cards::render_unread_dot(
+                                &workspace.id,
+                                unread,
+                                unread_ring,
+                                cx,
+                            ))
                         },
                     ))
                     .child(
@@ -2644,6 +2681,7 @@ impl WorkspacesPanel {
             .when(shown && self.revealing_shown_card, |card| {
                 card.relative().child(self.render_reveal_probe())
             });
+        let card = hover_card::attach(card, workspace, cx);
         self.with_card_menu(routing::ServerRef::Primary, workspace, card, cx)
     }
 
@@ -3420,6 +3458,77 @@ mod tests {
             unread: None,
             primary: false,
         }
+    }
+
+    #[gpui::test]
+    async fn a_pushed_agent_state_redraws_its_card_and_tab_without_a_poll(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let agent = |state: &str, revision: u64| AgentSummary {
+            id: "agent-1".into(),
+            state: state.into(),
+            provider: "claude".into(),
+            turns: 1,
+            revision,
+            ..AgentSummary::default()
+        };
+        let mut card = summary("one", "/w/one", None);
+        card.agents = vec![agent("working", 1)];
+        let (_workspace, panel, mut cx) = panel_window(vec![card.clone()], cx).await;
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                (
+                    panel.workspaces[0].agents[0].dot_state(),
+                    ui::AgentLiveStates::get(cx, "agent-1"),
+                )
+            })
+        };
+
+        for (pushed, glyph) in [
+            (agent("waiting", 2), ui::AgentDotState::Permission),
+            (agent("working", 3), ui::AgentDotState::Working),
+            (
+                AgentSummary {
+                    background_tasks: 1,
+                    ..agent("idle", 4)
+                },
+                ui::AgentDotState::Monitoring,
+            ),
+            (agent("idle", 5), ui::AgentDotState::Done),
+        ] {
+            let payload = serde_json::to_value(serde_json::json!({
+                "id": pushed.id, "state": pushed.state, "provider": pushed.provider,
+                "turns": pushed.turns, "background_tasks": pushed.background_tasks,
+                "revision": pushed.revision, "workspace": "ws-one",
+            }))
+            .expect("payload");
+            cx.update(|_, cx| handle_view_event("agent.state", payload, cx));
+            assert_eq!(
+                shown(&mut cx),
+                (glyph, Some(glyph)),
+                "card and tab show the pushed state at once"
+            );
+        }
+
+        let mut stale = card;
+        stale.agents = vec![agent("working", 3)];
+        panel.update(&mut cx, |panel, cx| {
+            panel.apply_snapshot(
+                Snapshot {
+                    workspaces: vec![stale],
+                    statuses: Vec::new(),
+                    view: panel.view.clone(),
+                    project_names: Default::default(),
+                    discovered: panel.discovered.clone(),
+                },
+                cx,
+            )
+        });
+        assert_eq!(
+            shown(&mut cx),
+            (ui::AgentDotState::Done, Some(ui::AgentDotState::Done)),
+            "a poll older than the push does not bring the old state back"
+        );
     }
 
     fn stacked(name: &str, stack: u64, position: u32) -> WorkspaceSummary {

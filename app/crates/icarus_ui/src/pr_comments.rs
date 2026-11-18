@@ -2,10 +2,11 @@
 //! rows, and opening a thread's line in the file's diff tab.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use collections::HashMap;
 use editor::{Editor, SelectionEffects, scroll::Autoscroll};
-use gpui::{AnyElement, App, Context, Entity, Task, Window};
+use gpui::{AnyElement, App, Context, Div, Entity, Task, Window};
 use language::Point;
 use serde::Deserialize;
 use serde_json::Value;
@@ -317,6 +318,7 @@ pub struct ConversationComment {
     pub body: String,
     pub url: Option<String>,
     pub created_at: Option<String>,
+    pub last_edited_at: Option<String>,
     pub review_state: Option<String>,
     pub reactions: Vec<ReactionSummary>,
     /// The REST id issue comment edits and deletes address.
@@ -371,6 +373,7 @@ impl ConversationComment {
             body: self.body.clone(),
             url: self.url.clone(),
             created_at: self.created_at.clone(),
+            last_edited_at: self.last_edited_at.clone(),
             reactions: self.reactions.clone(),
             viewer_can_update: self.viewer_can_update,
             viewer_can_delete: self.viewer_can_delete,
@@ -517,6 +520,366 @@ pub fn open_in_workspace(
             open_location(workspace, file, line, base, window, cx)
         })
         .log_err();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Orca's comment card (checks-panel/comment-row.tsx), drawn alike in the Checks panel and the diff
+// ---------------------------------------------------------------------------------------------
+
+pub type ClickHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+/// Gives or takes back a reaction: the comment, GitHub's reaction name, and whether it is given now.
+pub type ReactHandler = Rc<dyn Fn(String, String, bool, &mut App)>;
+
+/// An entry of a comment's More menu.
+pub struct CommentAction {
+    pub label: &'static str,
+    pub icon: IconName,
+    pub destructive: bool,
+    pub handler: ClickHandler,
+}
+
+/// What one comment of a card shows; `buttons` and `menu` appear on hover, as in Orca.
+pub struct CommentParts {
+    pub id: String,
+    pub comment: ThreadComment,
+    /// The card's first comment, whose header has a second row with the age and the location.
+    pub first: bool,
+    pub now: i64,
+    pub review_state: Option<ReviewState>,
+    pub location: Option<AnyElement>,
+    pub outdated: bool,
+    pub resolved: bool,
+    pub buttons: Vec<(&'static str, ClickHandler)>,
+    pub menu: Vec<CommentAction>,
+    pub body: AnyElement,
+    pub react: Option<ReactHandler>,
+}
+
+const ORCA_TEXT: f32 = 13.;
+const ORCA_META: f32 = 11.;
+
+fn px_rems(size: f32) -> LabelSize {
+    LabelSize::Custom(rems(size / 16.))
+}
+
+/// `rounded-lg border border-border bg-card`, its comments stacked with dividers.
+pub fn comment_card(cx: &App) -> Div {
+    let colors = cx.theme().colors();
+    v_flex()
+        .rounded_lg()
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.editor_background)
+        .overflow_hidden()
+}
+
+/// The viewer's own comment: only those offer Edit and Delete.
+pub fn is_own(comment_author: Option<&str>, viewer: Option<&str>) -> bool {
+    matches!((comment_author, viewer), (Some(author), Some(viewer)) if author.eq_ignore_ascii_case(viewer))
+}
+
+fn bot_badge(cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    div()
+        .flex_none()
+        .px(px(6.))
+        .py(px(1.))
+        .rounded_sm()
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.element_background)
+        .child(
+            Label::new("BOT")
+                .size(px_rems(10.))
+                .weight(gpui::FontWeight::SEMIBOLD)
+                .color(Color::Muted)
+                .single_line(),
+        )
+        .into_any_element()
+}
+
+fn meta_label(text: impl Into<SharedString>) -> Label {
+    Label::new(text)
+        .size(px_rems(ORCA_META))
+        .color(Color::Muted)
+        .single_line()
+}
+
+fn hover_toolbar(parts: &mut CommentParts, group: &SharedString) -> Option<AnyElement> {
+    if parts.buttons.is_empty() && parts.menu.is_empty() {
+        return None;
+    }
+    let id = parts.id.clone();
+    let mut toolbar = h_flex()
+        .flex_none()
+        .gap_0p5()
+        .visible_on_hover(group.clone());
+    for (index, (label, handler)) in parts.buttons.drain(..).enumerate() {
+        toolbar = toolbar.child(
+            Button::new(SharedString::from(format!("{id}-button-{index}")), label)
+                .label_size(px_rems(10.))
+                .on_click(move |_, window, cx| handler(window, cx)),
+        );
+    }
+    let menu = std::mem::take(&mut parts.menu);
+    if !menu.is_empty() {
+        let menu = Rc::new(menu);
+        toolbar = toolbar.child(
+            ui::PopoverMenu::new(SharedString::from(format!("{id}-more")))
+                .trigger_with_tooltip(
+                    IconButton::new(
+                        SharedString::from(format!("{id}-more-button")),
+                        IconName::Ellipsis,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted),
+                    Tooltip::text("More"),
+                )
+                .anchor(gpui::Anchor::TopRight)
+                .menu(move |window, cx| {
+                    let menu = menu.clone();
+                    Some(ui::ContextMenu::build(window, cx, move |mut list, _, _| {
+                        for action in menu.iter() {
+                            let handler = action.handler.clone();
+                            let entry = ui::ContextMenuEntry::new(action.label)
+                                .icon(action.icon)
+                                .icon_size(IconSize::XSmall)
+                                .when(action.destructive, |entry| entry.icon_color(Color::Error))
+                                .handler(move |window, cx| handler(window, cx));
+                            list = list.item(entry);
+                        }
+                        list
+                    }))
+                }),
+        );
+    }
+    Some(toolbar.into_any_element())
+}
+
+/// Orca's reaction chips, then the smiley-plus button offering all eight.
+fn reactions_row(parts: &CommentParts, cx: &App) -> Option<AnyElement> {
+    let react = parts.react.clone()?;
+    let colors = cx.theme().colors();
+    let comment = &parts.comment;
+    let mut row = h_flex().flex_wrap().gap(px(6.)).pt_2();
+    for reaction in comment.reactions.iter().filter(|r| r.count > 0) {
+        let (subject, content, reacted) = (
+            comment.id.clone(),
+            reaction.content.clone(),
+            reaction.viewer_has_reacted,
+        );
+        let react = react.clone();
+        row = row.child(
+            h_flex()
+                .id(SharedString::from(format!(
+                    "{}-reaction-{content}",
+                    parts.id
+                )))
+                .h(px(24.))
+                .px_2()
+                .gap_1()
+                .rounded_full()
+                .border_1()
+                .cursor_pointer()
+                .map(|chip| {
+                    if reacted {
+                        chip.border_color(colors.border_focused)
+                            .bg(colors.element_selected)
+                    } else {
+                        chip.border_color(colors.border)
+                            .hover(|style| style.bg(colors.element_hover))
+                    }
+                })
+                .child(
+                    Label::new(format!(
+                        "{} {}",
+                        crate::review::reaction_emoji(&reaction.content),
+                        reaction.count
+                    ))
+                    .size(px_rems(12.))
+                    .single_line(),
+                )
+                .on_click(move |_, _, cx| react(subject.clone(), content.clone(), !reacted, cx)),
+        );
+    }
+    let subject = comment.id.clone();
+    let reactions = comment.reactions.clone();
+    row = row.child(
+        ui::PopoverMenu::new(SharedString::from(format!("{}-react", parts.id)))
+            .trigger_with_tooltip(
+                IconButton::new(
+                    SharedString::from(format!("{}-react-button", parts.id)),
+                    IconName::SmilePlus,
+                )
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted),
+                Tooltip::text("Add reaction"),
+            )
+            .menu(move |window, cx| {
+                let (react, subject, reactions) =
+                    (react.clone(), subject.clone(), reactions.clone());
+                Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for reaction in crate::review::REACTIONS {
+                        let reacted = reactions
+                            .iter()
+                            .any(|r| r.content == reaction && r.viewer_has_reacted);
+                        let (react, subject) = (react.clone(), subject.clone());
+                        menu = menu.toggleable_entry(
+                            format!("{} {reaction}", crate::review::reaction_emoji(reaction)),
+                            reacted,
+                            IconPosition::End,
+                            None,
+                            move |_, cx| react(subject.clone(), reaction.into(), !reacted, cx),
+                        );
+                    }
+                    menu
+                }))
+            }),
+    );
+    Some(row.into_any_element())
+}
+
+/// One comment of a card: Orca's header (avatar, author, verdict, hover actions; then age,
+/// "(edited)", BOT, location), its body, and its reactions.
+pub fn render_comment(mut parts: CommentParts, cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    let group = SharedString::from(format!("{}-group", parts.id));
+    let comment = parts.comment.clone();
+    let author = comment.author.clone().unwrap_or_else(|| "ghost".into());
+    let bot = is_bot(comment.is_bot, comment.author.as_deref());
+    let time = comment
+        .created_at
+        .as_deref()
+        .and_then(crate::github_panel::parse_timestamp)
+        .map(|created| crate::github_panel::format_relative(parts.now - created));
+    let edited = comment.last_edited_at.is_some();
+    let author_label = Label::new(author.clone())
+        .size(px_rems(ORCA_TEXT))
+        .weight(gpui::FontWeight::SEMIBOLD)
+        .when(parts.resolved, |label| label.color(Color::Muted))
+        .single_line()
+        .truncate();
+    let avatar = crate::github_panel::render_avatar(
+        comment.author_avatar_url.as_deref(),
+        &author,
+        if bot {
+            crate::github_panel::AvatarKind::Bot
+        } else {
+            crate::github_panel::AvatarKind::Person
+        },
+        px(if parts.first { 20. } else { 16. }),
+        cx,
+    );
+    let toolbar = hover_toolbar(&mut parts, &group);
+    let header = if parts.first {
+        let location = parts.location.take();
+        let has_location = location.is_some();
+        v_flex()
+            .px_3()
+            .py_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_2()
+                    .child(avatar)
+                    .child(author_label)
+                    .children(
+                        parts
+                            .review_state
+                            .map(|state| render_review_state_badge(state, cx)),
+                    )
+                    .child(div().flex_1())
+                    .children(toolbar),
+            )
+            .child(
+                h_flex()
+                    .pl(px(28.))
+                    .min_w_0()
+                    .flex_wrap()
+                    .gap_x_2()
+                    .gap_y_1()
+                    .when_some(time.clone(), |row, time| row.child(meta_label(time)))
+                    .when(edited, |row| row.child(meta_label("(edited)")))
+                    .when(time.is_some() && has_location, |row| {
+                        row.child(div().mx_neg_1().child(meta_label("·")))
+                    })
+                    .when(bot, |row| row.child(bot_badge(cx)))
+                    .children(location)
+                    .when(parts.outdated, |row| {
+                        row.child(crate::github_panel::render_outdated_pill(cx))
+                    }),
+            )
+            .into_any_element()
+    } else {
+        h_flex()
+            .min_w_0()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .child(avatar)
+            .child(author_label)
+            .when_some(time, |row, time| row.child(meta_label(format!("· {time}"))))
+            .when(edited, |row| row.child(meta_label("(edited)")))
+            .when(bot, |row| row.child(bot_badge(cx)))
+            .child(div().flex_1())
+            .children(toolbar)
+            .into_any_element()
+    };
+    let reactions = reactions_row(&parts, cx);
+    v_flex()
+        .id(SharedString::from(parts.id.clone()))
+        .group(group)
+        .when(!parts.first, |column| {
+            column.border_t_1().border_color(colors.border_variant)
+        })
+        .child(header)
+        .child(
+            v_flex()
+                .px_4()
+                .py(px(10.))
+                .text_size(rems(ORCA_TEXT / 16.))
+                .line_height(gpui::relative(1.625))
+                .child(parts.body)
+                .children(reactions),
+        )
+        .into_any_element()
+}
+
+/// Orca's comment Markdown: the proportional UI font at 13 px, relaxed lines, every newline kept.
+pub fn comment_markdown_style(window: &Window, cx: &App) -> markdown::MarkdownStyle {
+    let colors = cx.theme().colors();
+    let mut style = markdown::MarkdownStyle::themed(markdown::MarkdownFont::Editor, window, cx);
+    style.base_text_style.font_size = rems(ORCA_TEXT / 16.).into();
+    style.base_text_style.line_height = gpui::relative(1.625);
+    style.soft_break_as_hard_break = true;
+    style.paragraph_spacing = px(8.);
+    style.inline_code.background_color = Some(colors.element_background);
+    style.inline_code.font_size = Some(rems(ORCA_TEXT * 0.92 / 16.).into());
+    style.link.underline = Some(gpui::UnderlineStyle {
+        thickness: px(1.),
+        color: Some(colors.text_muted),
+        wavy: false,
+    });
+    style.link.color = Some(colors.text.opacity(0.8));
+    let heading = |size: f32| {
+        Some(gpui::TextStyleRefinement {
+            font_size: Some(rems(size / 16.).into()),
+            font_weight: Some(gpui::FontWeight::SEMIBOLD),
+            ..Default::default()
+        })
+    };
+    style.heading_level_styles = Some(markdown::HeadingLevelStyles {
+        h1: heading(18.),
+        h2: heading(16.),
+        h3: heading(15.),
+        h4: heading(ORCA_TEXT),
+        h5: heading(ORCA_TEXT),
+        h6: heading(ORCA_TEXT),
+    });
+    style
 }
 
 #[cfg(test)]

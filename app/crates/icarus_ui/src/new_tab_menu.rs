@@ -945,6 +945,13 @@ fn render_empty_pane(
             .size_full()
             .items_center()
             .justify_center()
+            .gap_6()
+            .child(
+                gpui::img(ui::ICARUS_MARK)
+                    .debug_selector(|| "empty-pane-logo".into())
+                    .size(rems(4.))
+                    .flex_none(),
+            )
             .child(list)
             .into_any_element(),
     )

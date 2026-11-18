@@ -4,7 +4,9 @@
 //! `sleep:<ms> <text>` waits first, `write:<path> <text>` emits a Write tool call and result,
 //! `fail <text>` ends the turn as an error, `ask <question>` calls AskUserQuestion first,
 //! `env:A,B` answers with those environment variables, `args` with its command-line arguments,
-//! `settings` with its permission mode and model, `exit` terminates the process. In a long prompt,
+//! `settings` with its permission mode and model, `exit` terminates the process,
+//! `permit <tool>` asks for permission (`can_use_tool`) and answers with the decision it got,
+//! `background:<ms> <text>` leaves a background task running for that long after the turn. In a long prompt,
 //! the last line starting with `@fake ` is the message instead (so tests can steer note reply
 //! sessions through the thread). Control requests (`initialize`, `set_permission_mode`,
 //! `set_model`, `interrupt`) are answered as Claude Code does.
@@ -46,7 +48,8 @@ fn main() {
         .and_then(|at| args.get(at + 1).cloned())
         .unwrap_or_else(|| "default".to_string());
     let mut turn = 0u64;
-    for line in stdin.lock().lines() {
+    let mut lines = stdin.lock().lines();
+    while let Some(line) = lines.next() {
         let Ok(line) = line else { break };
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -166,6 +169,44 @@ fn main() {
                 ] }, "parent_tool_use_id": null, "session_id": session_id }),
             );
         }
+        if let Some(tool) = text.strip_prefix("permit ") {
+            let request_id = format!("perm_{turn}");
+            emit(
+                &mut out,
+                json!({ "type": "control_request", "request_id": request_id, "request": {
+                    "subtype": "can_use_tool", "tool_name": tool, "tool_use_id": format!("toolu_perm_{turn}"),
+                    "input": { "command": "true" } } }),
+            );
+            let mut behavior = "closed".to_string();
+            for line in lines.by_ref() {
+                let Ok(line) = line else { break };
+                let Ok(reply) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if reply["type"] == "control_response"
+                    && reply["response"]["request_id"] == request_id.as_str()
+                {
+                    behavior = reply["response"]["response"]["behavior"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    break;
+                }
+            }
+            text = format!("permit {behavior}");
+        }
+        let mut background = None;
+        if let Some(rest) = text.strip_prefix("background:") {
+            let (ms, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+            let task_id = format!("bg_{turn}");
+            emit(
+                &mut out,
+                json!({ "type": "system", "subtype": "task_started", "task_id": task_id,
+                    "is_backgrounded": true, "task_type": "local_bash", "session_id": session_id }),
+            );
+            background = Some((task_id, ms.parse::<u64>().unwrap_or(0)));
+            text = tail.to_string();
+        }
         if text == "args" {
             text = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
         }
@@ -217,5 +258,16 @@ fn main() {
                 "is_error": failed, "result": reply, "session_id": session_id, "stop_reason": "end_turn",
                 "duration_ms": 5, "total_cost_usd": 0.0, "num_turns": turn }),
         );
+        if let Some((task_id, ms)) = background {
+            let session_id = session_id.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(ms));
+                emit(
+                    &mut std::io::stdout(),
+                    json!({ "type": "system", "subtype": "task_notification", "task_id": task_id,
+                        "status": "completed", "session_id": session_id }),
+                );
+            });
+        }
     }
 }

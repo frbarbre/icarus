@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::notes::Target;
+use crate::pr_refresh::RefreshReason;
 use crate::server::{Server, params, rpc, to_value};
 
 pub const GIT_CHANGED_TOPIC: &str = "git.changed";
@@ -172,15 +173,15 @@ impl Server {
             }
             other => return Err(rpc("unknown_method", other)),
         };
-        // Pushes and pulls move PR facts too, so the next GitHub read must not reuse a cached one.
-        if matches!(method, "git.push" | "git.pull" | "git.sync" | "git.commit") {
-            self.github.invalidate(&workspace.project_id);
+        if matches!(method, "git.push" | "git.pull" | "git.sync") {
+            self.schedule_pr_refresh(&workspace.id, RefreshReason::PostPush);
         }
         self.broadcast(
             GIT_CHANGED_TOPIC,
             json!({ "workspace": workspace.id, "op": method.trim_start_matches("git.") }),
         );
         self.touch_activity(&workspace.id);
+        self.publish_next_action(workspace);
         Ok(value)
     }
 }

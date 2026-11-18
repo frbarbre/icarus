@@ -19,14 +19,14 @@ pub const PR_CONVERSATION_QUERY: &str =
     pullRequest(number: $number) {
       comments(first: 100, after: $commentsAfter) @include(if: $withComments) {
         pageInfo { hasNextPage endCursor }
-        nodes { id databaseId body url createdAt viewerCanUpdate viewerCanDelete
+        nodes { id databaseId body url createdAt lastEditedAt viewerCanUpdate viewerCanDelete
           author { __typename login avatarUrl(size: 48) }
           reactionGroups { content viewerHasReacted
             reactors(first: 3) { totalCount nodes { ... on Actor { login } } } } }
       }
       reviews(first: 100, after: $reviewsAfter) @include(if: $withReviews) {
         pageInfo { hasNextPage endCursor }
-        nodes { id databaseId state body url createdAt submittedAt viewerCanUpdate viewerCanDelete
+        nodes { id databaseId state body url createdAt submittedAt lastEditedAt viewerCanUpdate viewerCanDelete
           author { __typename login avatarUrl(size: 48) }
           reactionGroups { content viewerHasReacted
             reactors(first: 3) { totalCount nodes { ... on Actor { login } } } } }
@@ -56,6 +56,7 @@ pub struct ConversationComment {
     pub body: String,
     pub url: Option<String>,
     pub created_at: Option<String>,
+    pub last_edited_at: Option<String>,
     /// Reviews only: `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED` or `PENDING`.
     pub review_state: Option<String>,
     pub viewer_can_update: bool,
@@ -77,6 +78,8 @@ struct RawEntry {
     created_at: Option<String>,
     #[serde(default)]
     submitted_at: Option<String>,
+    #[serde(default)]
+    last_edited_at: Option<String>,
     #[serde(default)]
     state: Option<String>,
     #[serde(default)]
@@ -108,6 +111,7 @@ impl RawEntry {
             body: self.body,
             url: self.url,
             created_at: self.submitted_at.or(self.created_at),
+            last_edited_at: self.last_edited_at,
             review_state: match kind {
                 ConversationKind::Review => self.state,
                 ConversationKind::Comment => None,

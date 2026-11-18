@@ -448,6 +448,10 @@ mod tests {
             account: account.map(str::to_owned),
             remote_control: false,
             remote_control_url: None,
+            background_tasks: 0,
+            live: Default::default(),
+            permission_requests: Vec::new(),
+            revision: 0,
         }
     }
 

@@ -4,16 +4,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use gpui::{AnyWindowHandle, App, Context, Entity, Global, Render, Task, WeakEntity, Window};
+use futures::StreamExt as _;
+use futures::channel::mpsc;
+use gpui::{
+    AnyWindowHandle, App, Context, Entity, Global, Render, Subscription, Task, WeakEntity, Window,
+};
 use gpui_tokio::Tokio;
 use icarus_client::Client;
 use project::Project;
 use serde::Deserialize;
 use ui::{Tooltip, prelude::*};
+use util::ResultExt as _;
 
 use crate::RunNextAction;
 
-const NEXT_ACTION_REFRESH: Duration = Duration::from_secs(3);
+/// Only local git is read this often; GitHub's side arrives as `workspace.next_action` events.
+const LOCAL_GIT_REFRESH: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct NextAction {
@@ -40,7 +46,9 @@ pub struct NextActionButton {
     workspace_id: Option<String>,
     action: Option<NextAction>,
     running: bool,
+    wake: Option<mpsc::UnboundedSender<()>>,
     _poll: Task<()>,
+    _activation: Option<Subscription>,
 }
 
 fn project_paths(project: &WeakEntity<Project>, cx: &App) -> Vec<PathBuf> {
@@ -59,6 +67,7 @@ fn project_paths(project: &WeakEntity<Project>, cx: &App) -> Vec<PathBuf> {
 async fn lookup(
     client: Arc<Client>,
     paths: Vec<PathBuf>,
+    selected: bool,
 ) -> Result<(Option<String>, Option<NextAction>)> {
     let workspaces = client
         .request("workspace.list", serde_json::json!({}))
@@ -79,7 +88,10 @@ async fn lookup(
         return Ok((None, None));
     };
     let reply = client
-        .request("workspace.next_action", serde_json::json!({ "id": id }))
+        .request(
+            "workspace.next_action",
+            serde_json::json!({ "id": id, "selected": selected }),
+        )
         .await?;
     let reply: NextActionReply = serde_json::from_value(reply)?;
     Ok((workspace_id, reply.action))
@@ -93,15 +105,16 @@ impl NextActionButton {
             .0
             .insert(handle, weak_self);
         if !crate::enabled(cx) {
-            return Self {
-                client: None,
-                workspace_id: None,
-                action: None,
-                running: false,
-                _poll: Task::ready(()),
-            };
+            return Self::idle(None);
         }
         let project = project.downgrade();
+        let (wake, mut woken) = mpsc::unbounded();
+        // Becoming the window in front is Orca's worktree activation: the server refreshes a stale PR.
+        let activation = cx.observe_window_activation(window, |button, window, _| {
+            if window.is_window_active() {
+                button.wake();
+            }
+        });
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 if this.upgrade().is_none() {
@@ -110,15 +123,15 @@ impl NextActionButton {
                 let client = cx.update(|cx| crate::routing::client_for_weak_project(&project, cx));
                 if let Some(client) = client {
                     let paths = cx.update(|cx| project_paths(&project, cx));
-                    let result = Tokio::spawn_result(cx, lookup(client.clone(), paths)).await;
+                    let selected = cx
+                        .update_window(handle, |_, window, _| window.is_window_active())
+                        .unwrap_or(false);
+                    let result =
+                        Tokio::spawn_result(cx, lookup(client.clone(), paths, selected)).await;
                     let updated = this.update(cx, |button, cx| match result {
                         Ok((workspace_id, action)) => {
                             button.client = Some(client);
-                            if button.workspace_id != workspace_id || button.action != action {
-                                button.workspace_id = workspace_id;
-                                button.action = action;
-                                cx.notify();
-                            }
+                            button.set_state(workspace_id, action, cx);
                         }
                         Err(_) => {
                             button.client = None;
@@ -131,26 +144,75 @@ impl NextActionButton {
                         return;
                     }
                 }
-                cx.background_executor().timer(NEXT_ACTION_REFRESH).await;
+                let timer = cx.background_executor().timer(LOCAL_GIT_REFRESH);
+                futures::future::select(timer, woken.next()).await;
             }
         });
         Self {
+            wake: Some(wake),
+            _poll: poll,
+            _activation: Some(activation),
+            ..Self::idle(None)
+        }
+    }
+
+    fn idle(action: Option<NextAction>) -> Self {
+        Self {
             client: None,
             workspace_id: None,
-            action: None,
+            action,
             running: false,
-            _poll: poll,
+            wake: None,
+            _poll: Task::ready(()),
+            _activation: None,
         }
     }
 
     /// A button that never contacts a server and shows `action`, for visual tests.
     pub fn preview(action: NextAction) -> Self {
-        Self {
-            client: None,
-            workspace_id: None,
-            action: Some(action),
-            running: false,
-            _poll: Task::ready(()),
+        Self::idle(Some(action))
+    }
+
+    fn wake(&self) {
+        if let Some(wake) = &self.wake {
+            wake.unbounded_send(()).ok();
+        }
+    }
+
+    fn set_state(
+        &mut self,
+        workspace_id: Option<String>,
+        action: Option<NextAction>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_id != workspace_id || self.action != action {
+            self.workspace_id = workspace_id;
+            self.action = action;
+            cx.notify();
+        }
+    }
+
+    /// The server's word on this workspace: a new next step is shown as is, a changed card is re-read.
+    fn server_event(&mut self, topic: &str, payload: &serde_json::Value, cx: &mut Context<Self>) {
+        let Some(id) = self.workspace_id.clone() else {
+            return;
+        };
+        match topic {
+            "workspace.next_action" if payload["workspace"].as_str() == Some(id.as_str()) => {
+                if let Some(reply) =
+                    serde_json::from_value::<NextActionReply>(payload.clone()).log_err()
+                {
+                    self.set_state(Some(id), reply.action, cx);
+                }
+            }
+            "workspace.changed"
+                if payload["workspaces"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|w| w.as_str() == Some(id.as_str()))) =>
+            {
+                self.wake();
+            }
+            _ => {}
         }
     }
 
@@ -243,6 +305,16 @@ impl Render for NextActionButton {
     }
 }
 
+pub(crate) fn server_event(topic: &str, payload: &serde_json::Value, cx: &mut App) {
+    let buttons: Vec<Entity<NextActionButton>> = cx
+        .try_global::<NextActionButtons>()
+        .map(|buttons| buttons.0.values().filter_map(WeakEntity::upgrade).collect())
+        .unwrap_or_default();
+    for button in buttons {
+        button.update(cx, |button, cx| button.server_event(topic, payload, cx));
+    }
+}
+
 pub(crate) fn register(cx: &mut App) {
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
         workspace.register_action(|_workspace, _: &RunNextAction, window, cx| {
@@ -256,4 +328,62 @@ pub(crate) fn register(cx: &mut App) {
         });
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn step(kind: &str, label: &str) -> NextAction {
+        NextAction {
+            kind: kind.into(),
+            label: label.into(),
+            agent_step: kind != "merge",
+        }
+    }
+
+    #[gpui::test]
+    fn the_server_event_replaces_the_step_the_button_shows(cx: &mut gpui::TestAppContext) {
+        let button = cx.new(|_| {
+            let mut button = NextActionButton::preview(step("commit-and-push", "Commit & push"));
+            button.workspace_id = Some("ws-1".into());
+            button
+        });
+        let send = |topic: &str, payload: serde_json::Value, cx: &mut gpui::TestAppContext| {
+            button.update(cx, |button, cx| button.server_event(topic, &payload, cx));
+        };
+
+        send(
+            "workspace.next_action",
+            json!({ "workspace": "ws-2", "action": { "kind": "merge", "label": "Merge" } }),
+            cx,
+        );
+        button.read_with(cx, |button, _| {
+            assert_eq!(
+                button.action(),
+                Some(&step("commit-and-push", "Commit & push"))
+            );
+        });
+
+        send(
+            "workspace.next_action",
+            json!({
+                "workspace": "ws-1",
+                "action": { "kind": "merge", "label": "Merge", "agent_step": false },
+                "local": { "unpushed_commits": 0 },
+            }),
+            cx,
+        );
+        button.read_with(cx, |button, _| {
+            assert_eq!(button.action(), Some(&step("merge", "Merge")));
+        });
+
+        send(
+            "workspace.next_action",
+            json!({ "workspace": "ws-1", "action": null }),
+            cx,
+        );
+        button.read_with(cx, |button, _| assert_eq!(button.action(), None));
+    }
 }

@@ -473,8 +473,27 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             }
         }
     }
-    println!("\n--- Icarus: icarus_workspace_card_current ---");
+    println!("\n--- Icarus: icarus_workspace_card_current and icarus_card_hover ---");
     for (name, result) in run_icarus_current_card_tests(workspace_window, &mut cx, update_baseline)
+        .into_iter()
+        .chain(run_icarus_card_hover_tests(
+            workspace_window,
+            &mut cx,
+            update_baseline,
+        ))
+    {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\n--- Icarus: icarus_card_subagents ---");
+    for (name, result) in
+        run_icarus_card_subagents_tests(workspace_window, &mut cx, update_baseline)
     {
         match result {
             Ok(TestResult::Passed) => passed += 1,
@@ -1548,6 +1567,41 @@ fn run_icarus_github_panel_tests(
         Err(error) => results.push(("icarus_github_panel_conversation", Err(error))),
     }
 
+    // The three bot comments Orca's checks panel was compared against: GitHub's HTML subset, inline
+    // code, links and "(edited)".
+    let mut orca_cards = icarus_github_fixture();
+    orca_cards["collapsed"] = serde_json::json!({
+        "pr-attention": true, "pr-previews": true, "pr-checks": true, "pr-review": true,
+    });
+    orca_cards["threads"] = serde_json::json!([]);
+    orca_cards["audience"] = serde_json::json!("all");
+    orca_cards["conversation"] = serde_json::json!([
+        { "id": "O1", "kind": "comment", "author": "farm-bot", "is_bot": true,
+          "created_at": "2026-11-15T01:00:00Z", "last_edited_at": "2026-11-15T02:00:00Z",
+          "body": "✅ The farm reviewed bf4edfd: no blocking problems found.\n\n<sub>Was this helpful? React with 👍 or 👎, or reply starting with 💡 to suggest a change — it helps tune these reviews.</sub>" },
+        { "id": "O2", "kind": "comment", "author": "github-actions", "is_bot": true,
+          "created_at": "2026-11-15T01:00:00Z",
+          "body": "🔎 **Frontend preview deployment** for `bf4edfd`: https://feature-e-7191-renderfailede.billing.pages.dev" },
+        { "id": "O3", "kind": "comment", "author": "linear-code", "is_bot": true,
+          "created_at": "2026-11-15T00:00:00Z", "last_edited_at": "2026-11-15T01:00:00Z",
+          "body": "<p><a href=\"https://linear.app/acme/issue/E-7191\">E-7191</a></p>\n<p><a href=\"https://linear.app/acme/review/fix-e-7191?openGuide=true\">Review in Linear</a></p>" },
+    ]);
+    match show(orca_cards, cx) {
+        Ok(panel) => {
+            panel.update(cx, |panel, cx| panel.set_stack_expanded(false, cx));
+            cx.run_until_parked();
+            results.extend(run_icarus_dark_and_light(
+                "icarus_github_panel_orca_cards",
+                "icarus_github_panel_orca_cards_light",
+                workspace_window.into(),
+                cx,
+                update_baseline,
+            ));
+            hide(panel, cx);
+        }
+        Err(error) => results.push(("icarus_github_panel_orca_cards", Err(error))),
+    }
+
     match show_icarus_review_in_source_control(workspace_window, icarus_review_fixture(), cx) {
         Ok((checks, source_control, width)) => {
             results.extend(run_icarus_dark_and_light(
@@ -2507,6 +2561,65 @@ fn icarus_orca_style_workspaces() -> Vec<icarus_ui::WorkspaceSummary> {
     workspaces
 }
 
+/// Orca's worktree hover card beside a card linked to a pull request and a Linear issue.
+#[cfg(target_os = "macos")]
+fn run_icarus_card_hover_tests(
+    workspace_window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    let panel = workspace_window.update(cx, |workspace, window, cx| {
+        if let Some(previous) = workspace.panel::<icarus_ui::WorkspacesPanel>(cx) {
+            workspace.remove_panel(&previous, window, cx);
+        }
+        let mut workspaces: Vec<_> = icarus_orca_style_workspaces()
+            .into_iter()
+            .filter(|workspace| matches!(workspace.name.as_str(), "abc-101" | "abc-98"))
+            .collect();
+        for card in &mut workspaces {
+            card.status = None;
+            if card.name == "abc-101" {
+                card.branch = Some("feature/abc-101-editor-lazy-load-frames-in-batches-with".into());
+                if let Some(pr) = card.pr.as_mut() {
+                    pr.title = "perf(frontend): lazy-load frames in batches with loading shells".into();
+                }
+                if let Some(issue) = card.issue.as_mut() {
+                    issue["title"] =
+                        serde_json::json!("Editor: lazy-load frames in batches with loading shells");
+                    issue["url"] = serde_json::json!("https://linear.app/acme/issue/ABC-101");
+                    issue["state"] =
+                        serde_json::json!({ "name": "In Review", "type": "started", "color": "#f2c94c" });
+                }
+            }
+        }
+        let weak = workspace.weak_handle();
+        let panel = cx.new(|cx| icarus_ui::WorkspacesPanel::preview(weak, cx));
+        panel.update(cx, |panel, cx| panel.set_workspaces(workspaces, cx));
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<icarus_ui::WorkspacesPanel>(window, cx);
+        icarus_ui::hover_card::show(&panel, "ws-abc-101", cx);
+        panel
+    });
+    let panel = match panel {
+        Ok(panel) => panel,
+        Err(error) => return vec![("icarus_card_hover", Err(error))],
+    };
+    cx.run_until_parked();
+    let results = run_icarus_dark_and_light(
+        "icarus_card_hover",
+        "icarus_card_hover_light",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            workspace.remove_panel(&panel, window, cx);
+        })
+        .log_err();
+    results
+}
+
 /// The open worktree's card (filled like Orca's selected card) with its agents listed, and the
 /// main checkout's card with its "primary" badge, in dark and light themes.
 #[cfg(target_os = "macos")]
@@ -2587,8 +2700,12 @@ fn run_icarus_card_agent_states_tests(
             state: state.into(),
             provider: provider.into(),
             turns,
-            last_activity_ms: 0,
+            ..icarus_ui::AgentSummary::default()
         };
+    let monitoring = icarus_ui::AgentSummary {
+        background_tasks: 1,
+        ..agent("a7", "idle", 1, "claude", "Watch the deploy")
+    };
     let panel = workspace_window.update(cx, |workspace, window, cx| {
         if let Some(previous) = workspace.panel::<icarus_ui::WorkspacesPanel>(cx) {
             workspace.remove_panel(&previous, window, cx);
@@ -2612,6 +2729,8 @@ fn run_icarus_card_agent_states_tests(
                     agent("a3", "idle", 0, "codex", "Agent"),
                     agent("a4", "sleeping", 3, "claude", "Nightly triage"),
                     agent("a5", "exited", 1, "claude", "Spike the cache layer"),
+                    agent("a6", "waiting", 1, "claude", "Approve the migration"),
+                    monitoring.clone(),
                 ]
             } else {
                 vec![
@@ -2620,6 +2739,7 @@ fn run_icarus_card_agent_states_tests(
                     agent("b3", "idle", 1, "claude", "Agent"),
                     agent("b4", "idle", 0, "claude", "Agent"),
                     agent("b5", "sleeping", 2, "claude", "Agent"),
+                    agent("b6", "waiting", 1, "claude", "Agent"),
                 ]
             };
         }
@@ -2641,6 +2761,91 @@ fn run_icarus_card_agent_states_tests(
     let results = run_icarus_dark_and_light(
         "icarus_card_agent_states",
         "icarus_card_agent_states_light",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            workspace.remove_panel(&panel, window, cx);
+        })
+        .log_err();
+    results
+}
+
+/// A working agent's card row with its current tool and the subagents it spawned nested under it.
+#[cfg(target_os = "macos")]
+fn run_icarus_card_subagents_tests(
+    workspace_window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    let subagent = |id: &str, description: Option<&str>, activity: Option<&str>, state: &str| {
+        icarus_ui::SubagentSummary {
+            id: id.into(),
+            kind: "general-purpose".into(),
+            description: description.map(Into::into),
+            activity: activity.map(Into::into),
+            state: state.into(),
+            started_at_ms: now_ms,
+        }
+    };
+    let panel = workspace_window.update(cx, |workspace, window, cx| {
+        if let Some(previous) = workspace.panel::<icarus_ui::WorkspacesPanel>(cx) {
+            workspace.remove_panel(&previous, window, cx);
+        }
+        let mut workspaces: Vec<_> = icarus_preview_workspaces()
+            .into_iter()
+            .filter(|workspace| workspace.name == "abc-101")
+            .collect();
+        for card in &mut workspaces {
+            card.status = None;
+            card.agents = vec![
+                icarus_ui::AgentSummary {
+                    id: "a1".into(),
+                    title: Some("Review #4202".into()),
+                    state: "working".into(),
+                    provider: "claude".into(),
+                    turns: 1,
+                    activity: Some("Bash: mise exec -- ./bin/flow review 4202".into()),
+                    subagents: vec![
+                        subagent("s1", None, None, "working"),
+                        subagent("s2", None, Some("Read: src/server/review.rs"), "working"),
+                        subagent("s3", Some("Check the stack order"), None, "done"),
+                    ],
+                    ..icarus_ui::AgentSummary::default()
+                },
+                icarus_ui::AgentSummary {
+                    id: "a2".into(),
+                    title: Some("Fix the flaky login test".into()),
+                    state: "idle".into(),
+                    provider: "codex".into(),
+                    turns: 2,
+                    ..icarus_ui::AgentSummary::default()
+                },
+            ];
+        }
+        let weak = workspace.weak_handle();
+        let panel = cx.new(|cx| icarus_ui::WorkspacesPanel::preview(weak, cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_workspaces(workspaces, cx);
+            panel.toggle_agents("ws-abc-101", cx);
+        });
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<icarus_ui::WorkspacesPanel>(window, cx);
+        panel
+    });
+    let panel = match panel {
+        Ok(panel) => panel,
+        Err(error) => return vec![("icarus_card_subagents", Err(error))],
+    };
+    cx.run_until_parked();
+    let results = run_icarus_dark_and_light(
+        "icarus_card_subagents",
+        "icarus_card_subagents_light",
         workspace_window.into(),
         cx,
         update_baseline,
@@ -4307,6 +4512,22 @@ fn run_icarus_agent_tabs_screens(
                 )),
                 Err(error) => results.push(("icarus_agent_tab_states", Err(error))),
             }
+            match show_icarus_agent_tab_server_states(window, cx) {
+                Ok(()) => results.extend(run_icarus_dark_and_light(
+                    "icarus_agent_tab_server_states",
+                    "icarus_agent_tab_server_states_light",
+                    window.into(),
+                    cx,
+                    update_baseline,
+                )),
+                Err(error) => results.push(("icarus_agent_tab_server_states", Err(error))),
+            }
+            results.extend(run_icarus_agent_thread_activity_screens(
+                window,
+                cx,
+                update_baseline,
+            ));
+            cx.update(|cx| cx.remove_global::<ui::AgentLiveStates>());
             match show_icarus_empty_pane(window, cx) {
                 Ok(()) => results.extend(run_icarus_dark_and_light(
                     "icarus_empty_pane",
@@ -4399,6 +4620,190 @@ fn show_icarus_agent_tab_states(
     cx.update_window(window.into(), |_, window, _| window.refresh())?;
     cx.run_until_parked();
     Ok(())
+}
+
+/// The tabs drawn from the server's pushed states, as the cards are: the first agent monitoring
+/// background tasks, the second waiting on the user, whatever their threads think.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn show_icarus_agent_tab_server_states(
+    window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+) -> Result<()> {
+    use agent_ui::agent_tab::AgentTab;
+
+    let ids = window.update(cx, |workspace, _, cx| {
+        workspace
+            .items_of_type::<AgentTab>(cx)
+            .filter_map(|tab| tab.read(cx).agent_id(cx))
+            .collect::<Vec<_>>()
+    })?;
+    let [first, second] = ids.as_slice() else {
+        anyhow::bail!("expected two agent tabs");
+    };
+    cx.update(|cx| {
+        ui::AgentLiveStates::set(
+            cx,
+            [
+                (first.clone(), ui::AgentDotState::Monitoring),
+                (second.clone(), ui::AgentDotState::Permission),
+            ],
+        )
+    });
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _| window.refresh())?;
+    cx.run_until_parked();
+    Ok(())
+}
+
+/// The second agent's thread after a run of tool calls: compact summaries with the working
+/// indicator, the same thread verbose, and the pulsing line while background tasks run.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn run_icarus_agent_thread_activity_screens(
+    window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    let (agent_id, thread) = match show_icarus_agent_thread_tool_calls(window, cx) {
+        Ok(shown) => shown,
+        Err(error) => return vec![("icarus_agent_thread_compact", Err(error))],
+    };
+    let set_agent_state = |state: ui::AgentDotState, cx: &mut VisualTestAppContext| {
+        cx.update(|cx| ui::AgentLiveStates::set(cx, [(agent_id.clone(), state)]));
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .log_err();
+        cx.run_until_parked();
+    };
+    set_agent_state(ui::AgentDotState::Working, cx);
+    let mut results = run_icarus_dark_and_light(
+        "icarus_agent_thread_compact",
+        "icarus_agent_thread_compact_light",
+        window.into(),
+        cx,
+        update_baseline,
+    );
+    set_icarus_agent_verbose(true, cx);
+    set_agent_state(ui::AgentDotState::Working, cx);
+    results.push((
+        "icarus_agent_thread_verbose",
+        run_visual_test(
+            "icarus_agent_thread_verbose",
+            window.into(),
+            cx,
+            update_baseline,
+        ),
+    ));
+    set_icarus_agent_verbose(false, cx);
+    // The turn ends while the server keeps watching its background tasks.
+    let cancel = thread.update(cx, |thread, cx| thread.cancel(cx));
+    cx.background_executor.allow_parking();
+    cx.foreground_executor.block_test(cancel).log_err();
+    cx.background_executor.forbid_parking();
+    set_agent_state(ui::AgentDotState::Monitoring, cx);
+    results.push((
+        "icarus_agent_thread_monitoring",
+        run_visual_test(
+            "icarus_agent_thread_monitoring",
+            window.into(),
+            cx,
+            update_baseline,
+        ),
+    ));
+    results
+}
+
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn set_icarus_agent_verbose(verbose: bool, cx: &mut VisualTestAppContext) {
+    use gpui::BorrowAppContext as _;
+
+    cx.update(|cx| {
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().verbose = Some(verbose);
+            });
+        });
+    });
+    cx.run_until_parked();
+}
+
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn show_icarus_agent_thread_tool_calls(
+    window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+) -> Result<(String, Entity<acp_thread::AcpThread>)> {
+    use agent_client_protocol::v1::schema as acp_v1;
+    use agent_ui::agent_tab::AgentTab;
+
+    let tab = window
+        .update(cx, |workspace, _, cx| {
+            workspace.items_of_type::<AgentTab>(cx).nth(1)
+        })?
+        .context("expected two agent tabs")?;
+    let thread = cx
+        .read(|cx| {
+            tab.read(cx)
+                .thread_view(cx)
+                .map(|view| view.read(cx).thread.clone())
+        })
+        .context("agent tab did not connect")?;
+    let tool_call = |id: &str, kind: acp_v1::ToolKind, title: &str, status| {
+        acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new(acp_v1::ToolCallId::new(id.to_string()), title.to_string())
+                .kind(kind)
+                .status(status)
+                .content(vec![format!("{title}: ok").into()]),
+        )
+    };
+    let message = |text: &str| {
+        acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(text.into()))
+    };
+    let updates = vec![
+        tool_call(
+            "status",
+            acp_v1::ToolKind::Execute,
+            "git status",
+            acp_v1::ToolCallStatus::Completed,
+        ),
+        tool_call(
+            "fetch",
+            acp_v1::ToolKind::Execute,
+            "git fetch origin main",
+            acp_v1::ToolCallStatus::Completed,
+        ),
+        tool_call(
+            "read",
+            acp_v1::ToolKind::Read,
+            "Read src/login.rs",
+            acp_v1::ToolCallStatus::Completed,
+        ),
+        message("The redirect drops `next` when the session refresh fails. Patching it now."),
+        tool_call(
+            "edit",
+            acp_v1::ToolKind::Edit,
+            "Edit src/login.rs",
+            acp_v1::ToolCallStatus::Completed,
+        ),
+        message("Next I'll run the login tests."),
+        tool_call(
+            "test",
+            acp_v1::ToolKind::Execute,
+            "cargo test -p login",
+            acp_v1::ToolCallStatus::InProgress,
+        ),
+    ];
+    // One update per effect cycle: the thread view syncs each new entry as the last one.
+    for update in updates {
+        thread.update(cx, |thread, cx| thread.handle_session_update(update, cx))?;
+        cx.run_until_parked();
+    }
+    window.update(cx, |workspace, window, cx| {
+        workspace.activate_item(&tab, true, false, window, cx);
+    })?;
+    cx.run_until_parked();
+    let agent_id = cx
+        .read(|cx| tab.read(cx).agent_id(cx))
+        .context("agent tab has no session")?;
+    Ok((agent_id, thread))
 }
 
 /// Every tab closed: the pane offers what its "+" would, and there is no composer.

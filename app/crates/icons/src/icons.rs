@@ -250,6 +250,7 @@ pub enum IconName {
     SignalLow,
     SignalMedium,
     Slash,
+    SmilePlus,
     Sourcehut,
     Space,
     Sparkle,

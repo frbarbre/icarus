@@ -27,12 +27,12 @@ use crate::terminal::{SpawnOptions, TerminalEvent, TerminalManager};
 
 /// `workspace.root` from the user's settings, so restarts keep the folder without an env var.
 fn configured_workspace_root(home: &std::path::Path) -> Option<PathBuf> {
-    use icarus_settings::layers::{self, Layer, SettingsPaths};
+    use icarus_settings::layers::{Layer, SettingsPaths};
     let path = SettingsPaths::discover(None).user?;
-    let doc = match layers::read_layer(Layer::User, &path) {
+    let (_, doc) = match crate::settings::read_cached(Layer::User, &path) {
         Ok(doc) => doc?,
         Err(error) => {
-            tracing::warn!("workspace.root: reading {}: {error:?}", path.display());
+            tracing::warn!("workspace.root: {}", error.message);
             return None;
         }
     };
@@ -990,6 +990,25 @@ impl Server {
                     .map_err(|e| rpc("interrupt_failed", format!("{e:#}")))?;
                 Ok(json!({ "interrupted": true }))
             }
+            "agent.answer" => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                    request_id: String,
+                    decision: String,
+                    answers: Option<Value>,
+                }
+                let p: P = params(params_value)?;
+                let thread = self
+                    .agents
+                    .get(&p.id)
+                    .ok_or_else(|| rpc("not_found", &p.id))?;
+                thread
+                    .answer(&p.request_id, &p.decision, p.answers)
+                    .await
+                    .map_err(|e| rpc("answer_failed", format!("{e:#}")))?;
+                Ok(json!({ "answered": true }))
+            }
             "agent.kill" => {
                 #[derive(Deserialize)]
                 struct P {
@@ -1102,8 +1121,7 @@ impl Server {
                 let deadline =
                     Instant::now() + Duration::from_millis(p.timeout_ms.unwrap_or(600_000));
                 loop {
-                    let state = thread.state();
-                    if state == AgentState::Exited || (p.idle && state == AgentState::Idle) {
+                    if thread.state() == AgentState::Exited || (p.idle && thread.settled()) {
                         return to_value(thread.info());
                     }
                     if Instant::now() >= deadline {

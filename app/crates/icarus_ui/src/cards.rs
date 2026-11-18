@@ -329,16 +329,34 @@ gpui::actions!(
     ]
 );
 
-/// The card's unread dot: accent for a finished agent, warning when it needs you.
-pub fn render_unread_dot(workspace_id: &str, unread: &Unread, cx: &App) -> impl IntoElement {
-    let (color, tooltip) = match unread.kind {
-        UnreadKind::NeedsInput => (Color::Warning, "An agent needs your input"),
-        UnreadKind::Done => (Color::Accent, "An agent finished while you were away"),
+/// The card's unread badge: a small accent dot on the lead icon's top-left corner, ringed in the
+/// card's background so it stays legible over the glyph (Orca's 6px dot with a 2px ring).
+pub fn render_unread_dot(
+    workspace_id: &str,
+    unread: &Unread,
+    ring: gpui::Hsla,
+    cx: &App,
+) -> impl IntoElement {
+    let tooltip = match unread.kind {
+        UnreadKind::NeedsInput => "An agent needs your input",
+        UnreadKind::Done => "An agent finished while you were away",
     };
-    div()
+    h_flex()
         .id(SharedString::from(format!("icarus-unread-{workspace_id}")))
+        .absolute()
+        .left(px(-4.))
+        .top(px(-4.))
+        .size(px(10.))
+        .justify_center()
+        .rounded_full()
+        .bg(ring)
         .tooltip(ui::Tooltip::text(tooltip))
-        .child(div().size_2().rounded_full().bg(color.color(cx)))
+        .child(
+            div()
+                .size(px(6.))
+                .rounded_full()
+                .bg(Color::Accent.color(cx)),
+        )
 }
 
 pub const MOON_ICON: &str = "icons/icarus/moon.svg";
@@ -550,6 +568,7 @@ pub fn open_agent(path: std::path::PathBuf, agent_id: String, cx: &mut App) {
 pub struct CardList {
     pub scroll: gpui::ScrollHandle,
     expanded_agents: collections::HashSet<String>,
+    collapsed_subagents: collections::HashSet<String>,
     shown_workspace: Option<gpui::EntityId>,
 }
 
@@ -608,6 +627,24 @@ impl WorkspacesPanel {
         self.card_list.update(cx, |list, cx| {
             if !list.expanded_agents.remove(workspace_id) {
                 list.expanded_agents.insert(workspace_id.to_owned());
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    pub fn subagents_expanded(&self, agent_id: &str, cx: &App) -> bool {
+        !self
+            .card_list
+            .read(cx)
+            .collapsed_subagents
+            .contains(agent_id)
+    }
+
+    pub fn toggle_subagents(&mut self, agent_id: &str, cx: &mut Context<Self>) {
+        self.card_list.update(cx, |list, cx| {
+            if !list.collapsed_subagents.remove(agent_id) {
+                list.collapsed_subagents.insert(agent_id.to_owned());
             }
             cx.notify();
         });
@@ -739,6 +776,9 @@ impl WorkspacesPanel {
             }
         };
         let row_hover = cx.theme().colors().element_hover;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
         let list = expanded.then(|| {
             v_flex()
                 .pl_1p5()
@@ -747,36 +787,146 @@ impl WorkspacesPanel {
                     let title = agent.display_title();
                     let agent_row_id =
                         SharedString::from(format!("icarus-agent-{}-{}", workspace.id, agent.id));
-                    let open = {
+                    let open = |agent_id: &str| {
                         let path = workspace.path.clone();
-                        let agent_id = agent.id.clone();
+                        let agent_id = agent_id.to_owned();
                         cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
                             cx.stop_propagation();
                             open_agent(path.clone(), agent_id.clone(), cx);
                         })
                     };
-                    h_flex()
-                        .id(agent_row_id.clone())
-                        .debug_selector(|| agent_row_id.to_string())
-                        .px_0p5()
-                        .gap_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(row_hover))
-                        .on_click(open)
-                        .child(agent_state_icon(agent))
-                        .child(agent_provider_icon(&agent.provider))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(Label::new(title).size(LabelSize::XSmall).truncate()),
-                        )
-                        .child(
-                            Label::new(agent.dot_state().summary_label())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
+                    let subagents_shown = self.subagents_expanded(&agent.id, cx);
+                    let toggle_subagents = {
+                        let agent_id = agent.id.clone();
+                        cx.listener(move |panel, _: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            panel.toggle_subagents(&agent_id, cx);
+                        })
+                    };
+                    let has_subagents = !agent.subagents.is_empty();
+                    let row =
+                        h_flex()
+                            .id(agent_row_id.clone())
+                            .debug_selector(|| agent_row_id.to_string())
+                            .px_0p5()
+                            .gap_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(row_hover))
+                            .on_click(open(&agent.id))
+                            .child(agent_state_icon(agent))
+                            .child(agent_provider_icon(&agent.provider))
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .overflow_hidden()
+                                    .child(div().min_w_0().max_w(gpui::relative(0.7)).child(
+                                        Label::new(title).size(LabelSize::XSmall).truncate(),
+                                    ))
+                                    .when_some(agent.live_activity(), |line, activity| {
+                                        line.child(
+                                            div().flex_1().min_w_0().child(
+                                                Label::new(format!("— {activity}"))
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted)
+                                                    .truncate(),
+                                            ),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                Label::new(agent.activity_label())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .when(has_subagents && !subagents_shown, |row| {
+                                row.child(
+                                    Label::new(format!("+{}", agent.subagents.len()))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                            })
+                            .when(has_subagents, |row| {
+                                let toggle_id = SharedString::from(format!(
+                                    "icarus-subagents-{}-{}",
+                                    workspace.id, agent.id
+                                ));
+                                row.child(
+                                    IconButton::new(
+                                        toggle_id,
+                                        if subagents_shown {
+                                            IconName::ChevronUp
+                                        } else {
+                                            IconName::ChevronDown
+                                        },
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .shape(ui::IconButtonShape::Square)
+                                    .on_click(toggle_subagents),
+                                )
+                            });
+                    let children = (has_subagents && subagents_shown).then(|| {
+                        v_flex()
+                            .pl(px(16.))
+                            .gap_0p5()
+                            .children(agent.subagents.iter().map(|subagent| {
+                                let (lead, trail) = subagent.lead_and_trail();
+                                let child_id = SharedString::from(format!(
+                                    "icarus-subagent-{}-{}",
+                                    agent.id, subagent.id
+                                ));
+                                h_flex()
+                                    .id(child_id.clone())
+                                    .debug_selector(|| child_id.to_string())
+                                    .px_0p5()
+                                    .gap_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(row_hover))
+                                    .on_click(open(&agent.id))
+                                    .child(
+                                        ui::AgentStateIndicator::new(subagent.dot_state())
+                                            .size(px(10.)),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_1()
+                                            .overflow_hidden()
+                                            .child(
+                                                div().min_w_0().max_w(gpui::relative(0.7)).child(
+                                                    Label::new(lead)
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted)
+                                                        .truncate(),
+                                                ),
+                                            )
+                                            .when_some(trail, |line, trail| {
+                                                line.child(
+                                                    div().flex_1().min_w_0().child(
+                                                        Label::new(format!("— {trail}"))
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Muted)
+                                                            .alpha(0.7)
+                                                            .truncate(),
+                                                    ),
+                                                )
+                                            }),
+                                    )
+                                    .when(subagent.started_at_ms > 0, |row| {
+                                        row.child(
+                                            Label::new(short_age(subagent.started_at_ms, now_ms))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                    })
+                            }))
+                    });
+                    v_flex().gap_0p5().child(row).children(children)
                 }))
         });
         Some(
@@ -1723,6 +1873,76 @@ mod tests {
         cx.simulate_click(pill.center(), Modifiers::none());
         cx.run_until_parked();
         assert!(!panel.read_with(cx, |panel, cx| panel.agents_expanded("ws-busy", cx)));
+    }
+
+    #[gpui::test]
+    async fn a_pushed_state_nests_the_agents_subagents_under_its_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut card = crate::tests::summary("busy", "/w/busy", None);
+        card.agents = vec![AgentSummary {
+            id: "a".into(),
+            state: "working".into(),
+            provider: "claude".into(),
+            turns: 1,
+            revision: 1,
+            ..AgentSummary::default()
+        }];
+        let (_, panel, mut cx) = crate::tests::panel_window(vec![card], cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(gpui::size(px(1280.), px(800.)));
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_agents("ws-busy", cx);
+            panel
+                .workspace
+                .update(cx, |workspace, cx| {
+                    workspace.open_panel::<WorkspacesPanel>(window, cx)
+                })
+                .ok();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("icarus-agent-ws-busy-a").is_some());
+        assert!(cx.debug_bounds("icarus-subagent-a-toolu_1").is_none());
+
+        let payload = json!({
+            "id": "a", "state": "working", "provider": "claude", "turns": 1, "revision": 2,
+            "workspace": "ws-busy", "activity": "Bash: mise exec -- ./bin/flow",
+            "subagents": [
+                { "id": "toolu_1", "type": "general-purpose", "description": null,
+                  "activity": "Read: src/lib.rs", "state": "working", "started_at_ms": 1 },
+                { "id": "toolu_2", "type": "general-purpose", "description": "Check the diff",
+                  "activity": null, "state": "done", "started_at_ms": 1 },
+            ],
+        });
+        cx.update(|_, cx| crate::handle_view_event("agent.state", payload, cx));
+        cx.run_until_parked();
+        let agent = panel.read_with(cx, |panel, _| panel.workspaces[0].agents[0].clone());
+        assert_eq!(agent.live_activity(), Some("Bash: mise exec -- ./bin/flow"));
+        assert_eq!(
+            agent.subagents[0].lead_and_trail(),
+            ("general-purpose".into(), Some("Read: src/lib.rs".into()))
+        );
+        assert_eq!(
+            agent.subagents[1].lead_and_trail(),
+            ("Check the diff".into(), None)
+        );
+        assert_eq!(agent.subagents[1].dot_state(), ui::AgentDotState::Done);
+        let parent = cx
+            .debug_bounds("icarus-agent-ws-busy-a")
+            .expect("the agent row is drawn");
+        let child = cx
+            .debug_bounds("icarus-subagent-a-toolu_1")
+            .expect("the subagent row is drawn");
+        assert!(child.top() >= parent.bottom(), "nested under its agent");
+        assert!(child.left() > parent.left(), "indented");
+        assert!(cx.debug_bounds("icarus-subagent-a-toolu_2").is_some());
+
+        panel.update(cx, |panel, cx| panel.toggle_subagents("a", cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("icarus-subagent-a-toolu_1").is_none(),
+            "collapsed"
+        );
     }
 
     #[gpui::test]

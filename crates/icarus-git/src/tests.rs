@@ -76,6 +76,23 @@ fn a_process_git_leaves_holding_its_output_cannot_outlast_the_deadline() {
 }
 
 #[test]
+fn a_git_run_that_never_finishes_is_killed_with_a_clear_error() {
+    let repo = repo();
+    let started = std::time::Instant::now();
+    let error = git_timeout(
+        &repo.root,
+        &["-c", "alias.hang=!sleep 30", "hang"],
+        std::time::Duration::from_millis(300),
+    )
+    .expect_err("never finishes");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(
+        error.to_string().contains("did not finish within"),
+        "{error}"
+    );
+}
+
+#[test]
 fn canonical_remote_normalizes_common_url_shapes() {
     for url in [
         "https://github.com/Acme/Widgets.git",

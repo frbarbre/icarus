@@ -280,6 +280,7 @@
       "ctrl-alt-shift-pageup": "agent::ScrollOutputToPreviousMessage",
       "ctrl-alt-shift-pagedown": "agent::ScrollOutputToNextMessage",
       "ctrl-f": "agent::ToggleSearch",
+      "ctrl-o": "agent::ToggleVerbose",
       "f3": "agent::SelectNextThreadMatch",
       "shift-f3": "agent::SelectPreviousThreadMatch",
       "alt-c": "search::ToggleCaseSensitive",

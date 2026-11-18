@@ -5105,6 +5105,310 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn a_turn_the_server_runs_for_this_session_shows_as_working_and_stops_from_here(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let view = active_thread(&conversation_view, cx);
+        let session_id = view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        view.read_with(cx, |view, _| assert!(!view.generating_indicator_in_list));
+
+        cx.update(|_, cx| {
+            ui::AgentLiveStates::set(cx, [(session_id.0.to_string(), ui::AgentDotState::Working)])
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Idle);
+            assert!(
+                view.generating_indicator_in_list,
+                "a prompt sent from a card or another window still shows the working row"
+            );
+        });
+
+        view.update_in(cx, |view, _, cx| view.cancel_generation(cx));
+        assert_eq!(connection.take_cancel_calls(), vec![session_id.clone()]);
+
+        cx.update(|_, cx| {
+            ui::AgentLiveStates::set(cx, [(session_id.0.to_string(), ui::AgentDotState::Done)])
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.generating_indicator_in_list));
+    }
+
+    async fn thread_with_tool_calls(
+        updates: Vec<acp_v1::SessionUpdate>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ThreadView>, &mut VisualTestContext) {
+        set_verbose(false, cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(2000.)));
+        let view = active_thread(&conversation_view, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        connection.set_next_prompt_updates(updates);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("go", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    fn tool_call_update(
+        id: &str,
+        kind: acp_v1::ToolKind,
+        status: acp_v1::ToolCallStatus,
+    ) -> acp_v1::SessionUpdate {
+        acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new(id.to_string(), format!("Tool {id}"))
+                .kind(kind)
+                .status(status)
+                .content(vec![format!("output of {id}").into()]),
+        )
+    }
+
+    #[gpui::test]
+    async fn compact_mode_folds_consecutive_tool_calls_into_one_expandable_row(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (view, cx) = thread_with_tool_calls(
+            vec![
+                tool_call_update(
+                    "t1",
+                    acp_v1::ToolKind::Execute,
+                    acp_v1::ToolCallStatus::Completed,
+                ),
+                tool_call_update(
+                    "t2",
+                    acp_v1::ToolKind::Execute,
+                    acp_v1::ToolCallStatus::Completed,
+                ),
+                tool_call_update(
+                    "t3",
+                    acp_v1::ToolKind::Read,
+                    acp_v1::ToolCallStatus::Completed,
+                ),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    "Checked.".into(),
+                )),
+                tool_call_update(
+                    "t4",
+                    acp_v1::ToolKind::Edit,
+                    acp_v1::ToolCallStatus::Completed,
+                ),
+                tool_call_update(
+                    "t5",
+                    acp_v1::ToolKind::Execute,
+                    acp_v1::ToolCallStatus::Failed,
+                ),
+            ],
+            cx,
+        )
+        .await;
+
+        view.read_with(cx, |view, cx| {
+            assert!(!view.is_verbose());
+            let entries = view.thread.read(cx).entries();
+            assert_eq!(thread_view::compact_tool_group(entries, 2), Some(1..4));
+            assert_eq!(thread_view::compact_tool_group(entries, 4), None);
+            assert_eq!(thread_view::compact_tool_group(entries, 5), Some(5..6));
+            assert_eq!(
+                thread_view::compact_tool_group(entries, 6),
+                None,
+                "a failed tool call stays fully visible"
+            );
+            let summary = |range: std::ops::Range<usize>| {
+                thread_view::compact_tool_summary(entries[range].iter().filter_map(|entry| {
+                    match entry {
+                        AgentThreadEntry::ToolCall(tool_call) => Some(tool_call),
+                        _ => None,
+                    }
+                }))
+            };
+            assert_eq!(summary(1..4), "Ran 2 commands, read a file");
+            assert_eq!(summary(5..6), "Edited a file");
+        });
+
+        assert!(cx.debug_bounds("compact-tool-group-1").is_some());
+        assert!(cx.debug_bounds("compact-tool-group-5").is_some());
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_none());
+        assert!(cx.debug_bounds("tool-call-t3-standalone").is_none());
+        assert!(cx.debug_bounds("tool-call-t5-standalone").is_some());
+
+        view.update(cx, |view, cx| view.toggle_tool_group(1, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("compact-tool-group-1").is_some());
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_some());
+        assert!(cx.debug_bounds("tool-call-t3-standalone").is_some());
+        assert!(cx.debug_bounds("tool-call-t4-standalone").is_none());
+
+        view.update(cx, |view, cx| view.toggle_tool_group(1, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_none());
+    }
+
+    #[gpui::test]
+    async fn toggle_verbose_action_expands_every_tool_call_and_persists(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx) = thread_with_tool_calls(
+            vec![
+                tool_call_update(
+                    "t1",
+                    acp_v1::ToolKind::Execute,
+                    acp_v1::ToolCallStatus::Completed,
+                ),
+                tool_call_update(
+                    "t2",
+                    acp_v1::ToolKind::Search,
+                    acp_v1::ToolCallStatus::Completed,
+                ),
+            ],
+            cx,
+        )
+        .await;
+        assert!(cx.debug_bounds("compact-tool-group-1").is_some());
+
+        view.update_in(cx, |view, window, cx| {
+            view.focus_handle(cx).focus(window, cx)
+        });
+        cx.dispatch_action(crate::ToggleVerbose);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.is_verbose());
+            assert!(AgentSettings::get_global(cx).verbose);
+        });
+        assert!(cx.debug_bounds("compact-tool-group-1").is_none());
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_some());
+        assert!(cx.debug_bounds("tool-call-t2-standalone").is_some());
+
+        cx.dispatch_action(crate::ToggleVerbose);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.is_verbose()));
+        assert!(cx.debug_bounds("compact-tool-group-1").is_some());
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_none());
+    }
+
+    #[gpui::test]
+    async fn a_plan_awaiting_approval_stays_fully_visible_in_compact_mode(cx: &mut TestAppContext) {
+        init_test(cx);
+        set_verbose(false, cx);
+        let plan_call = |id: &str, status| {
+            acp_v1::ToolCall::new(id.to_string(), "Ready to code?")
+                .kind(acp_v1::ToolKind::SwitchMode)
+                .status(status)
+                .content(vec!["## Plan\n- Keep `next` through the refresh".into()])
+        };
+        let connection =
+            StubAgentConnection::new().with_permission_requests(HashMap::from_iter([(
+                acp_v2::ToolCallId::new("plan"),
+                PermissionOptions::Flat(vec![
+                    acp_v2::PermissionOption::new(
+                        "allow_accept_edits",
+                        "Yes, and auto-accept edits",
+                        acp_v2::PermissionOptionKind::AllowAlways,
+                    ),
+                    acp_v2::PermissionOption::new(
+                        "allow",
+                        "Yes, and manually approve edits",
+                        acp_v2::PermissionOptionKind::AllowOnce,
+                    ),
+                    acp_v2::PermissionOption::new(
+                        "deny",
+                        "No, keep planning",
+                        acp_v2::PermissionOptionKind::RejectOnce,
+                    ),
+                ]),
+            )]));
+        connection.set_next_prompt_updates(vec![
+            tool_call_update(
+                "t1",
+                acp_v1::ToolKind::Read,
+                acp_v1::ToolCallStatus::Completed,
+            ),
+            acp_v1::SessionUpdate::ToolCall(plan_call(
+                "earlier-plan",
+                acp_v1::ToolCallStatus::Completed,
+            )),
+            acp_v1::SessionUpdate::ToolCall(plan_call("plan", acp_v1::ToolCallStatus::Pending)),
+        ]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(2000.)));
+        let view = active_thread(&conversation_view, cx);
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Plan the fix", window, cx);
+        });
+        view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.activity(cx),
+                Some(thread_view::ThreadActivity::PlanReady)
+            );
+            let entries = view.thread.read(cx).entries();
+            assert_eq!(thread_view::compact_tool_group(entries, 1), Some(1..2));
+            assert_eq!(thread_view::compact_tool_group(entries, 2), None);
+            assert_eq!(thread_view::compact_tool_group(entries, 3), None);
+        });
+        assert!(cx.debug_bounds("compact-tool-group-1").is_some());
+        assert!(cx.debug_bounds("tool-call-plan-standalone").is_some());
+        assert!(
+            cx.debug_bounds("tool-call-output-2-0").is_some(),
+            "an approved plan stays readable in compact mode"
+        );
+    }
+
+    #[gpui::test]
+    async fn working_indicator_follows_the_thread_and_the_server_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx) = thread_with_tool_calls(
+            vec![tool_call_update(
+                "t1",
+                acp_v1::ToolKind::Execute,
+                acp_v1::ToolCallStatus::InProgress,
+            )],
+            cx,
+        )
+        .await;
+        let session_id = view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let set_state = |state: ui::AgentDotState, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| ui::AgentLiveStates::set(cx, [(session_id.0.to_string(), state)]));
+            cx.run_until_parked();
+            view.read_with(cx, |view, cx| {
+                assert_eq!(
+                    view.generating_indicator_in_list,
+                    view.activity(cx).is_some()
+                );
+                view.activity(cx)
+            })
+        };
+
+        assert_eq!(
+            set_state(ui::AgentDotState::Working, cx),
+            Some(thread_view::ThreadActivity::Working("Running a command…"))
+        );
+        assert_eq!(
+            set_state(ui::AgentDotState::Permission, cx),
+            Some(thread_view::ThreadActivity::WaitingForUser)
+        );
+        assert_eq!(
+            set_state(ui::AgentDotState::Monitoring, cx),
+            Some(thread_view::ThreadActivity::BackgroundTasks)
+        );
+        assert_eq!(set_state(ui::AgentDotState::Done, cx), None);
+        view.read_with(cx, |view, _| assert!(!view.generating_indicator_in_list));
+    }
+
+    #[gpui::test]
     async fn test_no_notification_when_queued_message_will_be_auto_sent(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -11003,6 +11307,18 @@ pub(crate) mod tests {
             agent_panel::init(cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             prompt_store::init(cx)
+        });
+        // Most tests inspect full tool call cards; compact-mode tests opt back out.
+        set_verbose(true, cx);
+    }
+
+    pub(crate) fn set_verbose(verbose: bool, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().verbose = Some(verbose);
+                });
+            });
         });
     }
 

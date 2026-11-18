@@ -134,6 +134,14 @@ pub fn from_agent_event(
                 data["request"].as_str().unwrap_or("a request")
             ),
         ),
+        "permission_request" if data["question"] != json!(true) => (
+            AGENT_WAITING,
+            format!("{label}: needs permission"),
+            data["tool_name"]
+                .as_str()
+                .map(|tool| format!("Allow {tool}?"))
+                .unwrap_or_else(|| "The agent asks for permission.".to_owned()),
+        ),
         "tool_call" if data["parent"].is_null() && data["name"] == "AskUserQuestion" => (
             AGENT_WAITING,
             format!("{label}: has a question"),
@@ -234,11 +242,19 @@ pub(crate) fn spawn(server: Arc<Server>) {
     };
     tokio::spawn(async move {
         while let Some((id, event)) = signals.recv().await {
+            if event.kind == crate::agent::STATE_SIGNAL {
+                server.broadcast("agent.state", event.data);
+                continue;
+            }
             let Some(agent) = server.agents.get(&id) else {
                 continue;
             };
             if event.kind == "turn_end" {
-                server.usage_seen(&agent.info());
+                let info = agent.info();
+                server.usage_seen(&info);
+                if let Some(workspace) = &info.workspace {
+                    server.agent_turn_ended(&id, workspace);
+                }
             }
             // A note reply's answer shows up in its thread; it is not a turn the user waits on.
             if server.store.is_note_reply_agent(&id).unwrap_or(false) {
@@ -422,6 +438,10 @@ mod tests {
             account: None,
             remote_control: false,
             remote_control_url: None,
+            background_tasks: 0,
+            live: Default::default(),
+            permission_requests: Vec::new(),
+            revision: 0,
         }
     }
 

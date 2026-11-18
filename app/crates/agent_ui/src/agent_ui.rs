@@ -405,6 +405,8 @@ actions!(
         ScrollOutputToNextMessage,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
+        /// Toggles between compact tool call summaries and fully expanded tool calls in agent threads.
+        ToggleVerbose,
         /// Import agent threads from other Icarus release channels (e.g. Preview, Nightly).
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
@@ -1121,6 +1123,7 @@ mod tests {
             tool_permissions: Default::default(),
             sandbox_permissions: Default::default(),
             show_turn_stats: false,
+            verbose: false,
             show_merge_conflict_indicator: true,
             auto_generate_thread_titles: true,
             max_idle_retained_threads: 5,

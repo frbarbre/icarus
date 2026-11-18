@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,7 @@ use collections::{HashMap, HashSet};
 use editor::Editor;
 use gpui::{
     Action, App, AsyncWindowContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, Pixels, Render, Task, WeakEntity, Window, actions, px, rgb,
+    Focusable, Hsla, Pixels, Render, Subscription, Task, WeakEntity, Window, actions, px, rgb,
 };
 use gpui_tokio::Tokio;
 use icarus_client::Client;
@@ -22,6 +23,7 @@ use workspace::dock::{DockPosition, Panel, PanelEvent, PanelSizeState};
 use crate::diff_tab::DiffBase;
 use crate::links::{PreviewDeployment, ordered_previews};
 use crate::pr_comments;
+use crate::pr_store::{PrReviewFailed, PrReviewStore, ReviewOp, Viewer};
 use crate::review::{
     ReviewDraft, ReviewSection, ReviewThread, ReviewView, ThreadComment as ReviewThreadComment,
 };
@@ -897,6 +899,10 @@ pub(crate) fn tone_color(tone: Tone, cx: &App) -> Option<Hsla> {
     Some(rgb(color).into())
 }
 
+pub(crate) fn render_outdated_pill(cx: &App) -> AnyElement {
+    render_pill("Outdated", Tone::Pending, cx).into_any_element()
+}
+
 fn render_pill(label: impl Into<SharedString>, tone: Tone, cx: &App) -> impl IntoElement {
     let colors = cx.theme().colors();
     let (text, background, border) = match tone_color(tone, cx) {
@@ -1045,6 +1051,7 @@ struct Snapshot {
     threads: Vec<ReviewThread>,
     /// Issue comments and review summaries, read with the threads.
     conversation: Vec<pr_comments::ConversationComment>,
+    viewer: Option<Viewer>,
     /// The workspace and PR `updated_at` the threads were read for; None when this snapshot skipped them.
     threads_for: Option<(String, Option<String>)>,
 }
@@ -1061,11 +1068,14 @@ enum ThreadsFetch {
     },
 }
 
-async fn fetch_threads(
-    client: &Client,
-    workspace: &str,
-    refresh: bool,
-) -> (Vec<ReviewThread>, Vec<pr_comments::ConversationComment>) {
+type FetchedThreads = (
+    Vec<ReviewThread>,
+    Vec<pr_comments::ConversationComment>,
+    Option<Viewer>,
+);
+
+/// `None` when the read failed: the shared store keeps what it has rather than going empty.
+async fn fetch_threads(client: &Client, workspace: &str, refresh: bool) -> Option<FetchedThreads> {
     let reply = client
         .request(
             "review.threads",
@@ -1073,13 +1083,14 @@ async fn fetch_threads(
         )
         .await;
     match reply {
-        Ok(reply) => (
+        Ok(reply) => Some((
             serde_json::from_value(reply["threads"].clone()).unwrap_or_default(),
             serde_json::from_value(reply["conversation"].clone()).unwrap_or_default(),
-        ),
+            serde_json::from_value(reply["viewer"].clone()).ok(),
+        )),
         Err(error) => {
             log::warn!("loading PR threads failed: {error:#}");
-            (Vec::new(), Vec::new())
+            None
         }
     }
 }
@@ -1109,21 +1120,22 @@ async fn fetch_snapshot(
     let pull_request = status
         .as_ref()
         .and_then(|status| status.pull_request.as_ref());
-    let ((threads, conversation), threads_for) = match (&current, pull_request) {
+    let ((threads, conversation, viewer), threads_for) = match (&current, pull_request) {
         (Some(current), Some(pull_request)) => {
             let key = (current.id.clone(), pull_request.updated_at.clone());
             let wanted = match &threads_fetch {
                 ThreadsFetch::Refresh => true,
                 ThreadsFetch::IfChanged { known, due } => *due || known.as_ref() != Some(&key),
             };
-            if wanted {
-                let refresh = threads_fetch == ThreadsFetch::Refresh;
-                (
-                    fetch_threads(&client, &current.id, refresh).await,
-                    Some(key),
-                )
+            let refresh = threads_fetch == ThreadsFetch::Refresh;
+            let fetched = if wanted {
+                fetch_threads(&client, &current.id, refresh).await
             } else {
-                (Default::default(), None)
+                None
+            };
+            match fetched {
+                Some(fetched) => (fetched, Some(key)),
+                None => (Default::default(), None),
             }
         }
         (Some(current), None) => (Default::default(), Some((current.id.clone(), None))),
@@ -1135,6 +1147,7 @@ async fn fetch_snapshot(
         status,
         threads,
         conversation,
+        viewer,
         threads_for,
     })
 }
@@ -1213,6 +1226,9 @@ pub struct GitHubPanel {
     /// Showing in its dock; threads are only read while it is.
     active: bool,
     threads_read_at: Option<Instant>,
+    /// The review state the diff tabs share; the snapshot's threads and conversation mirror it.
+    store: Entity<PrReviewStore>,
+    _store_subscriptions: [Subscription; 2],
     _poll: Task<()>,
 }
 
@@ -1329,7 +1345,19 @@ impl GitHubPanel {
     }
 
     fn empty(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+        let store = PrReviewStore::global(cx);
+        let store_subscriptions = [
+            cx.observe(&store, |panel, _, cx| panel.sync_from_store(cx)),
+            cx.subscribe(&store, |panel, _, failed: &PrReviewFailed, cx| {
+                if panel.store_key().as_deref() == Some(failed.workspace.as_str()) {
+                    panel.action_error = Some(failed.message.clone());
+                    cx.notify();
+                }
+            }),
+        ];
         Self {
+            store,
+            _store_subscriptions: store_subscriptions,
             focus_handle: cx.focus_handle(),
             workspace,
             position: DockPosition::Right,
@@ -1365,11 +1393,7 @@ impl GitHubPanel {
 
     /// Keeps one Markdown view per shown comment, rebuilt when its body changes.
     fn sync_markdown(&mut self, window: &Window, cx: &mut Context<Self>) {
-        self.markdown_style = Some(markdown::MarkdownStyle::themed(
-            markdown::MarkdownFont::Agent,
-            window,
-            cx,
-        ));
+        self.markdown_style = Some(pr_comments::comment_markdown_style(window, cx));
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1400,10 +1424,21 @@ impl GitHubPanel {
             }
             seen.insert(id);
         }
+        // A pending comment's view carries over to its confirmed id, so its text never blanks.
+        let by_body: HashMap<String, Entity<markdown::Markdown>> = self
+            .markdown
+            .values()
+            .map(|(body, markdown)| (body.clone(), markdown.clone()))
+            .collect();
         self.markdown.retain(|id, _| seen.contains(id));
         for (id, body) in missing {
-            let (text, _) = crate::media::split_media(&body);
-            let markdown = cx.new(|cx| markdown::Markdown::new(text.into(), None, None, cx));
+            let markdown = match by_body.get(&body) {
+                Some(markdown) => markdown.clone(),
+                None => {
+                    let (text, _) = crate::media::split_media(&body);
+                    cx.new(|cx| crate::review::comment_markdown(text, cx))
+                }
+            };
             self.markdown.insert(id, (body, markdown));
         }
     }
@@ -1415,90 +1450,27 @@ impl GitHubPanel {
         reacted: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(snapshot) = self.snapshot.as_mut() {
-            let reactions = snapshot
-                .threads
-                .iter_mut()
-                .flat_map(|thread| thread.comments.iter_mut())
-                .find(|comment| comment.id == subject)
-                .map(|comment| &mut comment.reactions)
-                .or_else(|| {
-                    snapshot
-                        .conversation
-                        .iter_mut()
-                        .find(|comment| comment.id == subject)
-                        .map(|comment| &mut comment.reactions)
-                });
-            if let Some(reactions) = reactions {
-                crate::review::toggle_reaction_locally(reactions, &reaction, !reacted);
-            }
-        }
-        let params =
-            serde_json::json!({ "subject": subject, "reaction": reaction, "remove": reacted });
-        self.run_conversation_call("review.react", params, cx);
+        let op = ReviewOp::React {
+            subject,
+            reaction,
+            react: !reacted,
+        };
+        self.change(op, cx);
     }
 
-    /// Adds a conversation comment or review summary to the workspace composer's attachments.
+    /// Adds a conversation comment or review summary to the workspace composer's attachments,
+    /// built from what the panel shows, so it lands at once.
     pub fn send_conversation_to_agent(&mut self, id: String, cx: &mut Context<Self>) {
-        let params = serde_json::json!({ "ids": [id] });
-        self.run_conversation_call("attach.pr_comments", params, cx);
-    }
-
-    /// Runs a comment RPC whose result the server writes into its cached comments, then reads that
-    /// cache back: the optimistic change is confirmed without asking GitHub for the list again.
-    fn run_conversation_call(
-        &mut self,
-        method: &'static str,
-        params: serde_json::Value,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(workspace) = self.current_workspace_id().map(str::to_owned) else {
-            return;
-        };
-        let mut params = params;
-        params["workspace"] = workspace.into();
-        let Some(call) = crate::review::request(self.client.clone(), method, params, cx) else {
-            return;
-        };
-        self.action_error = None;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = call.await;
-            let reread = this.update(cx, |panel, cx| {
-                if let Err(error) = &result {
-                    panel.action_error = Some(format!("{error:#}"));
-                }
-                crate::review::review_changed(cx);
-                panel
-                    .client
-                    .clone()
-                    .map(|client| (client, panel.project_paths(cx)))
-            })?;
-            let Some((client, paths)) = reread else {
-                return anyhow::Ok(());
-            };
-            let fetch = ThreadsFetch::IfChanged {
-                known: None,
-                due: true,
-            };
-            let snapshot = Tokio::spawn_result(cx, fetch_snapshot(client, paths, fetch)).await;
-            this.update(cx, |panel, cx| match snapshot {
-                Ok(snapshot) => panel.apply_snapshot(snapshot, cx),
-                Err(error) => panel.set_offline(error, cx),
-            })
-        })
-        .detach_and_log_err(cx);
+        if let Some(key) = self.store_key()
+            && crate::pr_store::send_conversation_to_agent(&key, &id, cx).is_none()
+        {
+            log::warn!("no comment {id} to send to the agent");
+        }
     }
 
     /// Opens the editor over a conversation comment or review summary the viewer may rewrite.
     pub fn start_edit(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(body) = self.snapshot.as_ref().and_then(|snapshot| {
-            snapshot
-                .conversation
-                .iter()
-                .find(|comment| comment.id == id)
-                .map(|comment| comment.body.clone())
-        }) else {
+        let Some((body, _)) = self.published(&id) else {
             return;
         };
         let editor = cx.new(|cx| {
@@ -1521,43 +1493,54 @@ impl GitHubPanel {
             return;
         };
         let body = editor.read(cx).text(cx).trim().to_owned();
-        let Some(comment) = self.snapshot.as_mut().and_then(|snapshot| {
-            snapshot
-                .conversation
-                .iter_mut()
-                .find(|comment| comment.id == id)
-        }) else {
+        let Some((known, published)) = self.published(&id) else {
             return;
         };
-        if body.is_empty() || body == comment.body {
+        if body.is_empty() || body == known {
             cx.notify();
             return;
         }
-        comment.body = body.clone();
-        let mut params = comment.published_ref();
-        params["body"] = body.into();
-        self.run_conversation_call("review.comment.edit_published", params, cx);
+        self.change(
+            ReviewOp::EditComment {
+                id,
+                body,
+                published,
+            },
+            cx,
+        );
     }
 
-    pub fn delete_conversation_comment(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(snapshot) = self.snapshot.as_mut() else {
+    pub fn delete_comment(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some((_, published)) = self.published(&id) else {
             return;
         };
-        let Some(index) = snapshot
-            .conversation
+        self.change(ReviewOp::DeleteComment { id, published }, cx);
+    }
+
+    /// A published comment's body and the reference the edit and delete RPCs address it by.
+    fn published(&self, id: &str) -> Option<(String, serde_json::Value)> {
+        let snapshot = self.snapshot.as_ref()?;
+        if let Some(comment) = snapshot.conversation.iter().find(|c| c.id == id) {
+            return Some((comment.body.clone(), comment.published_ref()));
+        }
+        snapshot
+            .threads
             .iter()
-            .position(|comment| comment.id == id)
-        else {
-            return;
-        };
-        let params = snapshot.conversation.remove(index).published_ref();
-        self.run_conversation_call("review.comment.delete_published", params, cx);
+            .flat_map(|thread| &thread.comments)
+            .find(|comment| comment.id == id)
+            .map(|comment| {
+                let published = serde_json::json!({ "kind": "review_comment", "node_id": id });
+                (comment.body.clone(), published)
+            })
     }
 
     /// Adds the thread to the workspace composer's attachments, as the diff thread's footer does.
     pub fn send_thread_to_agent(&mut self, thread: String, cx: &mut Context<Self>) {
-        let params = serde_json::json!({ "ids": [thread] });
-        self.run_review_call("attach.pr_comments", params, None, cx);
+        if let Some(key) = self.store_key()
+            && crate::pr_store::send_thread_to_agent(&key, &thread, cx).is_none()
+        {
+            log::warn!("no thread {thread} to send to the agent");
+        }
     }
 
     /// Reads the PR section layout from the user's settings, where Orca's import puts it.
@@ -1802,14 +1785,22 @@ impl GitHubPanel {
                 if let Some(layout) = &fixture.layout {
                     panel.layout = Layout::from_settings(layout);
                 }
+                let shared = (fixture.threads.clone(), fixture.conversation.clone());
                 panel.snapshot = Some(Snapshot {
                     workspaces: fixture.workspaces,
                     current,
                     status: fixture.pr_status,
                     threads: fixture.threads,
                     conversation: fixture.conversation,
+                    viewer: None,
                     threads_for: None,
                 });
+                if let Some(key) = panel.store_key() {
+                    let (threads, conversation) = shared;
+                    panel.store.update(cx, |store, cx| {
+                        store.set_loaded(&key, Some(threads), Some(conversation), None, None, cx)
+                    });
+                }
                 panel.preview_review = fixture.review.map(|review| (review, fixture.uncommitted));
             }
             Err(error) => panel.offline = Some(format!("invalid preview fixture: {error}")),
@@ -1849,7 +1840,8 @@ impl GitHubPanel {
     fn apply_snapshot(&mut self, mut snapshot: Snapshot, cx: &mut Context<Self>) {
         self.offline = None;
         self.refreshing = false;
-        if snapshot.threads_for.is_some() {
+        let read = snapshot.threads_for.is_some();
+        if read {
             self.threads_read_at = Some(Instant::now());
         } else if let Some(previous) = self.snapshot.take()
             && previous.current.as_ref().map(|current| &current.id)
@@ -1859,9 +1851,62 @@ impl GitHubPanel {
             snapshot.conversation = previous.conversation;
             snapshot.threads_for = previous.threads_for;
         }
+        let fetched = read.then(|| {
+            (
+                snapshot.threads.clone(),
+                snapshot.conversation.clone(),
+                snapshot.viewer.clone(),
+            )
+        });
         self.snapshot = Some(snapshot);
+        if let (Some((threads, conversation, viewer)), Some(key)) = (fetched, self.store_key()) {
+            // The store answers through `sync_from_store`, laying pending changes over the read.
+            self.store.update(cx, |store, cx| {
+                store.set_loaded(&key, Some(threads), Some(conversation), None, viewer, cx)
+            });
+        }
+        self.sync_from_store(cx);
         self.load_description(cx);
         cx.notify();
+    }
+
+    /// The current workspace's root, which keys its pull request in the shared store.
+    fn store_key(&self) -> Option<String> {
+        let current = self.snapshot.as_ref()?.current.as_ref()?;
+        Some(current.path.to_string_lossy().into_owned())
+    }
+
+    /// Mirrors the shared store's threads and conversation for the current workspace.
+    fn sync_from_store(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.store_key() else {
+            return;
+        };
+        let Some(data) = self.store.read(cx).data(&key) else {
+            return;
+        };
+        let (threads, conversation) = (data.threads.clone(), data.conversation.clone());
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return;
+        };
+        if snapshot.threads != threads || snapshot.conversation != conversation {
+            snapshot.threads = threads;
+            snapshot.conversation = conversation;
+            cx.notify();
+        }
+    }
+
+    /// Applies a review change through the shared store: both views show it at once.
+    fn change(&mut self, op: ReviewOp, cx: &mut Context<Self>) {
+        let Some(key) = self.store_key() else {
+            return;
+        };
+        self.action_error = None;
+        let client = self.client.clone();
+        self.store.update(cx, |store, cx| {
+            if let Some(task) = store.mutate(&key, client, op, cx) {
+                task.detach();
+            }
+        });
     }
 
     /// Reads the PR description again whenever the PR changes, so polling costs nothing otherwise.
@@ -2128,73 +2173,12 @@ impl GitHubPanel {
         pr_comments::open_in_workspace(&self.workspace, file, line, base, window, cx);
     }
 
-    /// Runs a review RPC for the current workspace, then reloads the threads and every review view.
-    fn run_review_call(
-        &mut self,
-        method: &'static str,
-        params: serde_json::Value,
-        thread: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(workspace) = self.current_workspace_id().map(str::to_owned) else {
-            return;
-        };
-        let mut params = params;
-        params["workspace"] = workspace.into();
-        let Some(call) = crate::review::request(self.client.clone(), method, params, cx) else {
-            return;
-        };
-        if let Some(thread) = &thread {
-            self.busy_threads.insert(thread.clone());
-        }
-        self.action_error = None;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = call.await;
-            this.update(cx, |panel, cx| {
-                if let Some(thread) = &thread {
-                    panel.busy_threads.remove(thread);
-                }
-                match result {
-                    Ok(_) => {
-                        if method == "review.reply" {
-                            panel.reply = None;
-                        }
-                    }
-                    Err(error) => panel.action_error = Some(format!("{error:#}")),
-                }
-                crate::review::review_changed(cx);
-                panel.refresh(cx);
-            })
-            .log_err();
-        })
-        .detach();
-    }
-
     pub fn set_thread_resolved(&mut self, thread: String, resolved: bool, cx: &mut Context<Self>) {
-        let method = if resolved {
-            "review.resolve"
-        } else {
-            "review.unresolve"
-        };
-        if let Some(found) = self
-            .snapshot
-            .as_mut()
-            .and_then(|snapshot| snapshot.threads.iter_mut().find(|t| t.id == thread))
-        {
-            found.is_resolved = resolved;
-        }
-        let params = serde_json::json!({ "thread": thread });
-        self.run_review_call(method, params, Some(thread), cx);
+        self.change(ReviewOp::Resolve { thread, resolved }, cx);
     }
 
     pub fn remove_draft(&mut self, id: String, cx: &mut Context<Self>) {
-        self.run_review_call(
-            "review.comment.remove",
-            serde_json::json!({ "id": id }),
-            None,
-            cx,
-        );
+        self.change(ReviewOp::RemoveDraft { id }, cx);
     }
 
     /// Opens the reply box under a thread, focused.
@@ -2241,75 +2225,60 @@ impl GitHubPanel {
                 .find(|comment| comment.id == thread)
                 .map(|comment| comment.author.clone())
         });
-        if let Some(author) = answered {
-            self.show_pending_conversation_reply(author.as_deref(), &body);
-            let params = serde_json::json!({ "body": body, "reply_to": author });
-            self.run_conversation_call("review.conversation.post", params, cx);
-            return;
-        }
-        self.show_pending_reply(&thread, &body);
-        let params = serde_json::json!({ "thread": thread, "body": body });
-        self.run_review_call("review.reply", params, Some(thread), cx);
-    }
-
-    /// GitHub has no replies on the conversation, so like Orca an answer is a new comment that
-    /// mentions the author; it shows at once and the server's copy replaces it.
-    fn show_pending_conversation_reply(&mut self, author: Option<&str>, body: &str) {
+        let (author, avatar_url) = self.viewer(cx);
         let created_at = OffsetDateTime::from_unix_timestamp(self.now())
             .ok()
-            .and_then(|now| {
-                now.format(&time::format_description::well_known::Rfc3339)
-                    .ok()
-            });
-        let Some(snapshot) = self.snapshot.as_mut() else {
-            return;
+            .and_then(|now| now.format(&Rfc3339).ok());
+        let id = self.store.update(cx, |store, _| store.pending_id());
+        let op = match answered {
+            // GitHub has no replies on the conversation, so like Orca an answer is a new comment
+            // that mentions the author.
+            Some(answered) => {
+                let shown = match answered.as_deref().map(|a| a.trim_end_matches("[bot]")) {
+                    Some(handle) if !handle.is_empty() => format!("@{handle} {body}"),
+                    _ => body.clone(),
+                };
+                ReviewOp::Conversation {
+                    comment: pr_comments::ConversationComment {
+                        id,
+                        kind: "comment".into(),
+                        author,
+                        author_avatar_url: avatar_url,
+                        body: shown,
+                        created_at,
+                        ..Default::default()
+                    },
+                    body,
+                    reply_to: answered,
+                }
+            }
+            None => ReviewOp::Reply {
+                thread,
+                comment: ReviewThreadComment {
+                    id,
+                    author,
+                    author_avatar_url: avatar_url,
+                    body,
+                    created_at,
+                    ..ReviewThreadComment::default()
+                },
+            },
         };
-        let viewer = snapshot
-            .conversation
-            .iter()
-            .find(|comment| comment.viewer_can_delete)
-            .map(|comment| (comment.author.clone(), comment.author_avatar_url.clone()));
-        let (viewer, viewer_avatar_url) = viewer.unwrap_or_default();
-        let body = match author.map(|author| author.trim_end_matches("[bot]")) {
-            Some(author) if !author.is_empty() => format!("@{author} {body}"),
-            _ => body.to_owned(),
-        };
-        snapshot
-            .conversation
-            .push(pr_comments::ConversationComment {
-                id: format!("pending-{}", snapshot.conversation.len()),
-                kind: "comment".into(),
-                author: viewer,
-                author_avatar_url: viewer_avatar_url,
-                body,
-                created_at,
-                ..Default::default()
-            });
+        self.change(op, cx);
     }
 
-    /// Shows a reply in its thread right away; the refresh after GitHub answers replaces it.
-    fn show_pending_reply(&mut self, thread: &str, body: &str) {
-        let Some(snapshot) = self.snapshot.as_mut() else {
-            return;
-        };
-        // Only the viewer can delete a comment, so such a comment names the viewer.
-        let viewer = snapshot
-            .threads
-            .iter()
-            .flat_map(|thread| &thread.comments)
-            .find(|comment| comment.viewer_can_delete)
-            .map(|comment| (comment.author.clone(), comment.author_avatar_url.clone()));
-        let Some(found) = snapshot.threads.iter_mut().find(|t| t.id == thread) else {
-            return;
-        };
-        let (author, author_avatar_url) = viewer.unwrap_or_default();
-        found.comments.push(ReviewThreadComment {
-            id: format!("pending-{}", found.comments.len()),
-            author,
-            author_avatar_url,
-            body: body.to_owned(),
-            ..ReviewThreadComment::default()
+    /// The signed-in user, who writes every comment sent from here.
+    fn viewer(&self, cx: &App) -> (Option<String>, Option<String>) {
+        let viewer = self.store_key().and_then(|key| {
+            self.store
+                .read(cx)
+                .data(&key)
+                .and_then(|data| data.viewer())
         });
+        match viewer {
+            Some(viewer) => (Some(viewer.login), viewer.avatar_url),
+            None => (None, None),
+        }
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3273,21 +3242,87 @@ impl GitHubPanel {
             .as_ref()
             .filter(|(id, _)| *id == thread.id)
             .map(|(_, editor)| editor.clone());
-        let mut card = v_flex()
+        let mut card = pr_comments::comment_card(cx)
             .mx_2()
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border_variant)
-            .bg(colors.editor_background)
-            .overflow_hidden();
+            .border_color(colors.border)
+            .when(thread.is_resolved, |card| card.opacity(0.6));
         for (index, comment) in thread.comments.iter().enumerate() {
             card = card.child(self.render_comment(thread, index, comment, cx));
         }
         if let Some(editor) = replying {
             card = card.child(self.render_reply_box(editor, busy, cx));
         }
-        card.child(self.render_thread_footer(thread, busy, cx))
-            .into_any_element()
+        card.into_any_element()
+    }
+
+    /// A click handler that runs `action` on this panel.
+    fn handler(
+        &self,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> pr_comments::ClickHandler {
+        let weak = cx.entity().downgrade();
+        Rc::new(move |window, cx| {
+            weak.update(cx, |panel, cx| action(panel, window, cx))
+                .log_err();
+        })
+    }
+
+    fn react_handler(&self, cx: &mut Context<Self>) -> pr_comments::ReactHandler {
+        let weak = cx.entity().downgrade();
+        Rc::new(move |subject, content, give, cx| {
+            weak.update(cx, |panel, cx| panel.react(subject, content, !give, cx))
+                .log_err();
+        })
+    }
+
+    /// Orca's More menu: send to the agent, open on GitHub, and edit or delete your own comment.
+    fn comment_menu(
+        &self,
+        comment: &crate::review::ThreadComment,
+        send: pr_comments::ClickHandler,
+        can_edit: bool,
+        can_delete: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<pr_comments::CommentAction> {
+        let mut menu = vec![pr_comments::CommentAction {
+            label: "Send to Agent",
+            icon: IconName::Send,
+            destructive: false,
+            handler: send,
+        }];
+        if let Some(url) = comment.url.clone() {
+            menu.push(pr_comments::CommentAction {
+                label: "Open on GitHub",
+                icon: IconName::ArrowUpRight,
+                destructive: false,
+                handler: Rc::new(move |_, cx| cx.open_url(&url)),
+            });
+        }
+        let viewer = self.viewer(cx).0;
+        let own = pr_comments::is_own(comment.author.as_deref(), viewer.as_deref());
+        if own && can_edit {
+            let id = comment.id.clone();
+            menu.push(pr_comments::CommentAction {
+                label: "Edit",
+                icon: IconName::Pencil,
+                destructive: false,
+                handler: self.handler(
+                    move |panel, window, cx| panel.start_edit(id.clone(), window, cx),
+                    cx,
+                ),
+            });
+        }
+        if own && can_delete {
+            let id = comment.id.clone();
+            menu.push(pr_comments::CommentAction {
+                label: "Delete",
+                icon: IconName::Trash,
+                destructive: true,
+                handler: self.handler(move |panel, _, cx| panel.delete_comment(id.clone(), cx), cx),
+            });
+        }
+        menu
     }
 
     fn render_comment(
@@ -3300,10 +3335,12 @@ impl GitHubPanel {
         let first = index == 0;
         let path = thread.path.clone();
         let line = pr_comments::thread_line(thread);
-        let id_base = format!("{}-{index}", thread.id);
         let location = first.then(|| {
             div()
-                .id(SharedString::from(format!("icarus-thread-link-{id_base}")))
+                .id(SharedString::from(format!(
+                    "icarus-thread-link-{}",
+                    thread.id
+                )))
                 .min_w_0()
                 .cursor_pointer()
                 .tooltip(Tooltip::text("Open in the diff"))
@@ -3324,28 +3361,76 @@ impl GitHubPanel {
             .iter()
             .flat_map(|comment| crate::media::split_media(&comment.body).1)
             .collect();
-        v_flex()
-            .when(!first, |comment| {
-                comment
-                    .border_t_1()
-                    .border_color(cx.theme().colors().border_variant)
-            })
-            .child(self.render_comment_header(
-                comment,
-                first,
-                None,
-                location,
-                first && thread.placement.outdated,
+        let pending = comment.id.starts_with(crate::pr_store::PENDING_PREFIX);
+        let mut buttons: Vec<(&'static str, pr_comments::ClickHandler)> = Vec::new();
+        let mut menu = Vec::new();
+        if !pending {
+            if first {
+                let can_toggle = if thread.is_resolved {
+                    thread.viewer_can_unresolve
+                } else {
+                    thread.viewer_can_resolve
+                };
+                let resolved = thread.is_resolved;
+                if can_toggle {
+                    let id = thread.id.clone();
+                    buttons.push((
+                        if resolved { "Unresolve" } else { "Resolve" },
+                        self.handler(
+                            move |panel, _, cx| {
+                                panel.set_thread_resolved(id.clone(), !resolved, cx)
+                            },
+                            cx,
+                        ),
+                    ));
+                }
+                if thread.viewer_can_reply && !resolved {
+                    let (id, author) = (thread.id.clone(), comment.author.clone());
+                    buttons.push((
+                        "Reply",
+                        self.handler(
+                            move |panel, window, cx| {
+                                panel.start_reply(id.clone(), author.clone(), window, cx)
+                            },
+                            cx,
+                        ),
+                    ));
+                }
+            }
+            let thread_id = thread.id.clone();
+            let send = self.handler(
+                move |panel, _, cx| panel.send_thread_to_agent(thread_id.clone(), cx),
                 cx,
-            ))
-            .child(
-                v_flex()
-                    .px_2()
-                    .py_1p5()
-                    .gap_1()
-                    .child(self.render_comment_body(comment, &gallery, cx))
-                    .child(self.render_reactions(comment, &id_base, cx)),
-            )
+            );
+            menu = self.comment_menu(
+                comment,
+                send,
+                comment.viewer_can_update,
+                comment.viewer_can_delete,
+                cx,
+            );
+        }
+        let body = match self.editing.as_ref().filter(|(id, _)| *id == comment.id) {
+            Some((_, editor)) => self.render_edit_box(editor.clone(), cx).into_any_element(),
+            None => self.render_comment_body(comment, &gallery, cx),
+        };
+        pr_comments::render_comment(
+            pr_comments::CommentParts {
+                id: format!("icarus-comment-{}-{index}", thread.id),
+                comment: comment.clone(),
+                first,
+                now: self.now(),
+                review_state: None,
+                location,
+                outdated: first && thread.placement.outdated,
+                resolved: thread.is_resolved,
+                buttons,
+                menu,
+                body,
+                react: (!pending).then(|| self.react_handler(cx)),
+            },
+            cx,
+        )
     }
 
     /// An issue comment or review summary: one comment, no thread to reply in or resolve.
@@ -3354,8 +3439,6 @@ impl GitHubPanel {
         conversation: &pr_comments::ConversationComment,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let border = cx.theme().colors().border_variant;
-        let background = cx.theme().colors().editor_background;
         let comment = conversation.as_thread_comment();
         let (_, gallery) = crate::media::split_media(&comment.body);
         let editing = self
@@ -3370,130 +3453,56 @@ impl GitHubPanel {
             .map(|(_, editor)| editor.clone());
         let body = match editing {
             Some(editor) => self.render_edit_box(editor, cx).into_any_element(),
-            None => v_flex()
-                .px_2()
-                .py_1p5()
-                .gap_1()
-                .child(self.render_comment_body(&comment, &gallery, cx))
-                .when(!conversation.is_pending(), |body| {
-                    body.child(self.render_reactions(&comment, &conversation.id, cx))
-                })
-                .into_any_element(),
+            None => self.render_comment_body(&comment, &gallery, cx),
         };
-        v_flex()
-            .id(SharedString::from(format!(
-                "icarus-conversation-{}",
-                conversation.id
-            )))
-            .mx_2()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(background)
-            .overflow_hidden()
-            .child(self.render_comment_header(
+        let pending = conversation.is_pending();
+        let mut buttons: Vec<(&'static str, pr_comments::ClickHandler)> = Vec::new();
+        let mut menu = Vec::new();
+        if !pending {
+            let (id, author) = (conversation.id.clone(), conversation.author.clone());
+            buttons.push((
+                "Reply",
+                self.handler(
+                    move |panel, window, cx| {
+                        panel.start_reply(id.clone(), author.clone(), window, cx)
+                    },
+                    cx,
+                ),
+            ));
+            let id = conversation.id.clone();
+            let send = self.handler(
+                move |panel, _, cx| panel.send_conversation_to_agent(id.clone(), cx),
+                cx,
+            );
+            menu = self.comment_menu(
                 &comment,
-                true,
-                conversation.review_state(),
-                None,
-                false,
+                send,
+                conversation.can_edit(),
+                conversation.can_delete(),
+                cx,
+            );
+        }
+        pr_comments::comment_card(cx)
+            .mx_2()
+            .child(pr_comments::render_comment(
+                pr_comments::CommentParts {
+                    id: format!("icarus-conversation-{}", conversation.id),
+                    comment,
+                    first: true,
+                    now: self.now(),
+                    review_state: conversation.review_state(),
+                    location: None,
+                    outdated: false,
+                    resolved: false,
+                    buttons,
+                    menu,
+                    body,
+                    react: (!pending).then(|| self.react_handler(cx)),
+                },
                 cx,
             ))
-            .child(body)
             .children(replying.map(|editor| self.render_reply_box(editor, false, cx)))
-            .when(!conversation.is_pending(), |card| {
-                card.child(self.render_conversation_footer(conversation, cx))
-            })
             .into_any_element()
-    }
-
-    /// Orca's card actions for a conversation comment or review summary: send it to an agent,
-    /// answer it, and edit or delete the viewer's own.
-    fn render_conversation_footer(
-        &self,
-        comment: &pr_comments::ConversationComment,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let id = comment.id.clone();
-        let author = comment.author.clone();
-        let url = comment.url.clone();
-        let (agent_id, reply_id, edit_id, delete_id) =
-            (id.clone(), id.clone(), id.clone(), id.clone());
-        h_flex()
-            .px_1()
-            .py_0p5()
-            .gap_0p5()
-            .border_t_1()
-            .border_color(cx.theme().colors().border_variant)
-            .child(
-                Button::new(
-                    SharedString::from(format!("icarus-conversation-agent-{id}")),
-                    "Send to an agent",
-                )
-                .label_size(LabelSize::XSmall)
-                .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
-                .tooltip(Tooltip::text(
-                    "Add this comment to the agent's next message",
-                ))
-                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                    panel.send_conversation_to_agent(agent_id.clone(), cx)
-                })),
-            )
-            .child(
-                Button::new(
-                    SharedString::from(format!("icarus-conversation-reply-{id}")),
-                    "Reply",
-                )
-                .label_size(LabelSize::XSmall)
-                .tooltip(Tooltip::text(
-                    "Comment on the pull request, mentioning the author",
-                ))
-                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-                    panel.start_reply(reply_id.clone(), author.clone(), window, cx)
-                })),
-            )
-            .when(comment.can_edit(), |row| {
-                row.child(
-                    Button::new(
-                        SharedString::from(format!("icarus-conversation-edit-{id}")),
-                        "Edit",
-                    )
-                    .label_size(LabelSize::XSmall)
-                    .on_click(cx.listener(
-                        move |panel, _: &ClickEvent, window, cx| {
-                            panel.start_edit(edit_id.clone(), window, cx)
-                        },
-                    )),
-                )
-            })
-            .when(comment.can_delete(), |row| {
-                row.child(
-                    Button::new(
-                        SharedString::from(format!("icarus-conversation-delete-{id}")),
-                        "Delete",
-                    )
-                    .label_size(LabelSize::XSmall)
-                    .color(Color::Error)
-                    .on_click(cx.listener(
-                        move |panel, _: &ClickEvent, _, cx| {
-                            panel.delete_conversation_comment(delete_id.clone(), cx)
-                        },
-                    )),
-                )
-            })
-            .child(div().flex_1())
-            .child(div().w(SLOT).flex_none().when_some(url, |slot, url| {
-                slot.child(
-                    IconButton::new(
-                        SharedString::from(format!("icarus-conversation-open-{id}")),
-                        IconName::ArrowUpRight,
-                    )
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Open on GitHub"))
-                    .on_click(move |_, _, cx| cx.open_url(&url)),
-                )
-            }))
     }
 
     fn render_edit_box(&self, editor: Entity<Editor>, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3540,112 +3549,6 @@ impl GitHubPanel {
             )
     }
 
-    /// Orca's card header: avatar, author and a review's verdict; under them on a card's first
-    /// comment the age, BOT badge, `file:line` and Outdated badge. A reply keeps it to one row.
-    fn render_comment_header(
-        &self,
-        comment: &crate::review::ThreadComment,
-        first: bool,
-        review_state: Option<pr_comments::ReviewState>,
-        location: Option<AnyElement>,
-        outdated: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let colors = cx.theme().colors();
-        let author = comment.author.clone().unwrap_or_else(|| "ghost".into());
-        let is_bot = pr_comments::is_bot(comment.is_bot, comment.author.as_deref());
-        let time = comment
-            .created_at
-            .as_deref()
-            .and_then(parse_timestamp)
-            .map(|created| format_relative(self.now() - created));
-        let bot_badge = || {
-            div()
-                .flex_none()
-                .px_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(colors.border)
-                .bg(colors.element_background)
-                .child(
-                    Label::new("BOT")
-                        .size(LabelSize::XSmall)
-                        .weight(gpui::FontWeight::SEMIBOLD)
-                        .color(Color::Muted)
-                        .single_line(),
-                )
-        };
-        let primary = h_flex()
-            .min_w_0()
-            .gap_1p5()
-            .child(render_avatar(
-                comment.author_avatar_url.as_deref(),
-                &author,
-                if is_bot {
-                    AvatarKind::Bot
-                } else {
-                    AvatarKind::Person
-                },
-                px(16.),
-                cx,
-            ))
-            .child(
-                Label::new(author)
-                    .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::SEMIBOLD)
-                    .single_line()
-                    .truncate(),
-            )
-            .children(review_state.map(|state| pr_comments::render_review_state_badge(state, cx)));
-        if !first {
-            return h_flex()
-                .px_2()
-                .pt_1p5()
-                .gap_1p5()
-                .child(primary)
-                .when_some(time, |row, time| {
-                    row.child(
-                        Label::new(format!("· {time}"))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .single_line(),
-                    )
-                })
-                .when(is_bot, |row| row.child(bot_badge()))
-                .into_any_element();
-        }
-        v_flex()
-            .px_2()
-            .py_1p5()
-            .gap_1()
-            .border_b_1()
-            .border_color(colors.border_variant)
-            .child(primary)
-            .child(
-                h_flex()
-                    .pl(px(22.))
-                    .min_w_0()
-                    .gap_1()
-                    .when_some(time.clone(), |row, time| {
-                        row.child(
-                            Label::new(time)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .single_line(),
-                        )
-                    })
-                    .when(time.is_some() && (is_bot || location.is_some()), |row| {
-                        row.child(Label::new("·").size(LabelSize::XSmall).color(Color::Muted))
-                    })
-                    .when(is_bot, |row| row.child(bot_badge()))
-                    .children(location)
-                    .when(outdated, |row| {
-                        row.child(render_pill("Outdated", Tone::Pending, cx))
-                    }),
-            )
-            .into_any_element()
-    }
-
     /// The comment's Markdown, then its images and videos; the viewer steps through `gallery`.
     fn render_comment_body(
         &self,
@@ -3656,7 +3559,6 @@ impl GitHubPanel {
         let (text, media) = crate::media::split_media(&comment.body);
         let text = match self.markdown.get(&comment.id) {
             Some((_, markdown)) => div()
-                .text_sm()
                 .child(markdown::MarkdownElement::new(
                     markdown.clone(),
                     markdown_style(self),
@@ -3674,80 +3576,6 @@ impl GitHubPanel {
                 cx,
             ))
             .into_any_element()
-    }
-
-    fn render_reactions(
-        &self,
-        comment: &crate::review::ThreadComment,
-        id_base: &str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let mut row = h_flex().gap_1();
-        for reaction in comment
-            .reactions
-            .iter()
-            .filter(|reaction| reaction.count > 0)
-        {
-            let subject = comment.id.clone();
-            let content = reaction.content.clone();
-            let reacted = reaction.viewer_has_reacted;
-            row = row.child(
-                Button::new(
-                    SharedString::from(format!("icarus-reaction-{id_base}-{content}")),
-                    format!(
-                        "{} {}",
-                        crate::review::reaction_emoji(&reaction.content),
-                        reaction.count
-                    ),
-                )
-                .style(ButtonStyle::Subtle)
-                .toggle_state(reacted)
-                .label_size(LabelSize::XSmall)
-                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                    panel.react(subject.clone(), content.clone(), reacted, cx)
-                })),
-            );
-        }
-        let weak = cx.entity().downgrade();
-        let subject = comment.id.clone();
-        let reactions = comment.reactions.clone();
-        row.child(
-            ui::PopoverMenu::new(SharedString::from(format!("icarus-react-{id_base}")))
-                .trigger_with_tooltip(
-                    IconButton::new(
-                        SharedString::from(format!("icarus-react-button-{id_base}")),
-                        IconName::ThumbsUp,
-                    )
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted),
-                    Tooltip::text("Add a reaction"),
-                )
-                .menu(move |window, cx| {
-                    let (weak, subject, reactions) =
-                        (weak.clone(), subject.clone(), reactions.clone());
-                    Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        for reaction in crate::review::REACTIONS {
-                            let reacted = reactions
-                                .iter()
-                                .any(|r| r.content == reaction && r.viewer_has_reacted);
-                            let (weak, subject) = (weak.clone(), subject.clone());
-                            menu = menu.toggleable_entry(
-                                format!("{} {reaction}", crate::review::reaction_emoji(reaction)),
-                                reacted,
-                                IconPosition::End,
-                                None,
-                                move |_, cx| {
-                                    weak.update(cx, |panel, cx| {
-                                        panel.react(subject.clone(), reaction.into(), reacted, cx)
-                                    })
-                                    .log_err();
-                                },
-                            );
-                        }
-                        menu
-                    }))
-                }),
-        )
     }
 
     fn render_reply_box(
@@ -3799,92 +3627,6 @@ impl GitHubPanel {
                             ),
                     ),
             )
-    }
-
-    fn render_thread_footer(
-        &self,
-        thread: &ReviewThread,
-        busy: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let id = thread.id.clone();
-        let author = thread
-            .comments
-            .first()
-            .and_then(|comment| comment.author.clone());
-        let can_toggle = if thread.is_resolved {
-            thread.viewer_can_unresolve
-        } else {
-            thread.viewer_can_resolve
-        };
-        let resolved = thread.is_resolved;
-        let url = thread
-            .comments
-            .first()
-            .and_then(|comment| comment.url.clone());
-        let reply_id = id.clone();
-        let agent_id = id.clone();
-        h_flex()
-            .px_1()
-            .py_0p5()
-            .gap_0p5()
-            .border_t_1()
-            .border_color(cx.theme().colors().border_variant)
-            .child(
-                Button::new(
-                    SharedString::from(format!("icarus-thread-agent-{id}")),
-                    "Send to an agent",
-                )
-                .label_size(LabelSize::XSmall)
-                .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
-                .tooltip(Tooltip::text("Add this thread to the agent's next message"))
-                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                    panel.send_thread_to_agent(agent_id.clone(), cx)
-                })),
-            )
-            .when(thread.viewer_can_reply && !resolved, |row| {
-                row.child(
-                    Button::new(
-                        SharedString::from(format!("icarus-thread-reply-{id}")),
-                        "Reply",
-                    )
-                    .label_size(LabelSize::XSmall)
-                    .on_click(cx.listener(
-                        move |panel, _: &ClickEvent, window, cx| {
-                            panel.start_reply(reply_id.clone(), author.clone(), window, cx)
-                        },
-                    )),
-                )
-            })
-            .when(can_toggle, |row| {
-                let id = id.clone();
-                row.child(
-                    Button::new(
-                        SharedString::from(format!("icarus-thread-resolve-{id}")),
-                        if resolved { "Unresolve" } else { "Resolve" },
-                    )
-                    .label_size(LabelSize::XSmall)
-                    .disabled(busy)
-                    .on_click(cx.listener(
-                        move |panel, _: &ClickEvent, _, cx| {
-                            panel.set_thread_resolved(id.clone(), !resolved, cx)
-                        },
-                    )),
-                )
-            })
-            .child(div().flex_1())
-            .child(div().w(SLOT).flex_none().when_some(url, |slot, url| {
-                slot.child(
-                    IconButton::new(
-                        SharedString::from(format!("icarus-thread-open-{id}")),
-                        IconName::ArrowUpRight,
-                    )
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Open on GitHub"))
-                    .on_click(move |_, _, cx| cx.open_url(&url)),
-                )
-            }))
     }
 
     fn render_drafts(&self, drafts: Vec<ReviewDraft>, cx: &mut Context<Self>) -> AnyElement {
@@ -4697,7 +4439,144 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             crate::review::tests::calls_to(&calls, "review.resolve"),
-            [serde_json::json!({ "thread": "T1", "workspace": "ws-1" })]
+            [serde_json::json!({ "thread": "T1", "workspace": "/project" })]
+        );
+    }
+
+    #[gpui::test]
+    async fn a_diff_comment_shows_in_the_diff_and_the_panel_before_github_answers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::review::tests::{calls_to, hold_rpc, stub_rpc};
+        use crate::review::{ComposerTarget, Destination};
+
+        let (workspace, panel, _, mut cx) = panel_in_workspace(cx).await;
+        let cx = &mut cx;
+        let calls = cx.update(|_, cx| {
+            stub_rpc(cx, |method, params| match method {
+                "review.threads" => Ok(serde_json::json!({
+                    "threads": panel_fixture()["threads"], "conversation": [],
+                    "viewer": { "login": "me", "avatar_url": "https://avatars.example/me" },
+                })),
+                "review.comment.list" => Ok(serde_json::json!({ "drafts": [] })),
+                "review.comment.post" if params["body"] == "fail" => {
+                    Err(anyhow::anyhow!("GitHub refused the comment"))
+                }
+                "review.comment.post" => Ok(serde_json::json!({ "thread": {
+                    "id": "PRRT_new", "path": "src/app.rs", "line": params["line"],
+                    "comments": [{ "id": "PRRC_new", "author": "me", "body": params["body"],
+                        "viewer_can_delete": true }],
+                    "placement": { "line": params["line"], "label": "Line 3" },
+                } })),
+                _ => Ok(serde_json::json!({})),
+            })
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_location("src/app.rs", Some(1), window, cx)
+        });
+        cx.run_until_parked();
+        let tab = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.items_of_type::<crate::DiffTab>(cx).next()
+            })
+            .expect("the diff tab opened");
+        let review = tab.update(cx, |tab, cx| {
+            tab.enable_review("/project".into(), "src/app.rs".into(), cx);
+            tab.review().cloned().expect("review")
+        });
+        review.update(cx, |review, cx| review.reload(cx));
+        cx.run_until_parked();
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            let diff: Vec<(String, String)> = review.read_with(cx, |review, _| {
+                review
+                    .threads()
+                    .iter()
+                    .map(|t| (t.id.clone(), t.comments[0].body.clone()))
+                    .collect()
+            });
+            let checks: Vec<(String, String)> = panel.read_with(cx, |panel, _| {
+                panel
+                    .snapshot
+                    .as_ref()
+                    .expect("snapshot")
+                    .threads
+                    .iter()
+                    .map(|t| (t.id.clone(), t.comments[0].body.clone()))
+                    .collect()
+            });
+            (diff, checks)
+        };
+        let comment = |line: u32, body: &str, cx: &mut gpui::VisualTestContext| {
+            review.update_in(cx, |review, window, cx| {
+                review.open_composer(
+                    ComposerTarget::Lines {
+                        start: line,
+                        end: line,
+                    },
+                    body.into(),
+                    window,
+                    cx,
+                );
+                review.submit_composer(Destination::Now, window, cx);
+            });
+        };
+
+        // GitHub is slow: the comment is in both views at once, written by the viewer.
+        cx.update(|_, cx| hold_rpc(cx, &["review.comment.post"]));
+        comment(1, "Pending one", cx);
+        let (diff, checks) = shown(cx);
+        assert_eq!(diff, checks, "one state for both views");
+        assert!(
+            diff.iter()
+                .any(|(id, body)| id.starts_with("pending-") && body == "Pending one")
+        );
+        let author = review.read_with(cx, |review, _| {
+            let thread = review
+                .threads()
+                .iter()
+                .find(|t| t.id.starts_with("pending-"));
+            thread.and_then(|t| t.comments[0].author.clone())
+        });
+        assert_eq!(author.as_deref(), Some("me"));
+
+        // A refresh with the same data keeps every block in place.
+        let blocks = review.read_with(cx, |review, _| review.block_ids().to_vec());
+        review.update(cx, |review, cx| review.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            review.read_with(cx, |review, _| review.block_ids().to_vec()),
+            blocks,
+            "no block is removed and put back: nothing flickers"
+        );
+        assert_eq!(
+            shown(cx).0,
+            diff,
+            "the pending comment stays over the reload"
+        );
+
+        // GitHub answers: the server's thread replaces the pending one without a refetch.
+        cx.update(|_, cx| hold_rpc(cx, &[]));
+        let reads = calls_to(&calls, "review.threads").len();
+        comment(3, "Looks off", cx);
+        cx.run_until_parked();
+        let (diff, checks) = shown(cx);
+        assert_eq!(diff, checks);
+        assert!(diff.contains(&("PRRT_new".to_owned(), "Looks off".to_owned())));
+
+        // GitHub refuses: it disappears from both and the panel says why.
+        comment(3, "fail", cx);
+        assert!(shown(cx).1.iter().any(|(_, body)| body == "fail"));
+        cx.run_until_parked();
+        let (diff, checks) = shown(cx);
+        assert!(!diff.iter().chain(&checks).any(|(_, body)| body == "fail"));
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.action_error.clone()),
+            Some("GitHub refused the comment".to_owned())
+        );
+        assert_eq!(
+            calls_to(&calls, "review.threads").len(),
+            reads,
+            "no refetch after a change"
         );
     }
 
@@ -4716,9 +4595,8 @@ mod tests {
                 .conversation
                 .clone()
         };
-        panel.update(cx, |panel, _| {
-            panel.snapshot.as_mut().expect("fixture").conversation =
-                serde_json::from_value(serde_json::json!([
+        panel.update(cx, |panel, cx| {
+            let conversation = serde_json::from_value(serde_json::json!([
                     { "id": "IC_1", "kind": "comment", "database_id": 5, "author": "me", "body": "old",
                       "viewer_can_update": true, "viewer_can_delete": true,
                       "reactions": [{ "content": "heart", "count": 1, "viewer_has_reacted": true }] },
@@ -4727,6 +4605,9 @@ mod tests {
                     { "id": "IC_2", "kind": "comment", "database_id": 6, "author": "farm-bot", "body": "ci" },
                 ]))
                 .expect("conversation");
+            panel.store.update(cx, |store, cx| {
+                store.set_loaded("/project", None, Some(conversation), None, None, cx)
+            });
         });
         panel.read_with(cx, |panel, _| {
             let all = conversation(panel);
@@ -4758,7 +4639,7 @@ mod tests {
             let (_, editor) = panel.editing.clone().expect("edit box");
             editor.update(cx, |editor, cx| editor.set_text("new", window, cx));
             panel.save_edit(cx);
-            panel.delete_conversation_comment("IC_2".into(), cx);
+            panel.delete_comment("IC_2".into(), cx);
         });
         panel.read_with(cx, |panel, _| {
             let all = conversation(panel);
@@ -4774,27 +4655,31 @@ mod tests {
         assert_eq!(
             crate::review::tests::calls_to(&calls, "review.conversation.post"),
             [
-                serde_json::json!({ "body": "Added them.", "reply_to": "carol", "workspace": "ws-1" })
+                serde_json::json!({ "body": "Added them.", "reply_to": "carol", "workspace": "/project" })
             ]
         );
         assert_eq!(
             crate::review::tests::calls_to(&calls, "review.comment.edit_published"),
             [
-                serde_json::json!({ "kind": "issue_comment", "id": 5, "body": "new", "workspace": "ws-1" })
+                serde_json::json!({ "kind": "issue_comment", "id": 5, "body": "new", "workspace": "/project" })
             ]
         );
         assert_eq!(
             crate::review::tests::calls_to(&calls, "review.comment.delete_published"),
-            [serde_json::json!({ "kind": "issue_comment", "id": 6, "workspace": "ws-1" })]
+            [serde_json::json!({ "kind": "issue_comment", "id": 6, "workspace": "/project" })]
         );
         panel.update(cx, |panel, cx| {
             panel.send_conversation_to_agent("PRR_1".into(), cx)
         });
-        cx.run_until_parked();
-        assert_eq!(
-            crate::review::tests::calls_to(&calls, "attach.pr_comments"),
-            [serde_json::json!({ "ids": ["PRR_1"], "workspace": "ws-1" })]
+        let attached = cx.update(|_, cx| crate::pr_store::local_attachment_texts(cx));
+        assert!(
+            attached.iter().any(
+                |text| text.starts_with("@carol's review (changes requested):")
+                    && text.ends_with("Needs tests")
+            ),
+            "attached at once from the shown comment: {attached:?}"
         );
+        assert!(crate::review::tests::calls_to(&calls, "attach.pr_comments").is_empty());
     }
 
     #[gpui::test]

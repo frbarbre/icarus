@@ -9,6 +9,9 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 const ATTEMPTS: usize = 2;
 
 const KEEP: &str = "ICARUS_KEEP_PATH";
+/// Set on the restart that applied the cached PATH, so that run still refreshes the cache.
+const RESTARTED: &str = "ICARUS_LOGIN_PATH_RESTARTED";
+const CACHE_FILE: &str = "login-path";
 
 /// Where version managers and package managers put the user's tools, relative to home or absolute.
 const USUAL_DIRS: &[&str] = &[
@@ -22,37 +25,63 @@ const USUAL_DIRS: &[&str] = &[
 ];
 
 /// Re-runs the server with the login shell's `PATH` first: launchd, systemd and plain SSH commands
-/// start it without the profile that puts `claude`, `codex` and `gh` on it. Returns if nothing changes.
-pub fn adopt() {
+/// start it without the profile that puts `claude`, `codex` and `gh` on it. A slow profile must not
+/// hold up startup, so this uses the PATH the last start saw (or the usual tool folders) and asks the
+/// login shell in the background for the next start. Returns if nothing changes.
+pub fn adopt(home: &Path) {
     // From a terminal the PATH is already the user's, and an interactive shell would fight it for the tty.
-    if std::env::var_os(KEEP).is_some() || std::io::stdin().is_terminal() {
+    if std::io::stdin().is_terminal() {
         return;
+    }
+    let restarted = std::env::var_os(RESTARTED).is_some();
+    if std::env::var_os(KEEP).is_some() && !restarted {
+        return;
+    }
+    let cache = home.join(CACHE_FILE);
+    if !restarted {
+        let current = std::env::var("PATH").unwrap_or_default();
+        let merged = starting_path(&cache, &current);
+        if merged != current
+            && let Ok(exe) = std::env::current_exe()
+        {
+            let error = Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .env("PATH", merged)
+                .env(KEEP, "1")
+                .env(RESTARTED, "1")
+                .exec();
+            eprintln!("could not restart with the login PATH: {error}");
+        }
     }
     let shell = crate::terminal::default_shell();
-    let current = std::env::var("PATH").unwrap_or_default();
-    let merged = match probe(&shell, TIMEOUT, ATTEMPTS) {
-        Ok(login) => merge(&login, &current),
-        Err(reason) => {
-            let home = dirs::home_dir().unwrap_or_default();
-            let merged = fallback(&home, &current, |dir| dir.is_dir());
-            eprintln!(
-                "warning: could not read PATH from the login shell {shell} ({reason}); using {merged}"
-            );
-            merged
-        }
-    };
-    if merged == current {
-        return;
+    std::thread::spawn(move || refresh_cache(&shell, &cache, TIMEOUT));
+}
+
+fn starting_path(cache: &Path, current: &str) -> String {
+    match std::fs::read_to_string(cache) {
+        Ok(login) if !login.trim().is_empty() => merge(login.trim(), current),
+        _ => fallback(&dirs::home_dir().unwrap_or_default(), current, |dir| {
+            dir.is_dir()
+        }),
     }
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let error = Command::new(exe)
-        .args(std::env::args_os().skip(1))
-        .env("PATH", merged)
-        .env(KEEP, "1")
-        .exec();
-    eprintln!("could not restart with the login PATH: {error}");
+}
+
+fn refresh_cache(shell: &str, cache: &Path, timeout: Duration) {
+    match probe(shell, timeout, ATTEMPTS) {
+        Ok(login) => {
+            if let Some(dir) = cache.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if std::fs::read_to_string(cache).ok().as_deref() != Some(login.as_str())
+                && let Err(error) = std::fs::write(cache, &login)
+            {
+                eprintln!("warning: could not save the login PATH: {error}");
+            }
+        }
+        Err(reason) => {
+            eprintln!("warning: could not read PATH from the login shell {shell} ({reason})")
+        }
+    }
 }
 
 fn probe(shell: &str, timeout: Duration, attempts: usize) -> Result<String, String> {
@@ -174,6 +203,33 @@ mod tests {
         assert_eq!(
             path,
             "/home/u/.local/bin:/home/u/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin"
+        );
+    }
+
+    #[test]
+    fn startup_uses_the_cached_login_path_and_the_probe_refreshes_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let cache = dir.path().join("state").join(CACHE_FILE);
+        std::fs::create_dir_all(cache.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&cache, "/cached/bin:/usr/bin\n").expect("write");
+        assert_eq!(
+            starting_path(&cache, "/usr/bin:/bin"),
+            "/cached/bin:/usr/bin:/bin"
+        );
+
+        let shell = fake_shell(dir.path(), &format!("printf '{MARKER}/probed/bin{MARKER}'"));
+        refresh_cache(&shell, &cache, Duration::from_secs(5));
+        assert_eq!(
+            std::fs::read_to_string(&cache).expect("cache"),
+            "/probed/bin"
+        );
+
+        let slow = fake_shell(dir.path(), "exec sleep 5");
+        refresh_cache(&slow, &cache, Duration::from_millis(100));
+        assert_eq!(
+            std::fs::read_to_string(&cache).expect("cache"),
+            "/probed/bin",
+            "a failed probe keeps the last good PATH"
         );
     }
 

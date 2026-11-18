@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use icarus_protocol::RpcError;
-use icarus_settings::layers::{self, Layer, SettingsPaths};
+use icarus_settings::layers::{Layer, SettingsPaths};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -104,11 +104,10 @@ impl Server {
         let Some(path) = SettingsPaths::discover(None).user else {
             return Ok(Vec::new());
         };
-        let doc = layers::read_layer(Layer::User, &path)
-            .map_err(|e| rpc("settings_invalid", format!("{e:?}")))?;
+        let doc = crate::settings::read_cached(Layer::User, &path)?;
         Ok(doc
             .as_ref()
-            .and_then(|doc| doc.get(KEY))
+            .and_then(|(_, doc)| doc.get(KEY))
             .map(to_json)
             .and_then(|value| value.as_array().cloned())
             .unwrap_or_default())

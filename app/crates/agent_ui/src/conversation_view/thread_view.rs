@@ -6,7 +6,7 @@ use crate::{
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
 use agent_client_protocol::v2::schema as acp_v2;
-use std::{cell::RefCell, path::Path};
+use std::{cell::RefCell, ops::Range, path::Path};
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity, OutputTokensUpdate,
@@ -320,6 +320,173 @@ impl RenderOnce for GeneratingSpinnerElement {
             window.use_state(cx, |_, _| GeneratingSpinner::new(self.variant))
         })
     }
+}
+
+#[derive(IntoElement)]
+struct ClaudeSpinner;
+
+const CLAUDE_ORANGE: u32 = 0xd97757;
+
+impl RenderOnce for ClaudeSpinner {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        const FRAMES: [&str; 10] = ["✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢", "·", "✢"];
+        h_flex().w_3().justify_center().child(
+            Label::new(FRAMES[0])
+                .size(LabelSize::Small)
+                .color(Color::Custom(gpui::rgb(CLAUDE_ORANGE).into()))
+                .with_animation(
+                    "claude-spinner",
+                    Animation::new(Duration::from_millis(1200)).repeat(),
+                    |mut label, delta| {
+                        let frame = (delta * FRAMES.len() as f32) as usize % FRAMES.len();
+                        label.set_text(FRAMES[frame]);
+                        label
+                    },
+                ),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadActivity {
+    Working(&'static str),
+    WaitingForUser,
+    PlanReady,
+    BackgroundTasks,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactToolKind {
+    Command,
+    Read,
+    Edit,
+    Search,
+    Fetch,
+    Other,
+}
+
+impl CompactToolKind {
+    fn of(tool_call: &ToolCall) -> Self {
+        if tool_call.terminals().next().is_some() {
+            return Self::Command;
+        }
+        match tool_call.kind() {
+            acp_v2::ToolKind::Execute => Self::Command,
+            acp_v2::ToolKind::Read => Self::Read,
+            acp_v2::ToolKind::Edit | acp_v2::ToolKind::Delete | acp_v2::ToolKind::Move => {
+                Self::Edit
+            }
+            acp_v2::ToolKind::Search => Self::Search,
+            acp_v2::ToolKind::Fetch => Self::Fetch,
+            _ => Self::Other,
+        }
+    }
+
+    fn past_label(self, count: usize) -> String {
+        let (single, verb, noun) = match self {
+            Self::Command => ("Ran a command", "Ran", "commands"),
+            Self::Read => ("Read a file", "Read", "files"),
+            Self::Edit => ("Edited a file", "Edited", "files"),
+            Self::Search => ("Searched once", "Searched", "times"),
+            Self::Fetch => ("Fetched a page", "Fetched", "pages"),
+            Self::Other => ("Used a tool", "Used", "tools"),
+        };
+        if count == 1 {
+            single.to_string()
+        } else {
+            format!("{verb} {count} {noun}")
+        }
+    }
+
+    fn present_label(self) -> &'static str {
+        match self {
+            Self::Command => "Running a command…",
+            Self::Read => "Reading a file…",
+            Self::Edit => "Editing a file…",
+            Self::Search => "Searching…",
+            Self::Fetch => "Fetching…",
+            Self::Other => "Working…",
+        }
+    }
+}
+
+/// Permission requests and failures stay fully visible in compact mode; everything else folds
+/// into its group's summary row.
+fn collapses_in_compact_mode(entry: &AgentThreadEntry) -> bool {
+    let AgentThreadEntry::ToolCall(tool_call) = entry else {
+        return false;
+    };
+    !tool_call.is_subagent()
+        && !is_plan_approval(tool_call)
+        && matches!(
+            tool_call.status(),
+            ToolCallStatus::Pending
+                | ToolCallStatus::InProgress
+                | ToolCallStatus::Paused
+                | ToolCallStatus::Completed
+                | ToolCallStatus::Canceled
+        )
+}
+
+fn is_plan_approval(tool_call: &ToolCall) -> bool {
+    matches!(tool_call.kind(), acp_v2::ToolKind::SwitchMode)
+}
+
+pub(crate) fn compact_tool_group(
+    entries: &[AgentThreadEntry],
+    entry_ix: usize,
+) -> Option<Range<usize>> {
+    if !collapses_in_compact_mode(entries.get(entry_ix)?) {
+        return None;
+    }
+    let start = entries[..entry_ix]
+        .iter()
+        .rposition(|entry| !collapses_in_compact_mode(entry))
+        .map_or(0, |ix| ix + 1);
+    let end = entries[entry_ix..]
+        .iter()
+        .position(|entry| !collapses_in_compact_mode(entry))
+        .map_or(entries.len(), |offset| entry_ix + offset);
+    Some(start..end)
+}
+
+pub(crate) fn compact_tool_summary<'a>(
+    tool_calls: impl IntoIterator<Item = &'a ToolCall>,
+) -> String {
+    let mut counts: Vec<(CompactToolKind, usize)> = Vec::new();
+    for tool_call in tool_calls {
+        let kind = CompactToolKind::of(tool_call);
+        match counts.iter_mut().find(|(counted, _)| *counted == kind) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .enumerate()
+        .map(|(ix, (kind, count))| {
+            let mut label = kind.past_label(count);
+            if ix > 0
+                && let Some(first) = label.get_mut(..1)
+            {
+                first.make_ascii_lowercase();
+            }
+            label
+        })
+        .join(", ")
+}
+
+pub(crate) fn toggle_verbose_setting(fs: Arc<dyn Fs>, cx: &mut App) {
+    let verbose = !AgentSettings::get_global(cx).verbose;
+    // Apply in memory first so every open thread flips this frame, not after the file round-trip.
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_user_settings(cx, |settings| {
+            settings.agent.get_or_insert_default().verbose = Some(verbose);
+        });
+    });
+    update_settings_file(fs, cx, move |settings, _| {
+        settings.agent.get_or_insert_default().verbose = Some(verbose);
+    });
 }
 
 pub enum AcpThreadViewEvent {
@@ -806,6 +973,8 @@ pub struct ThreadView {
     pending_sandbox_status_key: Option<SandboxStatusKey>,
     pub multi_root_callout_dismissed: bool,
     pub generating_indicator_in_list: bool,
+    verbose: bool,
+    expanded_tool_groups: HashSet<usize>,
     pub skill_loading_issues: Vec<SkillLoadingIssue>,
     /// Issues the user has explicitly dismissed. Each entry is matched against
     /// emitted issues by full equality; when an issue no longer appears in the
@@ -1046,6 +1215,19 @@ impl ThreadView {
 
         subscriptions.push(cx.observe(&thread, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe_global::<ui::AgentLiveStates>(|this, cx| {
+            this.sync_generating_indicator(cx);
+            cx.notify();
+        }));
+        subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+            let verbose = AgentSettings::get_global(cx).verbose;
+            if this.verbose != verbose {
+                this.verbose = verbose;
+                this.list_state
+                    .remeasure_items(0..this.list_state.item_count());
+                cx.notify();
+            }
+        }));
         subscriptions.push(cx.subscribe(&thread, |this, _, event, cx| {
             if matches!(
                 event,
@@ -1334,6 +1516,8 @@ impl ThreadView {
             pending_sandbox_status_key: None,
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
+            verbose: AgentSettings::get_global(cx).verbose,
+            expanded_tool_groups: HashSet::default(),
             skill_loading_issues: Vec::new(),
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
@@ -2730,6 +2914,12 @@ impl ThreadView {
         self.thread_retry_status.take();
         self.thread_error.take();
         self.message_queue.pause();
+        if self.runs_elsewhere(cx) {
+            let thread = self.thread.read(cx);
+            let (connection, session_id) =
+                (thread.connection().clone(), thread.session_id().clone());
+            connection.cancel(&session_id, cx).log_err();
+        }
         self._cancel_task = Some(self.cancel_thread(&self.thread, cx));
         self.sync_generating_indicator(cx);
         cx.notify();
@@ -6750,7 +6940,8 @@ impl ThreadView {
         let is_editor_empty = message_editor.is_empty(cx);
         let focus_handle = message_editor.focus_handle(cx);
 
-        let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
+        let is_generating =
+            self.thread.read(cx).status() == ThreadStatus::Generating || self.runs_elsewhere(cx);
         let is_unconfirmed = self.thread.read(cx).status() == ThreadStatus::Unconfirmed;
 
         if self.is_loading_contents {
@@ -7507,10 +7698,17 @@ impl ThreadView {
                 if let Some(entry) = entries.get(index) {
                     let rendered = this.render_entry(index, entries.len(), entry, window, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
-                } else if this.generating_indicator_in_list {
-                    let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
-                        || this.has_pending_request_elicitation(cx);
-                    let rendered = this.render_generating(confirmation, cx);
+                } else if this.generating_indicator_in_list
+                    && let Some(activity) = this.activity(cx)
+                {
+                    // Read here, not in `activity`: the conversation view may be mid-update there.
+                    let activity = match activity {
+                        ThreadActivity::Working(_) if this.has_pending_request_elicitation(cx) => {
+                            ThreadActivity::WaitingForUser
+                        }
+                        activity => activity,
+                    };
+                    let rendered = this.render_generating(activity, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else {
                     Empty.into_any()
@@ -7540,6 +7738,7 @@ impl ThreadView {
                 .is_none_or(|entry| !entry.is_indented());
 
         let mut assistant_message_is_blank = false;
+        let compact_group = self.compact_tool_group(entry_ix, cx);
 
         let primary = match &entry {
             AgentThreadEntry::UserMessage(message) => {
@@ -7775,6 +7974,18 @@ impl ThreadView {
                         .into_any()
                 }
             }
+            AgentThreadEntry::ToolCall(_)
+                if compact_group
+                    .as_ref()
+                    .is_some_and(|group| !self.expanded_tool_groups.contains(&group.start)) =>
+            {
+                match compact_group {
+                    Some(group) if group.start == entry_ix => {
+                        self.render_compact_tool_group(group, false, cx)
+                    }
+                    _ => Empty.into_any(),
+                }
+            }
             AgentThreadEntry::ToolCall(tool_call) => {
                 // A canceled tool call that produced visible output is still worth
                 // showing, but one that was canceled before producing anything just
@@ -7800,7 +8011,12 @@ impl ThreadView {
                             }
                         });
                     if !has_visible_content {
-                        return Empty.into_any();
+                        return match compact_group {
+                            Some(group) if group.start == entry_ix => {
+                                self.render_compact_tool_group(group, true, cx)
+                            }
+                            _ => Empty.into_any(),
+                        };
                     }
                 }
 
@@ -7814,7 +8030,7 @@ impl ThreadView {
                     cx,
                 );
 
-                if let Some(handle) = self
+                let tool_call = if let Some(handle) = self
                     .entry_view_state
                     .read(cx)
                     .entry(entry_ix)
@@ -7823,6 +8039,15 @@ impl ThreadView {
                     tool_call.track_focus(&handle).into_any()
                 } else {
                     tool_call.into_any()
+                };
+
+                match compact_group {
+                    Some(group) if group.start == entry_ix => v_flex()
+                        .w_full()
+                        .child(self.render_compact_tool_group(group, true, cx))
+                        .child(tool_call)
+                        .into_any(),
+                    _ => tool_call,
                 }
             }
             AgentThreadEntry::Elicitation(elicitation_id) => {
@@ -8749,10 +8974,7 @@ impl ThreadView {
 
     /// Ensures the list item count includes (or excludes) an extra item for the generating indicator
     pub(crate) fn sync_generating_indicator(&mut self, cx: &App) {
-        let thread = self.thread.read(cx);
-
-        let is_generating =
-            matches!(thread.status(), ThreadStatus::Generating) && !thread.is_compacting();
+        let is_generating = self.activity(cx).is_some();
 
         if is_generating && !self.generating_indicator_in_list {
             let entries_count = self.thread.read(cx).entries().len();
@@ -8765,30 +8987,151 @@ impl ThreadView {
         }
     }
 
-    fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
-        let show_stats = AgentSettings::get_global(cx).show_turn_stats;
-        let elapsed_label = show_stats
-            .then(|| {
-                self.turn_fields.turn_started_at.and_then(|started_at| {
-                    let elapsed = started_at.elapsed();
-                    (elapsed > STOPWATCH_THRESHOLD).then(|| duration_alt_display(elapsed))
-                })
+    /// The server reports this session busy with a turn this thread did not start (sent from a
+    /// card, a next action or another window), so the thread must still look and stop as working.
+    fn runs_elsewhere(&self, cx: &App) -> bool {
+        let thread = self.thread.read(cx);
+        thread.status() == ThreadStatus::Idle
+            && ui::AgentLiveStates::get(cx, &thread.session_id().0).is_some_and(|state| {
+                matches!(
+                    state,
+                    ui::AgentDotState::Working | ui::AgentDotState::Permission
+                )
             })
-            .flatten();
+    }
 
-        let is_blocked_on_terminal_command =
-            !confirmation && self.is_blocked_on_terminal_command(cx);
-        let is_waiting = confirmation || self.thread.read(cx).has_in_progress_tool_calls();
+    fn compact_tool_group(&self, entry_ix: usize, cx: &App) -> Option<Range<usize>> {
+        if self.verbose {
+            return None;
+        }
+        compact_tool_group(self.thread.read(cx).entries(), entry_ix)
+    }
 
-        let turn_tokens_label = elapsed_label
-            .is_some()
-            .then(|| {
-                self.turn_fields
-                    .turn_tokens
-                    .filter(|&tokens| tokens > TOKEN_THRESHOLD)
-                    .map(|tokens| crate::humanize_token_count(tokens))
-            })
-            .flatten();
+    fn render_compact_tool_group(
+        &self,
+        group: Range<usize>,
+        expanded: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let entries = self.thread.read(cx).entries();
+        let summary = compact_tool_summary(
+            entries
+                .get(group.clone())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|entry| match entry {
+                    AgentThreadEntry::ToolCall(tool_call) => Some(tool_call),
+                    _ => None,
+                }),
+        );
+        let start = group.start;
+        h_flex()
+            .px_5()
+            .py_1()
+            .child(
+                h_flex()
+                    .id(("compact-tool-group", start))
+                    .debug_selector(move || format!("compact-tool-group-{start}"))
+                    .gap_1()
+                    .cursor_pointer()
+                    .opacity(0.8)
+                    .hover(|style| style.opacity(1.))
+                    .child(
+                        Label::new(summary)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_tool_group(start, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    pub(crate) fn toggle_tool_group(&mut self, start: usize, cx: &mut Context<Self>) {
+        if !self.expanded_tool_groups.remove(&start) {
+            self.expanded_tool_groups.insert(start);
+        }
+        let end = compact_tool_group(self.thread.read(cx).entries(), start)
+            .map_or(start + 1, |group| group.end);
+        self.list_state.remeasure_items(start..end);
+        cx.notify();
+    }
+
+    pub(crate) fn is_verbose(&self) -> bool {
+        self.verbose
+    }
+
+    fn toggle_verbose(&mut self, _: &crate::ToggleVerbose, _: &mut Window, cx: &mut Context<Self>) {
+        let fs = self.thread.read(cx).project().read(cx).fs().clone();
+        toggle_verbose_setting(fs, cx);
+    }
+
+    pub(crate) fn activity(&self, cx: &App) -> Option<ThreadActivity> {
+        let thread = self.thread.read(cx);
+        let live_state = ui::AgentLiveStates::get(cx, &thread.session_id().0);
+        let generating = thread.status() == ThreadStatus::Generating && !thread.is_compacting();
+        if generating || self.runs_elsewhere(cx) {
+            let waiting_for_user = thread.is_waiting_for_confirmation()
+                || live_state == Some(ui::AgentDotState::Permission);
+            if waiting_for_user {
+                let plan_ready = thread.entries().iter().any(|entry| {
+                    matches!(entry, AgentThreadEntry::ToolCall(tool_call)
+                        if is_plan_approval(tool_call)
+                            && tool_call.status() == ToolCallStatus::WaitingForConfirmation)
+                });
+                return Some(if plan_ready {
+                    ThreadActivity::PlanReady
+                } else {
+                    ThreadActivity::WaitingForUser
+                });
+            }
+            let current_tool = thread.entries().iter().rev().find_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(tool_call)
+                    if matches!(
+                        tool_call.status(),
+                        ToolCallStatus::Pending | ToolCallStatus::InProgress
+                    ) =>
+                {
+                    Some(CompactToolKind::of(tool_call))
+                }
+                _ => None,
+            });
+            return Some(ThreadActivity::Working(
+                current_tool.map_or("Thinking…", CompactToolKind::present_label),
+            ));
+        }
+        (thread.status() == ThreadStatus::Idle && live_state == Some(ui::AgentDotState::Monitoring))
+            .then_some(ThreadActivity::BackgroundTasks)
+    }
+
+    fn render_generating(&self, activity: ThreadActivity, cx: &App) -> impl IntoElement {
+        let elapsed_label = self.turn_fields.turn_started_at.and_then(|started_at| {
+            let elapsed = started_at.elapsed();
+            (elapsed > STOPWATCH_THRESHOLD).then(|| duration_alt_display(elapsed))
+        });
+
+        let is_waiting = matches!(activity, ThreadActivity::WaitingForUser)
+            || self.thread.read(cx).has_in_progress_tool_calls();
+
+        let turn_tokens_label = (AgentSettings::get_global(cx).show_turn_stats
+            && elapsed_label.is_some())
+        .then(|| {
+            self.turn_fields
+                .turn_tokens
+                .filter(|&tokens| tokens > TOKEN_THRESHOLD)
+                .map(|tokens| crate::humanize_token_count(tokens))
+        })
+        .flatten();
 
         let arrow_icon = if is_waiting {
             IconName::ArrowUp
@@ -8796,36 +9139,37 @@ impl ThreadView {
             IconName::ArrowDown
         };
 
+        let pulsing_label = |text: &'static str| {
+            let label = Label::new(text).size(LabelSize::Small).color(Color::Muted);
+            if cx.reduce_motion() {
+                label.into_any_element()
+            } else {
+                label
+                    .with_animation(
+                        "thread-activity-pulse",
+                        Animation::new(Duration::from_secs(2)).repeat(),
+                        |label, delta| label.alpha(pulsating_between(0.35, 1.)(delta)),
+                    )
+                    .into_any_element()
+            }
+        };
+
         h_flex()
             .id("generating-spinner")
             .py_2()
-            .px(rems_from_px(22_f32))
-            .gap_2()
-            .map(|this| {
-                if confirmation {
-                    this.child(
-                        h_flex()
-                            .w_2()
-                            .justify_center()
-                            .child(GeneratingSpinnerElement::new(SpinnerVariant::Sand)),
-                    )
-                    .child(
-                        div().min_w(rems(8.)).child(
-                            LoadingLabel::new("Awaiting Confirmation")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .single_line(),
-                        ),
-                    )
-                } else if is_blocked_on_terminal_command {
-                    this
-                } else {
-                    this.child(
-                        h_flex()
-                            .w_2()
-                            .justify_center()
-                            .child(GeneratingSpinnerElement::new(SpinnerVariant::Dots)),
-                    )
+            .px_5()
+            .gap_1p5()
+            .map(|this| match activity {
+                ThreadActivity::Working(label) => this.child(ClaudeSpinner).child(
+                    Label::new(label)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .single_line(),
+                ),
+                ThreadActivity::WaitingForUser => this.child(pulsing_label("Waiting for you…")),
+                ThreadActivity::PlanReady => this.child(pulsing_label("Plan ready for review…")),
+                ThreadActivity::BackgroundTasks => {
+                    this.child(pulsing_label("Waiting for background tasks…"))
                 }
             })
             .when_some(elapsed_label, |this, elapsed| {
@@ -9211,40 +9555,6 @@ impl ThreadView {
             .join("\n\n");
 
         if text.is_empty() { None } else { Some(text) }
-    }
-
-    fn is_blocked_on_terminal_command(&self, cx: &App) -> bool {
-        let thread = self.thread.read(cx);
-        if !matches!(thread.status(), ThreadStatus::Generating) {
-            return false;
-        }
-
-        let mut has_running_terminal_call = false;
-
-        for entry in thread.entries().iter().rev() {
-            match entry {
-                AgentThreadEntry::UserMessage(_) => break,
-                AgentThreadEntry::ToolCall(tool_call)
-                    if matches!(
-                        tool_call.status(),
-                        ToolCallStatus::InProgress | ToolCallStatus::Pending
-                    ) =>
-                {
-                    if matches!(tool_call.kind(), acp_v2::ToolKind::Execute) {
-                        has_running_terminal_call = true;
-                    } else {
-                        return false;
-                    }
-                }
-                AgentThreadEntry::ToolCall(_)
-                | AgentThreadEntry::Elicitation(_)
-                | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::SessionMessage(_)
-                | AgentThreadEntry::ContextCompaction(_) => {}
-            }
-        }
-
-        has_running_terminal_call
     }
 
     fn render_session_message(
@@ -9900,7 +10210,8 @@ impl ThreadView {
             .entry_view_state
             .read(cx)
             .is_tool_call_content_visible(tool_call)
-            || generic_permissions.is_some();
+            || generic_permissions.is_some()
+            || is_plan_approval(tool_call);
 
         let input_output_header = |label: SharedString| {
             Label::new(label)
@@ -14241,6 +14552,7 @@ impl ThreadView {
         .on_action(cx.listener(Self::scroll_output_to_previous_message))
         .on_action(cx.listener(Self::scroll_output_to_next_message))
         .on_action(cx.listener(Self::toggle_search))
+        .on_action(cx.listener(Self::toggle_verbose))
         .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
             this.toggle_fast_mode(window, cx);
         }))

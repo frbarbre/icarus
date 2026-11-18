@@ -885,9 +885,16 @@ impl Server {
                         thread_json(t, count)
                     })
                     .collect();
+                let viewer = self.github.viewer().map(|login| {
+                    let avatar_url = self.github.viewer_avatar(&login).unwrap_or_else(|| {
+                        format!("https://avatars.githubusercontent.com/{login}")
+                    });
+                    json!({ "login": login, "avatar_url": avatar_url })
+                });
                 let mut reply = json!({
                     "pr": { "repo": target.repo.slug(), "number": target.number },
                     "threads": threads,
+                    "viewer": viewer,
                 });
                 if query.conversation {
                     // The threads still count when the other sources fail, as in Orca.
@@ -910,11 +917,14 @@ impl Server {
                     .reply_in_thread(&reply.thread, &reply.body)
                     .await
                     .map_err(github_error)?;
+                let author = self.github.viewer();
                 let comment = PrComment {
                     id: posted.id.clone(),
                     database_id: posted.database_id,
-                    author: self.github.viewer(),
-                    author_avatar_url: None,
+                    author_avatar_url: author
+                        .as_deref()
+                        .and_then(|login| self.github.viewer_avatar(login)),
+                    author,
                     is_bot: false,
                     body: reply.body.clone(),
                     url: posted.url.clone(),
@@ -1125,9 +1135,10 @@ impl Server {
         };
         if let CommentRef::ReviewComment { node_id } = comment {
             return match edited {
-                Some(body) => self
-                    .github
-                    .patch_comment(node_id, |cached| cached.body = body),
+                Some(body) => self.github.patch_comment(node_id, |cached| {
+                    cached.body = body;
+                    cached.last_edited_at = Some(now_rfc3339());
+                }),
                 None => false,
             };
         }
@@ -1136,7 +1147,10 @@ impl Server {
                 return false;
             };
             match &edited {
-                Some(body) => entries[index].body = body.clone(),
+                Some(body) => {
+                    entries[index].body = body.clone();
+                    entries[index].last_edited_at = Some(now_rfc3339());
+                }
                 None => {
                     entries.remove(index);
                 }
@@ -1169,16 +1183,20 @@ impl Server {
             .add_issue_comment(&target.repo, target.number, &body)
             .await
             .map_err(github_error)?;
+        let author = self.github.viewer();
         let comment = ConversationComment {
             id: posted.node_id.clone().unwrap_or_default(),
             database_id: Some(posted.id),
             kind: ConversationKind::Comment,
-            author: self.github.viewer(),
-            author_avatar_url: None,
+            author_avatar_url: author
+                .as_deref()
+                .and_then(|login| self.github.viewer_avatar(login)),
+            author,
             is_bot: false,
             body,
             url: posted.html_url.clone(),
             created_at: Some(now_rfc3339()),
+            last_edited_at: None,
             review_state: None,
             viewer_can_update: true,
             viewer_can_delete: true,
@@ -1407,8 +1425,55 @@ impl Server {
             )
             .await
             .map_err(github_error)?;
-        self.review_changed(Some(&workspace.id), None);
+        let author = self.github.viewer();
+        let comment = PrComment {
+            id: posted.node_id.clone().unwrap_or_default(),
+            database_id: Some(posted.id),
+            author_avatar_url: author
+                .as_deref()
+                .and_then(|login| self.github.viewer_avatar(login)),
+            author,
+            is_bot: false,
+            body: draft.body.clone(),
+            url: posted.html_url.clone(),
+            created_at: Some(now_rfc3339()),
+            last_edited_at: None,
+            viewer_can_update: true,
+            viewer_can_delete: true,
+            reactions: Vec::new(),
+        };
+        let thread = PrThread {
+            id: comment.id.clone(),
+            path: draft.path.clone(),
+            side: draft.side.clone(),
+            start_side: draft.start_side.clone(),
+            subject: draft.subject.clone(),
+            line: draft.line,
+            start_line: draft.start_line,
+            original_line: draft.line,
+            original_start_line: draft.start_line,
+            is_resolved: false,
+            is_outdated: false,
+            // Its id is the comment's until GitHub's thread id is read, which resolve and reply need.
+            viewer_can_resolve: false,
+            viewer_can_unresolve: false,
+            viewer_can_reply: false,
+            comments: vec![comment.clone()],
+        };
+        if self
+            .github
+            .push_thread(&target.repo, target.number, thread.clone())
+        {
+            self.broadcast(
+                REVIEW_CHANGED_TOPIC,
+                json!({ "workspace": workspace.id, "thread": null }),
+            );
+        } else {
+            self.review_changed(Some(&workspace.id), None);
+        }
+        let line_count = file_lines(&workspace.path, &thread.path).map(|lines| lines.len());
         Ok(json!({
+            "thread": thread_json(&thread, line_count),
             "comment": { "id": posted.id, "node_id": posted.node_id, "url": posted.html_url },
             "path": draft.path,
             "line": draft.line,

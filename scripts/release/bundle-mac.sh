@@ -115,9 +115,23 @@ done
 entitlements=$(mktemp)
 # Associated domains need a real team identity; ad-hoc signing rejects them.
 sed '/com.apple.developer.associated-domains/,+1d' crates/zed/resources/zed.entitlements >"$entitlements"
-codesign --force --deep --entitlements "$entitlements" --sign - "$app_path"
+# A stable key keeps macOS privacy grants (Documents, Full Disk Access) across updates; an ad-hoc
+# signature is a new identity every build, so macOS asks again after each one. rcodesign reads the
+# key from a file, so releases sign without the login keychain being unlocked.
+signing_dir="${ICARUS_SIGNING_DIR:-$HOME/.config/icarus/signing}"
+rcodesign=$(command -v rcodesign || echo "$HOME/.cargo/bin/rcodesign")
+if [ -x "$rcodesign" ] && [ -f "$signing_dir/icarus.p12" ] && [ -f "$signing_dir/p12.pass" ]; then
+  # No timestamp: a self-signed key gains nothing from Apple's timestamp server.
+  "$rcodesign" sign --p12-file "$signing_dir/icarus.p12" --p12-password-file "$signing_dir/p12.pass" \
+    --timestamp-url none --entitlements-xml-file "$entitlements" "$app_path"
+  signature="the Icarus key"
+else
+  codesign --force --deep --entitlements "$entitlements" --sign - "$app_path"
+  signature="an ad-hoc signature"
+fi
 rm -f "$entitlements"
-codesign --verify --verbose "$app_path" || echo "warning: codesign --verify failed on the ad-hoc signature" >&2
+echo "signed $app_path with $signature"
+codesign --verify --verbose "$app_path" || echo "warning: codesign --verify failed on $signature" >&2
 
 name="Icarus-$version-macos-$arch"
 rm -f "$out_dir/$name.zip" "$out_dir/$name.dmg"

@@ -542,6 +542,7 @@ pub(crate) struct ProjectPrs {
     at: Instant,
     pub viewer: Option<String>,
     pub by_branch: HashMap<String, Option<PrDetails>>,
+    fetched: HashMap<String, Instant>,
 }
 
 /// A copy read at an instant for a PR as of its `updated_at`; `None` for the instant marks a copy
@@ -580,6 +581,7 @@ pub struct GitHubService {
     teams: Mutex<HashMap<String, (Instant, TeamRoster)>>,
     viewer_login: Mutex<Option<String>>,
     poll: tokio::sync::Notify,
+    pub(crate) refreshes: Mutex<crate::pr_refresh::PrRefreshes>,
 }
 
 fn is_rate_limit(error: &GitHubError) -> bool {
@@ -593,7 +595,7 @@ fn is_rate_limit(error: &GitHubError) -> bool {
     )
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -616,6 +618,7 @@ impl GitHubService {
             teams: Mutex::new(HashMap::new()),
             viewer_login: Mutex::new(None),
             poll: tokio::sync::Notify::new(),
+            refreshes: Mutex::default(),
         }
     }
 
@@ -860,6 +863,37 @@ impl GitHubService {
         }
     }
 
+    /// Adds a thread GitHub just accepted to the PR's cached threads. The REST reply carries no
+    /// thread node id; the PR's moved `updated_at` makes the next poll read the real one.
+    pub(crate) fn push_thread(&self, repo: &RepoRef, number: u64, thread: PrThread) -> bool {
+        match lock(&self.threads).get_mut(&repo.match_key(number)) {
+            Some(copy) => {
+                copy.value.push(thread);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The viewer's avatar, from any cached comment they wrote.
+    pub(crate) fn viewer_avatar(&self, login: &str) -> Option<String> {
+        let from_threads = lock(&self.threads).values().find_map(|copy| {
+            copy.value
+                .iter()
+                .flat_map(|thread| &thread.comments)
+                .filter(|comment| comment.author.as_deref() == Some(login))
+                .find_map(|comment| comment.author_avatar_url.clone())
+        });
+        from_threads.or_else(|| {
+            lock(&self.conversations).values().find_map(|copy| {
+                copy.value
+                    .iter()
+                    .filter(|entry| entry.author.as_deref() == Some(login))
+                    .find_map(|entry| entry.author_avatar_url.clone())
+            })
+        })
+    }
+
     /// Like [`Self::patch_thread`], for one comment of a cached thread.
     pub(crate) fn patch_comment(
         &self,
@@ -913,7 +947,36 @@ impl GitHubService {
 
     pub(crate) fn invalidate(&self, project_id: &str) {
         lock(&self.prs).remove(project_id);
+        self.forget_stacks();
+    }
+
+    pub(crate) fn forget_stacks(&self) {
         lock(&self.stacks).clear();
+    }
+
+    /// When the branch's pull request was last read from GitHub, by a poll or a targeted refresh.
+    pub(crate) fn fetched_at(&self, project_id: &str, branch: &str) -> Option<Instant> {
+        lock(&self.prs)
+            .get(project_id)?
+            .fetched
+            .get(branch)
+            .copied()
+    }
+
+    /// Replaces one branch's pull request in the project's copy, leaving the other branches' age alone.
+    pub(crate) fn store_branch_pr(&self, project_id: &str, branch: &str, pull: Option<PrDetails>) {
+        let now = Instant::now();
+        let mut prs = lock(&self.prs);
+        let project = prs
+            .entry(project_id.to_owned())
+            .or_insert_with(|| ProjectPrs {
+                at: now,
+                viewer: None,
+                by_branch: HashMap::new(),
+                fetched: HashMap::new(),
+            });
+        project.by_branch.insert(branch.to_owned(), pull);
+        project.fetched.insert(branch.to_owned(), now);
     }
 
     /// The pull request of a branch as last polled, however old.
@@ -1275,6 +1338,7 @@ impl Server {
             at: Instant::now(),
             viewer: None,
             by_branch: HashMap::new(),
+            fetched: HashMap::new(),
         };
         if !branches.is_empty() {
             let targets: Vec<PrTarget> = branches.iter().cloned().map(PrTarget::Branch).collect();
@@ -1297,6 +1361,7 @@ impl Server {
             prs.viewer = snapshot.viewer_login;
             for entry in snapshot.entries {
                 if let PrTarget::Branch(branch) = entry.target {
+                    prs.fetched.insert(branch.clone(), prs.at);
                     prs.by_branch.insert(branch, entry.pull);
                 }
             }
@@ -1382,7 +1447,7 @@ impl Server {
         changed
     }
 
-    fn save_pr_cache(&self) {
+    pub(crate) fn save_pr_cache(&self) {
         let saved: HashMap<String, HashMap<String, Option<PrDetails>>> = lock(&self.github.prs)
             .iter()
             .map(|(project, prs)| (project.clone(), prs.by_branch.clone()))
@@ -1417,6 +1482,7 @@ impl Server {
                 at,
                 viewer: None,
                 by_branch,
+                fetched: HashMap::new(),
             });
         }
     }
@@ -1903,6 +1969,7 @@ mod tests {
                 at: Instant::now(),
                 viewer: None,
                 by_branch,
+                fetched: HashMap::new(),
             },
         );
         assert_eq!(
@@ -1994,82 +2061,43 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn polling_github_stays_within_its_budget() {
         let home = tempfile::tempdir().expect("home");
-        let fixtures = home.path().join("gh.json");
-        write_fixtures(&fixtures, "2026-11-15T12:00:00Z");
-        let gh = FixtureGh::new(fixtures.clone());
-        let log = gh.log_path();
-        let (server, _listener) = Server::bind_with(
-            crate::paths::ServerPaths {
-                home: home.path().join("server"),
-            },
-            GitHubService::new(ServerGh::Fixture(gh)),
-        )
-        .await
-        .expect("server");
-        for repo in ["widgets", "gadgets"] {
-            let root = home.path().join(repo);
-            let project = server
-                .store
-                .add_project(
-                    repo,
-                    &root,
-                    Some(&format!("github.com/acme/{repo}")),
-                    Some("main"),
-                )
-                .expect("project");
-            let prefix = &repo[..1];
-            for index in 1..=2 {
-                let branch = format!("{prefix}-{index}");
-                let workspace = Workspace {
-                    id: format!("ws-{branch}"),
-                    project_id: project.id.clone(),
-                    name: branch.clone(),
-                    path: root.join(&branch),
-                    branch: Some(branch),
-                    base_ref: Some("main".into()),
-                    status: None,
-                    title: None,
-                    issue: None,
-                    pull_request: None,
-                    created_at_ms: 0,
-                    pinned: false,
-                    manual_order: None,
-                    activity_at_ms: None,
-                    discovery: crate::state::Discovery::default(),
-                };
-                server
-                    .store
-                    .insert_workspace(&workspace)
-                    .expect("workspace");
-            }
-        }
+        let (server, fixtures, log) = fixture_server(home.path()).await;
         let _client = server.connect_test_client();
         spawn(Arc::clone(&server));
         server.github.wake_poll();
+        let selected = server
+            .store
+            .workspace("ws-w-1")
+            .expect("store")
+            .expect("workspace");
 
-        let app = |server: Arc<Server>, minutes: u64, threads: bool| async move {
-            let workspace = json!({ "workspace": "ws-w-1" });
-            for tick in 0..minutes * 12 {
-                server
-                    .github_dispatch("pr.status", workspace.clone())
-                    .await
-                    .expect("pr.status");
-                if tick % 6 == 0 {
+        let app = |server: Arc<Server>, minutes: u64, threads: bool| {
+            let selected = selected.clone();
+            async move {
+                let workspace = json!({ "workspace": "ws-w-1" });
+                for tick in 0..minutes * 12 {
                     server
-                        .github_dispatch("pr.previews", workspace.clone())
+                        .github_dispatch("pr.status", workspace.clone())
                         .await
-                        .expect("pr.previews");
+                        .expect("pr.status");
+                    server.note_selected(&selected).await;
+                    if tick % 6 == 0 {
+                        server
+                            .github_dispatch("pr.previews", workspace.clone())
+                            .await
+                            .expect("pr.previews");
+                    }
+                    if threads {
+                        server
+                            .review_dispatch(
+                                "review.threads",
+                                json!({ "workspace": "ws-w-1", "unresolved": true }),
+                            )
+                            .await
+                            .expect("review.threads");
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-                if threads {
-                    server
-                        .review_dispatch(
-                            "review.threads",
-                            json!({ "workspace": "ws-w-1", "unresolved": true }),
-                        )
-                        .await
-                        .expect("review.threads");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         };
 
@@ -2111,5 +2139,114 @@ mod tests {
             total <= repos * polls * 3,
             "{total} GitHub calls: {counts:?}"
         );
+    }
+
+    fn single_pr_queries(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| line["route"] == "graphql PrSnapshot")
+            .filter(|line| line["variables"].get("b1").is_none())
+            .filter_map(|line| line["variables"]["b0"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selecting_a_stale_workspace_refreshes_only_its_pull_request_once() {
+        let home = tempfile::tempdir().expect("home");
+        let (server, _fixtures, log) = fixture_server(home.path()).await;
+        let selected = server
+            .store
+            .workspace("ws-w-1")
+            .expect("store")
+            .expect("workspace");
+        let settle = || tokio::time::sleep(Duration::from_secs(1));
+
+        server.note_selected(&selected).await;
+        server.note_selected(&selected).await;
+        settle().await;
+        assert_eq!(
+            single_pr_queries(&log),
+            ["w-1"],
+            "never fetched: one query: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+
+        server.note_selected(&selected).await;
+        settle().await;
+        assert_eq!(single_pr_queries(&log).len(), 1, "fresh: no query");
+
+        tokio::time::sleep(crate::pr_refresh::SELECTED_STALE).await;
+        server.note_selected(&selected).await;
+        server.note_selected(&selected).await;
+        settle().await;
+        assert_eq!(
+            single_pr_queries(&log),
+            ["w-1", "w-1"],
+            "stale again: one more"
+        );
+        assert!(
+            server
+                .github
+                .fetched_at(&selected.project_id, "w-1")
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+        );
+    }
+
+    /// Projects widgets and gadgets with two workspaces each, against fixture GitHub.
+    async fn fixture_server(
+        home: &std::path::Path,
+    ) -> (Arc<Server>, std::path::PathBuf, std::path::PathBuf) {
+        let fixtures = home.join("gh.json");
+        write_fixtures(&fixtures, "2026-11-15T12:00:00Z");
+        let gh = FixtureGh::new(fixtures.clone());
+        let log = gh.log_path();
+        let (server, _listener) = Server::bind_with(
+            crate::paths::ServerPaths {
+                home: home.join("server"),
+            },
+            GitHubService::new(ServerGh::Fixture(gh)),
+        )
+        .await
+        .expect("server");
+        for repo in ["widgets", "gadgets"] {
+            let root = home.join(repo);
+            let project = server
+                .store
+                .add_project(
+                    repo,
+                    &root,
+                    Some(&format!("github.com/acme/{repo}")),
+                    Some("main"),
+                )
+                .expect("project");
+            let prefix = &repo[..1];
+            for index in 1..=2 {
+                let branch = format!("{prefix}-{index}");
+                let workspace = Workspace {
+                    id: format!("ws-{branch}"),
+                    project_id: project.id.clone(),
+                    name: branch.clone(),
+                    path: root.join(&branch),
+                    branch: Some(branch),
+                    base_ref: Some("main".into()),
+                    status: None,
+                    title: None,
+                    issue: None,
+                    pull_request: None,
+                    created_at_ms: 0,
+                    pinned: false,
+                    manual_order: None,
+                    activity_at_ms: None,
+                    discovery: crate::state::Discovery::default(),
+                };
+                server
+                    .store
+                    .insert_workspace(&workspace)
+                    .expect("workspace");
+            }
+        }
+        (server, fixtures, log)
     }
 }

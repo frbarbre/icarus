@@ -1,7 +1,9 @@
 use crate::{CommonAnimationExt, prelude::*, rems_from_px};
-use gpui::{Hsla, Pixels, px, rgb};
+use gpui::{Global, Hsla, Pixels, px, rgb};
+use std::collections::HashMap;
 
 const WORKING_ICON: &str = "icons/icarus/agent_working.svg";
+const MONITORING_ICON: &str = "icons/icarus/activity.svg";
 const QUESTION_ICON: &str = "icons/icarus/message_circle_question.svg";
 const DONE_ICON: &str = "icons/icarus/circle_check.svg";
 const SLEEPING_ICON: &str = "icons/icarus/moon.svg";
@@ -17,6 +19,8 @@ const NEUTRAL_500: u32 = 0x737373;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentDotState {
     Working,
+    /// The turn ended but background tasks it started still run.
+    Monitoring,
     /// Waiting on the user, e.g. to approve a tool call.
     Permission,
     Failed,
@@ -30,6 +34,7 @@ impl AgentDotState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Working => "Working",
+            Self::Monitoring => "Monitoring background tasks",
             Self::Permission => "Needs attention",
             Self::Failed => "Failed",
             Self::Interrupted => "Interrupted",
@@ -43,6 +48,7 @@ impl AgentDotState {
     pub fn summary_label(self) -> &'static str {
         match self {
             Self::Working => "working",
+            Self::Monitoring => "monitoring",
             Self::Permission => "needs attention",
             Self::Failed => "failed",
             Self::Interrupted => "interrupted",
@@ -58,11 +64,45 @@ impl AgentDotState {
             Self::Permission => 0,
             Self::Failed => 1,
             Self::Working => 2,
-            Self::Interrupted => 3,
-            Self::Done => 4,
-            Self::Idle => 5,
-            Self::Sleeping => 6,
+            Self::Monitoring => 3,
+            Self::Interrupted => 4,
+            Self::Done => 5,
+            Self::Idle => 6,
+            Self::Sleeping => 7,
         }
+    }
+
+    /// Whether an agent tab shows this beside its logo; a done or idle agent shows only the logo.
+    pub fn shown_on_tab(self) -> bool {
+        !matches!(self, Self::Done | Self::Idle)
+    }
+}
+
+/// Every server agent's current state glyph, by agent id: the one source the workspace cards and
+/// agent tabs both draw from, so they always agree and change in the same frame.
+#[derive(Default)]
+pub struct AgentLiveStates(HashMap<String, AgentDotState>);
+
+impl Global for AgentLiveStates {}
+
+impl AgentLiveStates {
+    pub fn get(cx: &App, agent_id: &str) -> Option<AgentDotState> {
+        cx.try_global::<Self>()?.0.get(agent_id).copied()
+    }
+
+    /// Stores the states that changed; observers of the global only hear about real changes.
+    pub fn set(cx: &mut App, states: impl IntoIterator<Item = (String, AgentDotState)>) {
+        let changed: Vec<_> = {
+            let current = cx.try_global::<Self>();
+            states
+                .into_iter()
+                .filter(|(id, state)| current.and_then(|c| c.0.get(id)) != Some(state))
+                .collect()
+        };
+        if changed.is_empty() {
+            return;
+        }
+        cx.default_global::<Self>().0.extend(changed);
     }
 }
 
@@ -105,6 +145,9 @@ impl RenderOnce for AgentStateIndicator {
             AgentDotState::Working => icon(WORKING_ICON, custom(YELLOW_500))
                 .with_rotate_animation(1)
                 .into_any_element(),
+            AgentDotState::Monitoring => {
+                icon(MONITORING_ICON, custom(YELLOW_500)).into_any_element()
+            }
             AgentDotState::Permission => icon(
                 QUESTION_ICON,
                 custom(if light { ORANGE_600 } else { ORANGE_500 }),

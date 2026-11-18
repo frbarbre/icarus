@@ -1829,6 +1829,36 @@ pub struct MarkdownElement {
 }
 
 impl MarkdownElement {
+    fn inline_tag_style(&self, name: &str) -> TextStyleRefinement {
+        match name {
+            // Text runs carry no size of their own, so smaller text keeps the paragraph's size.
+            "sub" | "sup" | "small" => TextStyleRefinement::default(),
+            "b" | "strong" => TextStyleRefinement {
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            },
+            "i" | "em" => TextStyleRefinement {
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            },
+            "del" | "s" => TextStyleRefinement {
+                strikethrough: Some(StrikethroughStyle {
+                    thickness: px(1.),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "ins" => TextStyleRefinement {
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            _ => self.style.inline_code.clone(),
+        }
+    }
+
     pub fn new(markdown: Entity<Markdown>, style: MarkdownStyle) -> Self {
         Self {
             markdown,
@@ -2711,6 +2741,7 @@ impl Element for MarkdownElement {
                 markdown.mermaid_state.clone(),
             )
         };
+        let parse_html = self.markdown.read(cx).options.parse_html;
         let mut builder = MarkdownElementBuilder::new(
             &self.style.container_style,
             self.style.base_text_style.clone(),
@@ -3412,6 +3443,17 @@ impl Element for MarkdownElement {
                     }
                     if html.trim_end().starts_with("</code>") {
                         builder.pop_text_style();
+                        continue;
+                    }
+                    if parse_html {
+                        // GitHub's inline subset styles its text; any other tag is dropped, never shown.
+                        if let Some((name, closing)) = parser::styled_inline_tag(html) {
+                            if closing {
+                                builder.pop_text_style();
+                            } else {
+                                builder.push_text_style(self.inline_tag_style(&name));
+                            }
+                        }
                         continue;
                     }
                     builder.push_text(&parsed_markdown.source[range.clone()], range.clone());

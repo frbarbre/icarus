@@ -5,7 +5,7 @@
 //! `AgentEvent`s, kept in memory and on disk, so clients can attach, detach and resume by
 //! sequence number while the agent keeps working.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -177,6 +177,8 @@ pub enum AgentState {
     Starting,
     Idle,
     Working,
+    /// Mid-turn and blocked on the user: a tool permission or a question.
+    Waiting,
     /// No process right now; the next message resumes the provider session.
     Sleeping,
     Exited,
@@ -219,7 +221,16 @@ pub struct AgentOptions {
 /// Agent events the server reacts to (notifications), forwarded with the agent's id.
 pub type AgentSignal = (String, AgentEvent);
 
-const SIGNAL_KINDS: &[&str] = &["turn_end", "exit", "notice", "tool_call"];
+const SIGNAL_KINDS: &[&str] = &[
+    "turn_end",
+    "exit",
+    "notice",
+    "tool_call",
+    "permission_request",
+];
+
+/// The signal sent whenever an agent's shown state changes; it is never logged.
+pub const STATE_SIGNAL: &str = "state";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentInfo {
@@ -243,6 +254,28 @@ pub struct AgentInfo {
     pub remote_control: bool,
     /// The claude.ai page of the Remote Control session, once Claude Code has registered it.
     pub remote_control_url: Option<String>,
+    /// Background tasks (shells, monitors, subagents) still running after the turn that started them.
+    pub background_tasks: usize,
+    #[serde(flatten)]
+    pub live: crate::subagents::Activity,
+    /// Permission and question requests waiting for the user's answer.
+    pub permission_requests: Vec<Value>,
+    /// Bumped on every change of the shown state, so a client keeps the newest of a poll and a push.
+    pub revision: u64,
+}
+
+impl AgentInfo {
+    /// What workspace cards and agent tabs need to draw the agent's state.
+    pub fn summary(&self) -> Value {
+        json!({
+            "id": self.id, "title": self.title, "state": self.state, "provider": self.provider,
+            "workspace": self.workspace, "turns": self.turns,
+            "last_activity_ms": self.last_activity_ms, "background_tasks": self.background_tasks,
+            "revision": self.revision,
+            "activity": self.live.activity, "subagents": self.live.subagents,
+            "waiting_reason": self.permission_requests.first().map(|request| request["reason"].clone()),
+        })
+    }
 }
 
 // Hooks run on the blocking pool because snapshots shell out to git.
@@ -272,6 +305,57 @@ struct State {
     chosen_model: Option<String>,
     /// What the provider said it offers: `{ commands, models }`.
     capabilities: Value,
+    /// Open `can_use_tool` requests by request id, in arrival order.
+    permissions: Vec<(String, Value)>,
+    /// Live background task ids, from Claude Code's task frames.
+    background: BTreeSet<String>,
+    live: crate::subagents::Activity,
+    /// The turn ended and its end snapshot is still being taken.
+    finishing: bool,
+    revision: u64,
+}
+
+impl State {
+    fn shown(&self) -> (AgentState, usize, crate::subagents::Activity) {
+        (self.state, self.background.len(), self.live.clone())
+    }
+
+    fn track_background(&mut self, frame: &Value) {
+        let id = frame["task_id"].as_str().map(str::to_string);
+        match frame["subtype"].as_str().unwrap_or_default() {
+            "background_tasks_changed" => {
+                self.background = frame["tasks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|task| task["task_id"].as_str().map(str::to_string))
+                    .collect();
+            }
+            "task_started" => {
+                let backgrounded = frame["is_backgrounded"] == json!(true)
+                    || matches!(frame["task_type"].as_str(), Some("monitor" | "workflow"));
+                let ambient = frame["ambient"] == json!(true);
+                if let (Some(id), true, false) = (id, backgrounded, ambient) {
+                    self.background.insert(id);
+                }
+            }
+            "task_notification" => {
+                if let Some(id) = id {
+                    self.background.remove(&id);
+                }
+            }
+            "task_updated" => {
+                let settled = matches!(
+                    frame["patch"]["status"].as_str(),
+                    Some("completed" | "failed" | "killed" | "stopped" | "cancelled")
+                );
+                if let (Some(id), true) = (id, settled) {
+                    self.background.remove(&id);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn note_prompt_title(state: &mut State, data: &Value) {
@@ -433,6 +517,9 @@ pub fn provider_command(options: &AgentOptions) -> Result<Vec<String>> {
                 "stream-json".into(),
                 "--verbose".into(),
                 "--include-partial-messages".into(),
+                // Permission and question prompts come to Icarus as `can_use_tool` control requests.
+                "--permission-prompt-tool".into(),
+                "stdio".into(),
             ];
             command.extend(permission_flags(options));
             if let Some(model) = &options.model {
@@ -446,6 +533,45 @@ pub fn provider_command(options: &AgentOptions) -> Result<Vec<String>> {
         }
         other => Err(anyhow!("unknown agent provider {other}")),
     }
+}
+
+/// The `can_use_tool` reply for a decision, plus the permission mode an approved plan switches to.
+fn permission_response(
+    request: &Value,
+    decision: &str,
+    answers: Option<Value>,
+) -> Result<(Value, Option<&'static str>)> {
+    let tool_use_id = request["tool_use_id"].clone();
+    let plan = request["reason"] == "plan" || request["tool_name"] == "ExitPlanMode";
+    let mode = match (decision, plan) {
+        ("allow_accept_edits", true) => Some("acceptEdits"),
+        ("allow" | "allow_always", true) => Some("default"),
+        ("allow" | "allow_always" | "deny", false) | ("deny", true) => None,
+        (other, _) => return Err(anyhow!("unknown decision {other}")),
+    };
+    if decision == "deny" {
+        let message = if plan {
+            "The user asked you to keep planning. Revise the plan and call ExitPlanMode again."
+        } else {
+            "User denied this action."
+        };
+        return Ok((
+            json!({ "behavior": "deny", "message": message, "toolUseID": tool_use_id }),
+            None,
+        ));
+    }
+    let mut input = request["input"].clone();
+    if let Some(answers) = answers {
+        input["answers"] = answers;
+    }
+    let mut allow = json!({ "behavior": "allow", "updatedInput": input, "toolUseID": tool_use_id });
+    if let Some(mode) = mode {
+        allow["updatedPermissions"] =
+            json!([{ "type": "setMode", "mode": mode, "destination": "session" }]);
+    } else if decision == "allow_always" && request["suggestions"].is_array() {
+        allow["updatedPermissions"] = request["suggestions"].clone();
+    }
+    Ok((allow, mode))
 }
 
 /// Maps one stream-JSON line from the agent to zero or more normalized events.
@@ -463,8 +589,36 @@ pub fn normalize(line: &Value) -> Vec<(String, Value)> {
                 json!({ "status": line["status"], "permission_mode": line["permissionMode"] }),
             )],
             "api_retry" | "permission_denied" => vec![("notice".into(), line.clone())],
+            "task_started" | "task_notification" | "task_updated" | "background_tasks_changed" => {
+                vec![("task".into(), line.clone())]
+            }
             _ => Vec::new(),
         },
+        "control_request" if line["request"]["subtype"] == "can_use_tool" => {
+            let request = &line["request"];
+            let reason = match request["tool_name"].as_str() {
+                Some("ExitPlanMode") => "plan",
+                Some("AskUserQuestion") => "question",
+                _ => "permission",
+            };
+            let mut data = json!({
+                "request_id": line["request_id"],
+                "tool_name": request["tool_name"],
+                "tool_use_id": request["tool_use_id"],
+                "input": request["input"],
+                "suggestions": request["permission_suggestions"],
+                "question": reason == "question",
+                "reason": reason,
+            });
+            if reason == "plan" {
+                data["plan"] = request["input"]["plan"].clone();
+            }
+            vec![("permission_request".into(), data)]
+        }
+        "control_cancel_request" => vec![(
+            "permission_resolved".into(),
+            json!({ "request_id": line["request_id"], "decision": "cancelled" }),
+        )],
         "stream_event" => {
             let event = &line["event"];
             match event["type"].as_str().unwrap_or_default() {
@@ -574,6 +728,12 @@ impl AgentThread {
             mode: None,
             chosen_model: None,
             capabilities: json!({}),
+            permissions: Vec::new(),
+            background: BTreeSet::new(),
+            live: Default::default(),
+            finishing: false,
+            // Starts at the clock so revisions keep rising across server restarts.
+            revision: now_ms(),
         };
         for event in events {
             track_choices(&mut state, &event.kind, &event.data);
@@ -758,12 +918,17 @@ impl AgentThread {
         let stderr = child.stderr.take().context("agent stderr")?;
         *self.stdin.lock().await = stdin;
         *self.child.lock().await = Some(child);
-        {
+        let woke = {
             let mut state = lock(&self.state);
             state.parking = false;
-            if matches!(state.state, AgentState::Exited | AgentState::Sleeping) {
+            let asleep = matches!(state.state, AgentState::Exited | AgentState::Sleeping);
+            if asleep {
                 state.state = AgentState::Starting;
             }
+            asleep
+        };
+        if woke {
+            self.state_changed();
         }
 
         let reading = Arc::clone(self);
@@ -773,6 +938,7 @@ impl AgentThread {
                 let events = reading.decode_line(&line).await;
                 // The end snapshot lands before `turn_end` is published, so waiters see the turn.
                 if events.iter().any(|(kind, _)| kind == "turn_end") {
+                    reading.turn_finishing();
                     reading.run_turn_hook(None).await;
                 }
                 for (kind, data) in events {
@@ -799,11 +965,16 @@ impl AgentThread {
             tokio::spawn(async move {
                 if let Ok(response) = settle("initialize", reply).await {
                     // Claude Code only reports its session once it gets a message; answering means it waits for one.
-                    {
+                    let started = {
                         let mut state = lock(&asking.state);
-                        if state.state == AgentState::Starting {
+                        let starting = state.state == AgentState::Starting;
+                        if starting {
                             state.state = AgentState::Idle;
                         }
+                        starting
+                    };
+                    if started {
+                        asking.state_changed();
                     }
                     asking.record_capabilities(claude_capabilities(&response));
                 }
@@ -975,8 +1146,23 @@ impl AgentThread {
             data,
         };
         state.last_activity_ms = event.at_ms;
+        let shown = state.shown();
         track_choices(&mut state, kind, &event.data);
         match kind {
+            "permission_request" => {
+                if let Some(id) = event.data["request_id"].as_str() {
+                    state.permissions.push((id.to_string(), event.data.clone()));
+                    state.state = AgentState::Waiting;
+                }
+            }
+            "permission_resolved" => {
+                let id = event.data["request_id"].as_str().unwrap_or_default();
+                state.permissions.retain(|(open, _)| open != id);
+                if state.permissions.is_empty() && state.state == AgentState::Waiting {
+                    state.state = AgentState::Working;
+                }
+            }
+            "task" => state.track_background(&event.data),
             "remote_control" => {
                 state.remote_control = event.data["enabled"].as_bool().unwrap_or_default();
             }
@@ -992,7 +1178,11 @@ impl AgentThread {
                 state.turns += 1;
                 note_prompt_title(&mut state, &event.data);
             }
-            "turn_end" => state.state = AgentState::Idle,
+            "turn_end" => {
+                state.state = AgentState::Idle;
+                state.finishing = false;
+                state.permissions.clear();
+            }
             "rate_limit" => {
                 state.rate_limits = Some(event.data.clone());
                 state.rate_limits_at_ms = Some(event.at_ms);
@@ -1011,9 +1201,18 @@ impl AgentThread {
                 } else {
                     AgentState::Sleeping
                 };
+                state.permissions.clear();
+                state.background.clear();
+                state.finishing = false;
             }
             _ => {}
         }
+        let background = std::mem::take(&mut state.background);
+        state
+            .live
+            .observe(kind, &event.data, event.at_ms, &background);
+        state.background = background;
+        let changed = state.shown() != shown;
         state.events.push(event.clone());
         if let Some(path) = &self.log_path
             && let Ok(line) = serde_json::to_string(&event)
@@ -1035,7 +1234,49 @@ impl AgentThread {
         {
             let _ = signals.send((self.id.clone(), event.clone()));
         }
+        if changed {
+            self.state_changed();
+        }
         event
+    }
+
+    /// Tells the server the agent's shown state moved, so clients redraw it without polling.
+    fn state_changed(&self) {
+        lock(&self.state).revision += 1;
+        if let Some(signals) = self.signals.get() {
+            let event = AgentEvent {
+                seq: u64::MAX,
+                at_ms: now_ms(),
+                kind: STATE_SIGNAL.into(),
+                data: self.info_without_url().summary(),
+            };
+            let _ = signals.send((self.id.clone(), event));
+        }
+    }
+
+    /// Shows the turn as done while its end snapshot is taken; `agent.wait` still waits for `turn_end`.
+    fn turn_finishing(&self) {
+        {
+            let mut state = lock(&self.state);
+            if !matches!(state.state, AgentState::Working | AgentState::Waiting) {
+                return;
+            }
+            state.state = AgentState::Idle;
+            state.finishing = true;
+            state.permissions.clear();
+            let background = std::mem::take(&mut state.background);
+            state
+                .live
+                .observe("turn_end", &Value::Null, now_ms(), &background);
+            state.background = background;
+        }
+        self.state_changed();
+    }
+
+    /// Idle with the last turn fully recorded.
+    pub fn settled(&self) -> bool {
+        let state = lock(&self.state);
+        state.state == AgentState::Idle && !state.finishing
     }
 
     async fn finish(&self) {
@@ -1135,6 +1376,10 @@ impl AgentThread {
             account: self.options.account.clone(),
             remote_control: state.remote_control,
             remote_control_url: None,
+            background_tasks: state.background.len(),
+            live: state.live.clone(),
+            permission_requests: state.permissions.iter().map(|(_, r)| r.clone()).collect(),
+            revision: state.revision,
         }
     }
 
@@ -1163,6 +1408,10 @@ impl AgentThread {
     pub async fn send(self: &Arc<Self>, text: &str, images: &[(String, String)]) -> Result<()> {
         if self.state() == AgentState::Exited {
             return Err(anyhow!("agent {} has exited", self.id));
+        }
+        // The next turn's start snapshot must not race the last turn's end snapshot.
+        while lock(&self.state).finishing {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         self.wake().await?;
         if self.is_codex() {
@@ -1336,6 +1585,37 @@ impl AgentThread {
             .as_array()
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Answers an open permission or question request: `allow`, `allow_always` or `deny`, and
+    /// for a plan also `allow_accept_edits`.
+    /// A question's answers (question text to chosen label) go in `answers`.
+    pub async fn answer(
+        &self,
+        request_id: &str,
+        decision: &str,
+        answers: Option<Value>,
+    ) -> Result<()> {
+        let request = lock(&self.state)
+            .permissions
+            .iter()
+            .find(|(id, _)| id == request_id)
+            .map(|(_, request)| request.clone())
+            .with_context(|| format!("agent {} has no open request {request_id}", self.id))?;
+        let (response, mode) = permission_response(&request, decision, answers)?;
+        self.write_line(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": request_id, "response": response },
+        }))
+        .await?;
+        if let Some(mode) = mode {
+            self.record("mode_changed", json!({ "permission_mode": mode }));
+        }
+        self.record(
+            "permission_resolved",
+            json!({ "request_id": request_id, "decision": decision }),
+        );
+        Ok(())
     }
 
     /// Asks the agent to stop the current turn.
@@ -1827,5 +2107,279 @@ mod tests {
             vec![prompt(0, "Look at the PR")],
         );
         assert_eq!(chosen.info().title.as_deref(), Some("Review #7"));
+    }
+
+    struct SlowTurnEnd;
+
+    impl TurnHook for SlowTurnEnd {
+        fn turn_started(&self, _agent: &AgentInfo, _prompt: &str) {}
+        fn turn_ended(&self, _agent: &AgentInfo) {
+            std::thread::sleep(Duration::from_millis(800));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_shows_done_before_its_end_snapshot_is_taken() {
+        let manager = AgentManager::new(None).with_turn_hook(Arc::new(SlowTurnEnd));
+        let mut signals = manager.take_signals().expect("signals");
+        let script = r#"while read l; do case "$l" in *'"user"'*) echo '{"type":"result","subtype":"success","is_error":false,"result":"ok"}';; esac; done"#;
+        let agent = manager
+            .create(AgentOptions {
+                provider: "claude".into(),
+                cwd: std::env::temp_dir(),
+                workspace: None,
+                title: None,
+                model: None,
+                bypass_permissions: true,
+                resume: None,
+                command: Some(vec!["sh".into(), "-c".into(), script.into()]),
+                env: BTreeMap::new(),
+                account: None,
+                remote_control: false,
+                permission_mode: None,
+            })
+            .await
+            .expect("agent");
+        agent.send("hi", &[]).await.expect("send");
+        let started = std::time::Instant::now();
+        let idle = loop {
+            let (_, event) = tokio::time::timeout(Duration::from_millis(500), signals.recv())
+                .await
+                .expect("a state push before the snapshot ends")
+                .expect("signals open");
+            if event.kind == STATE_SIGNAL
+                && event.data["state"] == "idle"
+                && event.data["turns"] == 1
+            {
+                break event;
+            }
+        };
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(idle.data["id"], agent.id());
+        assert!(
+            !agent.settled(),
+            "agent.wait still waits for the end snapshot"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !agent.settled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the turn never settled"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(agent.events_since(0).iter().any(|e| e.kind == "turn_end"));
+    }
+
+    #[test]
+    fn permission_requests_and_background_tasks_are_normalized() {
+        let ask = json!({ "type": "control_request", "request_id": "r1", "request": {
+            "subtype": "can_use_tool", "tool_name": "AskUserQuestion", "tool_use_id": "t1",
+            "input": { "questions": [] }, "permission_suggestions": [] } });
+        let [(kind, data)] = normalize(&ask).try_into().expect("one event");
+        assert_eq!(kind, "permission_request");
+        assert_eq!(data["request_id"], "r1");
+        assert_eq!(data["question"], true);
+        assert_eq!(data["reason"], "question");
+        let cancel = json!({ "type": "control_cancel_request", "request_id": "r1" });
+        assert_eq!(normalize(&cancel)[0].0, "permission_resolved");
+
+        let mut state = State {
+            state: AgentState::Idle,
+            events: Vec::new(),
+            provider_session: None,
+            model: None,
+            turns: 1,
+            prompt_title: None,
+            last_activity_ms: 0,
+            rate_limits: None,
+            rate_limits_at_ms: None,
+            killed: false,
+            parking: false,
+            remote_control: false,
+            mode: None,
+            chosen_model: None,
+            capabilities: json!({}),
+            permissions: Vec::new(),
+            background: BTreeSet::new(),
+            live: Default::default(),
+            finishing: false,
+            revision: 0,
+        };
+        let frame = |subtype: &str, extra: Value| {
+            let mut frame = json!({ "type": "system", "subtype": subtype, "task_id": "b1" });
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                frame[key] = value.clone();
+            }
+            frame
+        };
+        state.track_background(&frame("task_started", json!({ "is_backgrounded": false })));
+        assert_eq!(
+            state.background.len(),
+            0,
+            "foreground tasks end with their turn"
+        );
+        state.track_background(&frame("task_started", json!({ "task_type": "monitor" })));
+        assert_eq!(state.background.len(), 1);
+        state.track_background(&frame(
+            "task_updated",
+            json!({ "patch": { "status": "completed" } }),
+        ));
+        assert_eq!(state.background.len(), 0);
+        state.track_background(&json!({ "subtype": "background_tasks_changed",
+            "tasks": [{ "task_id": "a" }, { "task_id": "b" }] }));
+        assert_eq!(state.background.len(), 2);
+        state.track_background(&frame("task_notification", json!({})));
+        assert_eq!(state.background.len(), 2);
+        assert_eq!(normalize(&frame("task_started", json!({})))[0].0, "task");
+    }
+
+    #[test]
+    fn a_plan_request_waits_with_reason_plan_and_approval_switches_the_mode() {
+        let exit_plan = json!({ "type": "control_request", "request_id": "r2", "request": {
+            "subtype": "can_use_tool", "tool_name": "ExitPlanMode", "tool_use_id": "t2",
+            "input": { "plan": "# Plan\n- step" },
+            "permission_suggestions": [{ "type": "addRules" }] } });
+        let [(kind, data)] = normalize(&exit_plan).try_into().expect("one event");
+        assert_eq!(kind, "permission_request");
+        assert_eq!(data["reason"], "plan");
+        assert_eq!(data["plan"], "# Plan\n- step");
+        assert_eq!(data["question"], false);
+
+        let agent = AgentThread::new(
+            "p".into(),
+            AgentOptions {
+                provider: "claude".into(),
+                cwd: PathBuf::from("/tmp"),
+                workspace: None,
+                title: None,
+                model: None,
+                bypass_permissions: false,
+                resume: None,
+                command: None,
+                env: BTreeMap::new(),
+                account: None,
+                remote_control: false,
+                permission_mode: Some("plan".into()),
+            },
+            0,
+            None,
+            Vec::new(),
+        );
+        assert_eq!(agent.info().summary()["waiting_reason"], Value::Null);
+        agent.record(&kind, data.clone());
+        let info = agent.info();
+        assert_eq!(info.state, AgentState::Waiting);
+        assert_eq!(info.summary()["waiting_reason"], "plan");
+
+        let (response, mode) =
+            permission_response(&data, "allow_accept_edits", None).expect("response");
+        assert_eq!(mode, Some("acceptEdits"));
+        assert_eq!(response["behavior"], "allow");
+        assert_eq!(response["updatedInput"], data["input"]);
+        assert_eq!(
+            response["updatedPermissions"],
+            json!([{ "type": "setMode", "mode": "acceptEdits", "destination": "session" }])
+        );
+        let (response, mode) = permission_response(&data, "allow", None).expect("response");
+        assert_eq!(mode, Some("default"));
+        assert_eq!(response["updatedPermissions"][0]["mode"], "default");
+        let (response, mode) = permission_response(&data, "deny", None).expect("response");
+        assert_eq!(mode, None);
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("keep planning")
+        );
+
+        agent.record("mode_changed", json!({ "permission_mode": "acceptEdits" }));
+        assert_eq!(agent.current_mode(), "acceptEdits");
+
+        let (_, data) = normalize(&json!({ "type": "control_request", "request_id": "r3",
+            "request": { "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t3",
+                "input": {}, "permission_suggestions": [{ "type": "addRules" }] } }))
+        .remove(0);
+        assert_eq!(data["reason"], "permission");
+        let (response, mode) = permission_response(&data, "allow_always", None).expect("response");
+        assert_eq!(mode, None);
+        assert_eq!(response["updatedPermissions"], data["suggestions"]);
+        assert!(permission_response(&data, "allow_accept_edits", None).is_err());
+    }
+
+    #[test]
+    fn spawned_subagents_reach_the_summary_and_push_state() {
+        let agent = AgentThread::new(
+            "s".into(),
+            AgentOptions {
+                provider: "claude".into(),
+                cwd: PathBuf::from("/tmp"),
+                workspace: None,
+                title: None,
+                model: None,
+                bypass_permissions: true,
+                resume: None,
+                command: None,
+                env: BTreeMap::new(),
+                account: None,
+                remote_control: false,
+                permission_mode: None,
+            },
+            0,
+            None,
+            Vec::new(),
+        );
+        let (sender, mut signals) = mpsc::unbounded_channel();
+        agent.set_signals(sender);
+        let feed = |line: Value| {
+            for (kind, data) in normalize(&line) {
+                agent.record(&kind, data);
+            }
+        };
+        agent.record("user_message", json!({ "text": "Review #4202" }));
+        let tool_use = |id: &str, name: &str, input: Value, parent: Value| {
+            json!({ "type": "assistant", "parent_tool_use_id": parent, "message": { "id": id,
+                "content": [{ "type": "tool_use", "id": id, "name": name, "input": input }] } })
+        };
+        feed(tool_use(
+            "toolu_agent",
+            "Agent",
+            json!({ "description": "Check the diff", "subagent_type": "general-purpose" }),
+            Value::Null,
+        ));
+        feed(tool_use(
+            "toolu_bash",
+            "Bash",
+            json!({ "command": "mise exec -- ./bin/flow" }),
+            json!("toolu_agent"),
+        ));
+
+        let summary = agent.info().summary();
+        assert_eq!(summary["activity"], "Agent: Check the diff");
+        assert_eq!(summary["subagents"][0]["type"], "general-purpose");
+        assert_eq!(summary["subagents"][0]["state"], "working");
+        assert_eq!(
+            summary["subagents"][0]["activity"],
+            "Bash: mise exec -- ./bin/flow"
+        );
+        let mut pushed = Vec::new();
+        while let Ok((_, event)) = signals.try_recv() {
+            if event.kind == STATE_SIGNAL {
+                pushed.push(event.data);
+            }
+        }
+        assert_eq!(
+            pushed.last().expect("a state push")["subagents"][0]["activity"],
+            "Bash: mise exec -- ./bin/flow"
+        );
+        let revision = summary["revision"].as_u64().expect("revision");
+
+        feed(json!({ "type": "user", "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_agent", "content": "done" }] } }));
+        let summary = agent.info().summary();
+        assert_eq!(summary["subagents"][0]["state"], "done");
+        assert!(summary["revision"].as_u64().expect("revision") > revision);
+        feed(json!({ "type": "result", "subtype": "success" }));
+        assert_eq!(agent.info().summary()["subagents"], json!([]));
     }
 }

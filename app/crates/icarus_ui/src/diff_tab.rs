@@ -1339,9 +1339,10 @@ pub(crate) mod tests {
                         Err(anyhow::anyhow!("Pull request review thread line must be part of the diff"))
                     }
                     "review.comment.add" => {
-                        drafts.push(json!({ "id": "d1", "path": params["path"], "line": params["line"],
-                            "subject": "line", "body": params["body"] }));
-                        Ok(json!({}))
+                        let draft = json!({ "id": "d1", "path": params["path"], "line": params["line"],
+                            "subject": "line", "body": params["body"] });
+                        drafts.push(draft.clone());
+                        Ok(json!({ "draft": draft }))
                     }
                     "note.add" => Ok(json!({ "id": "note-new" })),
                     _ => Ok(json!({})),
@@ -1363,7 +1364,7 @@ pub(crate) mod tests {
         });
         assert_eq!(
             calls_to(&calls, "review.threads")[0],
-            json!({ "workspace": "/project", "path": "src/app.rs" })
+            json!({ "workspace": "/project", "refresh": false, "conversation": true })
         );
 
         // ⌘⇧A opens the box on the cursor's line.
@@ -1387,11 +1388,23 @@ pub(crate) mod tests {
             review.submit_composer(Destination::Review, window, cx)
         });
         cx.run_until_parked();
-        assert!(review.read_with(cx, |review, _| review.composer().is_some()));
+        let composer = review.read_with(cx, |review, _| review.composer().cloned().expect("back"));
         assert_eq!(
-            composer.read_with(cx, |composer, _| composer.error_text()),
-            Some("Pull request review thread line must be part of the diff".to_owned())
+            composer.read_with(cx, |composer, cx| (
+                composer.error_text(),
+                composer.editor().read(cx).text(cx)
+            )),
+            (
+                Some("Pull request review thread line must be part of the diff".to_owned()),
+                "fail".to_owned()
+            ),
+            "a refused comment rolls back and its box comes back with the text"
         );
+        review.read_with(cx, |review, _| assert!(review.drafts().is_empty()));
+        let type_text = |text: &str, cx: &mut gpui::VisualTestContext| {
+            let editor = composer.read_with(cx, |composer, _| composer.editor().clone());
+            editor.update_in(cx, |editor, window, cx| editor.set_text(text, window, cx));
+        };
         type_text("Rename this", cx);
         let focus = composer.read_with(cx, |composer, cx| composer.editor().focus_handle(cx));
         cx.update(|window, cx| window.focus(&focus, cx));
@@ -1449,9 +1462,16 @@ pub(crate) mod tests {
             [json!({ "workspace": "/project", "thread": "T1" })]
         );
         assert_eq!(calls_to(&calls, "review.react")[0]["reaction"], "+1");
-        assert_eq!(
-            calls_to(&calls, "attach.pr_comments"),
-            [json!({ "workspace": "/project", "ids": ["T2"] })]
+        assert!(
+            calls_to(&calls, "attach.pr_comments").is_empty(),
+            "the thread is attached from what is shown, without asking the server"
+        );
+        let attached = cx.update(|_, cx| crate::pr_store::local_attachment_texts(cx));
+        assert!(
+            attached
+                .iter()
+                .any(|text| text.starts_with("src/app.rs:2 (resolved)") && text.contains("@alice:")),
+            "{attached:?}"
         );
         assert_eq!(calls_to(&calls, "review.comment.remove")[0]["id"], "d1");
 
@@ -2135,7 +2155,7 @@ pub(crate) mod tests {
                 "review.threads" => {
                     let mut thread = thread_json("T1", 1, false);
                     thread["path"] = json!("src/new.rs");
-                    Ok(json!({ "threads": [thread] }))
+                    Ok(json!({ "threads": [thread, thread_json("T9", 1, false)] }))
                 }
                 "review.comment.list" => Ok(json!({ "drafts": [
                     { "id": "d1", "path": "src/new.rs", "line": 1, "subject": "line", "body": "Queued" },
@@ -2169,9 +2189,9 @@ pub(crate) mod tests {
             "relative to the workspace root"
         );
         assert_eq!(
-            calls_to(&calls, "review.threads")[0]["path"],
-            "src/new.rs",
-            "file editors show the PR's threads on this file too"
+            calls_to(&calls, "review.threads")[0]["workspace"],
+            "/project",
+            "file editors read the PR's shared threads and show this file's"
         );
         review.read_with(cx, |review, _| {
             assert_eq!(review.notes().len(), 1);

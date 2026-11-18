@@ -43,6 +43,7 @@ struct World {
     settings: PathBuf,
     _server: ServerProcess,
     client: Arc<Client>,
+    events: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<icarus_client::Event>>,
     project: String,
 }
 
@@ -98,7 +99,7 @@ impl World {
             assert!(Instant::now() < deadline, "server did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
-        let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+        let (client, events) = Client::connect(home.path(), "test").await.expect("connect");
         let project = client
             .request("project.add", json!({ "path": repo, "name": "widgets" }))
             .await
@@ -125,7 +126,34 @@ impl World {
             settings: settings_path,
             _server: ServerProcess { child },
             client,
+            events: tokio::sync::Mutex::new(events),
         }
+    }
+
+    /// The first `workspace.next_action` event for `workspace` whose step is `kind`.
+    async fn next_action_event(&self, workspace: &str, kind: &str, within: Duration) -> Value {
+        let mut events = self.events.lock().await;
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let event = tokio::time::timeout_at(deadline, events.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no {kind} next action for {workspace} in {within:?}"))
+                .expect("events");
+            if event.topic == "workspace.next_action"
+                && event.payload["workspace"] == workspace
+                && event.payload["action"]["kind"] == kind
+            {
+                return event.payload;
+            }
+        }
+    }
+
+    fn snapshot_queries(&self) -> Vec<Value> {
+        self.requests()
+            .into_iter()
+            .filter(|r| r["route"] == "graphql PrSnapshot")
+            .map(|r| r["variables"].clone())
+            .collect()
     }
 
     fn set_fixtures(&self, fixtures: Value) {
@@ -509,6 +537,74 @@ async fn run_next_action_starts_an_agent_or_calls_github() {
         request["body"]["merge_method"], "merge",
         "the repo's first allowed method"
     );
+}
+
+#[tokio::test]
+async fn a_push_updates_the_next_action_without_waiting_for_the_poll() {
+    let world = World::new(json!({}), json!({ "viewer": "me" })).await;
+    let (feat, feat_path, _) = world.workspace("feat").await;
+    world.workspace("other").await;
+    let commit = |name: &str| {
+        std::fs::write(feat_path.join(name), "change\n").expect("write");
+        git(&feat_path, &["add", "."]);
+        git(&feat_path, &["commit", "-q", "-m", name]);
+        git(&feat_path, &["rev-parse", "HEAD"])
+    };
+    let head = commit("one.txt");
+    assert_ne!(world.next_action(&feat).await["action"]["kind"], "merge");
+    world.set_fixtures(json!({ "viewer": "me", "pulls": [pull(9, "feat", &head, json!({}))] }));
+
+    let pushed = Instant::now();
+    world
+        .request("git.push", json!({ "workspace": feat }))
+        .await;
+    let event = world
+        .next_action_event(&feat, "merge", Duration::from_secs(6))
+        .await;
+    let took = pushed.elapsed();
+    assert!(
+        took >= Duration::from_secs(2) && took < Duration::from_secs(5),
+        "after GitHub's post-push delay, not the 60 s poll: {took:?}"
+    );
+    assert_eq!(event["local"]["unpushed_commits"], 0);
+    let targeted = world
+        .snapshot_queries()
+        .into_iter()
+        .filter(|vars| vars["b0"] == "feat" && vars.get("b1").is_none())
+        .count();
+    assert!(
+        targeted >= 1,
+        "one single-PR query: {:?}",
+        world.snapshot_queries()
+    );
+
+    let status = world
+        .request("pr.status", json!({ "workspace": feat }))
+        .await;
+    let button = world.next_action(&feat).await;
+    assert_eq!(status["pull_request"]["number"], 9, "{status}");
+    assert_eq!(
+        button["action"]["kind"], "merge",
+        "the panel and the button read one copy"
+    );
+
+    // A push the server didn't run (an agent's, a terminal's) shows up the next time it reads git.
+    let head = commit("two.txt");
+    world.set_fixtures(json!({
+        "viewer": "me",
+        "pulls": [pull(9, "feat", &head, json!({ "isDraft": true }))],
+    }));
+    assert_eq!(
+        world.next_action(&feat).await["action"]["kind"],
+        "commit-and-push"
+    );
+    git(&feat_path, &["push", "-q"]);
+    let pushed = Instant::now();
+    world.next_action(&feat).await;
+    world
+        .next_action_event(&feat, "ready-for-review", Duration::from_secs(6))
+        .await;
+    assert!(pushed.elapsed() < Duration::from_secs(5));
 }
 
 fn rules_settings(armed: Option<bool>) -> Value {

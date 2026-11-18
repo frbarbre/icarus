@@ -755,6 +755,42 @@ async fn threads_replies_resolution_reactions_and_media() {
         world.requests("graphql ReplyInThread")[0]["variables"],
         json!({ "threadId": "PRRT_1", "body": "Fixed in the next push." })
     );
+
+    let reads = world.requests("graphql PrReviewThreads").len();
+    let posted = world
+        .request(
+            "review.comment.post",
+            json!({ "workspace": ws, "path": "src/a.rs", "line": 3, "body": "Posted now." }),
+        )
+        .await;
+    assert_eq!(posted["thread"]["comments"][0]["author"], "me");
+    let cached = world
+        .request(
+            "review.threads",
+            json!({ "workspace": ws, "conversation": true }),
+        )
+        .await;
+    assert_eq!(cached["viewer"]["login"], "me");
+    let threads = cached["threads"].as_array().expect("threads");
+    let replied = threads
+        .iter()
+        .find(|thread| thread["id"] == "PRRT_1")
+        .expect("thread");
+    assert_eq!(
+        replied["comments"].as_array().map(Vec::len),
+        Some(2),
+        "the reply is patched into the cached thread"
+    );
+    let new = threads
+        .iter()
+        .find(|thread| thread["comments"][0]["body"] == "Posted now.")
+        .expect("the posted comment is patched into the cached threads");
+    assert_eq!(new["placement"]["line"], 3);
+    assert_eq!(
+        world.requests("graphql PrReviewThreads").len(),
+        reads,
+        "no thread refetch after a reply or a new comment"
+    );
     let resolved = world
         .request("review.resolve", json!({ "thread": "PRRT_1" }))
         .await;

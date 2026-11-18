@@ -160,8 +160,10 @@ async fn listen_inherited(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if matches!(cli.command, Command::Serve { .. }) {
-        icarus_server::login_path::adopt();
+    if matches!(cli.command, Command::Serve { .. })
+        && let Ok(paths) = ServerPaths::resolve(cli.home.as_deref())
+    {
+        icarus_server::login_path::adopt(&paths.home);
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

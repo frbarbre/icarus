@@ -312,7 +312,12 @@ impl HistoryIndex {
             .filter_map(|e| {
                 let info = live.get(&e.id);
                 let state = match info.map(|i| i.state) {
-                    Some(AgentState::Starting | AgentState::Idle | AgentState::Working) => {
+                    Some(
+                        AgentState::Starting
+                        | AgentState::Idle
+                        | AgentState::Working
+                        | AgentState::Waiting,
+                    ) => {
                         return None;
                     }
                     Some(AgentState::Sleeping) => "sleeping",
@@ -751,6 +756,10 @@ mod tests {
             account: None,
             remote_control: false,
             remote_control_url: None,
+            background_tasks: 0,
+            live: Default::default(),
+            permission_requests: Vec::new(),
+            revision: 0,
         };
         let sleeping = BTreeMap::from([("agent-a".to_owned(), info(AgentState::Sleeping))]);
         let entry = &index.query(&HistoryQuery::default(), &sleeping)[0];

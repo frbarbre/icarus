@@ -119,10 +119,15 @@ async fn a_workspace_created_with_the_review_layout_puts_its_agent_left_and_the_
     assert_eq!(layout["children"][1]["active"], 1, "the PR stays in front");
     assert_eq!(created["layout"]["delivered"], 1);
 
-    let event = tokio::time::timeout(Duration::from_secs(5), app_events.recv())
-        .await
-        .expect("event in time")
-        .expect("open stream");
+    let event = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), app_events.recv())
+            .await
+            .expect("event in time")
+            .expect("open stream");
+        if event.topic != "agent.state" {
+            break event;
+        }
+    };
     assert_eq!(event.topic, "open_layout");
     assert_eq!(event.payload["layout"], *layout);
     assert_eq!(event.payload["path"], created["path"]);

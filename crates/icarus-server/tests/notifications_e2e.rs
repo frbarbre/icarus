@@ -244,6 +244,90 @@ async fn agent_turns_failures_and_questions_become_stored_notifications() {
     assert!(world.notifications().await.is_empty());
 }
 
+impl World {
+    /// The next `agent.state` push for `id`, which must come within a second.
+    async fn next_state(&mut self, id: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let event = tokio::time::timeout_at(deadline.into(), self.events.recv())
+                .await
+                .expect("agent.state pushed promptly")
+                .expect("event stream open");
+            if event.topic == "agent.state" && event.payload["id"] == id {
+                return event.payload;
+            }
+        }
+    }
+
+    async fn states_until(&mut self, id: &str, last: (&str, u64)) -> Vec<(String, u64)> {
+        let mut seen = Vec::new();
+        loop {
+            let state = self.next_state(id).await;
+            let shown = (
+                state["state"].as_str().unwrap_or_default().to_owned(),
+                state["background_tasks"].as_u64().unwrap_or_default(),
+            );
+            let done = shown.0 == last.0 && shown.1 == last.1;
+            seen.push(shown);
+            if done {
+                return seen;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_agent_state_change_is_pushed_as_it_happens() {
+    let mut world = World::new(fake_agent_settings(json!({})), json!({ "viewer": "me" })).await;
+    let work = world.home.path().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let info = world
+        .request("agent.create", json!({ "cwd": work, "title": "Fixer" }))
+        .await;
+    let id = info["id"].as_str().expect("id").to_owned();
+    world.request("agent.wait", json!({ "id": id })).await;
+
+    world
+        .request("agent.send", json!({ "id": id, "text": "permit Bash" }))
+        .await;
+    let seen = world.states_until(&id, ("waiting", 0)).await;
+    assert!(seen.contains(&("working".to_owned(), 0)), "{seen:?}");
+    let open = world.request("agent.info", json!({ "id": id })).await;
+    let request = &open["permission_requests"][0];
+    assert_eq!(request["tool_name"], "Bash");
+    let waiting = world.wait_for("agent_waiting", 1).await;
+    assert_eq!(waiting[0]["title"], "Fixer: needs permission");
+
+    world
+        .request(
+            "agent.answer",
+            json!({ "id": id, "request_id": request["request_id"], "decision": "allow" }),
+        )
+        .await;
+    assert_eq!(
+        world.states_until(&id, ("idle", 0)).await,
+        vec![("working".to_owned(), 0), ("idle".to_owned(), 0)]
+    );
+    let reply = world.request("agent.read", json!({ "id": id })).await;
+    assert!(reply.to_string().contains("permit allow"), "{reply}");
+
+    world
+        .request(
+            "agent.send",
+            json!({ "id": id, "text": "background:300 watch" }),
+        )
+        .await;
+    assert_eq!(
+        world.states_until(&id, ("idle", 0)).await,
+        vec![
+            ("working".to_owned(), 0),
+            ("working".to_owned(), 1),
+            ("idle".to_owned(), 1),
+            ("idle".to_owned(), 0),
+        ]
+    );
+}
+
 fn pull(number: u64, branch: &str, head: &str, extra: Value) -> Value {
     let mut pull = json!({
         "id": format!("PR_{number}"),

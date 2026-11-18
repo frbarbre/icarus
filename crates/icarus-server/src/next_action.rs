@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::agent::AgentOptions;
 use crate::github::PrView;
+use crate::pr_refresh::RefreshReason;
 use crate::server::{Server, params, rpc};
 use crate::state::Workspace;
 
@@ -155,10 +156,11 @@ impl Server {
     }
 
     async fn resolve_next(
-        &self,
+        self: &Arc<Self>,
         workspace: &Workspace,
     ) -> Result<(Option<NextAction>, LocalState, PrView), RpcError> {
         let local = self.local_state(workspace).await?;
+        self.note_local_state(workspace, &local);
         let view = self
             .pr_view(workspace, local.branch.as_deref(), false)
             .await;
@@ -172,6 +174,21 @@ impl Server {
         };
         let action = next_action(&git, view.pr.as_ref(), view.known);
         Ok((action, local, view))
+    }
+
+    /// What `workspace.next_action` answers, and what the `workspace.next_action` event carries.
+    pub(crate) async fn next_action_reply(
+        self: &Arc<Self>,
+        workspace: &Workspace,
+    ) -> Result<Value, RpcError> {
+        let (action, local, view) = self.resolve_next(workspace).await?;
+        Ok(json!({
+            "workspace": workspace.id,
+            "action": action_json(action),
+            "local": local,
+            "known": view.known,
+            "error": view.error,
+        }))
     }
 
     /// Starts a new agent session in the workspace and sends it the prompt.
@@ -288,6 +305,8 @@ impl Server {
         #[derive(Deserialize)]
         struct P {
             id: String,
+            #[serde(default)]
+            selected: bool,
         }
         let p: P = params(p)?;
         let workspace = self
@@ -295,15 +314,13 @@ impl Server {
             .workspace(&p.id)
             .map_err(|e| rpc("internal", e))?
             .ok_or_else(|| rpc("not_found", format!("workspace {}", p.id)))?;
-        let (action, local, view) = self.resolve_next(&workspace).await?;
         if method == "workspace.next_action" {
-            return Ok(json!({
-                "action": action_json(action),
-                "local": local,
-                "known": view.known,
-                "error": view.error,
-            }));
+            if p.selected {
+                self.note_selected(&workspace).await;
+            }
+            return self.next_action_reply(&workspace).await;
         }
+        let (action, local, view) = self.resolve_next(&workspace).await?;
         let action = action.ok_or_else(|| rpc("no_action", "nothing to do for this workspace"))?;
         let project = self
             .store
@@ -323,6 +340,7 @@ impl Server {
                 .start_agent_session(&workspace, choice, label(action), &prompt)
                 .await
                 .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
+            self.note_action_agent(&id);
             return Ok(
                 json!({ "action": action_json(Some(action)), "started_agent": id, "github": null }),
             );
@@ -353,7 +371,8 @@ impl Server {
             _ => Err("not a GitHub step".to_owned()),
         }
         .map_err(|e| rpc("github_failed", e))?;
-        self.github.invalidate(&project.id);
+        self.github.forget_stacks();
+        self.schedule_pr_refresh(&workspace.id, RefreshReason::Action);
         Ok(json!({ "action": action_json(Some(action)), "started_agent": null, "github": result }))
     }
 }

@@ -752,7 +752,8 @@ pub fn imports_only_paths(
     candidates.sort_unstable();
     candidates.truncate(config.max_files);
     let check = |path: &str| -> bool {
-        let Ok(before) = crate::git(worktree, &["show", &format!("{merge_base}:{path}")]) else {
+        let Ok(before) = crate::git_read(worktree, &["show", &format!("{merge_base}:{path}")])
+        else {
             return false;
         };
         let Ok(after) = std::fs::read_to_string(worktree.join(path)) else {
@@ -958,7 +959,7 @@ pub fn list(worktree: &Path, classifier: &Classifier, query: &ListQuery) -> Resu
                 crate::resolve_commit(worktree, sha).ok_or_else(|| anyhow!("no commit {sha}"))?;
             let parent = crate::first_parent(worktree, &oid);
             let rows = crate::commit_rows(worktree, parent.as_deref(), &oid)?;
-            let subject = crate::git(worktree, &["show", "-s", "--format=%s", &oid])?
+            let subject = crate::git_read(worktree, &["show", "-s", "--format=%s", &oid])?
                 .trim()
                 .to_string();
             commit = Some(CommitInfo {

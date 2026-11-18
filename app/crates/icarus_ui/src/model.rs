@@ -15,12 +15,129 @@ pub struct AgentSummary {
     pub turns: u64,
     #[serde(default)]
     pub last_activity_ms: u64,
+    #[serde(default)]
+    pub background_tasks: u64,
+    /// Why a waiting agent waits: `plan`, `question` or `permission`.
+    #[serde(default)]
+    pub waiting_reason: Option<String>,
+    /// Rises with every change of the server-side state; the newest of a poll and a push wins.
+    #[serde(default)]
+    pub revision: u64,
+    /// The tool the agent runs right now, as `Bash: cargo test`.
+    #[serde(default)]
+    pub activity: Option<String>,
+    #[serde(default)]
+    pub subagents: Vec<SubagentSummary>,
 }
 
-impl AgentSummary {
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct SubagentSummary {
+    pub id: String,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub activity: Option<String>,
+    pub state: String,
+    #[serde(default)]
+    pub started_at_ms: u64,
+}
+
+impl SubagentSummary {
     pub fn dot_state(&self) -> ui::AgentDotState {
         match self.state.as_str() {
             "working" => ui::AgentDotState::Working,
+            _ => ui::AgentDotState::Done,
+        }
+    }
+
+    /// Orca's child row: the description leads when there is one, else the subagent's type.
+    pub fn lead_and_trail(&self) -> (String, Option<String>) {
+        let lead = self
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or(self.kind.as_str())
+            .to_owned();
+        (
+            lead,
+            self.activity.clone().filter(|_| self.state == "working"),
+        )
+    }
+}
+
+/// The newest summary of every server agent, from list polls and `agent.state` pushes alike.
+#[derive(Default)]
+pub(crate) struct LiveAgents(collections::HashMap<String, AgentSummary>);
+
+impl gpui::Global for LiveAgents {}
+
+impl LiveAgents {
+    fn newest(cx: &gpui::App, id: &str) -> Option<AgentSummary> {
+        cx.try_global::<Self>()?.0.get(id).cloned()
+    }
+}
+
+/// Folds these summaries into `LiveAgents` (a summary at least as new as the known one wins) and
+/// rewrites each to the newest known; true if any of them changed.
+pub(crate) fn merge_live_agents<'a>(
+    agents: impl IntoIterator<Item = &'a mut AgentSummary>,
+    cx: &mut gpui::App,
+) -> bool {
+    let mut learned = Vec::new();
+    let mut changed = false;
+    for agent in agents {
+        match LiveAgents::newest(cx, &agent.id) {
+            Some(known) if known.revision > agent.revision => {
+                if *agent != known {
+                    *agent = known;
+                    changed = true;
+                }
+            }
+            Some(known) if known == *agent => {}
+            _ => learned.push(agent.clone()),
+        }
+    }
+    let shown: Vec<_> = learned
+        .iter()
+        .map(|agent| (agent.id.clone(), agent.dot_state()))
+        .collect();
+    if !learned.is_empty() {
+        let live = cx.default_global::<LiveAgents>();
+        for agent in learned {
+            live.0.insert(agent.id.clone(), agent);
+        }
+    }
+    ui::AgentLiveStates::set(cx, shown);
+    changed
+}
+
+/// Applies a server's `agent.state` push, so cards and tabs redraw without waiting for a poll.
+pub(crate) fn agent_state_pushed(payload: serde_json::Value, cx: &mut gpui::App) {
+    let Ok(mut agent) = serde_json::from_value::<AgentSummary>(payload) else {
+        return;
+    };
+    merge_live_agents([&mut agent], cx);
+}
+
+impl AgentSummary {
+    /// The word beside the agent on its card; a plan waiting for approval reads as Orca's does.
+    pub fn activity_label(&self) -> &'static str {
+        match self.dot_state() {
+            ui::AgentDotState::Permission if self.waiting_reason.as_deref() == Some("plan") => {
+                "plan ready"
+            }
+            state => state.summary_label(),
+        }
+    }
+
+    pub fn dot_state(&self) -> ui::AgentDotState {
+        match self.state.as_str() {
+            "working" => ui::AgentDotState::Working,
+            "waiting" => ui::AgentDotState::Permission,
+            "idle" if self.background_tasks > 0 => ui::AgentDotState::Monitoring,
             "idle" if self.turns > 0 => ui::AgentDotState::Done,
             "sleeping" => ui::AgentDotState::Sleeping,
             "exited" => ui::AgentDotState::Interrupted,
@@ -38,6 +155,15 @@ impl AgentSummary {
                 || crate::accounts::provider_name(&self.provider).to_owned(),
                 str::to_owned,
             )
+    }
+
+    /// The running tool after the title, as Orca's agent row: only while the agent works or waits.
+    pub fn live_activity(&self) -> Option<&str> {
+        matches!(self.state.as_str(), "working" | "waiting")
+            .then_some(self.activity.as_deref())
+            .flatten()
+            .map(str::trim)
+            .filter(|activity| !activity.is_empty())
     }
 
     /// The agent's title, when it finished a turn and said something worth a line on the card.
@@ -655,6 +781,26 @@ mod tests {
             "gamma,beta,Alpha",
             "higher ranks first, unranked last"
         );
+    }
+
+    #[test]
+    fn a_plan_waiting_for_approval_reads_plan_ready() {
+        let parsed: AgentSummary = serde_json::from_value(serde_json::json!({
+            "id": "a", "state": "waiting", "provider": "claude", "waiting_reason": "plan",
+        }))
+        .unwrap();
+        assert_eq!(parsed.dot_state(), ui::AgentDotState::Permission);
+        assert_eq!(parsed.activity_label(), "plan ready");
+        let asking = AgentSummary {
+            waiting_reason: Some("permission".into()),
+            ..parsed.clone()
+        };
+        assert_eq!(asking.activity_label(), "needs attention");
+        let working = AgentSummary {
+            state: "working".into(),
+            ..parsed
+        };
+        assert_eq!(working.activity_label(), "working");
     }
 
     #[test]

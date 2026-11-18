@@ -389,6 +389,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub show_turn_stats: Option<bool>,
+    /// Whether agent threads show every tool call and terminal command expanded,
+    /// instead of collapsing them into compact summary rows.
+    ///
+    /// Default: false
+    pub verbose: Option<bool>,
     /// Whether to show the merge conflict indicator in the status bar
     /// that offers to resolve conflicts using the agent.
     ///

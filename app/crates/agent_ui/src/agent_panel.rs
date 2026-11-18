@@ -5854,6 +5854,27 @@ impl AgentPanel {
                                 let root_thread_view =
                                     conversation_view.read(cx).root_thread_view();
                                 if let Some(thread_view) = root_thread_view {
+                                    let verbose = thread_view.read(cx).is_verbose();
+                                    let fs = thread_view
+                                        .read(cx)
+                                        .thread
+                                        .read(cx)
+                                        .project()
+                                        .read(cx)
+                                        .fs()
+                                        .clone();
+                                    menu = menu.toggleable_entry(
+                                        "Verbose Tool Calls",
+                                        verbose,
+                                        IconPosition::End,
+                                        Some(Box::new(crate::ToggleVerbose)),
+                                        move |_, cx| {
+                                            crate::conversation_view::toggle_verbose_setting(
+                                                fs.clone(),
+                                                cx,
+                                            );
+                                        },
+                                    );
                                     let workspace = workspace.clone();
                                     menu = menu.entry("Open Thread as Markdown", None, {
                                         move |window, cx| {
@@ -7380,6 +7401,7 @@ mod tests {
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
         });
+        crate::conversation_view::tests::set_verbose(true, cx);
 
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;

@@ -101,43 +101,40 @@ pub fn git_timeout(repo: &Path, args: &[&str], timeout: std::time::Duration) -> 
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     );
     let deadline = std::time::Instant::now() + timeout;
+    let timed_out = |child: &mut std::process::Child| {
+        kill_group(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::anyhow!(
+            "git {} in {} did not finish within {:.1?} (is the folder blocked by macOS privacy settings?)",
+            args.join(" "),
+            repo.display(),
+            timeout
+        )
+    };
+    // Git closes stdout as it exits, so waiting on the pipe answers without polling.
+    let stdout =
+        match stdout.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(timed_out(&mut child)),
+        };
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if std::time::Instant::now() >= deadline {
-            kill_group(child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "git {} in {} did not finish within {}s",
-                args.join(" "),
-                repo.display(),
-                timeout.as_secs()
-            );
+            return Err(timed_out(&mut child));
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(1));
     };
     log_slow(repo, args, started);
-    // Something git started can keep the pipes open after git exited; the deadline still holds.
-    let collect = |receiver: &std::sync::mpsc::Receiver<Vec<u8>>| {
-        let wait = deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .max(std::time::Duration::from_millis(200));
-        receiver.recv_timeout(wait).or_else(|_| {
-            kill_group(child.id());
-            receiver.recv_timeout(std::time::Duration::from_secs(1))
-        })
-    };
-    let Ok(stdout) = collect(&stdout) else {
-        bail!(
-            "git {} in {} kept its output open past {}s",
-            args.join(" "),
-            repo.display(),
-            timeout.as_secs()
-        );
-    };
-    let stderr = collect(&stderr).unwrap_or_default();
+    let stderr = stderr
+        .recv_timeout(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(std::time::Duration::from_millis(200)),
+        )
+        .unwrap_or_default();
     if !status.success() {
         bail!(
             "git {} failed: {}",
@@ -148,8 +145,25 @@ pub fn git_timeout(repo: &Path, args: &[&str], timeout: std::time::Duration) -> 
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
+/// How long a read-only git run may take before it is killed; `ICARUS_GIT_TIMEOUT_MS` overrides it.
+pub fn read_timeout() -> std::time::Duration {
+    static TIMEOUT: std::sync::LazyLock<std::time::Duration> = std::sync::LazyLock::new(|| {
+        std::env::var("ICARUS_GIT_TIMEOUT_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_secs(20))
+    });
+    *TIMEOUT
+}
+
+/// A read-only git run under [`read_timeout`].
+pub fn git_read(repo: &Path, args: &[&str]) -> Result<String> {
+    git_timeout(repo, args, read_timeout())
+}
+
 fn git_ok(repo: &Path, args: &[&str]) -> Option<String> {
-    git(repo, args).ok().map(|s| s.trim().to_string())
+    git_read(repo, args).ok().map(|s| s.trim().to_string())
 }
 
 /// `https://github.com/acme/widgets.git` and `git@github.com:acme/widgets` both become `github.com/acme/widgets`.
@@ -191,7 +205,7 @@ pub struct RepoInfo {
 }
 
 pub fn repo_info(path: &Path) -> Result<RepoInfo> {
-    let common = git(
+    let common = git_read(
         path,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
@@ -202,7 +216,7 @@ pub fn repo_info(path: &Path) -> Result<RepoInfo> {
             .map(Path::to_path_buf)
             .unwrap_or(common.clone())
     } else {
-        PathBuf::from(git(path, &["rev-parse", "--show-toplevel"])?.trim())
+        PathBuf::from(git_read(path, &["rev-parse", "--show-toplevel"])?.trim())
     };
     let remote = git_ok(&root, &["remote", "get-url", "origin"]).and_then(|u| canonical_remote(&u));
     let default_base = default_base_ref(&root);
@@ -279,7 +293,7 @@ pub struct Worktree {
 }
 
 pub fn list_worktrees(repo: &Path) -> Result<Vec<Worktree>> {
-    Ok(parse_worktree_list(&git(
+    Ok(parse_worktree_list(&git_read(
         repo,
         &["worktree", "list", "--porcelain"],
     )?))
@@ -438,7 +452,7 @@ pub fn remove_worktree(
 
 pub fn is_dirty(path: &Path) -> Result<bool> {
     Ok(
-        !git(path, &["status", "--porcelain", "--untracked-files=normal"])?
+        !git_read(path, &["status", "--porcelain", "--untracked-files=normal"])?
             .trim()
             .is_empty(),
     )
@@ -667,7 +681,7 @@ fn line_counts(
     merge_base: &str,
     untracked: &[String],
 ) -> Result<(LineCounts, std::collections::BTreeSet<String>)> {
-    let output = git(
+    let output = git_read(
         worktree,
         &[
             "-c",
@@ -746,7 +760,17 @@ pub fn shared_status(worktree: &Path, untracked: &'static str) -> Result<String>
     }
     let started = std::time::Instant::now();
     let flag = format!("--untracked-files={untracked}");
-    let output = git(worktree, &["status", "--porcelain=v2", "-z", &flag])?;
+    // A background read must never hold index.lock while a commit or stage runs.
+    let output = git_read(
+        worktree,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            &flag,
+        ],
+    )?;
     *last = Some((started, output.clone()));
     Ok(output)
 }
@@ -923,7 +947,7 @@ pub fn changes(worktree: &Path, query: &ChangesQuery) -> Result<Changes> {
     let rows = match &compare {
         CompareStatus::Ready { merge_base, .. } if !query.uncommitted_only => {
             let head = head.clone().unwrap_or_default();
-            let raw = git(
+            let raw = git_read(
                 worktree,
                 &[
                     "diff",
@@ -1055,7 +1079,7 @@ pub fn branch_commits(
         });
     };
     let count = (limit + 1).to_string();
-    let output = git(
+    let output = git_read(
         worktree,
         &[
             "log",
@@ -1101,7 +1125,7 @@ pub fn commit_rows(worktree: &Path, from: Option<&str>, to: &str) -> Result<Vec<
             .trim()
             .to_string(),
     };
-    let raw = git(
+    let raw = git_read(
         worktree,
         &[
             "diff",
@@ -1167,7 +1191,7 @@ pub fn commit_files(worktree: &Path, sha: &str) -> Result<CommitFiles> {
             binary: row.binary,
         })
         .collect();
-    let subject = git(worktree, &["show", "-s", "--format=%s", &oid])?
+    let subject = git_read(worktree, &["show", "-s", "--format=%s", &oid])?
         .trim()
         .to_string();
     Ok(CommitFiles {

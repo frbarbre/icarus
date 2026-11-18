@@ -5,12 +5,21 @@ use std::sync::Arc;
 
 use icarus_protocol::RpcError;
 use icarus_settings::import::{export_orca, import_orca_text};
-use icarus_settings::layers::{self, KeyPath, Layer, LayerStack, SettingsPaths};
+use icarus_settings::layers::{self, KeyPath, Layer, LayerDoc, LayerStack, SettingsPaths};
 use icarus_settings::zed;
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 
 use crate::server::{Server, params, rpc};
+use crate::settings_cache;
+
+/// A settings layer through the cache, so a file macOS is holding never stalls the caller for long.
+pub(crate) fn read_cached(layer: Layer, path: &Path) -> Result<settings_cache::Doc, RpcError> {
+    settings_cache::read(layer, path).map_err(|failure| match failure {
+        settings_cache::Failure::Invalid(message) => rpc("settings_invalid", message),
+        settings_cache::Failure::Blocked(message) => rpc("settings_unavailable", message),
+    })
+}
 
 pub(crate) fn to_json(value: &icarus_settings::Value) -> Json {
     serde_json::from_str(&value.to_compact_string()).unwrap_or(Json::Null)
@@ -101,7 +110,9 @@ impl Server {
                 }
             }
         }
-        layers::write_document(path, doc).map_err(|e| rpc("io", e))
+        let written = layers::write_document(path, doc).map_err(|e| rpc("io", e));
+        settings_cache::forget(path);
+        written
     }
 
     fn project_root(&self, project: Option<&str>) -> Result<Option<PathBuf>, RpcError> {
@@ -121,29 +132,31 @@ impl Server {
         project_root: Option<&Path>,
     ) -> Result<LayerStack, RpcError> {
         let paths = SettingsPaths::discover(project_root);
-        let user = match paths
-            .user
-            .as_deref()
-            .map(|path| layers::read_layer(Layer::User, path))
-        {
-            Some(Ok(Some(doc))) => Some(doc),
-            Some(Err(error)) => return Err(rpc("settings_invalid", format!("{error:?}"))),
-            _ => None,
-        };
-        let presets: Vec<String> = user
-            .as_ref()
-            .and_then(|doc| doc.get("presets"))
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|i| i.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let preset_refs: Vec<&str> = presets.iter().map(String::as_str).collect();
-        LayerStack::load(&paths, &preset_refs)
-            .map_err(|e| rpc("settings_invalid", format!("{e:?}")))
+        let mut docs = Vec::new();
+        for layer in [Layer::User, Layer::Project, Layer::ProjectLocal] {
+            if let Some(path) = paths.path(layer)
+                && let Some((source, doc)) = read_cached(layer, path)?
+            {
+                docs.push(LayerDoc {
+                    layer,
+                    label: source.display().to_string(),
+                    origin: Some(source),
+                    doc,
+                });
+            }
+        }
+        let mut stack = LayerStack::with_defaults();
+        if let Some(user) = docs.iter().find(|d| d.layer == Layer::User) {
+            for name in layers::preset_names(&user.doc) {
+                stack
+                    .add_preset(&name)
+                    .map_err(|e| rpc("settings_invalid", format!("{e:?}")))?;
+            }
+        }
+        for doc in docs {
+            stack.push(doc);
+        }
+        Ok(stack)
     }
 
     /// Resolved settings as JSON, for other server modules.
@@ -206,7 +219,12 @@ impl Server {
                 } else {
                     None
                 };
-                self.write_key(&p.key, value, p.layer.as_deref(), p.project.as_deref())
+                let server = Arc::clone(self);
+                tokio::task::spawn_blocking(move || {
+                    server.write_key(&p.key, value, p.layer.as_deref(), p.project.as_deref())
+                })
+                .await
+                .map_err(|e| rpc("internal", e))?
             }
             "config.schema" => Ok(to_json(&layers::json_schema())),
             "config.paths" => {

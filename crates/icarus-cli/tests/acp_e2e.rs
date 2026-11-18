@@ -504,3 +504,62 @@ fn the_editor_gets_the_agents_commands_modes_and_models() {
         "restarted with Remote Control: {updates:?}"
     );
 }
+
+#[test]
+fn an_agents_permission_request_is_put_to_the_editor_and_answered() {
+    let home = tempfile::tempdir().expect("home");
+    let work = tempfile::tempdir().expect("work");
+    let _server = start_server(home.path());
+    let fake = sibling("icarus-fake-agent");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let session = runtime.block_on(async {
+        let (client, _) = icarus_client::Client::connect(home.path(), "test")
+            .await
+            .expect("connect");
+        client
+            .request(
+                "agent.create",
+                json!({ "cwd": work.path(), "command": [fake] }),
+            )
+            .await
+            .expect("create fake agent")
+    });
+    let agent_id = session["id"].as_str().expect("id").to_string();
+    let mut editor = Editor::start(home.path());
+    editor.call(
+        "initialize",
+        json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+    );
+    editor.call(
+        "session/new",
+        json!({ "cwd": work.path(), "mcpServers": [] }),
+    );
+
+    let prompt = json!({ "jsonrpc": "2.0", "id": 99, "method": "session/prompt",
+        "params": { "sessionId": agent_id, "prompt": [{ "type": "text", "text": "permit Bash" }] } });
+    writeln!(editor.stdin, "{prompt}").expect("write");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut asked = false;
+    let mut updates = Vec::new();
+    loop {
+        let message = editor
+            .lines
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the turn ends");
+        if message["method"] == "session/request_permission" {
+            assert_eq!(message["params"]["sessionId"], agent_id.as_str());
+            assert_eq!(message["params"]["toolCall"]["status"], "pending");
+            let answer = json!({ "jsonrpc": "2.0", "id": message["id"],
+                "result": { "outcome": { "outcome": "selected", "optionId": "allow" } } });
+            writeln!(editor.stdin, "{answer}").expect("answer");
+            asked = true;
+        } else if message["id"] == json!(99) {
+            assert_eq!(message["result"]["stopReason"], "end_turn");
+            break;
+        } else {
+            updates.push(message);
+        }
+    }
+    assert!(asked, "the editor was asked");
+    assert_eq!(reply_text(&updates), "echo: permit allow");
+}

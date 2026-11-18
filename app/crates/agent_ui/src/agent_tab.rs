@@ -11,7 +11,10 @@ use gpui::{
     div,
 };
 use project::Project;
-use ui::{AgentDotState, AgentStateIndicator, Color, Icon, IconName, Label, LabelSize, prelude::*};
+use ui::{
+    AgentDotState, AgentLiveStates, AgentStateIndicator, Color, Icon, IconName, Label, LabelSize,
+    prelude::*,
+};
 use workspace::item::{Item, ItemEvent, SerializableItem};
 use workspace::{ItemId, Pane, SaveIntent, Workspace, WorkspaceId, pane};
 
@@ -110,6 +113,10 @@ impl AgentTab {
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
         });
+        let live_states = cx.observe_global::<AgentLiveStates>(|_, cx| {
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
+        });
         let focus_handle = cx.focus_handle();
         // Activating the tab (click, keys, a notification) means "talk to this agent".
         let focus_subscription = cx.on_focus(&focus_handle, window, |tab, window, cx| {
@@ -124,7 +131,7 @@ impl AgentTab {
             workspace,
             marked_as_target: false,
             _focus_subscription: focus_subscription,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, live_states],
         };
         tab.observe_root_thread(cx);
         tab
@@ -222,8 +229,16 @@ impl AgentTab {
         }));
     }
 
-    /// What the tab's state glyph shows; an idle agent shows only its logo, as in Orca.
+    /// What the tab's state glyph shows; a done or idle agent shows only its logo, as in Orca.
+    /// A server agent's glyph is the one its workspace card shows; the thread's own status only
+    /// stands in for agents no Icarus server reports.
     fn dot_state(&self, cx: &App) -> Option<AgentDotState> {
+        if let Some(state) = self
+            .agent_id(cx)
+            .and_then(|id| AgentLiveStates::get(cx, &id))
+        {
+            return state.shown_on_tab().then_some(state);
+        }
         let view = self.thread_view(cx)?;
         let thread = view.read(cx).thread.read(cx);
         if thread.is_waiting_for_confirmation() {
@@ -1518,6 +1533,35 @@ mod tests {
             (Some(AgentDotState::Permission), false),
             "an agent waiting for a permission answer asks for attention"
         );
+
+        let server_agent = tabs[0]
+            .read_with(cx, |tab, cx| tab.agent_id(cx))
+            .expect("agent id");
+        let updated = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _watch = cx.update(|_, cx| {
+            let updated = updated.clone();
+            cx.subscribe(&tabs[0], move |_, event: &ItemEvent, _| {
+                if matches!(event, ItemEvent::UpdateTab) {
+                    updated.set(updated.get() + 1);
+                }
+            })
+        });
+        for (pushed, shown) in [
+            (AgentDotState::Permission, Some(AgentDotState::Permission)),
+            (AgentDotState::Monitoring, Some(AgentDotState::Monitoring)),
+            (AgentDotState::Done, None),
+            (AgentDotState::Sleeping, Some(AgentDotState::Sleeping)),
+        ] {
+            let before = updated.get();
+            cx.update(|_, cx| AgentLiveStates::set(cx, [(server_agent.clone(), pushed)]));
+            assert_eq!(
+                state(&tabs[0], cx),
+                (shown, shown.is_none()),
+                "the server's {pushed:?} wins over the thread's own status, in the same frame"
+            );
+            cx.run_until_parked();
+            assert!(updated.get() > before, "the tab redraws for {pushed:?}");
+        }
         drop((working, asking));
     }
 

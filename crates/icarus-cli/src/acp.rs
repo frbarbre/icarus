@@ -392,6 +392,87 @@ pub fn session_info_update(provider: &str, title: Option<&str>) -> Value {
     update
 }
 
+/// An agent's `can_use_tool` request as an ACP `session/request_permission`, with what each option answers.
+pub fn permission_request(
+    session_id: &str,
+    data: &Value,
+) -> (Value, Vec<(String, String, Option<Value>)>) {
+    let tool = data["tool_name"].as_str().unwrap_or("tool");
+    let input = &data["input"];
+    let question = &input["questions"][0];
+    let labels: Vec<&str> = question["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|option| option["label"].as_str().or(option.as_str()))
+        .collect();
+    let mut options = Vec::new();
+    let mut answers = Vec::new();
+    if data["reason"] == "plan" || tool == "ExitPlanMode" {
+        for (id, name, kind) in [
+            (
+                "allow_accept_edits",
+                "Yes, and auto-accept edits",
+                "allow_always",
+            ),
+            ("allow", "Yes, and manually approve edits", "allow_once"),
+            ("deny", "No, keep planning", "reject_once"),
+        ] {
+            options.push(json!({ "optionId": id, "name": name, "kind": kind }));
+            answers.push((id.to_string(), id.to_string(), None));
+        }
+        let plan = data["plan"].as_str().or(input["plan"].as_str());
+        let params = json!({
+            "sessionId": session_id,
+            "toolCall": {
+                "toolCallId": data["tool_use_id"],
+                "title": "Ready to code?",
+                "kind": "switch_mode",
+                "status": "pending",
+                "rawInput": input,
+                "content": [{ "type": "content",
+                    "content": { "type": "text", "text": plan.unwrap_or_default() } }],
+            },
+            "options": options,
+        });
+        return (params, answers);
+    }
+    if data["question"] == json!(true) && !labels.is_empty() {
+        let asked = question["question"].as_str().unwrap_or_default();
+        for (index, label) in labels.iter().enumerate() {
+            let id = format!("answer:{index}");
+            options.push(json!({ "optionId": id, "name": label, "kind": "allow_once" }));
+            answers.push((id, "allow".to_string(), Some(json!({ asked: label }))));
+        }
+        options.push(json!({ "optionId": "deny", "name": "Dismiss", "kind": "reject_once" }));
+        answers.push(("deny".into(), "deny".into(), None));
+    } else {
+        for (id, name, kind) in [
+            ("allow", "Allow", "allow_once"),
+            ("allow_always", "Always allow", "allow_always"),
+            ("deny", "Deny", "reject_once"),
+        ] {
+            options.push(json!({ "optionId": id, "name": name, "kind": kind }));
+            answers.push((id.to_string(), id.to_string(), None));
+        }
+    }
+    let title = question["question"]
+        .as_str()
+        .map_or_else(|| tool_title(tool, input), str::to_string);
+    let params = json!({
+        "sessionId": session_id,
+        "toolCall": {
+            "toolCallId": data["tool_use_id"],
+            "title": title,
+            "kind": tool_kind(tool),
+            "status": "pending",
+            "rawInput": input,
+        },
+        "options": options,
+    });
+    (params, answers)
+}
+
 type Writer = mpsc::UnboundedSender<Value>;
 type Connection = (Arc<Client>, mpsc::UnboundedReceiver<Event>);
 
@@ -429,6 +510,11 @@ struct Bridge {
     labels: Mutex<HashMap<String, (String, Option<String>)>>,
     /// First-prompt titles found (in a replay, or a prompt racing the label) before a session is labelled.
     pending_titles: Mutex<HashMap<String, String>>,
+    /// Requests this bridge sent the editor, waiting for its answer, by JSON-RPC id.
+    outgoing: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>,
+    next_outgoing: std::sync::atomic::AtomicU64,
+    /// Permission requests already put to the editor, so a reattach does not ask twice.
+    asked: Mutex<HashSet<String>>,
 }
 
 impl Bridge {
@@ -438,6 +524,67 @@ impl Bridge {
             "method": "session/update",
             "params": { "sessionId": session_id, "update": update },
         }));
+    }
+
+    /// Sends the editor a request and waits for its reply (`result` or `error`).
+    async fn ask_editor(&self, method: &str, params: Value) -> Value {
+        let id = self
+            .next_outgoing
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (sender, reply) = tokio::sync::oneshot::channel();
+        self.outgoing.lock().await.insert(id, sender);
+        let _ = self.out.send(
+            json!({ "jsonrpc": "2.0", "id": format!("icarus-{id}"), "method": method, "params": params }),
+        );
+        reply.await.unwrap_or(Value::Null)
+    }
+
+    async fn editor_replied(&self, message: Value) {
+        let Some(id) = message["id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("icarus-"))
+            .and_then(|id| id.parse::<u64>().ok())
+        else {
+            return;
+        };
+        if let Some(sender) = self.outgoing.lock().await.remove(&id) {
+            let _ = sender.send(message);
+        }
+    }
+
+    /// Puts an agent's permission or question request to the editor and sends its answer back.
+    fn ask_permission(self: &Arc<Self>, session_id: &str, data: &Value) {
+        let bridge = Arc::clone(self);
+        let session_id = session_id.to_string();
+        let data = data.clone();
+        tokio::spawn(async move {
+            let Some(request_id) = data["request_id"].as_str().map(str::to_string) else {
+                return;
+            };
+            if !bridge.asked.lock().await.insert(request_id.clone()) {
+                return;
+            }
+            let (params, answers) = permission_request(&session_id, &data);
+            let reply = bridge
+                .ask_editor("session/request_permission", params)
+                .await;
+            let outcome = &reply["result"]["outcome"];
+            let chosen = (outcome["outcome"] == "selected")
+                .then(|| outcome["optionId"].as_str())
+                .flatten()
+                .and_then(|id| answers.iter().find(|(option, _, _)| option == id));
+            let (decision, answers) = match chosen {
+                Some((_, decision, answers)) => (decision.as_str(), answers.clone()),
+                None => ("deny", None),
+            };
+            let _ = bridge
+                .client
+                .request(
+                    "agent.answer",
+                    json!({ "id": session_id, "request_id": request_id, "decision": decision, "answers": answers }),
+                )
+                .await;
+        });
     }
 
     fn respond(&self, id: Value, result: Value) {
@@ -527,7 +674,7 @@ impl Bridge {
 
     /// Answers a session request, then tells the editor the session's commands, which it only
     /// accepts for a session it knows.
-    async fn open_session(&self, id: Value, session_id: &str, mut result: Value) {
+    async fn open_session(self: &Arc<Self>, id: Value, session_id: &str, mut result: Value) {
         let state = self.session_state(session_id).await;
         for (key, value) in state.as_object().into_iter().flatten() {
             result[key] = value.clone();
@@ -535,6 +682,16 @@ impl Bridge {
         self.respond(id, result);
         self.advertise_commands(session_id).await;
         self.label_session(session_id).await;
+        // Asked once the editor has the session, or it could not show the request.
+        if let Ok(info) = self
+            .client
+            .request("agent.info", json!({ "id": session_id }))
+            .await
+        {
+            for request in info["permission_requests"].as_array().into_iter().flatten() {
+                self.ask_permission(session_id, request);
+            }
+        }
     }
 
     /// Tells the editor the session's harness and title (the server's, else its first prompt's).
@@ -640,7 +797,7 @@ impl Bridge {
         }))
     }
 
-    async fn attach(&self, session_id: &str, replay: bool) -> Result<u64> {
+    async fn attach(self: &Arc<Self>, session_id: &str, replay: bool) -> Result<u64> {
         let since = if replay {
             0
         } else {
@@ -687,7 +844,7 @@ impl Bridge {
     }
 
     /// After the server came back: attaches every session again and plays what was missed live.
-    async fn reattach(&self) {
+    async fn reattach(self: &Arc<Self>) {
         let sessions: Vec<(String, u64)> = self
             .attached
             .lock()
@@ -713,7 +870,7 @@ impl Bridge {
         }
     }
 
-    async fn on_server_event(&self, event: Event) {
+    async fn on_server_event(self: &Arc<Self>, event: Event) {
         if event.topic != "agent.event" {
             return;
         }
@@ -737,7 +894,7 @@ impl Bridge {
         true
     }
 
-    async fn on_agent_event(&self, session_id: &str, agent_event: &Value) {
+    async fn on_agent_event(self: &Arc<Self>, session_id: &str, agent_event: &Value) {
         let session_id = session_id.to_owned();
         if let Some(seq) = agent_event["seq"].as_u64()
             && let Some(next) = self.attached.lock().await.get_mut(&session_id)
@@ -769,6 +926,7 @@ impl Bridge {
         }
         let reports_mode = agent_event["data"]["permission_mode"].is_string();
         match kind {
+            "permission_request" => self.ask_permission(&session_id, &agent_event["data"]),
             "capabilities" => {
                 self.advertise_commands(&session_id).await;
                 self.update_config_options(&session_id).await;
@@ -959,6 +1117,9 @@ where
         claimed: Mutex::default(),
         labels: Mutex::default(),
         pending_titles: Mutex::default(),
+        outgoing: Mutex::default(),
+        next_outgoing: std::sync::atomic::AtomicU64::new(0),
+        asked: Mutex::default(),
     });
     tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -998,6 +1159,10 @@ where
             continue;
         };
         let handling = Arc::clone(&bridge);
+        if message.get("method").is_none() {
+            tokio::spawn(async move { handling.editor_replied(message).await });
+            continue;
+        }
         tokio::spawn(async move { handling.handle(message).await });
     }
     Ok(())
@@ -1011,6 +1176,74 @@ mod tests {
     fn parse(update: &Value) -> SessionUpdate {
         serde_json::from_value(update.clone())
             .unwrap_or_else(|e| panic!("invalid ACP update {update}: {e}"))
+    }
+
+    #[test]
+    fn permission_and_question_requests_become_acp_permission_requests() {
+        use agent_client_protocol_schema::v1::RequestPermissionRequest;
+        let (params, answers) = permission_request(
+            "s1",
+            &json!({ "request_id": "r1", "tool_name": "Bash", "tool_use_id": "t1",
+                "input": { "command": "ls" }, "question": false }),
+        );
+        let parsed: RequestPermissionRequest =
+            serde_json::from_value(params.clone()).unwrap_or_else(|e| panic!("{params}: {e}"));
+        assert_eq!(parsed.options.len(), 3);
+        assert_eq!(answers[1].1, "allow_always");
+
+        let (params, answers) = permission_request(
+            "s1",
+            &json!({ "request_id": "r2", "tool_name": "AskUserQuestion", "tool_use_id": "t2",
+                "question": true, "input": { "questions": [{ "question": "Which base?",
+                "options": [{ "label": "main" }, { "label": "dev" }] }] } }),
+        );
+        serde_json::from_value::<RequestPermissionRequest>(params.clone())
+            .unwrap_or_else(|e| panic!("{params}: {e}"));
+        assert_eq!(params["toolCall"]["title"], "Which base?");
+        assert_eq!(answers[1].0, "answer:1");
+        assert_eq!(answers[1].2, Some(json!({ "Which base?": "dev" })));
+        assert_eq!(answers.last().map(|a| a.1.as_str()), Some("deny"));
+    }
+
+    #[test]
+    fn a_plan_request_asks_whether_to_start_coding() {
+        use agent_client_protocol_schema::v1::RequestPermissionRequest;
+        let (params, answers) = permission_request(
+            "s1",
+            &json!({ "request_id": "r3", "tool_name": "ExitPlanMode", "tool_use_id": "t3",
+                "question": false, "reason": "plan", "plan": "# Plan\n- step",
+                "input": { "plan": "# Plan\n- step" } }),
+        );
+        serde_json::from_value::<RequestPermissionRequest>(params.clone())
+            .unwrap_or_else(|e| panic!("{params}: {e}"));
+        let call = &params["toolCall"];
+        assert_eq!(call["kind"], "switch_mode");
+        assert_eq!(call["title"], "Ready to code?");
+        assert_eq!(call["content"][0]["content"]["text"], "# Plan\n- step");
+        let options: Vec<(&str, &str)> = params["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|o| {
+                (
+                    o["optionId"].as_str().unwrap_or_default(),
+                    o["kind"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            options,
+            [
+                ("allow_accept_edits", "allow_always"),
+                ("allow", "allow_once"),
+                ("deny", "reject_once")
+            ]
+        );
+        assert!(
+            answers
+                .iter()
+                .all(|(id, decision, extra)| id == decision && extra.is_none())
+        );
     }
 
     #[test]

@@ -180,12 +180,7 @@ impl Server {
             .list()
             .into_iter()
             .filter(|a| a.workspace.as_deref() == Some(workspace.id.as_str()))
-            .map(|a| {
-                json!({
-                    "id": a.id, "title": a.title, "state": a.state, "provider": a.provider,
-                    "turns": a.turns, "last_activity_ms": a.last_activity_ms,
-                })
-            })
+            .map(|a| a.summary())
             .collect();
         let terminals: Vec<Value> = self
             .terminals
@@ -233,8 +228,7 @@ impl Server {
                     base_ref: Option<String>,
                 }
                 let p: P = params(p)?;
-                let info = icarus_git::repo_info(&p.path)
-                    .map_err(|e| rpc("not_a_repo", format!("{e:#}")))?;
+                let info = repo_info_off_thread(&p.path).await?;
                 let name = p
                     .name
                     .filter(|name| !name.trim().is_empty())
@@ -255,8 +249,7 @@ impl Server {
                     path: PathBuf,
                 }
                 let p: P = params(p)?;
-                let info = icarus_git::repo_info(&p.path)
-                    .map_err(|e| rpc("not_a_repo", format!("{e:#}")))?;
+                let info = repo_info_off_thread(&p.path).await?;
                 let existing = self
                     .store
                     .project_by_root(&info.root)
@@ -1362,6 +1355,14 @@ fn inspect_worktree(path: &std::path::Path) -> Result<FoundWorktree, RpcError> {
         branch,
         repo,
     })
+}
+
+async fn repo_info_off_thread(path: &std::path::Path) -> Result<icarus_git::RepoInfo, RpcError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || icarus_git::repo_info(&path))
+        .await
+        .map_err(internal)?
+        .map_err(|e| rpc("not_a_repo", format!("{e:#}")))
 }
 
 fn yes() -> bool {

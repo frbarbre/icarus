@@ -217,6 +217,20 @@ fn trim_metadata_range(source: &str, range: Range<usize>) -> Range<usize> {
     start..end
 }
 
+/// An inline tag GitHub styles (`<sub>`, `<b>`, `</kbd>`…): its lowercase name, and whether it closes.
+pub(crate) fn styled_inline_tag(html: &str) -> Option<(String, bool)> {
+    let inner = html.trim().strip_prefix('<')?.strip_suffix('>')?;
+    let (inner, closing) = match inner.strip_prefix('/') {
+        Some(rest) => (rest, true),
+        None => (inner, false),
+    };
+    const STYLED: [&str; 12] = [
+        "sub", "sup", "b", "strong", "i", "em", "kbd", "code", "ins", "del", "s", "small",
+    ];
+    let name = inner.split_ascii_whitespace().next()?.to_ascii_lowercase();
+    STYLED.contains(&name.as_str()).then_some((name, closing))
+}
+
 fn is_br_tag(html: &str) -> bool {
     let Some(inner) = html
         .trim()
@@ -583,7 +597,7 @@ pub(crate) fn parse_markdown_with_options(
                 while match parser.peek() {
                     Some((pulldown_cmark::Event::Text(_), _)) => true,
                     Some((pulldown_cmark::Event::InlineHtml(html), _)) => {
-                        parse_html && !is_br_tag(html)
+                        parse_html && !is_br_tag(html) && styled_inline_tag(html).is_none()
                     }
                     _ => false,
                 } {
@@ -2042,6 +2056,21 @@ mod tests {
                 "<br> in \"{input}\" should be preserved as InlineHtml when parse_html is disabled"
             );
         }
+    }
+
+    #[test]
+    fn test_styled_inline_tags_keep_their_own_events_with_parse_html() {
+        let input = "ok\n\n<sub>Was this helpful? React with 👍</sub>";
+        let parsed = parse_markdown_with_options(input, true, false, false);
+        let tags: Vec<&str> = parsed
+            .events
+            .iter()
+            .filter(|(_, event)| matches!(event, MarkdownEvent::InlineHtml))
+            .map(|(range, _)| &input[range.clone()])
+            .collect();
+        assert_eq!(tags, ["<sub>", "</sub>"]);
+        assert_eq!(styled_inline_tag("</SUB>"), Some(("sub".into(), true)));
+        assert_eq!(styled_inline_tag("<span>"), None);
     }
 
     #[test]

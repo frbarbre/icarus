@@ -1429,6 +1429,11 @@
     //
     // Default: false
     "show_turn_stats": false,
+    // Whether agent threads show every tool call and terminal command expanded,
+    // instead of collapsing them into compact summary rows.
+    //
+    // Default: false
+    "verbose": false,
     // Whether to show the merge conflict indicator in the status bar
     // that offers to resolve conflicts using the agent.
     //
