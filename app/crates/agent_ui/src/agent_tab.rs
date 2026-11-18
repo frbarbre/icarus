@@ -622,6 +622,7 @@ pub struct AgentComposer {
     target: Option<WeakEntity<AgentTab>>,
     recent: Vec<EntityId>,
     observed_target: Option<EntityId>,
+    observed_thread_view: Option<EntityId>,
     ensure_scheduled: bool,
     /// Focus asked for before the target's conversation loaded, with what had focus then; given once
     /// it has loaded, unless focus has moved on since.
@@ -649,6 +650,7 @@ impl AgentComposer {
             target: None,
             recent: Vec::new(),
             observed_target: None,
+            observed_thread_view: None,
             ensure_scheduled: false,
             pending_focus: None,
             _target_subscriptions: Vec::new(),
@@ -694,6 +696,7 @@ impl AgentComposer {
         if open_tabs.is_empty() {
             if self.target.take().is_some() || self.observed_target.is_some() {
                 self.observed_target = None;
+                self.observed_thread_view = None;
                 self.pending_focus = None;
                 self._target_subscriptions.clear();
                 cx.notify();
@@ -733,6 +736,7 @@ impl AgentComposer {
             self.pending_focus = None;
             self.observed_target = Some(id);
             let conversation_view = tab.read(cx).conversation_view.clone();
+            self.observed_thread_view = None;
             self._target_subscriptions = vec![
                 cx.observe(&tab, |_, _, cx| cx.notify()),
                 cx.observe(&conversation_view, |composer, _, cx| {
@@ -751,6 +755,10 @@ impl AgentComposer {
         let Some(thread_view) = self.target().and_then(|tab| tab.read(cx).thread_view(cx)) else {
             return;
         };
+        if self.observed_thread_view == Some(thread_view.entity_id()) {
+            return;
+        }
+        self.observed_thread_view = Some(thread_view.entity_id());
         self._target_subscriptions
             .push(cx.observe(&thread_view, |_, _, cx| cx.notify()));
     }
@@ -1585,6 +1593,151 @@ mod tests {
             assert!(updated.get() > before, "the tab redraws for {pushed:?}");
         }
         drop((working, asking));
+    }
+
+    #[gpui::test]
+    async fn redraw_budget_a_working_agent_redraws_only_its_indicator(cx: &mut TestAppContext) {
+        crate::test_support::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            crate::thread_metadata_store::init(cx);
+            init(cx);
+        });
+        let _connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        fs.insert_tree("/project", serde_json::json!({ "a.txt": "" }))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            panel.update(cx, |panel, cx| {
+                panel.select_agent(crate::Agent::Stub, window, cx)
+            });
+            workspace.add_panel(panel, window, cx);
+            open_agent_tab(workspace, None, None, false, window, cx);
+        });
+        cx.run_until_parked();
+        let tab = agent_tabs(&workspace, cx)[0].clone();
+        let thread_view = tab.read_with(cx, |tab, cx| tab.thread_view(cx).expect("connected"));
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let composer = workspace
+            .read_with(cx, |workspace, _| AgentComposer::for_workspace(workspace))
+            .expect("composer");
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let conversation_view = tab.read_with(cx, |tab, _| tab.conversation_view.clone());
+        let notifies = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::<
+            &str,
+            usize,
+        >::new()));
+        type Notifies =
+            std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<&'static str, usize>>>;
+        fn count<T: 'static>(
+            entity: &Entity<T>,
+            name: &'static str,
+            notifies: &Notifies,
+            cx: &mut App,
+        ) -> Subscription {
+            let notifies = notifies.clone();
+            cx.observe(entity, move |_, _| {
+                *notifies.borrow_mut().entry(name).or_default() += 1
+            })
+        }
+        let _counters = cx.update(|_, cx| {
+            vec![
+                count(&thread_view, "thread", &notifies, cx),
+                count(&conversation_view, "conversation", &notifies, cx),
+                count(&tab, "tab", &notifies, cx),
+                count(&composer, "composer", &notifies, cx),
+                count(&pane, "pane", &notifies, cx),
+            ]
+        });
+        let subscriptions = |cx: &mut VisualTestContext| {
+            composer.read_with(cx, |c, _| c._target_subscriptions.len())
+        };
+        let writes = || {
+            fs.files()
+                .iter()
+                .map(|path| fs.write_count_for_path(path))
+                .sum::<usize>()
+        };
+        let run_frames = |frames: usize, cx: &mut VisualTestContext| {
+            for _ in 0..frames {
+                cx.update(|window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.draw(cx).clear(cx);
+                });
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+            }
+        };
+        let writes_before = std::cell::Cell::new(writes());
+        let reset = || {
+            notifies.borrow_mut().clear();
+            writes_before.set(writes());
+        };
+        let phase = |flow: &str, budget: usize| {
+            let counts = std::mem::take(&mut *notifies.borrow_mut());
+            let most = counts.values().copied().max().unwrap_or(0);
+            let written = writes() - writes_before.get();
+            println!("REDRAWS\tagent\t{flow}\t{most}\t{budget}\t{written}");
+            assert!(most <= budget, "{flow}: {counts:?} over {budget}");
+            assert_eq!(written, 0, "{flow}: wrote files");
+            reset();
+        };
+
+        reset();
+        run_frames(300, cx);
+        phase("agent tab idle, 5 s", 3);
+
+        let working = thread.update(cx, |thread, cx| {
+            thread.send(vec!["Open a pull request for branch feature".into()], cx)
+        });
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().0.to_string());
+        cx.update(|_, cx| AgentLiveStates::set(cx, [(session_id, AgentDotState::Working)]));
+        cx.run_until_parked();
+        assert!(
+            thread_view.read_with(cx, |view, _| view.generating_indicator_in_list),
+            "the working row shows under the injected prompt"
+        );
+        reset();
+        run_frames(300, cx);
+        phase("agent thinking (animated row), 5 s", 10);
+
+        let subscriptions_before = subscriptions(cx);
+        for index in 0..20 {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(
+                        agent_client_protocol::v1::schema::SessionUpdate::ToolCall(
+                            agent_client_protocol::v1::schema::ToolCall::new(
+                                format!("t{index}"),
+                                format!("Tool {index}"),
+                            )
+                            .kind(agent_client_protocol::v1::schema::ToolKind::Execute)
+                            .status(agent_client_protocol::v1::schema::ToolCallStatus::InProgress),
+                        ),
+                        cx,
+                    )
+                    .expect("tool call")
+            });
+            run_frames(15, cx);
+        }
+        phase("agent streaming 20 tool calls, 5 s", 20 * 4);
+        assert_eq!(
+            subscriptions(cx),
+            subscriptions_before,
+            "the composer observes its target's thread once, however often the conversation changes"
+        );
+        drop(working);
     }
 
     #[gpui::test]

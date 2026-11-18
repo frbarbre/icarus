@@ -85,6 +85,11 @@ trap - EXIT
 echo "Bundled $app_path"
 
 release_dir="target/$target/release"
+# Shipped binaries are stripped, so a sample of a frozen release can only be symbolicated with these.
+symbols_dir="${ICARUS_SYMBOLS_DIR:-$HOME/.icarus-symbols}/$version-$arch"
+mkdir -p "$symbols_dir"
+cp "$release_dir/zed" "$release_dir/cli" "$symbols_dir/"
+echo "kept unstripped binaries in $symbols_dir (atos -o $symbols_dir/zed -l <load address> <addresses>)"
 strip -x "$release_dir/zed" "$release_dir/cli"
 cp "$release_dir/zed" "$app_path/Contents/MacOS/zed"
 cp "$release_dir/cli" "$app_path/Contents/MacOS/cli"

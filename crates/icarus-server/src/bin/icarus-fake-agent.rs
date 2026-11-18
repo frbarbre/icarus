@@ -1,7 +1,8 @@
 //! A scripted stand-in for `claude -p --input-format stream-json --output-format stream-json`.
 //!
 //! Each user message is answered with "echo: <text>". Prefixes change behaviour:
-//! `sleep:<ms> <text>` waits first, `write:<path> <text>` emits a Write tool call and result,
+//! `sleep:<ms> <text>` waits first, `stream:<ms> <text>` keeps sending status events for that
+//! long first (a thinking turn that stays busy), `write:<path> <text>` emits a Write tool call and result,
 //! `fail <text>` ends the turn as an error, `ask <question>` calls AskUserQuestion first,
 //! `env:A,B` answers with those environment variables, `args` with its command-line arguments,
 //! `settings` with its permission mode and model, `exit` terminates the process,
@@ -132,6 +133,18 @@ fn main() {
         if let Some(rest) = text.strip_prefix("sleep:") {
             let (ms, tail) = rest.split_once(' ').unwrap_or((rest, ""));
             std::thread::sleep(Duration::from_millis(ms.parse().unwrap_or(0)));
+            text = tail.to_string();
+        }
+        if let Some(rest) = text.strip_prefix("stream:") {
+            let (ms, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+            let until = std::time::Instant::now() + Duration::from_millis(ms.parse().unwrap_or(0));
+            while std::time::Instant::now() < until {
+                emit(
+                    &mut out,
+                    json!({ "type": "system", "subtype": "status", "status": "requesting", "session_id": session_id }),
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
             text = tail.to_string();
         }
         emit(

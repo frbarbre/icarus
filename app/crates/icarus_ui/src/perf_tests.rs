@@ -528,3 +528,146 @@ async fn a_submitted_note_goes_to_the_agent_composer_at_once(cx: &mut TestAppCon
         Duration::from_secs(1),
     );
 }
+
+/// Prints a `REDRAWS` row: the most notifies any watched view got, and how many files were written.
+fn check_redraws(flow: &str, notifies: usize, budget: usize, writes: usize) {
+    println!("REDRAWS\tapp\t{flow}\t{notifies}\t{budget}\t{writes}");
+    assert!(
+        notifies <= budget,
+        "{flow}: {notifies} redraws, over its {budget} budget"
+    );
+    assert_eq!(writes, 0, "{flow}: wrote {writes} files");
+}
+
+fn agent(id: &str, state: &str, last_activity_ms: u64) -> crate::model::AgentSummary {
+    crate::model::AgentSummary {
+        id: id.into(),
+        title: Some("Create PR".into()),
+        state: state.into(),
+        provider: "claude".into(),
+        turns: 1,
+        last_activity_ms,
+        revision: 7,
+        ..Default::default()
+    }
+}
+
+#[gpui::test]
+async fn redraw_budget_of_the_workspaces_sidebar(cx: &mut TestAppContext) {
+    let app_state = cx.update(|cx| {
+        let app_state = AppState::test(cx);
+        AppState::set_global(app_state.clone(), cx);
+        <project::DisableAiSettings as settings::Settings>::register(cx);
+        editor::init(cx);
+        app_state
+    });
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree("/project", json!({ "a.txt": "" })).await;
+    let project = project::Project::test(app_state.fs.clone(), [Path::new("/project")], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace");
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let cx = &mut cx;
+    let workspaces = |agents: Vec<crate::model::AgentSummary>| {
+        let mut feature = crate::tests::summary("feature", "/w/feature", None);
+        feature.agents = agents;
+        vec![
+            crate::tests::summary("main", "/project", None),
+            feature,
+            crate::tests::summary("fix", "/w/fix", None),
+        ]
+    };
+    let panel = workspace.update_in(cx, |workspace, window, cx| {
+        let panel = cx.new(|cx| crate::WorkspacesPanel::preview(workspace.weak_handle(), cx));
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<crate::WorkspacesPanel>(window, cx);
+        panel
+    });
+    // A second window's panel, holding its own copy of the same agents.
+    let other_panel = workspace.update(cx, |workspace, cx| {
+        cx.new(|cx| crate::WorkspacesPanel::preview(workspace.weak_handle(), cx))
+    });
+    let notifies = std::rc::Rc::new(std::cell::Cell::new([0usize; 3]));
+    let live_merges = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let _counters = cx.update(|_, cx| {
+        let count = |slot: usize| {
+            let notifies = notifies.clone();
+            move || {
+                let mut counts = notifies.get();
+                counts[slot] += 1;
+                notifies.set(counts);
+            }
+        };
+        let (first, second, third) = (count(0), count(1), count(2));
+        let live_merges = live_merges.clone();
+        vec![
+            cx.observe(&panel, move |_, _| first()),
+            cx.observe(&other_panel, move |_, _| second()),
+            cx.observe(&workspace, move |_, _| third()),
+            cx.observe_global::<crate::model::LiveAgents>(move |_| {
+                live_merges.set(live_merges.get() + 1);
+                assert!(
+                    live_merges.get() < 1000,
+                    "the panels overwrite each other's agents forever"
+                );
+            }),
+        ]
+    });
+    let writes = || {
+        fs.files()
+            .iter()
+            .map(|path| fs.write_count_for_path(path))
+            .sum::<usize>()
+    };
+    let measure = |flow: &str, budget: usize, cx: &mut VisualTestContext| {
+        cx.run_until_parked();
+        notifies.set([0; 3]);
+        let writes_before = writes();
+        for _ in 0..300 {
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+            drawn(cx);
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+        }
+        let most = notifies.get().into_iter().max().unwrap_or(0);
+        check_redraws(flow, most, budget, writes() - writes_before);
+    };
+
+    panel.update(cx, |panel, cx| {
+        panel.set_workspaces(workspaces(Vec::new()), cx)
+    });
+    measure("sidebar idle, 5 s", 2, cx);
+
+    let animated = vec![
+        agent("a1", "working", 100),
+        agent("a2", "working", 100),
+        agent("a3", "waiting", 100),
+        agent("a4", "idle", 100),
+    ];
+    panel.update(cx, |panel, cx| {
+        panel.set_workspaces(workspaces(animated), cx)
+    });
+    measure("sidebar with animated agent states, 5 s", 2, cx);
+
+    panel.update(cx, |panel, cx| {
+        panel.set_workspaces(workspaces(vec![agent("pr", "working", 100)]), cx)
+    });
+    other_panel.update(cx, |panel, cx| {
+        panel.set_workspaces(workspaces(vec![agent("pr", "working", 200)]), cx)
+    });
+    cx.update(|_, cx| {
+        let pushed = agent("pr", "working", 150);
+        crate::model::agent_state_pushed(
+            json!({
+                "id": pushed.id, "title": pushed.title, "state": pushed.state,
+                "provider": pushed.provider, "turns": pushed.turns,
+                "last_activity_ms": pushed.last_activity_ms, "revision": pushed.revision,
+            }),
+            cx,
+        )
+    });
+    measure("two windows' panels after an agent.state push, 5 s", 2, cx);
+    assert!(live_merges.get() < 20, "the panels settle on one copy");
+}

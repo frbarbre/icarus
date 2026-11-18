@@ -80,23 +80,28 @@ impl LiveAgents {
     }
 }
 
-/// Folds these summaries into `LiveAgents` (a summary at least as new as the known one wins) and
-/// rewrites each to the newest known; true if any of them changed.
+/// Folds these summaries into `LiveAgents` (only a strictly newer summary wins) and rewrites each
+/// to the newest known; true if any of them changed.
 pub(crate) fn merge_live_agents<'a>(
     agents: impl IntoIterator<Item = &'a mut AgentSummary>,
     cx: &mut gpui::App,
 ) -> bool {
-    let mut learned = Vec::new();
+    let mut learned = Vec::<AgentSummary>::new();
     let mut changed = false;
     for agent in agents {
-        match LiveAgents::newest(cx, &agent.id) {
-            Some(known) if known.revision > agent.revision => {
+        let newest = learned
+            .iter()
+            .rfind(|learned| learned.id == agent.id)
+            .cloned()
+            .or_else(|| LiveAgents::newest(cx, &agent.id));
+        match newest {
+            // Ties keep the known copy, else panels observing `LiveAgents` overwrite each other forever.
+            Some(known) if agent.recency() <= known.recency() => {
                 if *agent != known {
                     *agent = known;
                     changed = true;
                 }
             }
-            Some(known) if known == *agent => {}
             _ => learned.push(agent.clone()),
         }
     }
@@ -123,6 +128,10 @@ pub(crate) fn agent_state_pushed(payload: serde_json::Value, cx: &mut gpui::App)
 }
 
 impl AgentSummary {
+    fn recency(&self) -> (u64, u64) {
+        (self.revision, self.last_activity_ms)
+    }
+
     /// The word beside the agent on its card; a plan waiting for approval reads as Orca's does.
     pub fn activity_label(&self) -> &'static str {
         match self.dot_state() {
@@ -998,5 +1007,69 @@ mod tests {
             Some(serde_json::json!({ "provider": "linear", "id": "ABC-12", "title": "Fix login" }));
         assert_eq!(w.display_title(), "ABC-12");
         assert_eq!(w.subtitle().as_deref(), Some("Fix login"));
+    }
+
+    struct Panel {
+        agents: Vec<AgentSummary>,
+        merges: usize,
+        _live_agents: gpui::Subscription,
+    }
+
+    #[gpui::test]
+    fn panels_holding_different_copies_of_an_agent_settle(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let summary = |title: &str, last_activity_ms: u64| AgentSummary {
+            id: "a1".into(),
+            title: Some(title.into()),
+            state: "working".into(),
+            provider: "claude".into(),
+            revision: 7,
+            last_activity_ms,
+            ..AgentSummary::default()
+        };
+        let panel = |agents: Vec<AgentSummary>, cx: &mut gpui::TestAppContext| {
+            cx.new(|cx| Panel {
+                agents,
+                merges: 0,
+                _live_agents: cx.observe_global::<LiveAgents>(|panel: &mut Panel, cx| {
+                    panel.merges += 1;
+                    assert!(panel.merges < 50, "the panels overwrite each other forever");
+                    merge_live_agents(panel.agents.iter_mut(), cx);
+                }),
+            })
+        };
+        let polled_first = panel(vec![summary("Create PR", 100)], cx);
+        let polled_later = panel(vec![summary("Create PR", 200)], cx);
+        let duplicated = panel(
+            vec![
+                summary("Create PR", 300),
+                summary("Open a pull request", 300),
+            ],
+            cx,
+        );
+
+        cx.update(|cx| {
+            merge_live_agents(
+                polled_first.update(cx, |p, _| p.agents.clone()).iter_mut(),
+                cx,
+            );
+            merge_live_agents(
+                polled_later.update(cx, |p, _| p.agents.clone()).iter_mut(),
+                cx,
+            );
+            merge_live_agents(
+                duplicated.update(cx, |p, _| p.agents.clone()).iter_mut(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let newest = cx.update(|cx| LiveAgents::newest(cx, "a1")).expect("known");
+        assert_eq!(newest, summary("Create PR", 300));
+        for panel in [&polled_first, &polled_later, &duplicated] {
+            panel.read_with(cx, |panel, _| {
+                assert!(panel.agents.iter().all(|agent| *agent == newest));
+            });
+        }
     }
 }

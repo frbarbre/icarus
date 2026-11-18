@@ -327,24 +327,37 @@ struct ClaudeSpinner;
 
 const CLAUDE_ORANGE: u32 = 0xd97757;
 
+// Animated on the GPU: an element animation would re-render the whole thread every frame.
 impl RenderOnce for ClaudeSpinner {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        const FRAMES: [&str; 10] = ["✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢", "·", "✢"];
+        let pose = gpui::Transformation::default().with_scaling(gpui::size(0.8, 0.8));
         h_flex().w_3().justify_center().child(
-            Label::new(FRAMES[0])
-                .size(LabelSize::Small)
-                .color(Color::Custom(gpui::rgb(CLAUDE_ORANGE).into()))
-                .with_animation(
-                    "claude-spinner",
-                    Animation::new(Duration::from_millis(1200)).repeat(),
-                    |mut label, delta| {
-                        let frame = (delta * FRAMES.len() as f32) as usize % FRAMES.len();
-                        label.set_text(FRAMES[frame]);
-                        label
-                    },
+            gpui::svg()
+                .path(IconName::AiClaude.path())
+                .size(px(11.))
+                .flex_none()
+                .text_color(gpui::rgb(CLAUDE_ORANGE))
+                .with_timed_transformation(
+                    gpui::TimedTransformation::new(Duration::from_millis(1200))
+                        .from(pose)
+                        .to(pose
+                            .with_rotation(gpui::radians(std::f32::consts::FRAC_PI_2))
+                            .with_scaling(gpui::size(1., 1.)))
+                        .with_easing(gpui::Easing::EaseInOut)
+                        .alternate(),
                 ),
         )
     }
+}
+
+fn pulsing(svg: gpui::Svg) -> gpui::Svg {
+    svg.with_timed_transformation(
+        gpui::TimedTransformation::new(Duration::from_secs(1))
+            .from(gpui::Transformation::alpha(0.35))
+            .to(gpui::Transformation::alpha(1.))
+            .with_easing(gpui::Easing::EaseInOut)
+            .alternate(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -967,6 +980,7 @@ pub struct ThreadView {
     pending_sandbox_status_key: Option<SandboxStatusKey>,
     pub multi_root_callout_dismissed: bool,
     pub generating_indicator_in_list: bool,
+    stopwatch: Option<Task<()>>,
     verbose: bool,
     expanded_tool_groups: HashSet<usize>,
     pub skill_loading_issues: Vec<SkillLoadingIssue>,
@@ -1510,6 +1524,7 @@ impl ThreadView {
             pending_sandbox_status_key: None,
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
+            stopwatch: None,
             verbose: AgentSettings::get_global(cx).verbose,
             expanded_tool_groups: HashSet::default(),
             skill_loading_issues: Vec::new(),
@@ -7702,6 +7717,7 @@ impl ThreadView {
                         }
                         activity => activity,
                     };
+                    this.ensure_stopwatch(cx);
                     let rendered = this.render_generating(activity, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else {
@@ -9108,6 +9124,36 @@ impl ThreadView {
             .then_some(ThreadActivity::BackgroundTasks)
     }
 
+    /// Redraws the thread once a second while the turn's elapsed time is shown.
+    fn ensure_stopwatch(&mut self, cx: &mut Context<Self>) {
+        if self.stopwatch.is_some() {
+            return;
+        }
+        self.stopwatch =
+            Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let ticking = this
+                        .update(cx, |this, cx| {
+                            if !this.generating_indicator_in_list {
+                                this.stopwatch = None;
+                                return false;
+                            }
+                            if this.turn_fields.turn_started_at.is_some_and(|started_at| {
+                                started_at.elapsed() > STOPWATCH_THRESHOLD
+                            }) {
+                                cx.notify();
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !ticking {
+                        break;
+                    }
+                }
+            }));
+    }
+
     fn render_generating(&self, activity: ThreadActivity, cx: &App) -> impl IntoElement {
         let elapsed_label = self.turn_fields.turn_started_at.and_then(|started_at| {
             let elapsed = started_at.elapsed();
@@ -9133,19 +9179,20 @@ impl ThreadView {
             IconName::ArrowDown
         };
 
+        let muted = Color::Muted.color(cx);
         let pulsing_label = |text: &'static str| {
-            let label = Label::new(text).size(LabelSize::Small).color(Color::Muted);
-            if cx.reduce_motion() {
-                label.into_any_element()
-            } else {
-                label
-                    .with_animation(
-                        "thread-activity-pulse",
-                        Animation::new(Duration::from_secs(2)).repeat(),
-                        |label, delta| label.alpha(pulsating_between(0.35, 1.)(delta)),
-                    )
-                    .into_any_element()
-            }
+            h_flex()
+                .gap_1p5()
+                .child(
+                    h_flex().w_3().justify_center().child(pulsing(
+                        gpui::svg()
+                            .path(IconName::Circle.path())
+                            .size(px(12.))
+                            .flex_none()
+                            .text_color(muted),
+                    )),
+                )
+                .child(Label::new(text).size(LabelSize::Small).color(Color::Muted))
         };
 
         h_flex()
