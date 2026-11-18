@@ -862,7 +862,18 @@ fn render_empty_pane(
             .visible_worktrees(cx)
             .next()
             .is_some();
-        if !is_center || !has_worktrees {
+        if !is_center {
+            return None;
+        }
+        if crate::is_workspace_loading(pane.workspace().entity_id(), cx) {
+            return Some(
+                div()
+                    .debug_selector(|| "empty-pane-loading".into())
+                    .child(Label::new("Loading…").color(Color::Muted))
+                    .into_any_element(),
+            );
+        }
+        if !has_worktrees {
             return None;
         }
     }

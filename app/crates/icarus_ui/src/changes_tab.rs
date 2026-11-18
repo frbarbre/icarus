@@ -2215,11 +2215,15 @@ impl SourceControlPanel {
                         )
                         .tooltip(Tooltip::text(pull_request.title.clone()))
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            if let Some(workspace) = this.workspace.upgrade() {
+                            let Some(workspace) = this.workspace.upgrade() else {
+                                return;
+                            };
+                            // Deferred: opening Checks deactivates this panel, which is mid-update here.
+                            window.defer(cx, move |window, cx| {
                                 workspace.update(cx, |workspace, cx| {
                                     workspace.open_panel::<GitHubPanel>(window, cx);
                                 });
-                            }
+                            });
                         }))
                         .into_any_element()
                 }

@@ -400,39 +400,42 @@ pub fn end_closed_agent(agent_id: String, cx: &mut App) {
 /// Opens tabs, without taking focus, for the agents the server started in the workspace at `path`
 /// that no tab shows yet: review and automation agents, or ones started from the CLI.
 pub(crate) fn open_offered_agent_tabs(path: PathBuf, cx: &mut App) {
-    let Some(client) = app_client(cx) else {
-        return;
+    offered_agent_tabs(path, cx).detach();
+}
+
+fn offered_agent_tabs(path: PathBuf, cx: &mut App) -> Task<()> {
+    let key = path.to_string_lossy().into_owned();
+    let Some(taken) = review::request(
+        app_client(cx),
+        "workspace.take_agent_tabs",
+        serde_json::json!({ "id": key }),
+        cx,
+    ) else {
+        return Task::ready(());
     };
     cx.spawn(async move |cx| {
-        let key = path.to_string_lossy().into_owned();
-        let taken = Tokio::spawn_result(cx, async move {
-            client
-                .request(
-                    "workspace.take_agent_tabs",
-                    serde_json::json!({ "id": key }),
-                )
-                .await
-        })
-        .await?;
-        let agents: Vec<String> = serde_json::from_value(taken["agents"].clone())?;
-        if agents.is_empty() {
-            return anyhow::Ok(());
-        }
-        cx.update(|cx| {
-            let Some((window, workspace)) = window_for_path(&path, cx) else {
+        let opened = async {
+            let taken = taken.await?;
+            let agents: Option<Vec<String>> = serde_json::from_value(taken["agents"].clone())?;
+            let agents = agents.unwrap_or_default();
+            if agents.is_empty() {
                 return anyhow::Ok(());
-            };
-            window.update(cx, |_, window, cx| {
-                workspace.update(cx, |workspace, cx| {
-                    for agent_id in agents {
-                        request_agent_tab(Some(agent_id), None, false, workspace, window, cx);
-                    }
+            }
+            cx.update(|cx| {
+                let Some((window, workspace)) = window_for_path(&path, cx) else {
+                    return anyhow::Ok(());
+                };
+                window.update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        for agent_id in agents {
+                            request_agent_tab(Some(agent_id), None, false, workspace, window, cx);
+                        }
+                    })
                 })
             })
-        })?;
-        anyhow::Ok(())
+        };
+        opened.await.log_err();
     })
-    .detach_and_log_err(cx);
 }
 
 /// Shows the workspace's window (opening it if needed) and arranges its tabs as `pending` says.
@@ -463,6 +466,31 @@ struct OpeningWorkspaces {
 }
 
 impl gpui::Global for OpeningWorkspaces {}
+
+/// Workspaces whose saved tabs, layout or offered agent tabs are still on their way.
+#[derive(Default)]
+struct LoadingWorkspaces(HashSet<gpui::EntityId>);
+
+impl gpui::Global for LoadingWorkspaces {}
+
+pub(crate) fn is_workspace_loading(workspace: gpui::EntityId, cx: &App) -> bool {
+    cx.try_global::<LoadingWorkspaces>()
+        .is_some_and(|loading| loading.0.contains(&workspace))
+}
+
+fn workspace_loaded(workspace: &Entity<Workspace>, cx: &mut App) {
+    if !cx
+        .default_global::<LoadingWorkspaces>()
+        .0
+        .remove(&workspace.entity_id())
+    {
+        return;
+    }
+    let panes = workspace.read(cx).panes().to_vec();
+    for pane in panes {
+        pane.update(cx, |_, cx| cx.notify());
+    }
+}
 
 /// Shows the Icarus workspace at `path`: the window holding it comes to the front, else the front
 /// window switches to it (Orca's one window whose centre swaps per workspace).
@@ -536,25 +564,31 @@ fn show_workspace_window(
         let Some(opened) = window.await else {
             return anyhow::Ok(());
         };
-        let latest =
-            cx.update(|cx| cx.default_global::<OpeningWorkspaces>().latest.as_ref() == Some(&path));
-        opened.window.update(cx, |multi_workspace, window, cx| {
-            if latest {
-                multi_workspace.activate(opened.workspace.clone(), None, window, cx);
-                window.activate_window();
-            } else {
-                multi_workspace.add(opened.workspace.clone(), window, cx);
-            }
-        })?;
-        // Layouts wait for the saved tabs, which would otherwise be restored on top of them.
-        opened.loaded.await;
-        opened.window.update(cx, |_, window, cx| {
-            opened
-                .workspace
-                .update(cx, |workspace, cx| then(workspace, window, cx))
-        })?;
-        cx.update(|cx| open_offered_agent_tabs(path, cx));
-        anyhow::Ok(())
+        let shown = async {
+            let latest = cx.update(|cx| {
+                cx.default_global::<OpeningWorkspaces>().latest.as_ref() == Some(&path)
+            });
+            opened.window.update(cx, |multi_workspace, window, cx| {
+                if latest {
+                    multi_workspace.activate(opened.workspace.clone(), None, window, cx);
+                    window.activate_window();
+                } else {
+                    multi_workspace.add(opened.workspace.clone(), window, cx);
+                }
+            })?;
+            // Layouts wait for the saved tabs, which would otherwise be restored on top of them.
+            opened.loaded.clone().await;
+            opened.window.update(cx, |_, window, cx| {
+                opened
+                    .workspace
+                    .update(cx, |workspace, cx| then(workspace, window, cx))
+            })?;
+            cx.update(|cx| offered_agent_tabs(path, cx)).await;
+            anyhow::Ok(())
+        }
+        .await;
+        cx.update(|cx| workspace_loaded(&opened.workspace, cx));
+        shown
     })
     .detach_and_log_err(cx);
 }
@@ -566,6 +600,8 @@ fn open_local_workspace(path: PathBuf, app_state: Arc<AppState>, cx: &mut App) -
     let (created_tx, created_rx) = futures::channel::oneshot::channel();
     let init: Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send> =
         Box::new(move |_, window, cx| {
+            let workspace = cx.entity_id();
+            cx.default_global::<LoadingWorkspaces>().0.insert(workspace);
             if let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() {
                 created_tx.send((handle, cx.entity())).ok();
             }
@@ -3992,6 +4028,107 @@ mod tests {
                 .is_some()
         });
         assert!(scanned, "and the scan finishes behind it");
+    }
+
+    /// Opens `/w/opened` from a window on `/project`, drawing a frame after every step, and returns
+    /// which of the opened workspace's frames showed the empty pane's options or its loading state.
+    async fn frames_while_opening(
+        offered_agents: Vec<&'static str>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Vec<&'static str>, usize) {
+        let app_state = cx.update(|cx| {
+            let app_state = AppState::test(cx);
+            AppState::set_global(app_state.clone(), cx);
+            <project::DisableAiSettings as settings::Settings>::register(cx);
+            editor::init(cx);
+            project::trusted_worktrees::init(Default::default(), cx);
+            worktree_trust::register(cx);
+            worktree_trust::add_icarus_workspace_path(Path::new("/project"), cx);
+            new_tab_menu::register(cx);
+            review::tests::stub_rpc(cx, move |method, _| match method {
+                "workspace.take_agent_tabs" => Ok(serde_json::json!({ "agents": offered_agents })),
+                _ => Ok(serde_json::Value::Null),
+            });
+            set_open_agent_handler(cx, |_, _, _, workspace, window, cx| {
+                let item = cx.new(workspace::item::test::TestItem::new);
+                workspace.add_item_to_active_pane(Box::new(item), None, false, window, cx);
+            });
+            app_state
+        });
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree("/project", serde_json::json!({ "a.txt": "" }))
+            .await;
+        fs.insert_tree("/w/opened", serde_json::json!({ "b.txt": "" }))
+            .await;
+        let project =
+            project::Project::test(app_state.fs.clone(), [Path::new("/project")], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|_, cx| show_workspace(PathBuf::from("/w/opened"), cx));
+        let mut frames = Vec::new();
+        loop {
+            let progressed = cx.executor().tick();
+            let opened_tabs = window
+                .read_with(&cx, |multi_workspace, cx| {
+                    let shown = multi_workspace.workspace().read(cx);
+                    let is_opened = shown
+                        .root_paths(cx)
+                        .iter()
+                        .any(|root| root.as_ref() == Path::new("/w/opened"));
+                    is_opened.then(|| shown.active_pane().read(cx).items_len())
+                })
+                .expect("window");
+            if let Some(tabs) = opened_tabs {
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                if tabs == 0 {
+                    if cx.debug_bounds("empty-pane-options").is_some() {
+                        frames.push("options");
+                    } else if cx.debug_bounds("empty-pane-loading").is_some() {
+                        frames.push("loading");
+                    }
+                } else {
+                    frames.push("tabs");
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let tabs = window
+            .read_with(&cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_pane()
+                    .read(cx)
+                    .items_len()
+            })
+            .expect("window");
+        if tabs == 0 && cx.debug_bounds("empty-pane-options").is_some() {
+            frames.push("options");
+        }
+        frames.dedup();
+        (frames, tabs)
+    }
+
+    #[gpui::test]
+    async fn a_restoring_workspace_never_flashes_the_empty_pane(cx: &mut gpui::TestAppContext) {
+        let (frames, tabs) = frames_while_opening(vec!["agent-1"], cx).await;
+        assert_eq!(tabs, 1, "the offered agent's tab opens");
+        assert_eq!(
+            frames,
+            ["loading", "tabs"],
+            "the pane shows its loading state until the restored tabs arrive"
+        );
+    }
+
+    #[gpui::test]
+    async fn an_empty_workspace_offers_the_empty_pane_once_loaded(cx: &mut gpui::TestAppContext) {
+        let (frames, tabs) = frames_while_opening(Vec::new(), cx).await;
+        assert_eq!(tabs, 0);
+        assert_eq!(frames, ["loading", "options"]);
     }
 
     #[gpui::test]
