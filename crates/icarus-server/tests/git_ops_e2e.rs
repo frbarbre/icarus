@@ -335,3 +335,88 @@ async fn source_control_actions_run_in_the_worktree_and_announce_themselves() {
         "{leased:#}"
     );
 }
+
+#[tokio::test]
+async fn the_base_ref_can_be_searched_changed_and_reset_to_the_primary_branch() {
+    let root = tempfile::tempdir().expect("root");
+    let (_remote, repo) = project(root.path());
+    git(&repo, &["checkout", "-q", "-b", "develop"]);
+    std::fs::write(repo.join("b.txt"), "develop\n").expect("write");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "develop"]);
+    git(&repo, &["push", "-q", "-u", "origin", "develop"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    let home = tempfile::tempdir().expect("home");
+    let _server = start_server(home.path());
+    let (client, mut events) = Client::connect(home.path(), "icarus-app")
+        .await
+        .expect("connect");
+    let project = client
+        .request("project.add", json!({ "path": repo }))
+        .await
+        .expect("project");
+    let workspace = client
+        .request(
+            "workspace.create",
+            json!({ "project": project["id"], "name": "feature", "agent": false }),
+        )
+        .await
+        .expect("workspace");
+    let id = workspace["id"].clone();
+    assert_eq!(workspace["base_ref"], "origin/main");
+
+    let found = client
+        .request("workspace.refs", json!({ "id": id, "query": "dev" }))
+        .await
+        .expect("refs");
+    assert_eq!(found["default_base"], "origin/main");
+    assert_eq!(found["remote_count"], 1);
+    assert_eq!(found["base_ref"], "origin/main");
+    let mut names: Vec<&str> = found["refs"]
+        .as_array()
+        .expect("refs")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["develop", "origin/develop"]);
+    let capped = client
+        .request("workspace.refs", json!({ "id": id, "limit": 1 }))
+        .await
+        .expect("refs");
+    assert_eq!(capped["refs"].as_array().map(Vec::len), Some(1));
+
+    let changed = client
+        .request(
+            "workspace.set",
+            json!({ "id": id, "base": "origin/develop" }),
+        )
+        .await
+        .expect("set base");
+    assert_eq!(changed["base_ref"], "origin/develop");
+    loop {
+        if next_git_event(&mut events).await["op"] == "base" {
+            break;
+        }
+    }
+    let listing = client
+        .request("workspace.changes", json!({ "id": id }))
+        .await
+        .expect("changes");
+    assert_eq!(listing["compare"]["base"], "origin/develop");
+    assert_eq!(listing["compare"]["behind"], 1);
+
+    let primary = client
+        .request("workspace.set", json!({ "id": id, "base": "" }))
+        .await
+        .expect("use primary");
+    assert!(primary["base_ref"].is_null(), "{primary}");
+    let listing = client
+        .request("workspace.changes", json!({ "id": id }))
+        .await
+        .expect("changes");
+    assert_eq!(
+        listing["compare"]["base"], "origin/main",
+        "with no base of its own the workspace follows the primary branch"
+    );
+}

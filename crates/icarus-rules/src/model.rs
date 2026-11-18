@@ -51,6 +51,7 @@ pub enum Cond {
     Linked,
     BranchHasWorkspace,
     HeadIsLocal,
+    BaseFollowsTarget,
     HasPrHead,
     HeadBranchMatches,
     Dirty,

@@ -124,6 +124,69 @@ fn repo_info_finds_root_remote_and_default_base() {
 }
 
 #[test]
+fn base_ref_search_matches_segments_and_branch_prefixes_like_orca() {
+    let repo = repo();
+    for branch in ["feature/e-7331-mapbox", "feature/e-7365-cleanup", "release"] {
+        run(&repo.root, &["branch", branch]);
+    }
+    run(
+        &repo.root,
+        &[
+            "update-ref",
+            "refs/remotes/origin/feature/e-7331-mapbox",
+            "HEAD",
+        ],
+    );
+
+    let all = search_base_refs(&repo.root, "", 20).expect("search");
+    assert_eq!(all.default_base.as_deref(), Some("origin/main"));
+    assert_eq!(all.remote_count, 1);
+    assert!(
+        !all.refs
+            .iter()
+            .any(|name| name == "origin" || name.ends_with("/HEAD")),
+        "a remote's HEAD is never offered: {:?}",
+        all.refs
+    );
+    assert_eq!(all.refs.len(), 6, "{:?}", all.refs);
+
+    let mapbox = search_base_refs(&repo.root, "7331", 20).expect("search");
+    let mut names = mapbox.refs.clone();
+    names.sort();
+    assert_eq!(
+        names,
+        ["feature/e-7331-mapbox", "origin/feature/e-7331-mapbox"]
+    );
+
+    let by_remote = search_base_refs(&repo.root, "origin", 20).expect("search");
+    assert!(
+        by_remote
+            .refs
+            .iter()
+            .all(|name| name.starts_with("origin/"))
+    );
+    assert!(by_remote.refs.contains(&"origin/main".to_string()));
+
+    let rooted = search_base_refs(&repo.root, "feature/e-73", 20).expect("search");
+    let mut names = rooted.refs.clone();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "feature/e-7331-mapbox",
+            "feature/e-7365-cleanup",
+            "origin/feature/e-7331-mapbox"
+        ]
+    );
+
+    let globbed = search_base_refs(&repo.root, "rel*", 20).expect("search");
+    assert_eq!(globbed.refs, ["release"], "glob characters are dropped");
+
+    let capped = search_base_refs(&repo.root, "", 2).expect("search");
+    assert_eq!(capped.refs.len(), 2);
+}
+
+#[test]
 fn one_row_per_file_across_committed_staged_unstaged_and_untracked() {
     let repo = repo();
     let wt_path = repo.root.parent().expect("parent").join("wt");

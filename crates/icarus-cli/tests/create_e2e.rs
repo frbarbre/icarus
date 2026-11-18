@@ -299,6 +299,51 @@ fn workspaces_are_marked_read_and_unread() {
 }
 
 #[test]
+fn the_base_ref_is_searched_changed_and_reset_from_the_cli() {
+    let env = Env::start(json!({}));
+    let (repo, project) = env.project(&[]);
+    git(&repo, &["branch", "develop"]);
+    env.ok(&[
+        "workspace",
+        "create",
+        "--project",
+        &project,
+        "based",
+        "--no-agent",
+    ]);
+
+    assert_eq!(
+        env.ok(&["workspace", "refs", "based", "dev"]).trim(),
+        "develop"
+    );
+    let set = env.json(&["workspace", "set", "based", "--base", "develop"]);
+    assert_eq!(set["base_ref"], "develop");
+    assert_eq!(
+        env.ok(&["workspace", "refs", "based", "dev"]).trim(),
+        "develop  (current)"
+    );
+    let listed = env.json(&["workspace", "refs", "based", "--limit", "1"]);
+    assert_eq!(listed["refs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(listed["base_ref"], "develop");
+
+    let primary = env.json(&["workspace", "set", "based", "--use-primary"]);
+    assert!(primary["base_ref"].is_null(), "{primary}");
+    assert!(
+        !env.icarus(&[
+            "workspace",
+            "set",
+            "based",
+            "--base",
+            "main",
+            "--use-primary"
+        ])
+        .status
+        .success(),
+        "a base and --use-primary contradict each other"
+    );
+}
+
+#[test]
 fn a_worktree_of_another_clone_is_adopted_by_its_remote_and_removed_from_that_clone() {
     let env = Env::start(json!({}));
     let (_, project) = env.project(&[]);

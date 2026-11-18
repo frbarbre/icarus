@@ -74,6 +74,28 @@ pub(crate) struct LiveAgents(collections::HashMap<String, AgentSummary>);
 
 impl gpui::Global for LiveAgents {}
 
+/// Lines added and removed against each workspace's base, working tree included, as the Changes
+/// list last read them; cards prefer these to the pull request's numbers, as Orca's do.
+#[derive(Default)]
+pub(crate) struct LocalLineTotals(collections::HashMap<String, (u64, u64)>);
+
+impl gpui::Global for LocalLineTotals {}
+
+impl LocalLineTotals {
+    pub(crate) fn get(cx: &gpui::App, workspace_id: &str) -> Option<(u64, u64)> {
+        cx.try_global::<Self>()?.0.get(workspace_id).copied()
+    }
+
+    /// Only a changed total is written, since every sidebar redraws on a write.
+    pub(crate) fn publish(workspace_id: &str, totals: (u64, u64), cx: &mut gpui::App) {
+        if Self::get(cx, workspace_id) != Some(totals) {
+            cx.default_global::<Self>()
+                .0
+                .insert(workspace_id.to_owned(), totals);
+        }
+    }
+}
+
 impl LiveAgents {
     fn newest(cx: &gpui::App, id: &str) -> Option<AgentSummary> {
         cx.try_global::<Self>()?.0.get(id).cloned()

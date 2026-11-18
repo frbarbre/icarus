@@ -66,6 +66,8 @@ actions!(
         PullBranch,
         /// Pulls, then pushes.
         SyncBranch,
+        /// Picks the branch the Changes list compares against.
+        ChangeBaseRef,
     ]
 );
 
@@ -203,6 +205,28 @@ pub struct Row {
     pub conflicted: bool,
     #[serde(default)]
     pub facets: HashMap<String, Option<String>>,
+}
+
+/// The uncommitted rows of a whole-branch listing, shown until the server's own answer arrives.
+fn uncommitted_part(base: &Listing) -> Listing {
+    let local = |rows: &[Row]| -> Vec<Row> {
+        rows.iter()
+            .filter(|row| row.staged || row.unstaged || row.untracked || row.conflicted)
+            .cloned()
+            .collect()
+    };
+    let rows = local(&base.rows);
+    let totals = Totals {
+        files: rows.len(),
+        added: rows.iter().filter_map(|row| row.added).sum(),
+        removed: rows.iter().filter_map(|row| row.removed).sum(),
+    };
+    Listing {
+        all_rows: base.all_rows.as_deref().map(local),
+        rows,
+        totals,
+        ..base.clone()
+    }
 }
 
 impl Listing {
@@ -517,6 +541,7 @@ impl gpui::Global for SourceControlPanels {}
 /// A git action ran on the server (from any client or agent): reload the panels and open diffs.
 pub(crate) fn git_changed(payload: serde_json::Value, cx: &mut App) {
     let workspace = payload["workspace"].as_str().map(str::to_owned);
+    let base_changed = payload["op"] == "base";
     let panels = cx
         .try_global::<SourceControlPanels>()
         .map(|panels| panels.0.clone())
@@ -525,7 +550,11 @@ pub(crate) fn git_changed(payload: serde_json::Value, cx: &mut App) {
         panel
             .update(cx, |panel, cx| {
                 if workspace.is_none() || panel.icarus_workspace == workspace {
-                    panel.refresh(cx);
+                    if base_changed {
+                        panel.reload(cx);
+                    } else {
+                        panel.refresh(cx);
+                    }
                 }
             })
             .ok();
@@ -536,6 +565,16 @@ pub(crate) fn git_changed(payload: serde_json::Value, cx: &mut App) {
         });
     }
     crate::review::review_changed(cx);
+}
+
+/// A base without its `refs/…` namespace, keeping the remote so two remotes' bases stay apart.
+pub(crate) fn base_ref_label(base: &str) -> String {
+    let base = base.trim();
+    ["refs/remotes/", "refs/heads/", "refs/tags/"]
+        .iter()
+        .find_map(|prefix| base.strip_prefix(prefix))
+        .unwrap_or(base)
+        .to_string()
 }
 
 /// The server's message without its error code, so git's words reach the user unchanged.
@@ -791,6 +830,8 @@ pub struct SourceControlPanel {
     icarus_workspace: Option<String>,
     scope: ChangesScope,
     listing: Option<Listing>,
+    /// The last whole-branch listing, so flipping Uncommitted on and off shows at once.
+    base_listing: Option<Listing>,
     error: Option<SharedString>,
     selected: Option<usize>,
     /// The last file step's direction and time, to tell a held key's repeats from single presses.
@@ -898,6 +939,7 @@ impl SourceControlPanel {
             icarus_workspace: None,
             scope: ChangesScope::Base,
             listing: None,
+            base_listing: None,
             error: None,
             selected: None,
             last_step: None,
@@ -955,6 +997,7 @@ impl SourceControlPanel {
             icarus_workspace: Some("preview".into()),
             scope,
             listing: Some(listing),
+            base_listing: None,
             error: None,
             selected,
             last_step: None,
@@ -1046,6 +1089,14 @@ impl SourceControlPanel {
         if self.scope != scope {
             self.scope = scope;
             self.selected = None;
+            let instant = match &self.scope {
+                ChangesScope::Base => self.base_listing.clone(),
+                ChangesScope::Uncommitted => self.base_listing.as_ref().map(uncommitted_part),
+                _ => None,
+            };
+            if let Some(listing) = instant {
+                self.show_listing(listing, cx);
+            }
         }
         self.refresh(cx);
         cx.notify();
@@ -1190,6 +1241,17 @@ impl SourceControlPanel {
                     Ok((id, mut listing)) => {
                         this.icarus_workspace = Some(id.clone());
                         this.error = None;
+                        if this.scope == ChangesScope::Base {
+                            let rows = listing.all_rows.as_ref().unwrap_or(&listing.rows);
+                            let totals = rows.iter().fold((0, 0), |(added, removed), row| {
+                                (
+                                    added + row.added.unwrap_or(0),
+                                    removed + row.removed.unwrap_or(0),
+                                )
+                            });
+                            crate::model::LocalLineTotals::publish(&id, totals, cx);
+                            this.base_listing = Some(listing.clone());
+                        }
                         if (this.filter_epoch != epoch || this.filter_writes > 0)
                             && let Some(current) = &this.listing
                         {
@@ -1877,6 +1939,58 @@ impl SourceControlPanel {
         .detach();
     }
 
+    pub fn open_base_ref_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(id), Some(workspace)) = (self.icarus_workspace.clone(), self.workspace.upgrade())
+        else {
+            return;
+        };
+        let client = self.client(cx);
+        let panel = cx.entity().downgrade();
+        // Deferred: the panel and often the workspace are mid-update when this runs.
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    crate::base_ref_dialog::BaseRefDialog::new(panel, id, client, window, cx)
+                });
+            });
+        });
+    }
+
+    /// Compares the workspace against `base`; an empty one follows the primary branch again.
+    pub fn set_base_ref(&mut self, base: String, cx: &mut Context<Self>) {
+        let Some(id) = self.icarus_workspace.clone() else {
+            return;
+        };
+        let Some(task) = crate::review::request(
+            self.client(cx),
+            "workspace.set",
+            serde_json::json!({ "id": id, "base": base }),
+            cx,
+        ) else {
+            self.git_error = Some("Not connected to the Icarus server".into());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => this.reload(cx),
+                    Err(error) => this.git_error = Some(git_error_text(&error).into()),
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    /// Refreshes now, dropping a read already in flight since it may predate the change.
+    pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
+        self.refreshing = None;
+        self.refresh(cx);
+    }
+
     fn workspace_params(&self) -> Option<serde_json::Value> {
         self.icarus_workspace
             .as_ref()
@@ -2277,6 +2391,11 @@ impl SourceControlPanel {
                                         .log_err();
                                 },
                             );
+                            let base = weak.clone();
+                            let menu = menu.entry("Change Base Ref…", None, move |window, cx| {
+                                base.update(cx, |this, cx| this.open_base_ref_dialog(window, cx))
+                                    .log_err();
+                            });
                             let sections = weak.clone();
                             menu.separator().header("Sections").map(|mut menu| {
                                 for item in layout.ordered() {
@@ -2300,22 +2419,57 @@ impl SourceControlPanel {
                         }))
                     }),
             );
-        let ahead = compare.as_ref().and_then(|compare| compare.ahead);
-        let behind = compare.as_ref().and_then(|compare| compare.behind);
+        // As Orca, a count only shows when the branch is actually ahead or behind.
+        let ahead = compare
+            .as_ref()
+            .and_then(|compare| compare.ahead)
+            .filter(|count| *count > 0);
+        let behind = compare
+            .as_ref()
+            .and_then(|compare| compare.behind)
+            .filter(|count| *count > 0);
+        let has_branch = branch.is_some();
+        let (text, text_muted, border) = {
+            let colors = cx.theme().colors();
+            (colors.text, colors.text_muted, colors.border)
+        };
+        let base_font = theme::theme_settings(cx).buffer_font(cx).clone();
         let base_row = base.map(|base| {
+            let label = base_ref_label(&base);
             h_flex()
                 .min_w_0()
                 .gap(px(6.))
-                .child(
+                .child(if has_branch {
                     Label::new("→")
                         .size(LabelSize::Custom(rems_from_px(10.5_f32)))
-                        .color(Color::Muted),
-                )
+                        .color(Color::Custom(text_muted.opacity(0.7)))
+                } else {
+                    Label::new("vs")
+                        .size(LabelSize::Custom(rems_from_px(10.5_f32)))
+                        .color(Color::Muted)
+                })
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(mono(base.clone()).underline()),
+                    div().flex_1().min_w_0().flex().child(
+                        div()
+                            .id("scm-base-ref")
+                            .debug_selector(|| "scm-base-ref".to_string())
+                            .min_w_0()
+                            .max_w_full()
+                            .truncate()
+                            .cursor_pointer()
+                            .font(base_font.clone())
+                            .text_size(rems_from_px(10.5_f32))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text.opacity(0.9))
+                            .underline()
+                            .text_decoration_color(border)
+                            .hover(|style| style.text_color(text).text_decoration_color(text))
+                            .tooltip(Tooltip::text(format!("Change base ref ({base})")))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.open_base_ref_dialog(window, cx)
+                            }))
+                            .child(label),
+                    ),
                 )
                 .when_some(ahead, |row, ahead| {
                     row.child(
@@ -3810,6 +3964,11 @@ pub fn register(cx: &mut App) {
                 crate::commit_modal::CommitModal::new(panel, window, cx)
             });
         });
+        workspace.register_action(|workspace, _: &ChangeBaseRef, window, cx| {
+            if let Some(panel) = reveal_source_control(workspace, window, cx) {
+                panel.update(cx, |panel, cx| panel.open_base_ref_dialog(window, cx));
+            }
+        });
         workspace.register_action(|workspace, _: &PushBranch, window, cx| {
             if let Some(panel) = reveal_source_control(workspace, window, cx) {
                 panel.update(cx, |panel, cx| panel.push(false, cx));
@@ -4498,6 +4657,126 @@ mod tests {
             }),
             "committing closes the dialog"
         );
+    }
+
+    #[gpui::test]
+    async fn change_base_ref_searches_picks_a_branch_and_closes_like_orca(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::base_ref_dialog::BaseRefDialog;
+        let pinned = std::sync::Arc::new(std::sync::Mutex::new(Some("origin/main".to_string())));
+        let state = pinned.clone();
+        let (workspace, panel, calls, mut cx) = git_panel(cx, move |method, params| {
+            let mut pinned = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            match method {
+                "workspace.refs" => {
+                    let refs = match params["query"].as_str().unwrap_or_default() {
+                        "dev" => vec!["origin/develop", "develop"],
+                        _ => vec!["origin/main"],
+                    };
+                    Ok(json!({ "base_ref": *pinned, "default_base": "origin/main",
+                        "remote_count": 1, "refs": refs }))
+                }
+                "workspace.set" => {
+                    let base = params["base"].as_str().unwrap_or_default();
+                    *pinned = (!base.is_empty()).then(|| base.to_string());
+                    Ok(json!({ "base_ref": *pinned }))
+                }
+                _ => Ok(json!({})),
+            }
+        })
+        .await;
+        let cx = &mut cx;
+        let dialog = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace.active_modal::<BaseRefDialog>(cx)
+            })
+        };
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is on screen"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_panel::<SourceControlPanel>(window, cx)
+        });
+        cx.run_until_parked();
+        click("scm-base-ref", cx);
+        let opened = dialog(cx).expect("clicking the base opens Change Base Ref");
+        opened.read_with(cx, |dialog, _| {
+            assert_eq!(dialog.pinned(), Some("origin/main"));
+            assert!(
+                dialog.results().is_empty(),
+                "nothing is listed before a search"
+            );
+        });
+
+        let search = opened.read_with(cx, |dialog, _| dialog.search_editor().clone());
+        search.update_in(cx, |editor, window, cx| editor.set_text("d", window, cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        assert!(
+            crate::review::tests::calls_to(&calls, "workspace.refs")
+                .iter()
+                .all(|params| params["query"] == ""),
+            "one letter doesn't search, as in Orca"
+        );
+
+        search.update_in(cx, |editor, window, cx| editor.set_text("dev", window, cx));
+        cx.run_until_parked();
+        opened.read_with(cx, |dialog, _| assert!(dialog.is_searching()));
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        opened.read_with(cx, |dialog, _| {
+            assert!(!dialog.is_searching());
+            assert_eq!(dialog.results(), ["origin/develop", "develop"]);
+        });
+
+        click("base-ref-result-origin/develop", cx);
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "workspace.set"),
+            [json!({ "id": "ws-1", "base": "origin/develop" })]
+        );
+        assert!(dialog(cx).is_none(), "picking a branch closes the dialog");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.git_error.is_none(), "the base was saved");
+        });
+
+        cx.dispatch_action(ChangeBaseRef);
+        cx.run_until_parked();
+        let reopened = dialog(cx).expect("the action opens it too");
+        reopened.read_with(cx, |dialog, _| {
+            assert_eq!(
+                dialog.pinned(),
+                Some("origin/develop"),
+                "the new base is pinned"
+            )
+        });
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(dialog(cx).is_none(), "Esc closes it");
+
+        cx.dispatch_action(ChangeBaseRef);
+        cx.run_until_parked();
+        click("base-ref-use-primary", cx);
+        assert_eq!(
+            crate::review::tests::calls_to(&calls, "workspace.set").last(),
+            Some(&json!({ "id": "ws-1", "base": "" })),
+            "Use Primary drops the workspace's own base"
+        );
+        assert!(dialog(cx).is_none());
+
+        cx.dispatch_action(ChangeBaseRef);
+        cx.run_until_parked();
+        dialog(cx)
+            .expect("opens")
+            .read_with(cx, |dialog, _| assert_eq!(dialog.pinned(), None));
+        click("base-ref-close", cx);
+        assert!(dialog(cx).is_none(), "the × closes it");
     }
 
     #[gpui::test]

@@ -247,7 +247,13 @@ impl Transformable for Icon {
 
 impl RenderOnce for Icon {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let color = self.color.color(cx);
+        // Provider logos keep their brand colour everywhere, as Orca draws them.
+        let color = match &self.source {
+            IconSource::Embedded(path) if path.as_ref() == &*IconName::AiClaude.path() => {
+                gpui::rgb(0xd97757).into()
+            }
+            _ => self.color.color(cx),
+        };
         let svg = match self.source {
             IconSource::Embedded(path) => svg().path(path),
             IconSource::ExternalSvg(path) => svg().external_path(path),

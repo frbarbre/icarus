@@ -190,7 +190,9 @@ pub(crate) fn tree(elements: &[DebugElement]) -> Vec<Value> {
 }
 
 fn front_window(cx: &App) -> Result<AnyWindowHandle> {
+    // Why the stack: with the app in the background nothing is active, and `windows()` is unordered.
     cx.active_window()
+        .or_else(|| cx.window_stack()?.into_iter().next())
         .or_else(|| cx.windows().into_iter().next())
         .context("no app window is open")
 }

@@ -355,6 +355,8 @@ impl DiffTab {
     fn apply_mode(&mut self, cx: &mut Context<Self>) {
         let mode = self.mode;
         self.editor.update(cx, |editor, cx| {
+            // As Orca: the Changes view is for reading, edits happen in Edit.
+            editor.set_read_only(mode == DiffTabMode::Diff);
             editor.buffer().update(cx, |buffer, cx| match mode {
                 DiffTabMode::Diff => {
                     buffer.set_all_diff_hunks_expanded(cx);
@@ -365,6 +367,7 @@ impl DiffTab {
                     buffer.collapse_diff_hunks(vec![Anchor::Min..Anchor::Max], cx);
                 }
             });
+            cx.notify();
         });
     }
 

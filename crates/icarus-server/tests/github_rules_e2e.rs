@@ -429,6 +429,36 @@ async fn pr_previews_come_from_deployments_and_ride_along_in_pr_status() {
 }
 
 #[tokio::test]
+async fn a_pr_turned_draft_after_it_was_read_offers_ready_for_review() {
+    let world = World::new(json!({}), json!({ "viewer": "me" })).await;
+    let (id, _, head) = world.workspace("later-draft").await;
+    let fixtures = |draft: bool| {
+        json!({
+            "viewer": "me",
+            "repo": { "squashMergeAllowed": true, "autoMergeAllowed": true, "mergeQueue": { "id": "MQ_1" } },
+            "pulls": [pull(7, "later-draft", &head, json!({ "isDraft": draft }))],
+        })
+    };
+    world.set_fixtures(fixtures(false));
+    assert_eq!(
+        world.next_action(&id).await["action"]["kind"],
+        "add-to-merge-queue"
+    );
+
+    world.set_fixtures(fixtures(true));
+    world
+        .client
+        .request("pr.status", json!({ "workspace": id, "refresh": true }))
+        .await
+        .expect("refresh");
+
+    assert_eq!(
+        world.next_action(&id).await["action"]["kind"],
+        "ready-for-review"
+    );
+}
+
+#[tokio::test]
 async fn next_action_resolves_each_step() {
     let world = World::new(json!({}), json!({ "viewer": "me" })).await;
     let (no_pr, _, _) = world.workspace("no-pr").await;

@@ -450,6 +450,17 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             }
         }
     }
+    println!("\n--- Icarus: icarus_base_ref_dialog ---");
+    for (name, result) in run_icarus_base_ref_dialog_tests(&mut cx, update_baseline) {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
     println!("\n--- Icarus: icarus_workspace_ports ---");
     for (name, result) in
         run_icarus_workspace_ports_tests(workspace_window, &mut cx, update_baseline)
@@ -1466,6 +1477,79 @@ fn run_icarus_changes_tree_tests(
         })
         .log_err();
     cx.run_until_parked();
+    results
+}
+
+/// Source Control's Change Base Ref dialog, as Orca shows it for a stacked PR's workspace: at rest,
+/// then searching.
+fn run_icarus_base_ref_dialog_tests(
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    use icarus_ui::base_ref_dialog::{BaseRefDialog, BaseRefs};
+
+    let pinned = "refs/remotes/origin/feature/e-7331-add-mapbox-targeting-ui-for-campaign";
+    // Its own window: the runner's workspace window has no modal layer to draw a dialog in.
+    let shoot = |refs: BaseRefs,
+                 query: &'static str,
+                 dark: &'static str,
+                 light: &'static str,
+                 cx: &mut VisualTestAppContext| {
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(720.0), px(480.0)),
+            })),
+            focus: false,
+            show: false,
+            ..Default::default()
+        };
+        match cx.update(|cx| {
+            cx.open_window(options, |window, cx| {
+                cx.new(|cx| BaseRefDialog::preview(refs, query, window, cx))
+            })
+        }) {
+            Ok(dialog) => {
+                cx.run_until_parked();
+                let results =
+                    run_icarus_dark_and_light(dark, light, dialog.into(), cx, update_baseline);
+                cx.update_window(dialog.into(), |_, window, _cx| window.remove_window())
+                    .log_err();
+                results
+            }
+            Err(error) => vec![(dark, Err(error))],
+        }
+    };
+    let at_rest = BaseRefs {
+        base_ref: Some(pinned.to_string()),
+        default_base: Some("origin/main".to_string()),
+        remote_count: 1,
+        refs: Vec::new(),
+    };
+    let mut results = shoot(
+        at_rest,
+        "",
+        "icarus_base_ref_dialog",
+        "icarus_base_ref_dialog_light",
+        cx,
+    );
+    let searching = BaseRefs {
+        base_ref: Some(pinned.to_string()),
+        default_base: Some("origin/main".to_string()),
+        remote_count: 2,
+        refs: vec![
+            pinned.to_string(),
+            "origin/feature/e-7365-clean-up-and-fixes-for-campaign-flow".to_string(),
+            "feature/e-7331-add-mapbox-targeting-ui-for-campaign".to_string(),
+        ],
+    };
+    results.extend(shoot(
+        searching,
+        "feature/e-73",
+        "icarus_base_ref_dialog_search",
+        "icarus_base_ref_dialog_search_light",
+        cx,
+    ));
     results
 }
 

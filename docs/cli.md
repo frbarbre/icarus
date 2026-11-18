@@ -44,7 +44,8 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `workspace list [--project] [--all]` / `show <ws>` | List workspaces, rescanning worktrees first (`--all` adds hidden ones), or show one. |
 | `workspace hide <ws>` / `unhide <ws> [--follow-settings]` | Hide or show a workspace in the sidebar. See [Worktrees made elsewhere](workspaces.md#worktrees-made-elsewhere). |
 | `workspace inbox [--project]` / `show-source <source> --project <p>` | Newly found worktrees, and showing every worktree from a source. |
-| `workspace set <ws> [--status] [--title] [--base] [--pin\|--unpin]` | Change a workspace. |
+| `workspace set <ws> [--status] [--title] [--base\|--use-primary] [--pin\|--unpin]` | Change a workspace. `--use-primary` drops its own base so it follows the repository's primary branch. |
+| `workspace refs <ws> [query] [--limit]` | Branches the base can be changed to (Source Control's Change Base Ref). |
 | `workspace reorder <ws>...` | Put workspaces at the top of the Manual sort. |
 | `workspace mark-read` / `mark-unread <ws>` | Clear or set the unread mark. |
 | `workspace setup <ws> [--trust]` | Run the setup script again. |

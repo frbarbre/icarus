@@ -409,6 +409,15 @@ pub fn with_thousands(count: u64) -> String {
     grouped
 }
 
+/// The card's `+added −removed`: the local total once the Changes list has read it, else GitHub's.
+pub fn card_diff(local: Option<(u64, u64)>, pr: &PrSummary) -> Option<(u64, u64, &'static str)> {
+    let (added, removed, source) = match local {
+        Some((added, removed)) => (added, removed, "Local changes"),
+        None => (pr.additions, pr.deletions, "Pull request on GitHub"),
+    };
+    (added > 0 || removed > 0).then_some((added, removed, source))
+}
+
 /// `10h`, `3d`: how long ago `at_ms` was, as short as the card's activity line needs.
 pub fn short_age(at_ms: u64, now_ms: u64) -> String {
     let seconds = now_ms.saturating_sub(at_ms) / 1000;

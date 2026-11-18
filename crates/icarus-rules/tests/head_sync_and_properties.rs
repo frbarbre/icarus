@@ -17,7 +17,6 @@ mod main_github_review_head_sync_test {
         HeadSyncObservation {
             head: HEAD.to_owned(),
             symbolic_branch: Some("feature".to_owned()),
-            dirty_tracked: false,
             target_reachable: true,
             viewer_email: Some("me@example.test".to_owned()),
             local_only_authors: vec!["author@example.test".to_owned()],
@@ -60,15 +59,6 @@ mod main_github_review_head_sync_test {
                     ..observed()
                 },
                 skip(HeadSyncSkip::OwnCommits),
-            ),
-            (
-                "keeps uncommitted changes",
-                NEW,
-                HeadSyncObservation {
-                    dirty_tracked: true,
-                    ..observed()
-                },
-                skip(HeadSyncSkip::Dirty),
             ),
             (
                 "keeps a checkout on another branch",

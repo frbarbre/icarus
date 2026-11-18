@@ -235,7 +235,11 @@ impl MarkdownStyle {
                 ui_font_size.into()
             }),
             line_height: Some(line_height.into()),
-            color: Some(colors.text),
+            // Why the editor's: themes like Cursor Dark draw `text` at 60% alpha, too faint for a chat.
+            color: Some(match font {
+                MarkdownFont::Agent => colors.editor_foreground,
+                _ => colors.text,
+            }),
             ..Default::default()
         });
 

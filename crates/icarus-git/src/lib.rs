@@ -275,6 +275,106 @@ pub fn qualify_ref(repo: &Path, name: &str) -> Option<String> {
     })
 }
 
+/// What the Change Base Ref picker offers for a repository.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BaseRefs {
+    /// What a workspace without a base of its own compares against.
+    pub default_base: Option<String>,
+    pub remote_count: usize,
+    /// Short names (`origin/main`, `main`), most recently committed first.
+    pub refs: Vec<String>,
+}
+
+/// Branches matching `query` the way Orca's base ref search matches them: one word matches
+/// inside any segment of the name; `a/b` matches segment by segment, or as a branch prefix.
+pub fn search_base_refs(repo: &Path, query: &str, limit: usize) -> Result<BaseRefs> {
+    let remotes: Vec<String> = git_ok(repo, &["remote"])
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .map(str::to_string)
+        .collect();
+    let listing = git_read(
+        repo,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)%00%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    let query: String = query
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '*' | '?' | '[' | ']' | '\\'))
+        .collect();
+    let tokens: Vec<&str> = query.split('/').filter(|token| !token.is_empty()).collect();
+    let prefix = tokens.join("/");
+    let mut segmented = Vec::new();
+    let mut rooted = Vec::new();
+    for line in listing.lines() {
+        let Some((full, short)) = line.split_once('\0') else {
+            continue;
+        };
+        let (path, branch) = if let Some(path) = full.strip_prefix("refs/heads/") {
+            (path, path)
+        } else if let Some(path) = full.strip_prefix("refs/remotes/") {
+            let configured = remotes
+                .iter()
+                .filter(|remote| path.starts_with(&format!("{remote}/")))
+                .max_by_key(|remote| remote.len());
+            let branch = match configured {
+                Some(remote) => &path[remote.len() + 1..],
+                None => path.split_once('/').map_or(path, |(_, branch)| branch),
+            };
+            // A remote's HEAD only points at one of its branches.
+            if branch == "HEAD" && (configured.is_some() || path.matches('/').count() == 1) {
+                continue;
+            }
+            (path, branch)
+        } else {
+            continue;
+        };
+        let segments: Vec<&str> = path.split('/').collect();
+        if tokens.len() <= 1 {
+            let token = tokens.first().copied().unwrap_or("");
+            if segments.iter().any(|segment| segment.contains(token)) {
+                segmented.push(short.to_string());
+            }
+            continue;
+        }
+        if segments.len() == tokens.len()
+            && segments
+                .iter()
+                .zip(&tokens)
+                .all(|(segment, token)| segment.contains(token))
+        {
+            segmented.push(short.to_string());
+        }
+        if branch.starts_with(&prefix) {
+            rooted.push(short.to_string());
+        }
+    }
+    let mut refs: Vec<String> = Vec::new();
+    for index in 0..segmented.len().max(rooted.len()) {
+        for name in [segmented.get(index), rooted.get(index)]
+            .into_iter()
+            .flatten()
+        {
+            if refs.len() < limit && !refs.contains(name) {
+                refs.push(name.clone());
+            }
+        }
+    }
+    Ok(BaseRefs {
+        default_base: default_base_ref(repo),
+        remote_count: remotes.len(),
+        refs,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Worktree {
     pub path: PathBuf,
@@ -507,7 +607,9 @@ pub fn local_state(worktree: &Path) -> Result<LocalState> {
     };
     let default_branch =
         default_base_ref(worktree).map(|base| base.rsplit('/').next().unwrap_or(&base).to_string());
-    let is_default_branch = matches!((&branch, &default_branch), (Some(b), Some(d)) if b == d);
+    // As Orca: `main` and `master` count as the default even when the remote's HEAD is unknown.
+    let is_default_branch = matches!((&branch, &default_branch), (Some(b), Some(d)) if b == d)
+        || matches!(branch.as_deref(), Some("main" | "master"));
     Ok(LocalState {
         branch,
         head_oid,

@@ -149,6 +149,8 @@ pub enum PlannedAction {
         path: String,
         branch: String,
         head_oid: String,
+        /// The PR's target branch, which the workspace's base follows.
+        base_branch: String,
     },
     Notify {
         workspace_id: Option<String>,
@@ -413,6 +415,7 @@ impl Ctx<'_, '_> {
                 on_pr(&|pr| self.world.branches.contains(&pr.head_ref_name))
             }
             Cond::HeadIsLocal => on_both(&|pr, ws| ws.head_oid == pr.head_ref_oid),
+            Cond::BaseFollowsTarget => on_both(&|pr, ws| ws.base_follows(&pr.base_ref_name)),
             Cond::HasPrHead => on_pr(&|pr| !pr.head_ref_oid.is_empty()),
             Cond::HeadBranchMatches => {
                 on_both(&|pr, ws| ws.branch_name() == Some(pr.head_ref_name.as_str()))
@@ -581,6 +584,7 @@ impl Emitter<'_> {
                         path: ws.path.clone(),
                         branch: branch.to_owned(),
                         head_oid: pr.head_ref_oid.clone(),
+                        base_branch: pr.base_ref_name.clone(),
                     });
                 }
             }

@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod base_ref_dialog;
 pub mod browser;
 pub mod cards;
 pub mod changes_tab;
@@ -1433,6 +1434,16 @@ pub enum Connection {
     Unavailable(String),
 }
 
+/// The newest snapshot any panel fetched, so a window opened later draws its cards at once.
+#[derive(Clone)]
+struct LastSnapshot {
+    snapshot: Snapshot,
+    server_version: String,
+}
+
+impl gpui::Global for LastSnapshot {}
+
+#[derive(Clone)]
 struct Snapshot {
     workspaces: Vec<WorkspaceSummary>,
     statuses: Vec<StatusColumn>,
@@ -1513,6 +1524,7 @@ pub struct WorkspacesPanel {
     remote: Entity<servers::RemoteServers>,
     _remote_observation: Subscription,
     _live_agents: Subscription,
+    _local_line_totals: Subscription,
 }
 
 impl WorkspacesPanel {
@@ -1538,6 +1550,12 @@ impl WorkspacesPanel {
             return panel;
         }
         panel.view = cards::CardView::default();
+        if let Some(last) = cx.try_global::<LastSnapshot>().cloned() {
+            panel.connection = Connection::Connected {
+                server_version: last.server_version,
+            };
+            panel.apply_snapshot(last.snapshot, cx);
+        }
         panel._poll = cx.spawn(async move |this, cx| {
             let mut last_poll: Option<Instant> = None;
             loop {
@@ -1578,6 +1596,10 @@ impl WorkspacesPanel {
                         panel.connection = Connection::Connected {
                             server_version: client.server_version.clone(),
                         };
+                        cx.set_global(LastSnapshot {
+                            snapshot: snapshot.clone(),
+                            server_version: client.server_version.clone(),
+                        });
                         panel.client = Some(client);
                         panel.apply_snapshot(snapshot, cx);
                     }
@@ -1632,6 +1654,7 @@ impl WorkspacesPanel {
                     cx.notify();
                 }
             }),
+            _local_line_totals: cx.observe_global::<model::LocalLineTotals>(|_, cx| cx.notify()),
         }
     }
 
@@ -2436,21 +2459,33 @@ impl WorkspacesPanel {
                 },
             )
             .when_some(
-                pr.filter(|pr| view.shows("pr-diff") && (pr.additions > 0 || pr.deletions > 0)),
-                |row, pr| {
+                pr.filter(|_| view.shows("pr-diff")).and_then(|pr| {
+                    cards::card_diff(model::LocalLineTotals::get(cx, &workspace.id), pr)
+                }),
+                |row, (added, removed, source)| {
+                    let tooltip = format!(
+                        "{source}: {} lines added, {} lines deleted",
+                        cards::with_thousands(added),
+                        cards::with_thousands(removed)
+                    );
                     row.child(
                         h_flex()
+                            .id(SharedString::from(format!(
+                                "icarus-card-diff-{}",
+                                workspace.id
+                            )))
                             .gap_1()
                             .child(
-                                Label::new(format!("+{}", cards::with_thousands(pr.additions)))
+                                Label::new(format!("+{}", cards::with_thousands(added)))
                                     .size(LabelSize::XSmall)
                                     .color(Color::Created),
                             )
                             .child(
-                                Label::new(format!("−{}", cards::with_thousands(pr.deletions)))
+                                Label::new(format!("−{}", cards::with_thousands(removed)))
                                     .size(LabelSize::XSmall)
                                     .color(Color::Deleted),
-                            ),
+                            )
+                            .tooltip(Tooltip::text(tooltip)),
                     )
                 },
             )
@@ -2632,7 +2667,7 @@ impl WorkspacesPanel {
             .child(
                 h_flex()
                     .gap_1p5()
-                    .child(div().relative().flex_none().child(lead_icon).when_some(
+                    .child(h_flex().relative().flex_none().child(lead_icon).when_some(
                         unread,
                         |icon, unread| {
                             icon.child(cards::render_unread_dot(
@@ -2649,7 +2684,7 @@ impl WorkspacesPanel {
                             .min_w_0()
                             .gap_1p5()
                             .child(
-                                div().min_w_0().child(
+                                h_flex().min_w_0().child(
                                     Label::new(title)
                                         .weight(gpui::FontWeight::SEMIBOLD)
                                         .color(if inactive {

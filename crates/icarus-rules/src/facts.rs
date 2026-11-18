@@ -557,6 +557,8 @@ pub struct Workspace {
     pub display_name: String,
     pub path: String,
     pub branch: Option<String>,
+    /// What the workspace's Changes read against, e.g. `origin/main`.
+    pub base_ref: Option<String>,
     pub status: Option<StatusId>,
     pub head_oid: String,
     pub dirty: bool,
@@ -581,6 +583,7 @@ impl Default for Workspace {
             display_name: String::new(),
             path: String::new(),
             branch: None,
+            base_ref: None,
             status: None,
             head_oid: String::new(),
             dirty: false,
@@ -596,7 +599,24 @@ impl Default for Workspace {
     }
 }
 
+/// False when `base_ref` is a branch other than `target`; a base pinned to a commit (a review's
+/// "since review") follows the target by itself, so it counts as following.
+pub fn base_follows(base_ref: Option<&str>, target: &str) -> bool {
+    let Some(base) = base_ref else {
+        return false;
+    };
+    let base = base.strip_prefix("refs/remotes/").unwrap_or(base);
+    match base.strip_prefix("origin/") {
+        Some(branch) => branch == target,
+        None => true,
+    }
+}
+
 impl Workspace {
+    pub fn base_follows(&self, target: &str) -> bool {
+        base_follows(self.base_ref.as_deref(), target)
+    }
+
     pub fn branch_name(&self) -> Option<&str> {
         self.branch
             .as_deref()

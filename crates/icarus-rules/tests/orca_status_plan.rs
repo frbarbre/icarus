@@ -1028,7 +1028,29 @@ mod shared_github_review_head_sync_test {
         let mut ws = workspace("wt", 3179);
         ws.branch = Some("feature/e-1".to_owned());
         ws.head_oid = "old-head".to_owned();
+        ws.base_ref = Some("origin/main".to_owned());
         ws
+    }
+
+    #[test]
+    fn syncs_a_review_whose_pr_was_retargeted() {
+        let mut retargeted = moved();
+        retargeted.head_ref_oid = "old-head".to_owned();
+        retargeted.base_ref_name = "feature/parent".to_owned();
+        assert_eq!(
+            plan(retargeted, candidate()),
+            vec![("wt".to_owned(), "old-head".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_base_pinned_to_the_last_review_counts_as_on_target() {
+        let mut current = moved();
+        current.head_ref_oid = "old-head".to_owned();
+        current.base_ref_name = "feature/parent".to_owned();
+        let mut pinned = candidate();
+        pinned.base_ref = Some("refs/icarus/review-base/wt-0123456789ab".to_owned());
+        assert!(plan(current, pinned).is_empty());
     }
 
     fn plan(subject: icarus_rules::facts::PullRequest, ws: Workspace) -> Vec<(String, String)> {

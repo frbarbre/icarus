@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 pub struct HeadSyncObservation {
     pub head: String,
     pub symbolic_branch: Option<String>,
-    pub dirty_tracked: bool,
     pub target_reachable: bool,
     pub viewer_email: Option<String>,
     pub local_only_authors: Vec<String>,
@@ -13,7 +12,6 @@ pub struct HeadSyncObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HeadSyncSkip {
-    Dirty,
     OwnCommits,
     OtherBranch,
     Unreachable,
@@ -46,9 +44,6 @@ pub fn decide_head_sync(
     // Why: a detached HEAD or another branch is a rebase in progress or a checkout the reviewer chose.
     if observed.symbolic_branch.as_deref() != Some(branch) {
         return skip(HeadSyncSkip::OtherBranch);
-    }
-    if observed.dirty_tracked {
-        return skip(HeadSyncSkip::Dirty);
     }
     if !observed.target_reachable {
         return skip(HeadSyncSkip::Unreachable);

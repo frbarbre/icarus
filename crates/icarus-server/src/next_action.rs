@@ -199,6 +199,17 @@ impl Server {
         title: &str,
         prompt: &str,
     ) -> anyhow::Result<String> {
+        // As Orca: the workspace's default agent tab, still unused, takes the prompt instead of a new tab.
+        let unused = self.agents.list().into_iter().find(|agent| {
+            agent.workspace.as_deref() == Some(workspace.id.as_str())
+                && agent.turns == 0
+                && agent.provider == choice.provider
+        });
+        if let Some(agent) = unused.and_then(|info| self.agents.get(&info.id)) {
+            self.offer_agent_tab(&agent.info());
+            agent.send(prompt, &[]).await?;
+            return Ok(agent.id().to_owned());
+        }
         let mut options = AgentOptions {
             provider: choice.provider,
             cwd: workspace.path.clone(),

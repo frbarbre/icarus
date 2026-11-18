@@ -112,13 +112,21 @@ fn observe_head(path: &Path, branch: &str, target: &str) -> HeadSyncObservation 
     HeadSyncObservation {
         head: run(&["rev-parse", "HEAD"]).unwrap_or_default(),
         symbolic_branch: run(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
-        dirty_tracked: run(&["status", "--porcelain", "--untracked-files=no"])
-            .is_none_or(|s| !s.is_empty()),
         target_reachable: run(&["cat-file", "-e", &format!("{target}^{{commit}}")]).is_some(),
         viewer_email: run(&["config", "user.email"]),
         local_only_authors: run(&["log", "--format=%ae", &format!("{target}..HEAD")])
             .map(|s| s.lines().map(str::to_owned).collect())
             .unwrap_or_default(),
+    }
+}
+
+fn fetch_target(path: &Path, branch: &str) {
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    // Why ignored: an unreachable remote still leaves a usable base if the ref was fetched before.
+    if let Err(error) =
+        icarus_git::git(path, &["fetch", "--quiet", "--no-tags", "origin", &refspec])
+    {
+        tracing::warn!("fetching the review target {branch}: {error:#}");
     }
 }
 
@@ -427,6 +435,7 @@ impl Server {
                     display_name: workspace.title.clone().unwrap_or(workspace.name.clone()),
                     path: workspace.path.to_string_lossy().into_owned(),
                     branch,
+                    base_ref: workspace.base_ref.clone(),
                     status: workspace.status.clone(),
                     head_oid: local.head_oid.clone().unwrap_or_default(),
                     dirty: local.has_uncommitted_changes,
@@ -608,21 +617,28 @@ impl Server {
                 timeout_ms,
             } => self.run_command(workspace_id, path, command, *timeout_ms),
             PlannedAction::SyncToPrHead {
+                workspace_id,
                 path,
                 branch,
                 head_oid,
-                ..
+                base_branch,
             } => {
                 let (path, branch, head) = (path.clone(), branch.clone(), head_oid.clone());
-                match tokio::task::spawn_blocking(move || {
+                let mut decision = match tokio::task::spawn_blocking(move || {
                     sync_to_head(Path::new(&path), &branch, &head)
                 })
                 .await
                 {
-                    Ok(Ok(decision)) => Executed::ok(decision),
-                    Ok(Err(error)) => Executed::failed(error),
-                    Err(error) => Executed::failed(error),
+                    Ok(Ok(decision)) => decision,
+                    Ok(Err(error)) => return Executed::failed(error),
+                    Err(error) => return Executed::failed(error),
+                };
+                match self.retarget_base(workspace_id, base_branch).await {
+                    Ok(Some(base_ref)) => decision["base_ref"] = json!(base_ref),
+                    Ok(None) => {}
+                    Err(error) => return Executed::failed(error),
                 }
+                Executed::ok(decision)
             }
             PlannedAction::Notify {
                 workspace_id,
@@ -701,6 +717,40 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Points a workspace whose base is another branch at the PR's current target, fetched first.
+    async fn retarget_base(
+        &self,
+        workspace_id: &str,
+        base_branch: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(mut workspace) = self
+            .store
+            .workspace(workspace_id)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        if base_branch.is_empty()
+            || icarus_rules::facts::base_follows(workspace.base_ref.as_deref(), base_branch)
+        {
+            return Ok(None);
+        }
+        let (path, branch) = (workspace.path.clone(), base_branch.to_owned());
+        tokio::task::spawn_blocking(move || fetch_target(&path, &branch))
+            .await
+            .map_err(|e| e.to_string())?;
+        let base_ref = format!("origin/{base_branch}");
+        workspace.base_ref = Some(base_ref.clone());
+        self.store
+            .update_workspace(&workspace)
+            .map_err(|e| e.to_string())?;
+        self.broadcast(
+            "workspace.changed",
+            json!({ "workspaces": [workspace.id], "source": "rules.retarget" }),
+        );
+        Ok(Some(base_ref))
     }
 
     async fn launch(
@@ -933,4 +983,91 @@ fn ci_events(facts: &Facts, ci_triage: &[(String, Value)]) -> Vec<Event> {
         }
     }
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        icarus_git::git(dir, args).expect("git").trim().to_owned()
+    }
+
+    fn commit(dir: &Path, file: &str, text: &str) -> String {
+        std::fs::write(dir.join(file), text).expect("write");
+        git(dir, &["add", file]);
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=Author",
+                "-c",
+                "user.email=author@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                file,
+            ],
+        );
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn a_review_with_stale_uncommitted_changes_moves_to_the_new_head() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let author = tmp.path().join("author");
+        let review = tmp.path().join("review");
+        git(
+            tmp.path(),
+            &["init", "-q", "--bare", "-b", "main", "origin.git"],
+        );
+        git(tmp.path(), &["clone", "-q", "origin.git", "author"]);
+        git(&author, &["checkout", "-q", "-b", "feature"]);
+        commit(&author, "a.txt", "one\n");
+        git(&author, &["push", "-q", "origin", "feature"]);
+        git(
+            tmp.path(),
+            &["clone", "-q", "-b", "feature", "origin.git", "review"],
+        );
+        git(&review, &["config", "user.email", "me@example.test"]);
+        let pushed = commit(&author, "a.txt", "two\n");
+        git(&author, &["push", "-q", "origin", "feature"]);
+        std::fs::write(review.join("a.txt"), "stale edit\n").expect("write");
+
+        let decision = sync_to_head(&review, "feature", &pushed).expect("sync");
+
+        assert_eq!(decision["kind"], "reset-hard");
+        assert_eq!(git(&review, &["rev-parse", "HEAD"]), pushed);
+        assert_eq!(git(&review, &["status", "--porcelain"]), "");
+        assert_eq!(
+            std::fs::read_to_string(review.join("a.txt")).expect("read"),
+            "two\n"
+        );
+    }
+
+    #[test]
+    fn fetching_a_new_target_makes_its_remote_branch_usable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let author = tmp.path().join("author");
+        let review = tmp.path().join("review");
+        git(
+            tmp.path(),
+            &["init", "-q", "--bare", "-b", "main", "origin.git"],
+        );
+        git(tmp.path(), &["clone", "-q", "origin.git", "author"]);
+        commit(&author, "a.txt", "one\n");
+        git(&author, &["push", "-q", "origin", "HEAD:main"]);
+        git(tmp.path(), &["clone", "-q", "origin.git", "review"]);
+        git(&author, &["checkout", "-q", "-b", "feature/parent"]);
+        let parent = commit(&author, "b.txt", "parent\n");
+        git(&author, &["push", "-q", "origin", "feature/parent"]);
+
+        fetch_target(&review, "feature/parent");
+
+        assert_eq!(
+            git(&review, &["rev-parse", "origin/feature/parent"]),
+            parent
+        );
+    }
 }

@@ -916,10 +916,21 @@ enum WorkspaceCommand {
         title: Option<String>,
         #[arg(long)]
         base: Option<String>,
+        /// Drop the workspace's own base so it follows the repository's primary branch.
+        #[arg(long, conflicts_with = "base")]
+        use_primary: bool,
         #[arg(long, conflicts_with = "unpin")]
         pin: bool,
         #[arg(long)]
         unpin: bool,
+    },
+    /// Search the branches a workspace's base can be changed to, most recently committed first.
+    Refs {
+        id: String,
+        /// Matches inside any segment of a branch name; `a/b` also matches as a prefix.
+        query: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Put workspaces at the top of the sidebar's Manual sort, in the order given.
     Reorder {
@@ -2543,10 +2554,16 @@ async fn main() -> Result<()> {
                     status,
                     title,
                     base,
+                    use_primary,
                     pin,
                     unpin,
                 } => {
                     let pinned = (*pin || *unpin).then_some(*pin);
+                    let base = if *use_primary {
+                        Some(String::new())
+                    } else {
+                        base.clone()
+                    };
                     let value = client
                         .request(
                             "workspace.set",
@@ -2554,6 +2571,30 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     print(&cli, &value, summary);
+                }
+                WorkspaceCommand::Refs { id, query, limit } => {
+                    let value = client
+                        .request(
+                            "workspace.refs",
+                            json!({ "id": id, "query": query.clone().unwrap_or_default(), "limit": limit }),
+                        )
+                        .await?;
+                    print(&cli, &value, |v| {
+                        v["refs"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(|name| {
+                                if v["base_ref"].as_str() == Some(name) {
+                                    format!("{name}  (current)")
+                                } else {
+                                    name.to_owned()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    });
                 }
                 WorkspaceCommand::Reorder { ids } => {
                     let value = client

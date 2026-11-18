@@ -705,7 +705,7 @@ pub fn build(input: &OrcaPresetInput) -> OrcaPreset {
             Cond::LocalCheckout,
             Cond::PrOpen,
             Cond::HasPrHead,
-            Cond::HeadIsLocal.not(),
+            Cond::any(vec![Cond::HeadIsLocal.not(), Cond::BaseFollowsTarget.not()]),
             Cond::HeadBranchMatches,
         ]),
         guards: Vec::new(),

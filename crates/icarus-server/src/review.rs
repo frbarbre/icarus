@@ -280,9 +280,17 @@ pub fn base_options(context: &ReviewContext, has_commit: &dyn Fn(&str) -> bool) 
 }
 
 /// `since-review` when the last-reviewed commit is here, else the whole PR against its target.
-pub fn default_base(context: &ReviewContext, has_commit: &dyn Fn(&str) -> bool) -> &'static str {
+pub fn default_base(
+    context: &ReviewContext,
+    current_base_ref: Option<&str>,
+    has_commit: &dyn Fn(&str) -> bool,
+) -> &'static str {
+    let target = format!("origin/{}", context.base_ref_name);
+    let on_target = current_base_ref
+        .is_some_and(|base| base.strip_prefix("refs/remotes/").unwrap_or(base) == target);
+    // As Orca: a workspace already reading the whole PR stays there rather than flipping on each view.
     match context.viewer_latest_review_commit.as_deref() {
-        Some(oid) if has_commit(oid) => "since-review",
+        Some(oid) if !on_target && has_commit(oid) => "since-review",
         _ => "whole",
     }
 }
@@ -1308,26 +1316,28 @@ impl Server {
         if let Some(context) = &context {
             let path = workspace.path.clone();
             let context_c = context.clone();
+            let current_base_ref = workspace.base_ref.clone();
             let (options, default) = tokio::task::spawn_blocking(move || {
                 let has = |oid: &str| commit_exists(&path, oid);
                 (
                     base_options(&context_c, &has),
-                    default_base(&context_c, &has),
+                    default_base(&context_c, current_base_ref.as_deref(), &has),
                 )
             })
             .await
             .map_err(internal)?;
             base["options"] = json!(options);
             base["default"] = json!(default);
-            base["selected"] = json!(session.base.as_deref().unwrap_or(default));
-            if let Some(pick) = session.base.as_deref() {
-                match self.apply_review_base(workspace, pick, context).await {
-                    Ok(applied) => {
-                        base["applied_ref"] = json!(applied.base_ref);
-                        base["applied"] = json!(applied);
-                    }
-                    Err(error) => base["error"] = json!(error),
+            // Why the default is applied too: otherwise a stacked PR's Changes read against the
+            // workspace's own base (main) and list everything the target branch adds.
+            let pick = session.base.as_deref().unwrap_or(default);
+            base["selected"] = json!(pick);
+            match self.apply_review_base(workspace, pick, context).await {
+                Ok(applied) => {
+                    base["applied_ref"] = json!(applied.base_ref);
+                    base["applied"] = json!(applied);
                 }
+                Err(error) => base["error"] = json!(error),
             }
         }
         let own = context.as_ref().is_some_and(|c| c.viewer_did_author);
@@ -1811,9 +1821,18 @@ mod tests {
         assert_eq!(options[1]["tags"], json!(["Review 2"]));
         assert_eq!(options[3]["tags"], json!(["Review 1"]));
         assert_eq!(options[4]["label"], "main · target branch");
-        assert_eq!(default_base(&context(), &all), "since-review");
+        assert_eq!(default_base(&context(), Some("origin/main"), &all), "whole");
+        assert_eq!(
+            default_base(&context(), Some("refs/remotes/origin/main"), &all),
+            "whole"
+        );
+        assert_eq!(
+            default_base(&context(), Some("origin/develop"), &all),
+            "since-review"
+        );
+        assert_eq!(default_base(&context(), None, &all), "since-review");
         let none = |_: &str| false;
-        assert_eq!(default_base(&context(), &none), "whole");
+        assert_eq!(default_base(&context(), None, &none), "whole");
         assert_eq!(base_options(&context(), &none)[0]["available"], false);
     }
 

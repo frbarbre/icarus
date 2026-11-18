@@ -200,14 +200,13 @@ impl Server {
             self.store.kv_get(&sleep_key(&workspace.id)),
             Ok(Some(_))
         ));
-        value["pr_author"] = workspace
-            .branch
-            .as_deref()
+        let primary = workspace.discovery.origin == crate::discovery::ORIGIN_PRIMARY;
+        // As Orca: the main checkout's branch is the base, so a PR headed by it (a release) isn't its own.
+        let pr_branch = workspace.branch.as_deref().filter(|_| !primary);
+        value["pr_author"] = pr_branch
             .map(|branch| self.github.cached_pr_author(&workspace.project_id, branch))
             .unwrap_or(Value::Null);
-        value["pr"] = workspace
-            .branch
-            .as_deref()
+        value["pr"] = pr_branch
             .map(|branch| self.github.cached_pr_summary(&workspace.project_id, branch))
             .unwrap_or(Value::Null);
         self.enrich_issue(&mut value["issue"]);
@@ -437,8 +436,14 @@ impl Server {
                 if let Some(title) = p.title {
                     workspace.title = Some(title);
                 }
+                let base_changed = p
+                    .base
+                    .as_ref()
+                    .is_some_and(|base| workspace.base_ref.as_deref().unwrap_or("") != base.trim());
                 if let Some(base) = p.base {
-                    workspace.base_ref = Some(base);
+                    // An empty base follows the repository's primary branch again, as Orca's "Use Primary".
+                    workspace.base_ref =
+                        Some(base.trim().to_string()).filter(|base| !base.is_empty());
                 }
                 if let Some(issue) = p.issue {
                     workspace.issue = if issue.is_null() { None } else { Some(issue) };
@@ -454,7 +459,41 @@ impl Server {
                         json!({ "workspaces": [workspace.id], "source": "pin" }),
                     );
                 }
+                if base_changed {
+                    self.git_writes
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    self.broadcast(
+                        crate::gitops::GIT_CHANGED_TOPIC,
+                        json!({ "workspace": workspace.id, "op": "base" }),
+                    );
+                    self.publish_next_action(workspace.clone());
+                }
                 Ok(self.workspace_json(&workspace))
+            }
+            "workspace.refs" => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                    #[serde(default)]
+                    query: String,
+                    limit: Option<usize>,
+                }
+                let p: P = params(p)?;
+                let workspace = self.workspace_by_key(&p.id)?;
+                let limit = p.limit.unwrap_or(20).clamp(1, 200);
+                let path = workspace.path.clone();
+                let refs = tokio::task::spawn_blocking(move || {
+                    icarus_git::search_base_refs(&path, &p.query, limit)
+                })
+                .await
+                .map_err(internal)?
+                .map_err(|e| rpc("git_failed", format!("{e:#}")))?;
+                Ok(json!({
+                    "base_ref": workspace.base_ref,
+                    "default_base": refs.default_base,
+                    "remote_count": refs.remote_count,
+                    "refs": refs.refs,
+                }))
             }
             "workspace.reorder" => {
                 #[derive(Deserialize)]

@@ -110,7 +110,7 @@ pub struct Server {
     pub(crate) focus: std::sync::Mutex<HashMap<String, String>>,
     reads: crate::coalesce::Coalesced,
     /// Bumped as each git write finishes, so a read never joins a run that started before it.
-    git_writes: std::sync::atomic::AtomicU64,
+    pub(crate) git_writes: std::sync::atomic::AtomicU64,
 }
 
 type Outbound = mpsc::UnboundedSender<ServerMessage>;

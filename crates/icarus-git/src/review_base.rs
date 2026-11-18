@@ -122,6 +122,30 @@ pub fn resolve_review_base(
         return Ok(ReviewBase::Reviewed { base: reviewed });
     }
     let (tree, conflicted) = merge_tree(worktree, &reviewed_base, &current_base, &reviewed)?;
+    let prefix = format!("{REVIEW_BASE_PREFIX}{}-", worktree_key(worktree));
+    let existing = git(
+        worktree,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(tree) %(parent)",
+            REVIEW_BASE_PREFIX.trim_end_matches('/'),
+        ],
+    )
+    .unwrap_or_default();
+    // Why reuse: commit-tree stamps the time, so rebuilding would rename the base on every view
+    // and every rename makes the app reload the workspace.
+    let reusable = existing.lines().find_map(|line| {
+        let mut fields = line.split(' ');
+        let (name, ref_tree, parent) = (fields.next()?, fields.next()?, fields.next()?);
+        (name.starts_with(&prefix) && ref_tree == tree && parent == current_base)
+            .then(|| name.to_owned())
+    });
+    if let Some(base_ref) = reusable {
+        return Ok(ReviewBase::Interdiff {
+            base_ref,
+            conflicted,
+        });
+    }
     let message = format!(
         "Reviewed {} replayed onto {}",
         &reviewed[..12.min(reviewed.len())],
@@ -144,7 +168,6 @@ pub fn resolve_review_base(
     )?
     .trim()
     .to_owned();
-    let prefix = format!("{REVIEW_BASE_PREFIX}{}-", worktree_key(worktree));
     // Why a new name per rebuild: anything caching by ref name must not serve the old replay.
     let name = format!("{prefix}{}", &commit[..12.min(commit.len())]);
     git(worktree, &["update-ref", &name, &commit])?;
@@ -310,6 +333,21 @@ mod tests {
         ]);
         assert_eq!(refs.lines().count(), 1, "{refs}");
         assert_eq!(refs.trim(), second.base_ref().expect("ref"));
+    }
+
+    #[test]
+    fn resolving_the_same_interdiff_again_keeps_its_ref() {
+        let repo = Repo::new();
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        let reviewed = repo.commit("b.txt", "b\n", "first");
+        repo.git(&["checkout", "-q", "main"]);
+        repo.commit("upstream.txt", "u\n", "upstream");
+        repo.git(&["checkout", "-q", "feature"]);
+        repo.git(&["rebase", "-q", "main"]);
+        let first = resolve_review_base(&repo.path, &reviewed, "main").expect("first");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = resolve_review_base(&repo.path, &reviewed, "main").expect("second");
+        assert_eq!(first, second);
     }
 
     #[test]
