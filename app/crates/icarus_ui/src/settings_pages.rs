@@ -1,4 +1,4 @@
-//! Icarus's own settings as a tab (plan §4, features.md §2.17). Everything goes through the server's
+//! Icarus's settings as pages of the app's settings window. Everything goes through the server's
 //! `config.*` RPCs, so the user, project and project-local layers stay authoritative and each row
 //! says which layer its value comes from. Complex values open the layer's JSON file instead.
 
@@ -9,19 +9,19 @@ use std::sync::Arc;
 use anyhow::Result;
 use editor::{Editor, EditorEvent};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, Task, WeakEntity,
-    Window, actions, div,
+    AnyElement, AnyWindowHandle, App, Context, Entity, Focusable, IntoElement, ParentElement,
+    Render, SharedString, Styled, Subscription, Task, WeakEntity, Window, WindowHandle, actions,
+    div,
 };
 use icarus_client::Client;
 use serde_json::{Value, json};
+use settings_ui::ExtensionSection;
 use ui::{
     ContextMenu, IconButton, IconName, Label, LabelSize, PopoverMenu, Switch, ToggleButtonGroup,
     ToggleButtonSimple, ToggleState, Tooltip, prelude::*,
 };
 use util::ResultExt as _;
-use workspace::item::{Item, ItemEvent};
-use workspace::{OpenOptions, Workspace};
+use workspace::{MultiWorkspace, OpenOptions, Workspace};
 
 use crate::cards::CARD_FIELDS;
 use crate::model::StatusColumn;
@@ -31,7 +31,7 @@ use crate::status_style::{STATUS_COLORS, STATUS_ICONS, status_icon, swatch_color
 actions!(
     icarus,
     [
-        /// Opens Icarus's own settings: statuses, rules, agents, integrations and more.
+        /// Opens Icarus's settings: statuses, automations and prompts.
         OpenSettings,
         /// Opens Icarus's settings at the apps in Source Control's "Open in" menu.
         CustomizeOpenInApps,
@@ -42,19 +42,106 @@ actions!(
     ]
 );
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Statuses,
+    Scripts,
+    Prompts,
+    Cards,
+    Ports,
+    Layouts,
+    OpenIn,
+    Agents,
+    Integrations,
+    Notifications,
+    Updates,
+}
+
+pub const PAGES: &[(&str, &[Section])] = &[
+    (
+        "Automations",
+        &[Section::Statuses, Section::Scripts, Section::Prompts],
+    ),
+    (
+        "Workspaces",
+        &[
+            Section::Cards,
+            Section::Ports,
+            Section::Layouts,
+            Section::OpenIn,
+        ],
+    ),
+    (
+        "Icarus",
+        &[
+            Section::Agents,
+            Section::Integrations,
+            Section::Notifications,
+            Section::Updates,
+        ],
+    ),
+];
+
+impl Section {
+    pub fn title(self) -> &'static str {
+        match self {
+            Section::Statuses => "Statuses",
+            Section::Scripts => "Scripts",
+            Section::Prompts => "Prompts",
+            Section::Cards => "Workspace Cards",
+            Section::Ports => "Ports and Previews",
+            Section::Layouts => "Layouts",
+            Section::OpenIn => "Open In Apps",
+            Section::Agents => "Agents",
+            Section::Integrations => "Integrations",
+            Section::Notifications => "Notifications",
+            Section::Updates => "Updates",
+        }
+    }
+
+    fn page(self) -> &'static str {
+        PAGES
+            .iter()
+            .find(|(_, sections)| sections.contains(&self))
+            .map_or("Automations", |(page, _)| page)
+    }
+
+    fn starts_page(self) -> bool {
+        PAGES
+            .iter()
+            .any(|(_, sections)| sections.first() == Some(&self))
+    }
+}
+
 const OPEN_IN: &str = "sourceControl.openIn";
+const PROMPTS: &str = "prompts";
+// The next-action button reads these; listed even when unset so they stay editable.
+const NEXT_ACTION_PROMPTS: [&str; 4] = [
+    "commitAndPush",
+    "createPullRequest",
+    "readyForReview",
+    "reviewPullRequest",
+];
+const SCRIPTS: &str = "automations.scripts";
 
-/// The scrolled blocks of the view, so a block can be scrolled into view.
-const AGENTS_BLOCK: usize = 1;
-const LINEAR_BLOCK: usize = 2;
-const OPEN_IN_BLOCK: usize = 3;
-
-/// One app in the "Open in" list editor.
 struct OpenInRow {
     id: String,
     label: Entity<Editor>,
     command: Entity<Editor>,
     _subscriptions: [Subscription; 2],
+}
+
+struct PromptRow {
+    id: String,
+    template: Entity<Editor>,
+    _subscription: Subscription,
+}
+
+struct ScriptRow {
+    project_id: String,
+    saved: String,
+    path: Entity<Editor>,
+    _subscription: Subscription,
 }
 
 /// The layer edits go to.
@@ -80,8 +167,6 @@ enum Control {
     Toggle,
     Choice(&'static [&'static str]),
     Text,
-    /// A prompt template: several lines, blank means the built-in one.
-    Prompt,
     Integer,
     /// One of the user's status columns, or none.
     Status,
@@ -128,8 +213,6 @@ impl Field {
         }
     }
 }
-
-const NEW_WORKSPACE_STATUS: &str = "rules.pr.newWorkspaceStatus";
 
 const AGENTS: &[Field] = &[
     field(
@@ -179,169 +262,6 @@ const AUTOMATIONS: &[Field] = &[
         "Hold column",
         "Workspaces in this column get no actions unless the action says force.",
         Control::Status,
-    ),
-];
-
-const PROMPTS: &str = "prompts";
-const SCRIPTS: &str = "automations.scripts";
-
-/// One prompt template in the prompts editor.
-struct PromptRow {
-    id: String,
-    template: Entity<Editor>,
-    _subscription: Subscription,
-}
-
-/// One project's script path in the automations section.
-struct ScriptRow {
-    project_id: String,
-    saved: String,
-    path: Entity<Editor>,
-    _subscription: Subscription,
-}
-
-const AUTOMATION: &[Field] = &[
-    field(
-        "rules.enabled",
-        "Run the automation loop",
-        "Poll pull requests and plan rule actions.",
-        Control::Toggle,
-    ),
-    field(
-        "rules.armed",
-        "Act on plans",
-        "Until on, every tick is a dry run.",
-        Control::Toggle,
-    ),
-    field(
-        "rules.interval_ms",
-        "Polling interval (ms)",
-        "How often the rules run.",
-        Control::Integer,
-    ),
-    field(
-        "rules.pr.enabled",
-        "Move cards by pull request state",
-        "The status rules below.",
-        Control::Toggle,
-    ),
-];
-
-const RULE_OPTIONS: &[Field] = &[
-    field(
-        NEW_WORKSPACE_STATUS,
-        "New workspaces start in",
-        "Where a new workspace goes before it has a pull request; existing ones keep their column.",
-        Control::Status,
-    ),
-    field(
-        "rules.pr.holdStatus",
-        "Hold workspaces in",
-        "The rules never move, remove or update a workspace in this column.",
-        Control::Status,
-    ),
-    field(
-        "rules.pr.mergingCheckName",
-        "Merge gate check name",
-        "The check run or commit status that decides \"Merge gate passed\".",
-        Control::Text,
-    )
-    .placeholder("Reviews satisfied"),
-    field(
-        "rules.pr.pmApprovalTeam",
-        "PM approval team",
-        "As org/team-slug; empty skips the PM approval column.",
-        Control::Text,
-    )
-    .placeholder("org/team-slug"),
-    field(
-        "rules.pr.reviewEnteredCommand",
-        "Command when your PR enters Review",
-        "Runs once in the workspace's folder each time it moves into the review column.",
-        Control::Text,
-    )
-    .placeholder("Run nothing"),
-    field(
-        "rules.pr.onResolved",
-        "When your PR is merged or closed",
-        "Delete removes the workspace once its pull request is done.",
-        Control::Choice(&["none", "delete"]),
-    ),
-    field(
-        "rules.pr.onReviewed",
-        "When you have reviewed",
-        "Delete removes a review workspace once your review is in.",
-        Control::Choice(&["none", "delete"]),
-    ),
-    field(
-        "rules.pr.resolveConflictsWithAgent",
-        "Resolve conflicts with an agent",
-        "Start an agent when your PR enters the conflicts column.",
-        Control::Toggle,
-    ),
-    field(
-        "rules.pr.conflictPromptTemplate",
-        "Conflict prompt",
-        "What that agent is asked; blank uses the built-in prompt.",
-        Control::Prompt,
-    ),
-    field(
-        "rules.pr.reviewInbox.enabled",
-        "Review inbox",
-        "Create a review workspace for each review request.",
-        Control::Toggle,
-    ),
-    field(
-        "rules.pr.reviewInbox.agent",
-        "Review agent",
-        "Runs reviews, conflict fixes and action prompts.",
-        Control::Choice(&["claude", "codex"]),
-    ),
-    field(
-        "rules.pr.reviewInbox.view",
-        "Review agent view",
-        "How a review workspace shows its agent.",
-        Control::Choice(&["chat", "terminal", "default"]),
-    ),
-    field(
-        "rules.pr.reviewInbox.promptTemplate",
-        "Review prompt",
-        "The first look at a pull request; blank uses the built-in prompt.",
-        Control::Prompt,
-    ),
-    field(
-        "rules.pr.reviewInbox.rereviewPromptTemplate",
-        "Re-review prompt",
-        "After new commits; blank uses the built-in prompt.",
-        Control::Prompt,
-    ),
-];
-
-/// Orca's top bar action prompts (`actionPrompts`), used by the next-action button.
-const ACTION_PROMPTS: &[Field] = &[
-    field(
-        "rules.pr.actionPrompts.commitAndPush",
-        "Commit & push",
-        "Blank uses the built-in prompt.",
-        Control::Prompt,
-    ),
-    field(
-        "rules.pr.actionPrompts.createPullRequest",
-        "Create PR",
-        "Blank uses the built-in prompt.",
-        Control::Prompt,
-    ),
-    field(
-        "rules.pr.actionPrompts.readyForReview",
-        "Ready for review",
-        "Blank uses the built-in prompt.",
-        Control::Prompt,
-    ),
-    field(
-        "rules.pr.actionPrompts.reviewPullRequest",
-        "Review",
-        "Blank uses the built-in prompt.",
-        Control::Prompt,
     ),
 ];
 
@@ -403,29 +323,13 @@ const UPDATES: &[Field] = &[field(
     Control::Choice(&["stable", "none"]),
 )];
 
-/// Orca's PR conditions, in the order its settings list them.
-pub const CONDITIONS: &[(&str, &str)] = &[
-    ("merged", "Merged"),
-    ("closed", "Closed"),
-    ("reviewing", "Reviewing"),
-    ("merge-queue", "In the merge queue"),
-    ("conflicts", "Has conflicts"),
-    ("draft", "Draft"),
-    ("changes-requested", "Changes requested"),
-    ("merging", "Merging"),
-    ("pm-approval", "Waiting for PM approval"),
-    ("review", "In review"),
-];
-
-const STATUS_BY_CONDITION: &str = "rules.pr.statusByCondition";
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
     pub layer: String,
     pub path: Option<String>,
 }
 
-/// What the view shows, loaded in one go.
+/// What the pages show, loaded in one go.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub resolved: Value,
@@ -454,9 +358,8 @@ pub fn slug(label: &str) -> String {
     out.trim_matches('-').to_owned()
 }
 
-pub struct SettingsView {
-    workspace: WeakEntity<Workspace>,
-    focus_handle: FocusHandle,
+pub struct IcarusSettings {
+    workspace_window: Option<WindowHandle<MultiWorkspace>>,
     client: Option<Arc<Client>>,
     root: Option<PathBuf>,
     project: Option<String>,
@@ -469,9 +372,6 @@ pub struct SettingsView {
     status_editor: Entity<Editor>,
     renaming: Option<String>,
     open_in_rows: Vec<OpenInRow>,
-    scroll_handle: ScrollHandle,
-    /// The block to scroll to once the settings have loaded.
-    reveal: Option<usize>,
     /// The server's `linear.status`; never holds the key.
     linear: Option<Value>,
     linear_key: Entity<Editor>,
@@ -566,114 +466,69 @@ fn ago(since_ms: i64) -> String {
     }
 }
 
-/// One line on a project's last run and its shadow comparison with the built-in rules.
+/// One line on a project's last run.
 pub fn run_summary(project: &Value) -> String {
     let last = &project["last_run"];
-    let last = match last["started_ms"].as_i64() {
-        None => "Never run".to_owned(),
-        Some(started) => {
-            let outcome = if last["failed"].as_bool() == Some(true) {
-                "failed"
-            } else if last["acted"].as_bool() == Some(true) {
-                "acted"
-            } else {
-                "no changes"
-            };
-            let dry = if last["dry_run"].as_bool() == Some(true) {
-                ", dry run"
-            } else {
-                ""
-            };
-            format!("Last run {}: {outcome}{dry}", ago(started))
-        }
+    let Some(started) = last["started_ms"].as_i64() else {
+        return "Never run".to_owned();
     };
-    let shadow = &project["shadow"];
-    let compared = shadow["compared"].as_i64().unwrap_or(0);
-    if compared == 0 {
-        return last;
-    }
-    let differed = shadow["differed"].as_i64().unwrap_or(0);
-    let since = shadow["since_ms"]
-        .as_i64()
-        .map(|since| format!(" since {}", ago(since)))
-        .unwrap_or_default();
-    format!("{last} · shadow: {differed} of {compared} ticks differed from the rules{since}")
+    let outcome = if last["failed"].as_bool() == Some(true) {
+        "failed"
+    } else if last["acted"].as_bool() == Some(true) {
+        "acted"
+    } else {
+        "no changes"
+    };
+    let dry = if last["dry_run"].as_bool() == Some(true) {
+        ", dry run"
+    } else {
+        ""
+    };
+    format!("Last run {}: {outcome}{dry}", ago(started))
 }
 
 #[derive(Default)]
-struct OpenSettingsViews(Vec<(gpui::AnyWindowHandle, WeakEntity<SettingsView>)>);
+struct LiveSettings(Vec<(AnyWindowHandle, WeakEntity<IcarusSettings>)>);
 
-impl gpui::Global for OpenSettingsViews {}
+impl gpui::Global for LiveSettings {}
 
 /// Handles the server's `config.changed`: settings were written somewhere (CLI, an agent, an editor).
 pub(crate) fn config_changed(cx: &mut App) {
-    let views = cx
-        .try_global::<OpenSettingsViews>()
-        .map(|views| views.0.clone())
+    let open = cx
+        .try_global::<LiveSettings>()
+        .map(|open| open.0.clone())
         .unwrap_or_default();
-    for (handle, view) in views {
+    for (handle, settings) in open {
         handle
             .update(cx, |_, window, cx| {
-                view.update(cx, |view, cx| view.reload(window, cx))
+                settings.update(cx, |settings, cx| settings.reload(window, cx))
             })
             .ok();
     }
-    if cx.has_global::<OpenSettingsViews>() {
-        cx.update_global::<OpenSettingsViews, _>(|views, _| {
-            views.0.retain(|(_, view)| view.upgrade().is_some());
+    if cx.has_global::<LiveSettings>() {
+        cx.update_global::<LiveSettings, _>(|open, _| {
+            open.0.retain(|(_, settings)| settings.upgrade().is_some());
         });
     }
 }
 
-impl EventEmitter<ItemEvent> for SettingsView {}
-
-impl Focusable for SettingsView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl SettingsView {
+impl IcarusSettings {
     pub fn new(
-        workspace: WeakEntity<Workspace>,
+        workspace_window: Option<WindowHandle<MultiWorkspace>>,
         root: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut editors = HashMap::new();
         let mut subscriptions = Vec::new();
-        for field in [
-            AUTOMATIONS,
-            AUTOMATION,
-            RULE_OPTIONS,
-            ACTION_PROMPTS,
-            INTEGRATIONS,
-            PORTS,
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|f| {
-            matches!(
-                f.control,
-                Control::Text | Control::Prompt | Control::Integer
-            )
-        }) {
-            let prompt = field.control == Control::Prompt;
+        for field in [AUTOMATIONS, INTEGRATIONS, PORTS]
+            .into_iter()
+            .flatten()
+            .filter(|field| matches!(field.control, Control::Text | Control::Integer))
+        {
             let editor = cx.new(|cx| {
-                let mut editor = if prompt {
-                    let mut editor = Editor::auto_height(1, 8, window, cx);
-                    editor.set_soft_wrap();
-                    editor
-                } else {
-                    Editor::single_line(window, cx)
-                };
-                editor.set_placeholder_text(
-                    field
-                        .placeholder
-                        .unwrap_or(if prompt { "Built-in prompt" } else { "Not set" }),
-                    window,
-                    cx,
-                );
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text(field.placeholder.unwrap_or("Not set"), window, cx);
                 editor
             });
             let key = field.key;
@@ -706,9 +561,8 @@ impl SettingsView {
             editor.set_placeholder_text("New prompt id", window, cx);
             editor
         });
-        let mut view = Self {
-            workspace,
-            focus_handle: cx.focus_handle(),
+        let mut settings = Self {
+            workspace_window,
             client: app_client(cx),
             root,
             project: None,
@@ -721,8 +575,6 @@ impl SettingsView {
             status_editor,
             renaming: None,
             open_in_rows: Vec::new(),
-            scroll_handle: ScrollHandle::new(),
-            reveal: None,
             linear: None,
             linear_key,
             linear_busy: false,
@@ -742,19 +594,17 @@ impl SettingsView {
         };
         let handle = window.window_handle();
         let weak = cx.weak_entity();
-        cx.default_global::<OpenSettingsViews>()
-            .0
-            .push((handle, weak));
-        view.reload(window, cx);
-        view
+        cx.default_global::<LiveSettings>().0.push((handle, weak));
+        settings.reload(window, cx);
+        settings
     }
 
-    /// The view filled from a fixed snapshot, for screenshots and tests.
+    /// The pages filled from a fixed snapshot, for screenshots and tests.
     pub fn preview(snapshot: Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut view = Self::new(WeakEntity::new_invalid(), None, window, cx);
-        view.loading = None;
-        view.apply(snapshot, window, cx);
-        view
+        let mut settings = Self::new(None, None, window, cx);
+        settings.loading = None;
+        settings.apply(snapshot, window, cx);
+        settings
     }
 
     pub fn scope(&self) -> Scope {
@@ -847,9 +697,6 @@ impl SettingsView {
         let keys: Vec<&'static str> = [
             AGENTS,
             AUTOMATIONS,
-            AUTOMATION,
-            RULE_OPTIONS,
-            ACTION_PROMPTS,
             INTEGRATIONS,
             NOTIFICATIONS,
             PORTS,
@@ -857,13 +704,8 @@ impl SettingsView {
         ]
         .into_iter()
         .flatten()
-        .map(|f| f.key)
-        .chain([
-            "workspace.statuses",
-            "workspace.cardFields",
-            STATUS_BY_CONDITION,
-            OPEN_IN,
-        ])
+        .map(|field| field.key)
+        .chain(["workspace.statuses", "workspace.cardFields", OPEN_IN])
         .collect();
         let project = self.project.clone();
         let workspaces = request(client.clone(), "workspace.list", json!({}), cx);
@@ -972,33 +814,7 @@ impl SettingsView {
         self.snapshot = Some(snapshot);
         self.sync_open_in_rows(window, cx);
         self.sync_prompt_rows(window, cx);
-        if let Some(block) = self.reveal.take() {
-            self.scroll_handle.scroll_to_top_of_item(block);
-        }
         cx.notify();
-    }
-
-    /// Scrolls to a block, now or once the settings have loaded.
-    fn reveal_block(&mut self, block: usize, cx: &mut Context<Self>) {
-        if self.snapshot.is_some() {
-            self.scroll_handle.scroll_to_top_of_item(block);
-            cx.notify();
-        } else {
-            self.reveal = Some(block);
-        }
-    }
-
-    pub fn reveal_agents(&mut self, cx: &mut Context<Self>) {
-        self.reveal_block(AGENTS_BLOCK, cx);
-    }
-
-    pub fn reveal_open_in(&mut self, cx: &mut Context<Self>) {
-        self.reveal_block(OPEN_IN_BLOCK, cx);
-    }
-
-    pub fn reveal_linear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.reveal_block(LINEAR_BLOCK, cx);
-        window.focus(&self.linear_key.focus_handle(cx), cx);
     }
 
     /// The apps as saved (unknown fields kept), or Orca's default while none are.
@@ -1350,6 +1166,11 @@ impl SettingsView {
                     .collect()
             })
             .unwrap_or_default();
+        for id in NEXT_ACTION_PROMPTS {
+            if !prompts.iter().any(|(saved, _)| saved == id) {
+                prompts.push((id.to_owned(), String::new()));
+            }
+        }
         prompts.sort();
         prompts
     }
@@ -1377,11 +1198,12 @@ impl SettingsView {
                 let template = cx.new(|cx| {
                     let mut editor = Editor::auto_height(1, 8, window, cx);
                     editor.set_soft_wrap();
-                    editor.set_placeholder_text(
-                        "Template, e.g. Fix the checks of #{{pr.number}}",
-                        window,
-                        cx,
-                    );
+                    let placeholder = if NEXT_ACTION_PROMPTS.contains(&id.as_str()) {
+                        "The built-in prompt for the next-action button's step"
+                    } else {
+                        "Template, e.g. Fix the checks of #{{pr.number}}"
+                    };
+                    editor.set_placeholder_text(placeholder, window, cx);
                     editor.set_text(text, window, cx);
                     editor
                 });
@@ -1706,29 +1528,6 @@ impl SettingsView {
         self.write_statuses(&statuses, window, cx);
     }
 
-    /// A status column setting; a new-workspace column also stamps when it took effect, as Orca does,
-    /// so only workspaces created afterwards start there.
-    pub fn choose_status(
-        &mut self,
-        key: &str,
-        status: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if key == NEW_WORKSPACE_STATUS {
-            let since = status.as_ref().map(|_| {
-                json!(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|elapsed| elapsed.as_millis() as u64)
-                        .unwrap_or_default()
-                )
-            });
-            self.write(&format!("{NEW_WORKSPACE_STATUS}Since"), since, window, cx);
-        }
-        self.write(key, status.map(|status| json!(status)), window, cx);
-    }
-
     pub fn toggle_card_field(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let mut fields: Vec<String> = self
             .snapshot
@@ -1749,7 +1548,7 @@ impl SettingsView {
         self.write("workspace.cardFields", Some(json!(fields)), window, cx);
     }
 
-    fn open_layer_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_layer_file(&mut self, cx: &mut Context<Self>) {
         let key = self.scope.layer();
         let Some(path) = self
             .snapshot
@@ -1761,17 +1560,25 @@ impl SettingsView {
             cx.notify();
             return;
         };
+        let Some(workspace_window) = self.workspace_window else {
+            self.error = Some(format!("Open {} in an editor.", path.display()));
+            cx.notify();
+            return;
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).log_err();
         }
         if !path.exists() {
             std::fs::write(&path, "{\n}\n").log_err();
         }
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace
-                    .open_abs_path(path, OpenOptions::default(), window, cx)
-                    .detach_and_log_err(cx);
+        workspace_window
+            .update(cx, |multi, window, cx| {
+                window.activate_window();
+                multi.workspace().update(cx, |workspace, cx| {
+                    workspace
+                        .open_abs_path(path, OpenOptions::default(), window, cx)
+                        .detach_and_log_err(cx);
+                });
             })
             .log_err();
     }
@@ -1791,8 +1598,7 @@ impl SettingsView {
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
                     );
-                    let first = text
-                        .lines()
+                    text.lines()
                         .map(str::trim)
                         .find(|l| l.contains("Logged in") || l.contains("not logged"))
                         .unwrap_or(if output.status.success() {
@@ -1801,8 +1607,7 @@ impl SettingsView {
                             "Not signed in: run `gh auth login`."
                         })
                         .trim_start_matches(['✓', 'X', ' '])
-                        .to_owned();
-                    first
+                        .to_owned()
                 }
                 Err(_) => "The GitHub CLI (gh) isn't installed.".to_owned(),
             }
@@ -1841,6 +1646,32 @@ impl SettingsView {
         }
     }
 
+    fn text_field(editor: &Entity<Editor>, width: f32, cx: &App) -> impl IntoElement {
+        div()
+            .w(px(width))
+            .px_1p5()
+            .py_0p5()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(editor.clone())
+    }
+
+    fn describe(label: impl Into<SharedString>, help: impl Into<SharedString>) -> impl IntoElement {
+        v_flex().min_w_0().child(Label::new(label.into())).child(
+            Label::new(help.into())
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+    }
+
+    fn render_rows(&self, fields: &'static [Field], cx: &mut Context<Self>) -> Vec<AnyElement> {
+        fields
+            .iter()
+            .map(|field| self.render_row(field, cx))
+            .collect()
+    }
+
     fn render_row(&self, field: &Field, cx: &mut Context<Self>) -> AnyElement {
         let value = self
             .snapshot
@@ -1858,8 +1689,10 @@ impl SettingsView {
                 Switch::new(SharedString::from(format!("switch-{key}")), on.into())
                     .on_click(move |state, window, cx| {
                         let on = *state == ToggleState::Selected;
-                        weak.update(cx, |view, cx| view.write(key, Some(json!(on)), window, cx))
-                            .log_err();
+                        weak.update(cx, |settings, cx| {
+                            settings.write(key, Some(json!(on)), window, cx)
+                        })
+                        .log_err();
                     })
                     .into_any_element()
             }
@@ -1887,8 +1720,8 @@ impl SettingsView {
                             for option in options {
                                 let weak = weak.clone();
                                 menu = menu.entry(*option, None, move |window, cx| {
-                                    weak.update(cx, |view, cx| {
-                                        view.write(key, Some(json!(option)), window, cx)
+                                    weak.update(cx, |settings, cx| {
+                                        settings.write(key, Some(json!(option)), window, cx)
                                     })
                                     .log_err();
                                 });
@@ -1932,8 +1765,13 @@ impl SettingsView {
                             for (id, label) in choices {
                                 let weak = weak.clone();
                                 menu = menu.entry(label, None, move |window, cx| {
-                                    weak.update(cx, |view, cx| {
-                                        view.choose_status(key, id.clone(), window, cx)
+                                    weak.update(cx, |settings, cx| {
+                                        settings.write(
+                                            key,
+                                            id.clone().map(|id| json!(id)),
+                                            window,
+                                            cx,
+                                        )
                                     })
                                     .log_err();
                                 });
@@ -1943,20 +1781,8 @@ impl SettingsView {
                     })
                     .into_any_element()
             }
-            Control::Text | Control::Prompt | Control::Integer => match self.editors.get(key) {
-                Some(editor) => div()
-                    .w(px(if field.control == Control::Prompt {
-                        320.
-                    } else {
-                        260.
-                    }))
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(editor.clone())
-                    .into_any_element(),
+            Control::Text | Control::Integer => match self.editors.get(key) {
+                Some(editor) => Self::text_field(editor, 260., cx).into_any_element(),
                 None => div().into_any_element(),
             },
         };
@@ -1969,7 +1795,7 @@ impl SettingsView {
             .icon_size(ui::IconSize::XSmall)
             .tooltip(Tooltip::text("Remove from this layer"))
             .on_click(move |_, window, cx| {
-                weak.update(cx, |view, cx| view.write(key, None, window, cx))
+                weak.update(cx, |settings, cx| settings.write(key, None, window, cx))
                     .log_err();
             })
         });
@@ -1978,13 +1804,7 @@ impl SettingsView {
             .py_1p5()
             .gap_4()
             .justify_between()
-            .child(
-                v_flex().min_w_0().child(Label::new(field.label)).child(
-                    Label::new(field.help)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
-            )
+            .child(Self::describe(field.label, field.help))
             .child(
                 h_flex()
                     .gap_2()
@@ -2000,13 +1820,152 @@ impl SettingsView {
             .into_any_element()
     }
 
-    fn section(title: &'static str, cx: &App) -> impl IntoElement {
-        div()
-            .pt_5()
-            .pb_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
-            .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+    fn render_scope(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_project = self.project.is_some();
+        let scope = self.scope;
+        v_flex()
+            .pb_2()
+            .child(
+                h_flex()
+                    .gap_4()
+                    .justify_between()
+                    .child(Self::describe(
+                        "Icarus settings layer",
+                        match scope {
+                            Scope::User => {
+                                "Changes go to your settings (~/.config/icarus/icarus.json)."
+                            }
+                            Scope::Project => {
+                                "Changes go to the project's icarus.json, shared with everyone."
+                            }
+                            Scope::Local => {
+                                "Changes go to the project's icarus.local.json, on this machine only."
+                            }
+                        },
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_none()
+                            .child(
+                                ToggleButtonGroup::single_row(
+                                    "icarus-settings-scope",
+                                    [
+                                        ToggleButtonSimple::new(
+                                            "You",
+                                            cx.listener(|settings, _, _, cx| {
+                                                settings.set_scope(Scope::User, cx)
+                                            }),
+                                        ),
+                                        ToggleButtonSimple::new(
+                                            "Project",
+                                            cx.listener(move |settings, _, _, cx| {
+                                                if has_project {
+                                                    settings.set_scope(Scope::Project, cx)
+                                                }
+                                            }),
+                                        ),
+                                        ToggleButtonSimple::new(
+                                            "Local",
+                                            cx.listener(move |settings, _, _, cx| {
+                                                if has_project {
+                                                    settings.set_scope(Scope::Local, cx)
+                                                }
+                                            }),
+                                        ),
+                                    ],
+                                )
+                                .selected_index(match scope {
+                                    Scope::User => 0,
+                                    Scope::Project => 1,
+                                    Scope::Local => 2,
+                                })
+                                .style(ui::ToggleButtonGroupStyle::Outlined),
+                            )
+                            .child(
+                                ui::Button::new("icarus-settings-json", "Edit in JSON")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|settings, _, _, cx| {
+                                        settings.open_layer_file(cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .when_some(self.error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
+            .when(self.loading.is_some() && self.snapshot.is_none(), |this| {
+                this.child(Label::new("Loading…").color(Color::Muted))
+            })
+    }
+
+    fn render_section(&self, section: Section, cx: &mut Context<Self>) -> AnyElement {
+        match section {
+            Section::Statuses => self.render_statuses(cx).into_any_element(),
+            Section::Scripts => v_flex()
+                .children(self.render_rows(AUTOMATIONS, cx))
+                .child(self.render_automation_projects(cx))
+                .into_any_element(),
+            Section::Prompts => self.render_prompts(cx).into_any_element(),
+            Section::Cards => self.render_cards(cx).into_any_element(),
+            Section::Ports => v_flex()
+                .children(self.render_rows(PORTS, cx))
+                .into_any_element(),
+            Section::Layouts => self.render_layouts(cx).into_any_element(),
+            Section::OpenIn => self.render_open_in(cx).into_any_element(),
+            Section::Agents => v_flex()
+                .children(self.render_rows(AGENTS, cx))
+                .into_any_element(),
+            Section::Integrations => v_flex()
+                .child(
+                    h_flex()
+                        .py_1p5()
+                        .gap_4()
+                        .justify_between()
+                        .child(Self::describe(
+                            "GitHub",
+                            self.gh
+                                .clone()
+                                .unwrap_or_else(|| "Uses your GitHub CLI login (gh).".to_owned()),
+                        ))
+                        .child(
+                            ui::Button::new("icarus-settings-gh", "Check")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|settings, _, window, cx| {
+                                    settings.check_gh(window, cx)
+                                })),
+                        ),
+                )
+                .child(self.render_linear(cx))
+                .children(self.render_rows(INTEGRATIONS, cx))
+                .into_any_element(),
+            Section::Notifications => v_flex()
+                .children(self.render_rows(NOTIFICATIONS, cx))
+                .child(self.render_kinds(cx))
+                .into_any_element(),
+            Section::Updates => v_flex()
+                .children(self.render_rows(UPDATES, cx))
+                .into_any_element(),
+        }
+    }
+
+    fn render_layouts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let layouts = self
+            .snapshot
+            .as_ref()
+            .map(|s| s.layouts.join(", "))
+            .filter(|layouts| !layouts.is_empty())
+            .unwrap_or_else(|| "None".to_owned());
+        h_flex()
+            .py_1p5()
+            .gap_4()
+            .justify_between()
+            .child(Self::describe("Named tab layouts", layouts))
+            .child(
+                ui::Button::new("icarus-settings-layouts", "Edit in JSON")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|settings, _, _, cx| settings.open_layer_file(cx))),
+            )
     }
 
     fn render_statuses(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2081,8 +2040,8 @@ impl SettingsView {
                                                                 .into_any_element()
                                                         },
                                                         move |window, cx| {
-                                                            weak.update(cx, |view, cx| {
-                                                                view.restyle_status(
+                                                            weak.update(cx, |settings, cx| {
+                                                                settings.restyle_status(
                                                                     &id,
                                                                     Some(color.id),
                                                                     None,
@@ -2120,8 +2079,8 @@ impl SettingsView {
                                                         icon.label,
                                                         None,
                                                         move |window, cx| {
-                                                            weak.update(cx, |view, cx| {
-                                                                view.restyle_status(
+                                                            weak.update(cx, |settings, cx| {
+                                                                settings.restyle_status(
                                                                     &id,
                                                                     None,
                                                                     Some(icon.id),
@@ -2146,13 +2105,13 @@ impl SettingsView {
                                         let label = label_text.clone();
                                         let id = id_rename.clone();
                                         rename
-                                            .update(cx, |view, cx| {
-                                                view.renaming = Some(id);
-                                                view.status_editor.update(cx, |editor, cx| {
+                                            .update(cx, |settings, cx| {
+                                                settings.renaming = Some(id);
+                                                settings.status_editor.update(cx, |editor, cx| {
                                                     editor.set_text(label, window, cx)
                                                 });
                                                 window.focus(
-                                                    &view.status_editor.focus_handle(cx),
+                                                    &settings.status_editor.focus_handle(cx),
                                                     cx,
                                                 );
                                                 cx.notify();
@@ -2165,8 +2124,8 @@ impl SettingsView {
                                     .icon_size(ui::IconSize::XSmall)
                                     .disabled(index == 0)
                                     .on_click(move |_, window, cx| {
-                                        up.update(cx, |view, cx| {
-                                            view.move_status(&id_up, -1, window, cx)
+                                        up.update(cx, |settings, cx| {
+                                            settings.move_status(&id_up, -1, window, cx)
                                         })
                                         .log_err();
                                     }),
@@ -2176,8 +2135,8 @@ impl SettingsView {
                                     .icon_size(ui::IconSize::XSmall)
                                     .disabled(index + 1 == count)
                                     .on_click(move |_, window, cx| {
-                                        down.update(cx, |view, cx| {
-                                            view.move_status(&id_down, 1, window, cx)
+                                        down.update(cx, |settings, cx| {
+                                            settings.move_status(&id_down, 1, window, cx)
                                         })
                                         .log_err();
                                     }),
@@ -2188,8 +2147,8 @@ impl SettingsView {
                                     .tooltip(Tooltip::text("Remove"))
                                     .on_click(move |_, window, cx| {
                                         remove
-                                            .update(cx, |view, cx| {
-                                                view.remove_status(&id_remove, window, cx)
+                                            .update(cx, |settings, cx| {
+                                                settings.remove_status(&id_remove, window, cx)
                                             })
                                             .log_err();
                                     }),
@@ -2200,16 +2159,7 @@ impl SettingsView {
                 h_flex()
                     .pt_1()
                     .gap_2()
-                    .child(
-                        div()
-                            .w(px(260.))
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(cx.theme().colors().border_variant)
-                            .child(self.status_editor.clone()),
-                    )
+                    .child(Self::text_field(&self.status_editor, 260., cx))
                     .child(
                         ui::Button::new(
                             "status-add",
@@ -2220,92 +2170,11 @@ impl SettingsView {
                             },
                         )
                         .label_size(LabelSize::Small)
-                        .on_click(
-                            cx.listener(|view, _, window, cx| {
-                                view.add_or_rename_status(window, cx)
-                            }),
-                        ),
+                        .on_click(cx.listener(
+                            |settings, _, window, cx| settings.add_or_rename_status(window, cx),
+                        )),
                     ),
             )
-    }
-
-    fn render_conditions(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let statuses = self.statuses();
-        let mapping = self
-            .snapshot
-            .as_ref()
-            .and_then(|s| lookup(&s.resolved, STATUS_BY_CONDITION))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let weak = cx.entity().downgrade();
-        v_flex().children(CONDITIONS.iter().map(|(condition, label)| {
-            let target = mapping
-                .get(*condition)
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let shown: SharedString = target
-                .as_ref()
-                .map(|id| {
-                    statuses
-                        .iter()
-                        .find(|s| &s.id == id)
-                        .map_or_else(|| id.clone(), |s| s.label.clone())
-                })
-                .unwrap_or_else(|| "Don't move".to_owned())
-                .into();
-            let weak = weak.clone();
-            let statuses = statuses.clone();
-            h_flex()
-                .py_1()
-                .justify_between()
-                .child(Label::new(*label))
-                .child(
-                    PopoverMenu::new(SharedString::from(format!("condition-{condition}")))
-                        .trigger(
-                            ui::Button::new(
-                                SharedString::from(format!("condition-button-{condition}")),
-                                shown,
-                            )
-                            .label_size(LabelSize::Small)
-                            .end_icon(
-                                ui::Icon::new(IconName::ChevronDown).size(ui::IconSize::XSmall),
-                            ),
-                        )
-                        .menu(move |window, cx| {
-                            let weak = weak.clone();
-                            let statuses = statuses.clone();
-                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                let key = format!("{STATUS_BY_CONDITION}.{condition}");
-                                {
-                                    let weak = weak.clone();
-                                    let key = key.clone();
-                                    menu = menu.entry("Don't move", None, move |window, cx| {
-                                        weak.update(cx, |view, cx| {
-                                            view.write(&key, None, window, cx)
-                                        })
-                                        .log_err();
-                                    });
-                                }
-                                for status in &statuses {
-                                    let weak = weak.clone();
-                                    let key = key.clone();
-                                    let id = status.id.clone();
-                                    menu = menu.entry(
-                                        status.label.clone(),
-                                        None,
-                                        move |window, cx| {
-                                            weak.update(cx, |view, cx| {
-                                                view.write(&key, Some(json!(id)), window, cx)
-                                            })
-                                            .log_err();
-                                        },
-                                    );
-                                }
-                                menu
-                            }))
-                        }),
-                )
-        }))
     }
 
     fn render_kinds(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2327,8 +2196,8 @@ impl SettingsView {
                         move |state, window, cx| {
                             let key = format!("notifications.{kind}");
                             let on = *state == ToggleState::Selected;
-                            weak.update(cx, |view, cx| {
-                                view.write(&key, Some(json!(on)), window, cx)
+                            weak.update(cx, |settings, cx| {
+                                settings.write(&key, Some(json!(on)), window, cx)
                             })
                             .log_err();
                         },
@@ -2339,21 +2208,11 @@ impl SettingsView {
 
     fn render_open_in(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.open_in_rows.len();
-        let field = |editor: &Entity<Editor>, width: f32, cx: &App| {
-            div()
-                .w(px(width))
-                .px_1p5()
-                .py_0p5()
-                .rounded_sm()
-                .border_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(editor.clone())
-        };
         let reset = self.set_here(OPEN_IN).then(|| {
             ui::Button::new("open-in-reset", "Use the default")
                 .label_size(LabelSize::Small)
-                .on_click(cx.listener(|view, _, window, cx| {
-                    view.write_to(Scope::User, OPEN_IN, None, window, cx)
+                .on_click(cx.listener(|settings, _, window, cx| {
+                    settings.write_to(Scope::User, OPEN_IN, None, window, cx)
                 }))
         });
         v_flex()
@@ -2362,19 +2221,11 @@ impl SettingsView {
                     .py_1p5()
                     .gap_4()
                     .justify_between()
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(Label::new("Open in apps"))
-                            .child(
-                                Label::new(
-                                    "A changed file's \"Open in\" menu. A plain command gets the file's \
-                                     path; a command with spaces runs through the shell. Saved in your settings.",
-                                )
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            ),
-                    )
+                    .child(Self::describe(
+                        "Open in apps",
+                        "A changed file's \"Open in\" menu. A plain command gets the file's \
+                         path; a command with spaces runs through the shell. Saved in your settings.",
+                    ))
                     .child(
                         h_flex()
                             .gap_2()
@@ -2386,8 +2237,8 @@ impl SettingsView {
                                     .start_icon(
                                         ui::Icon::new(IconName::Plus).size(ui::IconSize::XSmall),
                                     )
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.add_open_in_app(window, cx)
+                                    .on_click(cx.listener(|settings, _, window, cx| {
+                                        settings.add_open_in_app(window, cx)
                                     })),
                             ),
                     ),
@@ -2404,16 +2255,16 @@ impl SettingsView {
                 h_flex()
                     .py_1()
                     .gap_2()
-                    .child(field(&row.label, 160., cx))
-                    .child(field(&row.command, 240., cx))
+                    .child(Self::text_field(&row.label, 160., cx))
+                    .child(Self::text_field(&row.command, 240., cx))
                     .child(div().flex_1())
                     .child(
                         IconButton::new(id("up"), IconName::ArrowUp)
                             .icon_size(ui::IconSize::XSmall)
                             .disabled(index == 0)
                             .tooltip(Tooltip::text("Move up"))
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.move_open_in_app(index, true, window, cx)
+                            .on_click(cx.listener(move |settings, _, window, cx| {
+                                settings.move_open_in_app(index, true, window, cx)
                             })),
                     )
                     .child(
@@ -2421,16 +2272,16 @@ impl SettingsView {
                             .icon_size(ui::IconSize::XSmall)
                             .disabled(index + 1 == count)
                             .tooltip(Tooltip::text("Move down"))
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.move_open_in_app(index, false, window, cx)
+                            .on_click(cx.listener(move |settings, _, window, cx| {
+                                settings.move_open_in_app(index, false, window, cx)
                             })),
                     )
                     .child(
                         IconButton::new(id("remove"), IconName::Trash)
                             .icon_size(ui::IconSize::XSmall)
                             .tooltip(Tooltip::text("Remove app"))
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.remove_open_in_app(index, window, cx)
+                            .on_click(cx.listener(move |settings, _, window, cx| {
+                                settings.remove_open_in_app(index, window, cx)
                             })),
                     )
             }))
@@ -2449,30 +2300,15 @@ impl SettingsView {
                     .w_full()
                     .gap_4()
                     .justify_between()
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(Label::new("Linear API key"))
-                            .child(
-                                Label::new(linear_summary(self.linear.as_ref()))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                    )
+                    .child(Self::describe(
+                        "Linear API key",
+                        linear_summary(self.linear.as_ref()),
+                    ))
                     .child(
                         h_flex()
                             .gap_2()
                             .flex_none()
-                            .child(
-                                div()
-                                    .w(px(200.))
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(cx.theme().colors().border_variant)
-                                    .child(self.linear_key.clone()),
-                            )
+                            .child(Self::text_field(&self.linear_key, 200., cx))
                             .child(
                                 ui::Button::new(
                                     "icarus-linear-save",
@@ -2481,7 +2317,7 @@ impl SettingsView {
                                 .label_size(LabelSize::Small)
                                 .disabled(busy)
                                 .on_click(cx.listener(
-                                    |view, _, window, cx| view.save_linear_key(window, cx),
+                                    |settings, _, window, cx| settings.save_linear_key(window, cx),
                                 )),
                             )
                             .when(stored, |this| {
@@ -2489,8 +2325,8 @@ impl SettingsView {
                                     ui::Button::new("icarus-linear-remove", "Remove")
                                         .label_size(LabelSize::Small)
                                         .disabled(busy)
-                                        .on_click(cx.listener(|view, _, window, cx| {
-                                            view.remove_linear_key(window, cx)
+                                        .on_click(cx.listener(|settings, _, window, cx| {
+                                            settings.remove_linear_key(window, cx)
                                         })),
                                 )
                             }),
@@ -2508,36 +2344,24 @@ impl SettingsView {
             .as_ref()
             .map(|status| status["running"].as_bool() == Some(true));
         let busy = self.automation_busy.clone();
-        let field = |editor: &Entity<Editor>, cx: &App| {
-            div()
-                .w(px(260.))
-                .px_1p5()
-                .py_0p5()
-                .rounded_sm()
-                .border_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(editor.clone())
-        };
         v_flex()
             .child(
                 h_flex()
                     .py_1p5()
                     .gap_4()
                     .justify_between()
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(Label::new("Scripts per project"))
-                            .child(
-                                Label::new(match running {
-                                    None => "Checking…".to_owned(),
-                                    Some(true) => "A run is in progress. Paths are relative to ~/.config/icarus and saved in your settings.".to_owned(),
-                                    Some(false) => "Paths are relative to ~/.config/icarus and saved in your settings.".to_owned(),
-                                })
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            ),
-                    )
+                    .child(Self::describe(
+                        "Scripts per project",
+                        match running {
+                            None => "Checking…",
+                            Some(true) => {
+                                "A run is in progress. Paths are relative to ~/.config/icarus and saved in your settings."
+                            }
+                            Some(false) => {
+                                "Paths are relative to ~/.config/icarus and saved in your settings."
+                            }
+                        },
+                    ))
                     .child(
                         h_flex()
                             .gap_2()
@@ -2551,8 +2375,8 @@ impl SettingsView {
                                 ui::Button::new("automation-schema", "Regenerate types")
                                     .label_size(LabelSize::Small)
                                     .disabled(busy.as_deref() == Some("schema"))
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.regenerate_types(window, cx)
+                                    .on_click(cx.listener(|settings, _, window, cx| {
+                                        settings.regenerate_types(window, cx)
                                     })),
                             ),
                     ),
@@ -2584,21 +2408,12 @@ impl SettingsView {
                         h_flex()
                             .gap_4()
                             .justify_between()
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .child(Label::new(name))
-                                    .child(
-                                        Label::new(run_summary(project))
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    ),
-                            )
+                            .child(Self::describe(name, run_summary(project)))
                             .child(
                                 h_flex()
                                     .gap_2()
                                     .flex_none()
-                                    .children(row.map(|row| field(&row.path, cx)))
+                                    .children(row.map(|row| Self::text_field(&row.path, 260., cx)))
                                     .child(
                                         ui::Button::new(
                                             SharedString::from(format!("automation-run-{index}")),
@@ -2606,8 +2421,8 @@ impl SettingsView {
                                         )
                                         .label_size(LabelSize::Small)
                                         .disabled(running || project["script"].is_null())
-                                        .on_click(cx.listener(move |view, _, window, cx| {
-                                            view.dry_run(project_id.clone(), window, cx)
+                                        .on_click(cx.listener(move |settings, _, window, cx| {
+                                            settings.dry_run(project_id.clone(), window, cx)
                                         })),
                                     ),
                             ),
@@ -2640,19 +2455,15 @@ impl SettingsView {
                     .py_1p5()
                     .gap_4()
                     .justify_between()
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(Label::new("Prompt templates"))
-                            .child(
-                                Label::new(
-                                    "Scripts start agents with these by id; {{path}} substitutes from \
-                                     the automation scope, e.g. {{workspace.name}} or {{pr.number}}.",
-                                )
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            ),
-                    )
+                    .child(Self::describe(
+                        "Prompt templates",
+                        "Scripts start agents with these by id; {{path}} substitutes from \
+                         the automation scope, e.g. {{workspace.name}} or {{pr.number}}. \
+                         commitAndPush, createPullRequest, readyForReview and reviewPullRequest \
+                         are the next-action button's steps (empty uses the built-in prompt); \
+                         they use {{branch}}, {{baseRef}}, {{worktreePath}}, {{prNumber}}, \
+                         {{prUrl}}, {{prTitle}}, {{draftMode}}, {{templateRule}} and {{prInstructions}}.",
+                    ))
                     .child(
                         PopoverMenu::new("prompt-preview-workspace")
                             .trigger(
@@ -2670,8 +2481,8 @@ impl SettingsView {
                                     for (id, name) in workspaces {
                                         let weak = weak.clone();
                                         menu = menu.entry(name, None, move |_, cx| {
-                                            weak.update(cx, |view, cx| {
-                                                view.preview_workspace = Some(id.clone());
+                                            weak.update(cx, |settings, cx| {
+                                                settings.preview_workspace = Some(id.clone());
                                                 cx.notify();
                                             })
                                             .log_err();
@@ -2710,75 +2521,76 @@ impl SettingsView {
                                 h_flex()
                                     .gap_0p5()
                                     .flex_none()
-                                    .child(
-                                        div()
-                                            .w(px(420.))
-                                            .px_1p5()
-                                            .py_0p5()
-                                            .rounded_sm()
-                                            .border_1()
-                                            .border_color(cx.theme().colors().border_variant)
-                                            .child(row.template.clone()),
-                                    )
+                                    .child(Self::text_field(&row.template, 420., cx))
                                     .child(
                                         ui::Button::new(element_id("preview"), "Preview")
                                             .label_size(LabelSize::Small)
-                                            .on_click(cx.listener(move |view, _, window, cx| {
-                                                view.preview_prompt(id_preview.clone(), window, cx)
-                                            })),
+                                            .on_click(cx.listener(
+                                                move |settings, _, window, cx| {
+                                                    settings.preview_prompt(
+                                                        id_preview.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                },
+                                            )),
                                     )
                                     .child(
                                         IconButton::new(element_id("rename"), IconName::Pencil)
                                             .icon_size(ui::IconSize::XSmall)
                                             .tooltip(Tooltip::text("Rename"))
-                                            .on_click(cx.listener(move |view, _, window, cx| {
-                                                view.prompt_renaming = Some(id_rename.clone());
-                                                let id = id_rename.clone();
-                                                view.prompt_name.update(cx, |editor, cx| {
-                                                    editor.set_text(id, window, cx)
-                                                });
-                                                window.focus(&view.prompt_name.focus_handle(cx), cx);
-                                                cx.notify();
-                                            })),
+                                            .on_click(cx.listener(
+                                                move |settings, _, window, cx| {
+                                                    settings.prompt_renaming =
+                                                        Some(id_rename.clone());
+                                                    let id = id_rename.clone();
+                                                    settings.prompt_name.update(
+                                                        cx,
+                                                        |editor, cx| {
+                                                            editor.set_text(id, window, cx)
+                                                        },
+                                                    );
+                                                    window.focus(
+                                                        &settings.prompt_name.focus_handle(cx),
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                },
+                                            )),
                                     )
                                     .child(
                                         IconButton::new(element_id("remove"), IconName::Trash)
                                             .icon_size(ui::IconSize::XSmall)
                                             .tooltip(Tooltip::text("Remove"))
-                                            .on_click(cx.listener(move |view, _, window, cx| {
-                                                view.remove_prompt(&id_remove, window, cx)
-                                            })),
+                                            .on_click(cx.listener(
+                                                move |settings, _, window, cx| {
+                                                    settings.remove_prompt(&id_remove, window, cx)
+                                                },
+                                            )),
                                     ),
                             ),
                     )
-                    .children(preview.map(|preview| match preview {
-                        Ok(text) => div()
-                            .mt_1()
-                            .p_2()
-                            .rounded_sm()
-                            .bg(cx.theme().colors().surface_background)
-                            .child(Label::new(text).size(LabelSize::Small))
-                            .into_any_element(),
-                        Err(error) => Label::new(error)
-                            .size(LabelSize::Small)
-                            .color(Color::Error)
-                            .into_any_element(),
+                    .children(preview.map(|preview| {
+                        match preview {
+                            Ok(text) => div()
+                                .mt_1()
+                                .p_2()
+                                .rounded_sm()
+                                .bg(cx.theme().colors().surface_background)
+                                .child(Label::new(text).size(LabelSize::Small))
+                                .into_any_element(),
+                            Err(error) => Label::new(error)
+                                .size(LabelSize::Small)
+                                .color(Color::Error)
+                                .into_any_element(),
+                        }
                     }))
             }))
             .child(
                 h_flex()
                     .pt_1()
                     .gap_2()
-                    .child(
-                        div()
-                            .w(px(260.))
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(cx.theme().colors().border_variant)
-                            .child(self.prompt_name.clone()),
-                    )
+                    .child(Self::text_field(&self.prompt_name, 260., cx))
                     .child(
                         ui::Button::new(
                             "prompt-add",
@@ -2789,9 +2601,9 @@ impl SettingsView {
                             },
                         )
                         .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.add_or_rename_prompt(window, cx)
-                        })),
+                        .on_click(cx.listener(
+                            |settings, _, window, cx| settings.add_or_rename_prompt(window, cx),
+                        )),
                     ),
             )
     }
@@ -2820,8 +2632,8 @@ impl SettingsView {
                 .child(
                     Switch::new(SharedString::from(format!("card-{}", field.id)), on.into())
                         .on_click(move |_, window, cx| {
-                            weak.update(cx, |view, cx| {
-                                view.toggle_card_field(field.id, window, cx)
+                            weak.update(cx, |settings, cx| {
+                                settings.toggle_card_field(field.id, window, cx)
                             })
                             .log_err();
                         }),
@@ -2830,275 +2642,173 @@ impl SettingsView {
     }
 }
 
-impl Render for SettingsView {
+pub struct SectionView {
+    settings: Entity<IcarusSettings>,
+    section: Section,
+    _observation: Subscription,
+}
+
+impl SectionView {
+    pub fn new(settings: Entity<IcarusSettings>, section: Section, cx: &mut Context<Self>) -> Self {
+        let observation = cx.observe(&settings, |_, _, cx| cx.notify());
+        Self {
+            settings,
+            section,
+            _observation: observation,
+        }
+    }
+}
+
+impl Render for SectionView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_project = self.project.is_some();
-        let scope = self.scope;
-        let rows = |fields: &'static [Field], this: &Self, cx: &mut Context<Self>| {
-            fields
-                .iter()
-                .map(|field| this.render_row(field, cx))
-                .collect::<Vec<_>>()
-        };
-        let agents = rows(AGENTS, self, cx);
-        let automations = rows(AUTOMATIONS, self, cx);
-        let automation = rows(AUTOMATION, self, cx);
-        let rule_options = rows(RULE_OPTIONS, self, cx);
-        let action_prompts = rows(ACTION_PROMPTS, self, cx);
-        let column = || v_flex().mx_auto().max_w(px(760.)).w_full().px_6();
-        let integrations = rows(INTEGRATIONS, self, cx);
-        let notifications = rows(NOTIFICATIONS, self, cx);
-        let ports = rows(PORTS, self, cx);
-        let updates = rows(UPDATES, self, cx);
-        let layouts = self
-            .snapshot
-            .as_ref()
-            .map(|s| s.layouts.join(", "))
-            .unwrap_or_default();
-        div()
-            .id("icarus-settings")
-            .key_context("IcarusSettings")
-            .track_focus(&self.focus_handle)
+        let section = self.section;
+        self.settings.update(cx, |settings, cx| {
+            v_flex()
+                .w_full()
+                .when(section.starts_page(), |this| {
+                    this.child(settings.render_scope(cx))
+                })
+                .child(settings.render_section(section, cx))
+        })
+    }
+}
+
+pub struct PagePreview {
+    sections: Vec<(Section, Entity<SectionView>)>,
+}
+
+impl PagePreview {
+    pub fn new(
+        page: &str,
+        snapshot: Snapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let settings = cx.new(|cx| IcarusSettings::preview(snapshot, window, cx));
+        let sections = PAGES
+            .iter()
+            .find(|(title, _)| *title == page)
+            .map(|(_, sections)| *sections)
+            .unwrap_or_default()
+            .iter()
+            .map(|section| {
+                let view = cx.new(|cx| SectionView::new(settings.clone(), *section, cx));
+                (*section, view)
+            })
+            .collect();
+        Self { sections }
+    }
+}
+
+impl Render for PagePreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
             .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll_handle)
+            .px_8()
+            .gap_4()
             .bg(cx.theme().colors().editor_background)
-            .child(
-                column()
-                    .pt_5()
+            .children(self.sections.iter().map(|(section, view)| {
+                v_flex()
                     .child(
-                        h_flex()
-                            .justify_between()
-                            .child(Headline::new("Icarus settings").size(HeadlineSize::Small))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        ToggleButtonGroup::single_row(
-                                            "icarus-settings-scope",
-                                            [
-                                                ToggleButtonSimple::new(
-                                                    "You",
-                                                    cx.listener(|view, _, _, cx| view.set_scope(Scope::User, cx)),
-                                                ),
-                                                ToggleButtonSimple::new(
-                                                    "Project",
-                                                    cx.listener(move |view, _, _, cx| {
-                                                        if has_project {
-                                                            view.set_scope(Scope::Project, cx)
-                                                        }
-                                                    }),
-                                                ),
-                                                ToggleButtonSimple::new(
-                                                    "Local",
-                                                    cx.listener(move |view, _, _, cx| {
-                                                        if has_project {
-                                                            view.set_scope(Scope::Local, cx)
-                                                        }
-                                                    }),
-                                                ),
-                                            ],
-                                        )
-                                        .selected_index(match scope {
-                                            Scope::User => 0,
-                                            Scope::Project => 1,
-                                            Scope::Local => 2,
-                                        })
-                                        .style(ui::ToggleButtonGroupStyle::Outlined),
-                                    )
-                                    .child(
-                                        ui::Button::new("icarus-settings-json", "Edit in JSON")
-                                            .label_size(LabelSize::Small)
-                                            .on_click(cx.listener(|view, _, window, cx| view.open_layer_file(window, cx))),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        Label::new(match scope {
-                            Scope::User => "Changes go to your settings (~/.config/icarus/icarus.json).",
-                            Scope::Project => "Changes go to the project's icarus.json, shared with everyone.",
-                            Scope::Local => "Changes go to the project's icarus.local.json, on this machine only.",
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    )
-                    .when_some(self.error.clone(), |this, error| {
-                        this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
-                    })
-                    .when(self.loading.is_some() && self.snapshot.is_none(), |this| {
-                        this.child(Label::new("Loading…").color(Color::Muted))
-                    })
-                    .child(Self::section("STATUSES", cx))
-                    .child(self.render_statuses(cx))
-                    .child(Self::section("AUTOMATIONS", cx))
-                    .children(automations)
-                    .child(self.render_automation_projects(cx))
-                    .child(Self::section("PROMPTS", cx))
-                    .child(self.render_prompts(cx))
-                    .child(
-                        div()
-                            .pt_6()
-                            .child(Label::new("Built-in rules (being replaced by automation scripts)")),
-                    )
-                    .child(Self::section("AUTOMATION", cx))
-                    .children(automation)
-                    .child(
-                        Label::new("Where a pull request's state moves its card:")
+                        Label::new(section.title())
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
-                    .child(self.render_conditions(cx))
-                    .child(Self::section("PULL REQUEST RULES", cx))
-                    .children(rule_options)
-                    .child(Self::section("TOP BAR ACTION PROMPTS", cx))
-                    .child(
-                        Label::new(
-                            "The next-action button's prompts. They can use {{branch}}, {{baseRef}}, \
-                             {{worktreePath}}, {{prNumber}}, {{prUrl}}, {{prTitle}}, {{draftMode}}, \
-                             {{templateRule}} and {{prInstructions}}.",
-                        )
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    )
-                    .children(action_prompts),
-            )
-            .child(
-                column()
-                    .child(Self::section("AGENTS", cx))
-                    .children(agents),
-            )
-            .child(
-                column()
-                    .child(Self::section("INTEGRATIONS", cx))
-                    .child(
-                        h_flex()
-                            .py_1p5()
-                            .justify_between()
-                            .child(
-                                v_flex().child(Label::new("GitHub")).child(
-                                    Label::new(self.gh.clone().unwrap_or_else(|| {
-                                        "Uses your GitHub CLI login (gh).".to_owned()
-                                    }))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                                ),
-                            )
-                            .child(
-                                ui::Button::new("icarus-settings-gh", "Check")
-                                    .label_size(LabelSize::Small)
-                                    .on_click(cx.listener(|view, _, window, cx| view.check_gh(window, cx))),
-                            ),
-                    )
-                    .child(self.render_linear(cx))
-                    .children(integrations)
-                    .child(Self::section("NOTIFICATIONS", cx))
-                    .children(notifications)
-                    .child(self.render_kinds(cx))
-                    .child(Self::section("WORKSPACE CARDS", cx))
-                    .child(self.render_cards(cx))
-                    .child(Self::section("PORTS AND PREVIEWS", cx))
-                    .children(ports)
-                    .child(Self::section("LAYOUTS", cx))
-                    .child(
-                        h_flex()
-                            .py_1p5()
-                            .justify_between()
-                            .child(
-                                v_flex().child(Label::new("Named tab layouts")).child(
-                                    Label::new(if layouts.is_empty() { "None".to_owned() } else { layouts })
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                ),
-                            )
-                            .child(
-                                ui::Button::new("icarus-settings-layouts", "Edit in JSON")
-                                    .label_size(LabelSize::Small)
-                                    .on_click(cx.listener(|view, _, window, cx| view.open_layer_file(window, cx))),
-                            ),
-                    ),
-            )
-            .child(
-                column()
-                    .child(Self::section("SOURCE CONTROL", cx))
-                    .child(self.render_open_in(cx)),
-            )
-            .child(
-                column()
-                    .pb_5()
-                    .child(Self::section("UPDATES", cx))
-                    .children(updates),
-            )
+                    .child(view.clone())
+            }))
     }
 }
 
-impl Item for SettingsView {
-    type Event = ItemEvent;
-
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Icarus Settings".into()
-    }
-
-    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<ui::Icon> {
-        Some(ui::Icon::new(IconName::Settings))
-    }
-
-    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
-        f(*event)
-    }
-}
-
-/// Shows the settings tab, reusing an open one.
-fn open_settings(
-    workspace: &mut Workspace,
+// One model per settings window, so its pages agree on the scope and the loaded values.
+fn settings_for_window(
+    workspace_window: Option<WindowHandle<MultiWorkspace>>,
     window: &mut Window,
-    cx: &mut Context<Workspace>,
-) -> Entity<SettingsView> {
-    let existing = workspace.items_of_type::<SettingsView>(cx).next();
+    cx: &mut App,
+) -> Entity<IcarusSettings> {
+    let handle = window.window_handle();
+    let existing = cx.try_global::<LiveSettings>().and_then(|open| {
+        open.0
+            .iter()
+            .find(|(window, _)| *window == handle)
+            .and_then(|(_, settings)| settings.upgrade())
+    });
     if let Some(existing) = existing {
-        workspace.activate_item(&existing, true, true, window, cx);
         return existing;
     }
-    let root = workspace
-        .root_paths(cx)
-        .into_iter()
-        .next()
-        .map(|path| path.to_path_buf());
-    let weak = workspace.weak_handle();
-    let view = cx.new(|cx| SettingsView::new(weak, root, window, cx));
-    workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
-    view
+    let root = workspace_window
+        .and_then(|handle| handle.read(cx).ok())
+        .and_then(|multi| {
+            multi
+                .workspace()
+                .read(cx)
+                .root_paths(cx)
+                .into_iter()
+                .next()
+                .map(|path| path.to_path_buf())
+        });
+    cx.new(|cx| IcarusSettings::new(workspace_window, root, window, cx))
 }
 
-/// Shows the settings tab at the Linear API key field.
-pub fn open_linear_settings(
-    workspace: &mut Workspace,
+fn build_page(
+    sections: &'static [Section],
+    workspace_window: Option<WindowHandle<MultiWorkspace>>,
     window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    open_settings(workspace, window, cx).update(cx, |view, cx| view.reveal_linear(window, cx));
+    cx: &mut App,
+) -> Vec<ExtensionSection> {
+    let settings = settings_for_window(workspace_window, window, cx);
+    sections
+        .iter()
+        .map(|section| ExtensionSection {
+            title: section.title(),
+            view: cx
+                .new(|cx| SectionView::new(settings.clone(), *section, cx))
+                .into(),
+        })
+        .collect()
 }
 
-pub fn open_agent_settings(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    open_settings(workspace, window, cx).update(cx, |view, cx| view.reveal_agents(cx));
+pub fn open_section(section: Section, window: &mut Window, cx: &mut App) {
+    settings_ui::open_settings_section(
+        section.page(),
+        Some(section.title()),
+        window.window_handle().downcast::<MultiWorkspace>(),
+        cx,
+    );
+}
+
+pub fn open_linear_settings(window: &mut Window, cx: &mut App) {
+    open_section(Section::Integrations, window, cx);
+}
+
+pub fn open_agent_settings(window: &mut Window, cx: &mut App) {
+    open_section(Section::Agents, window, cx);
 }
 
 pub fn register(cx: &mut App) {
+    for &(page, sections) in PAGES {
+        settings_ui::register_extension_page(
+            page,
+            move |workspace_window, window, cx| build_page(sections, workspace_window, window, cx),
+            cx,
+        );
+    }
     cx.observe_new(|workspace: &mut Workspace, _, _| {
-        workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
-            open_settings(workspace, window, cx);
+        workspace.register_action(|_, _: &OpenSettings, window, cx| {
+            settings_ui::open_settings_section(
+                Section::Statuses.page(),
+                None,
+                window.window_handle().downcast::<MultiWorkspace>(),
+                cx,
+            );
         });
-        workspace.register_action(|workspace, _: &CustomizeOpenInApps, window, cx| {
-            open_settings(workspace, window, cx).update(cx, |view, cx| view.reveal_open_in(cx));
+        workspace.register_action(|_, _: &CustomizeOpenInApps, window, cx| {
+            open_section(Section::OpenIn, window, cx);
         });
-        workspace.register_action(|workspace, _: &ConnectLinear, window, cx| {
-            open_linear_settings(workspace, window, cx);
+        workspace.register_action(|_, _: &ConnectLinear, window, cx| {
+            open_linear_settings(window, cx);
         });
-        workspace.register_action(|workspace, _: &OpenAgentSettings, window, cx| {
-            open_agent_settings(workspace, window, cx);
+        workspace.register_action(|_, _: &OpenAgentSettings, window, cx| {
+            open_agent_settings(window, cx);
         });
     })
     .detach();
@@ -3119,29 +2829,33 @@ mod tests {
                 ],
                 "cardFields": ["pr"],
             },
-            "rules": {
-                "enabled": true,
-                "armed": false,
-                "interval_ms": 60000,
-                "pr": { "enabled": true, "statusByCondition": { "conflicts": "review" } },
-            },
+            "automations": { "enabled": true, "armed": false, "interval_ms": 60000 },
+            "prompts": { "fix-ci": "Fix the checks of #{{pr.number}}" },
             "agents": { "default": "claude" },
             "notifications": { "enabled": true },
         })
     }
 
-    #[gpui::test]
-    fn a_settings_change_before_any_settings_tab_opened_is_ignored(cx: &mut TestAppContext) {
-        cx.update(config_changed);
-    }
-
-    #[gpui::test]
-    async fn the_settings_view_reads_layers_and_writes_to_the_chosen_one(cx: &mut TestAppContext) {
+    fn init_settings(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
+    }
+
+    fn new_settings(window: &mut gpui::VisualTestContext) -> Entity<IcarusSettings> {
+        window.update(|window, cx| cx.new(|cx| IcarusSettings::new(None, None, window, cx)))
+    }
+
+    #[gpui::test]
+    fn a_settings_change_before_any_settings_window_opened_is_ignored(cx: &mut TestAppContext) {
+        cx.update(config_changed);
+    }
+
+    #[gpui::test]
+    async fn the_pages_read_layers_and_write_to_the_chosen_one(cx: &mut TestAppContext) {
+        init_settings(cx);
         let calls = cx.update(|cx| {
             stub_rpc(cx, |method, params| match method {
                 "config.get" => Ok(resolved()),
@@ -3152,7 +2866,7 @@ mod tests {
                 "config.paths" => {
                     Ok(json!({ "user": "/cfg/icarus.json", "project": null, "local": null }))
                 }
-                "config.explain" if params["key"] == "rules.armed" => {
+                "config.explain" if params["key"] == "automations.armed" => {
                     Ok(json!({ "from": { "layer": "user", "path": "/cfg/icarus.json" } }))
                 }
                 "config.explain" => Ok(json!({ "from": { "layer": "default" } })),
@@ -3160,45 +2874,45 @@ mod tests {
             })
         });
         let window = cx.add_empty_window();
-        let view = window.update(|window, cx| {
-            cx.new(|cx| SettingsView::new(WeakEntity::new_invalid(), None, window, cx))
-        });
+        let settings = new_settings(window);
         window.run_until_parked();
-        view.read_with(window, |view, _| {
-            let snapshot = view.snapshot().expect("loaded");
+        settings.read_with(window, |settings, _| {
+            let snapshot = settings.snapshot().expect("loaded");
             assert_eq!(snapshot.layouts, ["default", "review"]);
             assert_eq!(snapshot.kinds.len(), 2);
-            assert_eq!(view.statuses().len(), 2);
-            assert!(
-                view.set_here("rules.armed"),
-                "armed comes from the user layer"
-            );
-            assert!(!view.set_here("rules.enabled"));
+            assert_eq!(settings.statuses().len(), 2);
             assert_eq!(
-                view.source_label("rules.enabled"),
+                settings.prompts().len(),
+                1 + NEXT_ACTION_PROMPTS.len(),
+                "the next-action prompts are listed even when unset"
+            );
+            assert!(settings.set_here("automations.armed"));
+            assert!(!settings.set_here("automations.enabled"));
+            assert_eq!(
+                settings.source_label("automations.enabled"),
                 None,
                 "defaults show no source"
             );
         });
-
-        view.update_in(window, |view, window, cx| {
-            view.write("rules.armed", Some(json!(true)), window, cx);
+        settings.update_in(window, |settings, window, cx| {
+            settings.write("automations.armed", Some(json!(true)), window, cx);
         });
         window.run_until_parked();
         assert_eq!(
             calls_to(&calls, "config.set")[0],
-            json!({ "key": "rules.armed", "layer": "user", "value": true })
+            json!({ "key": "automations.armed", "layer": "user", "value": true })
         );
 
-        view.update_in(window, |view, window, cx| {
-            view.status_editor
+        settings.update_in(window, |settings, window, cx| {
+            settings
+                .status_editor
                 .update(cx, |editor, cx| editor.set_text("On hold", window, cx));
-            view.add_or_rename_status(window, cx);
+            settings.add_or_rename_status(window, cx);
         });
         window.run_until_parked();
         let statuses = calls_to(&calls, "config.set")
             .into_iter()
-            .find(|c| c["key"] == "workspace.statuses")
+            .find(|call| call["key"] == "workspace.statuses")
             .expect("statuses written");
         assert_eq!(
             statuses["value"][2],
@@ -3209,136 +2923,106 @@ mod tests {
             "other statuses keep their style"
         );
 
-        view.update_in(window, |view, window, cx| {
-            view.toggle_card_field("pr", window, cx);
-            view.project = Some("p-1".into());
-            view.set_scope(Scope::Project, cx);
-            view.write(
-                &format!("{STATUS_BY_CONDITION}.draft"),
-                Some(json!("todo")),
-                window,
-                cx,
-            );
-            view.write(
-                &format!("{STATUS_BY_CONDITION}.conflicts"),
-                None,
-                window,
-                cx,
-            );
+        settings.update_in(window, |settings, window, cx| {
+            settings.toggle_card_field("pr", window, cx);
+            settings.project = Some("p-1".into());
+            settings.set_scope(Scope::Project, cx);
+            settings.write("automations.hold_status", Some(json!("todo")), window, cx);
+            settings.write("automations.interval_ms", None, window, cx);
         });
         window.run_until_parked();
         let sets = calls_to(&calls, "config.set");
         assert!(
             sets.iter()
-                .any(|c| c["key"] == "workspace.cardFields" && c["value"] == json!([]))
+                .any(|call| call["key"] == "workspace.cardFields" && call["value"] == json!([]))
         );
-        assert!(sets.iter().any(|c| {
-            c["key"] == "rules.pr.statusByCondition.draft"
-                && c["layer"] == "project"
-                && c["project"] == "p-1"
+        assert!(sets.iter().any(|call| {
+            call["key"] == "automations.hold_status"
+                && call["layer"] == "project"
+                && call["project"] == "p-1"
         }));
         assert_eq!(
             calls_to(&calls, "config.unset")[0],
-            json!({ "key": "rules.pr.statusByCondition.conflicts", "layer": "project", "project": "p-1" })
+            json!({ "key": "automations.interval_ms", "layer": "project", "project": "p-1" })
         );
     }
 
     #[gpui::test]
-    async fn the_pull_request_rule_options_load_and_save_from_the_tab(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-        });
+    async fn the_automation_buttons_call_the_server(cx: &mut TestAppContext) {
+        init_settings(cx);
         let calls = cx.update(|cx| {
             stub_rpc(cx, |method, _| match method {
-                "config.get" => {
-                    let mut value = resolved();
-                    value["rules"]["pr"]["onResolved"] = json!("delete");
-                    value["rules"]["pr"]["reviewInbox"] =
-                        json!({ "enabled": true, "agent": "claude", "promptTemplate": "Review {pr_url}\nCarefully." });
-                    Ok(value)
+                "config.get" => Ok(resolved()),
+                "config.explain" => Ok(json!({ "from": { "layer": "default" } })),
+                "automation.status" => Ok(json!({
+                    "running": false,
+                    "projects": [{ "id": "p-1", "project": "widgets", "script": "automations/widgets.ts", "script_exists": true, "last_run": null }],
+                })),
+                "workspace.list" => Ok(json!([{ "id": "ws-1", "name": "Fix login" }])),
+                "automation.run" => {
+                    Ok(json!({ "runs": [{ "error": null, "results": [{ "ok": true }] }] }))
                 }
-                "config.explain" => Ok(json!({ "from": { "layer": "user" } })),
+                "prompt.render" => Ok(json!({ "prompt": "Fix the checks of #7" })),
                 _ => Ok(json!({})),
             })
         });
         let window = cx.add_empty_window();
-        let view = window.update(|window, cx| {
-            cx.new(|cx| SettingsView::new(WeakEntity::new_invalid(), None, window, cx))
-        });
+        let settings = new_settings(window);
         window.run_until_parked();
-        let explained: Vec<Value> = calls_to(&calls, "config.explain")
-            .into_iter()
-            .map(|call| call["key"].clone())
-            .collect();
-        for field in RULE_OPTIONS {
-            assert!(
-                explained.contains(&json!(field.key)),
-                "{} shows where it comes from",
-                field.key
-            );
-        }
-        let prompt = view.read_with(window, |view, cx| {
-            assert!(view.set_here("rules.pr.onResolved"));
-            let editor = view.editors["rules.pr.reviewInbox.promptTemplate"].clone();
-            assert_eq!(editor.read(cx).text(cx), "Review {pr_url}\nCarefully.");
+        settings.read_with(window, |settings, cx| {
+            assert_eq!(settings.script_rows.len(), 1);
             assert_eq!(
-                view.editors["rules.pr.conflictPromptTemplate"]
-                    .read(cx)
-                    .text(cx),
-                "",
-                "blank shows the built-in placeholder"
+                settings.script_rows[0].path.read(cx).text(cx),
+                "automations/widgets.ts"
             );
-            editor
         });
 
-        view.update_in(window, |view, window, cx| {
-            view.write("rules.pr.onReviewed", Some(json!("delete")), window, cx);
-            view.write(
-                "rules.pr.resolveConflictsWithAgent",
-                Some(json!(true)),
-                window,
-                cx,
-            );
-            prompt.update(cx, |editor, cx| {
-                editor.set_text("Look closer.\nTwice.", window, cx)
-            });
-            view.commit_text(
-                "rules.pr.reviewInbox.promptTemplate",
-                "Look closer.\nTwice.",
-                false,
-                window,
-                cx,
-            );
+        settings.update_in(window, |settings, window, cx| {
+            settings.dry_run("p-1".into(), window, cx);
+            settings.regenerate_types(window, cx);
+            settings.preview_prompt("fix-ci".into(), window, cx);
         });
         window.run_until_parked();
-        let sets = calls_to(&calls, "config.set");
-        for (key, value) in [
-            ("rules.pr.onReviewed", json!("delete")),
-            ("rules.pr.resolveConflictsWithAgent", json!(true)),
-            (
-                "rules.pr.reviewInbox.promptTemplate",
-                json!("Look closer.\nTwice."),
-            ),
-        ] {
-            assert!(
-                sets.iter()
-                    .any(|call| call["key"] == key && call["value"] == value),
-                "{key} saved: {sets:?}"
+        assert_eq!(
+            calls_to(&calls, "automation.run"),
+            [json!({ "project": "p-1", "dry_run": true })]
+        );
+        assert_eq!(calls_to(&calls, "automation.schema").len(), 1);
+        assert_eq!(
+            calls_to(&calls, "prompt.render")[0],
+            json!({ "id": "fix-ci", "workspace": "ws-1", "template": "Fix the checks of #{{pr.number}}" })
+        );
+        settings.read_with(window, |settings, _| {
+            assert_eq!(
+                settings.automation_notes.get("p-1").map(String::as_str),
+                Some("Dry run: 1 action, 0 errors")
             );
-        }
+            assert_eq!(
+                settings.automation_notes.get("schema").map(String::as_str),
+                Some("Types regenerated.")
+            );
+            assert_eq!(
+                settings.prompt_preview,
+                Some(("fix-ci".into(), Ok("Fix the checks of #7".into())))
+            );
+        });
+
+        settings.update_in(window, |settings, window, cx| {
+            settings.commit_script("p-1", "widgets", "automations/other.ts", window, cx);
+        });
+        window.run_until_parked();
+        assert!(calls_to(&calls, "config.set").iter().any(|call| {
+            call["key"] == "automations.scripts.widgets"
+                && call["layer"] == "user"
+                && call["value"] == "automations/other.ts"
+        }));
     }
 
     #[gpui::test]
-    async fn a_settings_change_elsewhere_reloads_the_view_but_not_mid_edit(
+    async fn a_settings_change_elsewhere_reloads_the_pages_but_not_mid_edit(
         cx: &mut TestAppContext,
     ) {
-        cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-        });
+        init_settings(cx);
         let current = Arc::new(std::sync::Mutex::new(resolved()));
         cx.update(|cx| {
             let current = current.clone();
@@ -3348,12 +3032,12 @@ mod tests {
                 _ => Ok(json!({})),
             })
         });
-        // Rendered, so the field's blur event fires.
-        let (view, window) = cx.add_window_view(|window, cx| {
-            SettingsView::new(WeakEntity::new_invalid(), None, window, cx)
-        });
+        let window = cx.add_empty_window();
+        let settings = new_settings(window);
         window.run_until_parked();
-        view.read_with(window, |view, _| assert_eq!(view.statuses().len(), 2));
+        settings.read_with(window, |settings, _| {
+            assert_eq!(settings.statuses().len(), 2)
+        });
 
         let add_status = |label: &str| {
             current.lock().expect("lock")["workspace"]["statuses"]
@@ -3369,10 +3053,17 @@ mod tests {
         add_status("Shipped");
         changed(window);
         window.run_until_parked();
-        view.read_with(window, |view, _| assert_eq!(view.statuses().len(), 3));
+        settings.read_with(window, |settings, _| {
+            assert_eq!(settings.statuses().len(), 3)
+        });
 
-        let editor = view.read_with(window, |view, _| {
-            view.editors.values().next().expect("a text field").clone()
+        let editor = settings.read_with(window, |settings, _| {
+            settings
+                .editors
+                .values()
+                .next()
+                .expect("a text field")
+                .clone()
         });
         window.update(|window, cx| {
             window.focus(&editor.focus_handle(cx), cx);
@@ -3381,7 +3072,9 @@ mod tests {
         add_status("Archived");
         changed(window);
         window.run_until_parked();
-        view.read_with(window, |view, _| assert_eq!(view.statuses().len(), 4));
+        settings.read_with(window, |settings, _| {
+            assert_eq!(settings.statuses().len(), 4)
+        });
         window.update(|_, cx| {
             assert_eq!(
                 editor.read(cx).text(cx),
@@ -3391,115 +3084,38 @@ mod tests {
         });
     }
 
-    fn init_settings(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-        });
-    }
-
     #[gpui::test]
-    async fn the_remaining_orca_rule_options_have_controls(cx: &mut TestAppContext) {
+    async fn the_pages_of_one_settings_window_share_their_state(cx: &mut TestAppContext) {
         init_settings(cx);
-        let calls = cx.update(|cx| {
+        cx.update(|cx| {
             stub_rpc(cx, |method, _| match method {
-                "config.get" => {
-                    let mut value = resolved();
-                    value["rules"]["pr"]["mergingCheckName"] = json!("Merge gate");
-                    value["rules"]["pr"]["actionPrompts"] =
-                        json!({ "readyForReview": "Polish #{{prNumber}}." });
-                    Ok(value)
-                }
-                "config.explain" => Ok(json!({ "from": { "layer": "default" } })),
+                "config.get" => Ok(resolved()),
                 _ => Ok(json!({})),
-            })
+            });
         });
         let window = cx.add_empty_window();
-        let view = window.update(|window, cx| {
-            cx.new(|cx| SettingsView::new(WeakEntity::new_invalid(), None, window, cx))
+        let pages = window.update(|window, cx| {
+            PAGES
+                .iter()
+                .map(|(_, sections)| build_page(sections, None, window, cx))
+                .collect::<Vec<_>>()
         });
         window.run_until_parked();
-        for key in [
-            NEW_WORKSPACE_STATUS,
-            "rules.pr.holdStatus",
-            "rules.pr.pmApprovalTeam",
-            "rules.pr.actionPrompts.commitAndPush",
-        ] {
-            assert!(
-                calls_to(&calls, "config.explain")
-                    .iter()
-                    .any(|call| call["key"] == key),
-                "{key} shows where it comes from"
-            );
-        }
-        view.read_with(window, |view, cx| {
-            let text = |key: &str| view.editors[key].read(cx).text(cx);
-            assert_eq!(text("rules.pr.mergingCheckName"), "Merge gate");
-            assert_eq!(
-                text("rules.pr.actionPrompts.readyForReview"),
-                "Polish #{{prNumber}}."
-            );
-            assert_eq!(
-                text("rules.pr.actionPrompts.reviewPullRequest"),
-                "",
-                "blank is the built-in prompt"
-            );
-        });
-
-        view.update_in(window, |view, window, cx| {
-            view.choose_status(NEW_WORKSPACE_STATUS, Some("todo".into()), window, cx);
-            view.choose_status("rules.pr.holdStatus", Some("review".into()), window, cx);
-            view.commit_text("rules.pr.pmApprovalTeam", "acme/pm", false, window, cx);
-            view.commit_text(
-                "rules.pr.reviewEnteredCommand",
-                "mise run stop",
-                false,
-                window,
-                cx,
-            );
-            view.commit_text(
-                "rules.pr.actionPrompts.commitAndPush",
-                "Commit it.\nPush it.",
-                false,
-                window,
-                cx,
-            );
-        });
-        window.run_until_parked();
-        let sets = calls_to(&calls, "config.set");
-        let set = |key: &str| {
-            sets.iter()
-                .find(|call| call["key"] == key)
-                .map(|call| call["value"].clone())
-        };
-        assert_eq!(set(NEW_WORKSPACE_STATUS), Some(json!("todo")));
-        assert!(
-            set("rules.pr.newWorkspaceStatusSince")
-                .is_some_and(|since| since.as_u64().is_some_and(|since| since > 0)),
-            "Orca stamps when the column took effect"
-        );
-        assert_eq!(set("rules.pr.holdStatus"), Some(json!("review")));
-        assert_eq!(set("rules.pr.pmApprovalTeam"), Some(json!("acme/pm")));
-        assert_eq!(
-            set("rules.pr.reviewEnteredCommand"),
-            Some(json!("mise run stop"))
-        );
-        assert_eq!(
-            set("rules.pr.actionPrompts.commitAndPush"),
-            Some(json!("Commit it.\nPush it."))
-        );
-
-        view.update_in(window, |view, window, cx| {
-            view.choose_status(NEW_WORKSPACE_STATUS, None, window, cx)
-        });
-        window.run_until_parked();
-        let unset: Vec<Value> = calls_to(&calls, "config.unset")
-            .into_iter()
-            .map(|call| call["key"].clone())
+        let titles: Vec<Vec<&str>> = pages
+            .iter()
+            .map(|page| page.iter().map(|section| section.title).collect())
             .collect();
-        assert!(unset.contains(&json!(NEW_WORKSPACE_STATUS)));
-        assert!(unset.contains(&json!("rules.pr.newWorkspaceStatusSince")));
+        assert_eq!(titles[0], ["Statuses", "Scripts", "Prompts"]);
+        assert_eq!(Section::OpenIn.page(), "Workspaces");
+        assert_eq!(Section::Integrations.page(), "Icarus");
+        let live = window.update(|_, cx| {
+            cx.global::<LiveSettings>()
+                .0
+                .iter()
+                .filter(|(_, settings)| settings.upgrade().is_some())
+                .count()
+        });
+        assert_eq!(live, 1);
     }
 
     #[gpui::test]
@@ -3519,13 +3135,13 @@ mod tests {
                 _ => Ok(json!({})),
             })
         });
-        let (view, window) = cx.add_window_view(|window, cx| {
-            SettingsView::new(WeakEntity::new_invalid(), None, window, cx)
-        });
+        let window = cx.add_empty_window();
+        let settings = new_settings(window);
         window.run_until_parked();
-        let rows = |view: &Entity<SettingsView>, window: &mut gpui::VisualTestContext| {
-            view.read_with(window, |view, cx| {
-                view.open_in_rows
+        let rows = |settings: &Entity<IcarusSettings>, window: &mut gpui::VisualTestContext| {
+            settings.read_with(window, |settings, cx| {
+                settings
+                    .open_in_rows
                     .iter()
                     .map(|row| {
                         format!(
@@ -3537,15 +3153,15 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         };
-        assert_eq!(rows(&view, window), ["VS Code=code"], "Orca's default");
+        assert_eq!(rows(&settings, window), ["VS Code=code"], "Orca's default");
 
-        view.update_in(window, |view, window, cx| {
-            view.project = Some("p-1".into());
-            view.set_scope(Scope::Project, cx);
-            view.add_open_in_app(window, cx);
+        settings.update_in(window, |settings, window, cx| {
+            settings.project = Some("p-1".into());
+            settings.set_scope(Scope::Project, cx);
+            settings.add_open_in_app(window, cx);
         });
         window.run_until_parked();
-        assert_eq!(rows(&view, window), ["VS Code=code", "New app="]);
+        assert_eq!(rows(&settings, window), ["VS Code=code", "New app="]);
         let saved = calls_to(&calls, "config.set");
         assert_eq!(
             saved[0]["layer"], "user",
@@ -3559,34 +3175,40 @@ mod tests {
             app.update(config_changed);
         }
         window.run_until_parked();
-        view.update_in(window, |view, window, cx| {
-            let row = &view.open_in_rows[1];
+        settings.update_in(window, |settings, window, cx| {
+            let row = &settings.open_in_rows[1];
             let (label, command) = (row.label.clone(), row.command.clone());
             label.update(cx, |editor, cx| editor.set_text("Xcode", window, cx));
             command.update(cx, |editor, cx| {
                 editor.set_text(" open -a Xcode ", window, cx)
             });
-            view.commit_open_in(window, cx);
+            settings.commit_open_in(window, cx);
         });
         window.run_until_parked();
-        assert_eq!(rows(&view, window), ["VS Code=code", "Xcode=open -a Xcode"]);
-        let apps = view.read_with(window, |view, _| view.open_in_apps());
+        assert_eq!(
+            rows(&settings, window),
+            ["VS Code=code", "Xcode=open -a Xcode"]
+        );
+        let apps = settings.read_with(window, |settings, _| settings.open_in_apps());
         assert_eq!(
             apps[0]["icon"], "vscode",
             "fields the editor doesn't show stay"
         );
         assert_eq!(apps[1]["id"], "custom-1");
 
-        view.update_in(window, |view, window, cx| {
-            view.move_open_in_app(1, true, window, cx)
+        settings.update_in(window, |settings, window, cx| {
+            settings.move_open_in_app(1, true, window, cx)
         });
         window.run_until_parked();
-        assert_eq!(rows(&view, window), ["Xcode=open -a Xcode", "VS Code=code"]);
-        view.update_in(window, |view, window, cx| {
-            view.remove_open_in_app(1, window, cx)
+        assert_eq!(
+            rows(&settings, window),
+            ["Xcode=open -a Xcode", "VS Code=code"]
+        );
+        settings.update_in(window, |settings, window, cx| {
+            settings.remove_open_in_app(1, window, cx)
         });
         window.run_until_parked();
-        assert_eq!(rows(&view, window), ["Xcode=open -a Xcode"]);
+        assert_eq!(rows(&settings, window), ["Xcode=open -a Xcode"]);
         let parsed = crate::source_control_settings::SourceControlSettings::from_settings(
             &current.lock().expect("lock")["sourceControl"],
         );
@@ -3594,48 +3216,6 @@ mod tests {
             parsed.open_in[0].command, "open -a Xcode",
             "the menu reads it"
         );
-    }
-
-    #[gpui::test]
-    async fn customize_apps_opens_the_settings_tab_at_the_open_in_apps(cx: &mut TestAppContext) {
-        init_settings(cx);
-        cx.update(|cx| {
-            register(cx);
-            stub_rpc(cx, |method, _| match method {
-                "config.get" => Ok(resolved()),
-                "config.explain" => Ok(json!({ "from": { "layer": "default" } })),
-                _ => Ok(json!({})),
-            });
-        });
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree("/project", json!({ "a.txt": "a" })).await;
-        let project = project::Project::test(fs, [std::path::Path::new("/project")], cx).await;
-        let window = cx.add_window(|window, cx| {
-            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
-        });
-        let workspace = window
-            .read_with(cx, |multi, _| multi.workspace().clone())
-            .expect("workspace");
-        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
-        cx.dispatch_action(CustomizeOpenInApps);
-        cx.run_until_parked();
-        let open = |cx: &mut gpui::VisualTestContext| {
-            workspace.read_with(cx, |workspace, cx| {
-                workspace
-                    .items_of_type::<SettingsView>(cx)
-                    .collect::<Vec<_>>()
-            })
-        };
-        let views = open(&mut cx);
-        assert_eq!(views.len(), 1);
-        views[0].read_with(&cx, |view, _| {
-            assert!(view.snapshot().is_some());
-            assert!(view.reveal.is_none(), "scrolled once the settings loaded");
-            assert_eq!(view.open_in_rows.len(), 1);
-        });
-        cx.dispatch_action(CustomizeOpenInApps);
-        cx.run_until_parked();
-        assert_eq!(open(&mut cx).len(), 1, "the open tab is reused");
     }
 
     #[gpui::test]
@@ -3682,33 +3262,32 @@ mod tests {
             })
         });
         let window = cx.add_empty_window();
-        let view = window.update(|window, cx| {
-            cx.new(|cx| SettingsView::new(WeakEntity::new_invalid(), None, window, cx))
-        });
+        let settings = new_settings(window);
         window.run_until_parked();
-        view.read_with(window, |view, _| {
+        settings.read_with(window, |settings, _| {
             assert!(
-                linear_summary(view.linear_status()).starts_with("Not connected"),
+                linear_summary(settings.linear_status()).starts_with("Not connected"),
                 "{:?}",
-                view.linear_status()
+                settings.linear_status()
             );
         });
 
         let paste = |key: &'static str, window: &mut gpui::VisualTestContext| {
-            view.update_in(window, |view, window, cx| {
-                view.linear_key
+            settings.update_in(window, |settings, window, cx| {
+                settings
+                    .linear_key
                     .update(cx, |editor, cx| editor.set_text(key, window, cx));
-                view.save_linear_key(window, cx);
+                settings.save_linear_key(window, cx);
             });
             window.run_until_parked();
         };
         paste("lin_api_wrong", window);
-        view.read_with(window, |view, cx| {
+        settings.read_with(window, |settings, cx| {
             assert_eq!(
-                view.linear_error.as_deref(),
+                settings.linear_error.as_deref(),
                 Some("Linear rejected this API key; nothing was saved")
             );
-            assert_eq!(view.linear_key.read(cx).text(cx), "lin_api_wrong");
+            assert_eq!(settings.linear_key.read(cx).text(cx), "lin_api_wrong");
         });
 
         paste(" lin_api_good ", window);
@@ -3716,26 +3295,26 @@ mod tests {
             calls_to(&calls, "linear.set_api_key").last(),
             Some(&json!({ "key": "lin_api_good" }))
         );
-        view.read_with(window, |view, cx| {
-            assert_eq!(view.linear_error, None);
+        settings.read_with(window, |settings, cx| {
+            assert_eq!(settings.linear_error, None);
             assert_eq!(
-                view.linear_key.read(cx).text(cx),
+                settings.linear_key.read(cx).text(cx),
                 "",
                 "the field is cleared"
             );
             assert_eq!(
-                linear_summary(view.linear_status()),
+                linear_summary(settings.linear_status()),
                 "Connected as Ada (stored in Keychain)"
             );
         });
 
-        view.update_in(window, |view, window, cx| {
-            view.remove_linear_key(window, cx)
+        settings.update_in(window, |settings, window, cx| {
+            settings.remove_linear_key(window, cx)
         });
         window.run_until_parked();
         assert_eq!(calls_to(&calls, "linear.clear_api_key").len(), 1);
-        view.read_with(window, |view, _| {
-            assert!(linear_summary(view.linear_status()).starts_with("Not connected"));
+        settings.read_with(window, |settings, _| {
+            assert!(linear_summary(settings.linear_status()).starts_with("Not connected"));
         });
     }
 
@@ -3782,8 +3361,7 @@ mod tests {
 
     #[test]
     fn a_project_without_runs_says_so() {
-        let project = json!({ "last_run": null, "shadow": { "compared": 0, "differed": 0, "since_ms": null } });
-        assert_eq!(run_summary(&project), "Never run");
+        assert_eq!(run_summary(&json!({ "last_run": null })), "Never run");
     }
 
     #[test]

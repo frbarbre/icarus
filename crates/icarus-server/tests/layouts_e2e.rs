@@ -332,3 +332,171 @@ async fn an_invalid_layout_in_settings_is_reported_by_name() {
         .expect_err("invalid layout");
     assert!(format!("{error:#}").contains("layouts.broken"), "{error:#}");
 }
+
+#[tokio::test]
+async fn tab_and_pane_changes_queue_in_order_and_listing_asks_the_app() {
+    let fake = env!("CARGO_BIN_EXE_icarus-fake-agent");
+    let repo = repo_with_settings(json!({ "agents": { "commands": { "claude": [fake] } } }));
+    let home = tempfile::tempdir().expect("home");
+    let _server = start_server(home.path());
+    let (client, _) = Client::connect(home.path(), "icarus-cli")
+        .await
+        .expect("cli");
+    let project = client
+        .request("project.add", json!({ "path": repo.path() }))
+        .await
+        .expect("project");
+    let created = client
+        .request_timeout(
+            "workspace.create",
+            json!({ "project": project["id"], "name": "tabs" }),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("create");
+    let ws = created["id"].clone();
+    let stale: Vec<Value> = serde_json::from_value(
+        client
+            .request("tab.pending", json!({}))
+            .await
+            .expect("pending"),
+    )
+    .expect("list");
+
+    let split = client
+        .request(
+            "pane.split",
+            json!({ "workspace": ws, "direction": "right" }),
+        )
+        .await
+        .expect("split");
+    assert_eq!(split["delivered"], 0, "no app, so it waits");
+    client
+        .request(
+            "tab.open",
+            json!({ "workspace": ws, "type": "browser", "url": "https://example.com", "pane": "right", "focus": true }),
+        )
+        .await
+        .expect("open");
+    client
+        .request(
+            "tab.move",
+            json!({ "workspace": ws, "tab": "42", "pane": "0.1", "index": 0 }),
+        )
+        .await
+        .expect("move");
+    client
+        .request("pane.close", json!({ "workspace": ws, "pane": "p7" }))
+        .await
+        .expect("close pane");
+    for bad in [
+        json!({ "workspace": ws, "direction": "sideways" }),
+        json!({ "workspace": ws, "direction": "down", "pane": "middle" }),
+    ] {
+        assert!(client.request("pane.split", bad).await.is_err());
+    }
+    assert!(
+        client
+            .request("tab.focus", json!({ "workspace": ws, "tab": "the agent" }))
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .request(
+                "tab.open",
+                json!({ "workspace": ws, "type": "browser", "url": "x", "focus": true, "background": true }),
+            )
+            .await
+            .is_err()
+    );
+
+    let pending: Vec<Value> = serde_json::from_value(
+        client
+            .request("tab.pending", json!({}))
+            .await
+            .expect("pending"),
+    )
+    .expect("list");
+    let ops: Vec<&str> = pending[stale.len()..]
+        .iter()
+        .map(|p| p["tab"]["op"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        ops,
+        ["split", "open", "move", "close_pane"],
+        "in the order made"
+    );
+    let open = &pending[stale.len() + 1]["tab"];
+    assert_eq!(open["pane"], "right");
+    assert_eq!(open["focus"], true);
+    assert_eq!(open["tab"]["url"], "https://example.com");
+    assert_eq!(open["path"], created["path"]);
+
+    let error = client
+        .request("tab.list", json!({ "workspace": ws }))
+        .await
+        .expect_err("no app to ask");
+    assert!(format!("{error:#}").contains("not_open"), "{error:#}");
+
+    let (app, mut app_events) = Client::connect(home.path(), "icarus-app")
+        .await
+        .expect("app");
+    let workspace_path = created["path"].clone();
+    tokio::spawn(async move {
+        while let Some(event) = app_events.recv().await {
+            if event.topic != "layout_query" {
+                continue;
+            }
+            let layout = if event.payload["path"] == workspace_path {
+                json!({
+                    "tree": { "split": "row", "children": [{ "pane": "p1" }, { "pane": "p2" }] },
+                    "panes": [
+                        { "id": "p1", "path": "0", "active": false, "tabs": [
+                            { "id": "11", "type": "agent", "title": "Agent", "active": true },
+                        ]},
+                        { "id": "p2", "path": "1", "active": true, "tabs": [
+                            { "id": "21", "type": "diff", "title": "a.rs", "active": false },
+                            { "id": "22", "type": "browser", "title": "PR", "active": true },
+                        ]},
+                    ],
+                })
+            } else {
+                Value::Null
+            };
+            app.request(
+                "pane.answer",
+                json!({ "request": event.payload["request"], "layout": layout }),
+            )
+            .await
+            .expect("answer");
+        }
+    });
+
+    let tabs = client
+        .request("tab.list", json!({ "workspace": ws }))
+        .await
+        .expect("tab list");
+    assert_eq!(tabs["panes"][1]["tabs"][1]["id"], "22");
+    let panes = client
+        .request("pane.list", json!({ "workspace": ws }))
+        .await
+        .expect("pane list");
+    assert_eq!(panes["tree"]["split"], "row");
+    assert_eq!(panes["panes"][1]["tabs"], 2);
+    assert_eq!(panes["panes"][1]["active_tab"]["title"], "PR");
+
+    let other = client
+        .request_timeout(
+            "workspace.create",
+            json!({ "project": project["id"], "name": "closed" }),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("create");
+    let error = client
+        .request("pane.list", json!({ "workspace": other["id"] }))
+        .await
+        .expect_err("no window shows it");
+    assert!(format!("{error:#}").contains("not_open"), "{error:#}");
+}

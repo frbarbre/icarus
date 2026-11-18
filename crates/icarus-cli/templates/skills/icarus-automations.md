@@ -7,12 +7,12 @@ An automation is one script per project that Icarus runs on a timer, when someth
 1. **Interview first.** Ask what should happen and when, in their words: which columns cards move through, what an agent should do on a review request or a red CI run, what they want to be told about, what must never happen automatically (deletes, pushes). Don't write code until you can say the flow back in a few lines and they agree.
 2. **Statuses and prompts are settings, not code.** List them with `icarus config get workspace.statuses` and `icarus prompt list`; change them with `icarus config set workspace.statuses '<json>'` and `icarus config set prompts.<id> '<text>'`, and check a prompt with `icarus prompt render`. Scripts refer to them by id, so a renamed column needs no script change.
 3. **Start from the template.** Scripts live in `~/.config/icarus/automations/` (`$ICARUS_CONFIG_DIR/automations/` when that is set). `icarus automation template > <that folder>/<project>.ts` writes the built-in GitHub PR flow with its options at the top. Change the options before changing the logic. `icarus automation schema` writes `.generated/icarus.d.ts` beside it, so the editor checks the script's types.
-4. **Point the project at it:** `icarus config set automations.scripts.<project> <project>.ts` (a path relative to that folder, or absolute; the key is the project's name or id).
+4. **Point the project at it:** `icarus config set automations.scripts.<project> automations/<project>.ts` (a path relative to `~/.config/icarus/`, or absolute; the key is the project's name or id).
 5. **Dry run before arming.** Until `automations.armed` is true, every run only records what it would do. Run `icarus automation run --project <project> --dry-run`, show the user the planned actions in `icarus automation show <run>`, and get a yes before `icarus config set automations.armed true`.
 
-## While the built-in rules still run
+## Settings from the old built-in rules
 
-Both engines run side by side and every timed run is compared ("shadow mode"). `icarus automation status` shows how often they disagreed, and `icarus automation runs --shadow` lists the runs where they did. Disagreements that the user wants are fine; tell them which ones remain before they turn the built-in rules off.
+Icarus no longer has built-in rules. When it finds `rules` in the user settings (from an older Icarus or an Orca import), it writes them into `automations/orca-flow.ts`, points their projects at it, and saves the old settings in `automations/rules-backup.json`. If the user asks where their rules went, show them that script's options.
 
 ## Actions a script can return
 

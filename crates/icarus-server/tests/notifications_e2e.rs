@@ -1,4 +1,3 @@
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,26 +15,10 @@ impl Drop for ServerProcess {
     }
 }
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .expect("git");
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
 /// A server with its own settings dir and fixture GitHub.
 struct World {
     home: TempDir,
     config: TempDir,
-    fixtures: PathBuf,
     _server: ServerProcess,
     client: Arc<Client>,
     events: tokio::sync::mpsc::UnboundedReceiver<icarus_client::Event>,
@@ -68,7 +51,6 @@ impl World {
         Self {
             home,
             config,
-            fixtures: fixtures_path,
             _server: ServerProcess(child),
             client,
             events,
@@ -328,129 +310,74 @@ async fn every_agent_state_change_is_pushed_as_it_happens() {
     );
 }
 
-fn pull(number: u64, branch: &str, head: &str, extra: Value) -> Value {
-    let mut pull = json!({
-        "id": format!("PR_{number}"),
-        "number": number,
-        "title": format!("Pull request {number}"),
-        "url": format!("https://github.com/acme/widgets/pull/{number}"),
-        "state": "OPEN",
-        "isDraft": false,
-        "headRefName": branch,
-        "baseRefName": "main",
-        "headRefOid": head,
-        "headRef": { "name": branch },
-        "baseRef": { "name": "main" },
-        "mergeable": "MERGEABLE",
-        "mergeStateStatus": "CLEAN",
-        "author": { "login": "me" },
-        "repository": { "name": "widgets", "owner": { "login": "acme" }, "autoMergeAllowed": true },
+#[tokio::test]
+async fn old_rules_settings_become_the_orca_flow_script_at_startup() {
+    let settings = json!({
+        "notifications": { "rules": true },
+        "presets": ["github-pr-flow"],
+        "rules": {
+            "enabled": true,
+            "armed": true,
+            "pr": {
+                "statusByCondition": { "merged": "completed", "reviewing": "in-review" },
+                "holdStatus": "todo",
+                "actionPrompts": { "commitAndPush": "Commit it" },
+                "handledPullRequests": ["acme/widgets#4"],
+            },
+        },
     });
-    for (key, value) in extra.as_object().into_iter().flatten() {
-        pull[key] = value.clone();
-    }
-    pull
-}
+    let world = World::new(settings, json!({ "viewer": "me" })).await;
+    let done = world.wait_for("automation", 1).await;
+    assert_eq!(
+        done[0]["title"],
+        "Built-in rules are now an automation script"
+    );
 
-fn failing_checks() -> Value {
-    json!({ "nodes": [ { "commit": { "statusCheckRollup": { "state": "FAILURE", "contexts": { "nodes": [
-        { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "FAILURE",
-          "detailsUrl": "https://github.com/acme/widgets/actions/runs/77/job/1" }
-    ] } } } } ] })
+    let user: Value = serde_json::from_str(
+        &std::fs::read_to_string(world.config.path().join("icarus.json")).expect("settings"),
+    )
+    .expect("json");
+    assert!(user.get("rules").is_none(), "{user}");
+    assert!(user.get("presets").is_none(), "{user}");
+    assert_eq!(user["notifications"], json!({ "automation": true }));
+    assert_eq!(user["automations"]["armed"], true);
+    assert_eq!(user["automations"]["hold_status"], "todo");
+    assert_eq!(user["prompts"]["commitAndPush"], "Commit it");
+    assert_eq!(user["sidebar"]["reviewingStatus"], "in-review");
+
+    let automations = world.config.path().join("automations");
+    let script = std::fs::read_to_string(automations.join("orca-flow.ts")).expect("script");
+    assert!(script.contains(r#""merged": "completed""#), "{script}");
+    assert!(script.contains("acme/widgets#4"), "{script}");
+    let backup = std::fs::read_to_string(automations.join("rules-backup.json")).expect("backup");
+    assert!(backup.contains("holdStatus"));
+
+    world
+        .request(
+            "config.set",
+            json!({ "key": "theme.mode", "value": "dark" }),
+        )
+        .await;
 }
 
 #[tokio::test]
-async fn the_github_poll_notifies_ci_failures_merges_and_review_requests_once() {
-    let repos = tempfile::tempdir().expect("repos");
-    let repo = repos.path().join("widgets");
-    std::fs::create_dir_all(&repo).expect("repo");
-    git(
-        repos.path(),
-        &["init", "-q", "--bare", "-b", "main", "origin.git"],
-    );
-    git(&repo, &["init", "-q", "-b", "main"]);
-    git(&repo, &["config", "user.email", "me@example.com"]);
-    git(&repo, &["config", "user.name", "Me"]);
-    git(&repo, &["config", "commit.gpgsign", "false"]);
-    std::fs::write(repo.join("readme.md"), "hello\n").expect("write");
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
-    git(
-        &repo,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/widgets.git",
-        ],
-    );
-    let settings = json!({ "rules": {
-        "projects": ["widgets"],
-        "pr": { "enabled": true, "reviewInbox": { "enabled": true, "agent": "claude" } },
-    } });
-    let world = World::new(settings, json!({ "viewer": "me" })).await;
-    let project = world
-        .request("project.add", json!({ "path": repo, "name": "widgets" }))
-        .await;
-    let origin = repos.path().join("origin.git");
-    git(
-        &repo,
-        &[
-            "remote",
-            "set-url",
-            "origin",
-            origin.to_str().expect("utf8"),
-        ],
-    );
-    git(&repo, &["push", "-q", "origin", "main"]);
-    let mut heads = Vec::new();
-    let mut ids = Vec::new();
-    for name in ["feat-red", "feat-done"] {
-        let ws = world
-            .request(
-                "workspace.create",
-                json!({ "project": project["id"], "name": name, "agent": false }),
-            )
-            .await;
-        heads.push(git(
-            Path::new(ws["path"].as_str().expect("path")),
-            &["rev-parse", "HEAD"],
-        ));
-        ids.push(ws["id"].as_str().expect("id").to_owned());
-    }
-    std::fs::write(
-        &world.fixtures,
-        json!({
-            "viewer": "me",
-            "pulls": [
-                pull(11, "feat-red", &heads[0], json!({ "commits": failing_checks(), "mergeStateStatus": "UNSTABLE" })),
-                pull(12, "feat-done", &heads[1], json!({ "state": "MERGED" })),
-            ],
-            "inbox": [pull(20, "their-branch", "abc123", json!({ "author": { "login": "alice" }, "title": "Add search" }))],
-        })
-        .to_string(),
-    )
-    .expect("fixtures");
-
-    let tick = world.request("rules.tick", json!({})).await;
-    assert_eq!(tick["dry_run"], true, "{tick}");
-    assert_eq!(tick["notifications"], 3, "{tick}");
-    let ci = world.wait_for("ci_failed", 1).await;
+async fn a_script_notification_is_sent_once_per_kind_and_subject() {
+    let world = World::new(json!({}), json!({ "viewer": "me" })).await;
+    let send = json!({
+        "kind": "ci_failed", "subject": "acme/widgets#11@abc",
+        "title": "CI failed on #11", "body": "build failing",
+    });
+    world.request("notification.send", send.clone()).await;
+    world.request("notification.send", send.clone()).await;
+    let mut next_head = send.clone();
+    next_head["subject"] = json!("acme/widgets#11@def");
+    world.request("notification.send", next_head).await;
+    let ci = world.wait_for("ci_failed", 2).await;
+    assert_eq!(ci.len(), 2, "{ci:?}");
     assert_eq!(ci[0]["title"], "CI failed on #11");
-    assert_eq!(ci[0]["body"], "Pull request 11: build failing");
-    assert_eq!(ci[0]["workspace_id"], ids[0].as_str());
-    assert_eq!(
-        ci[0]["data"]["url"],
-        "https://github.com/acme/widgets/pull/11"
-    );
-    let merged = world.wait_for("pr_merged", 1).await;
-    assert_eq!(merged[0]["title"], "#12 merged");
-    assert_eq!(merged[0]["workspace_id"], ids[1].as_str());
-    let review = world.wait_for("review_requested", 1).await;
-    assert_eq!(review[0]["title"], "Review requested: #20");
-    assert_eq!(review[0]["body"], "Add search by alice");
 
-    let again = world.request("rules.tick", json!({})).await;
-    assert_eq!(again["notifications"], 0, "the same state is news once");
-    assert_eq!(world.notifications().await.len(), 3);
+    let mut bad = send;
+    bad["kind"] = json!("weather");
+    let refused = world.client.request("notification.send", bad).await;
+    assert!(refused.is_err());
 }

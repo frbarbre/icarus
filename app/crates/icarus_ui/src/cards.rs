@@ -192,7 +192,7 @@ pub struct CardView {
     pub stack_ascending: bool,
     /// This app's own fields (`client.json`), which win over `fields` when set.
     pub local_fields: Option<Vec<String>>,
-    /// The status the rules give someone else's PR; stack grouping lists it first.
+    /// `sidebar.reviewingStatus`: the status for someone else's PR; stack grouping lists it first.
     pub reviewing_status: Option<String>,
 }
 
@@ -229,12 +229,8 @@ impl CardView {
         self.group_by != GroupBy::Status && self.shows(STATUS_FIELD)
     }
 
-    /// Reads `workspace.cardFields`, the `sidebar` object and `rules.pr`.
-    pub fn from_settings(
-        card_fields: &serde_json::Value,
-        sidebar: &serde_json::Value,
-        rules: &serde_json::Value,
-    ) -> Self {
+    /// Reads `workspace.cardFields` and the `sidebar` object.
+    pub fn from_settings(card_fields: &serde_json::Value, sidebar: &serde_json::Value) -> Self {
         let defaults = Self::default();
         let fields = card_fields
             .as_array()
@@ -245,12 +241,6 @@ impl CardView {
                     .collect()
             })
             .unwrap_or(defaults.fields);
-        let reviewing_status = rules["enabled"]
-            .as_bool()
-            .unwrap_or(false)
-            .then(|| rules["statusByCondition"]["reviewing"].as_str())
-            .flatten()
-            .map(str::to_string);
         Self {
             fields,
             group_by: sidebar["groupBy"]
@@ -263,7 +253,10 @@ impl CardView {
                 .unwrap_or_default(),
             stack_ascending: sidebar["stackOrder"].as_str() == Some("asc"),
             local_fields: None,
-            reviewing_status,
+            reviewing_status: sidebar["reviewingStatus"]
+                .as_str()
+                .filter(|status| !status.is_empty())
+                .map(str::to_owned),
         }
     }
 
@@ -1302,14 +1295,12 @@ mod tests {
         let view = CardView::from_settings(
             &json!(["pr", "made-up", "linear-title"]),
             &json!({ "groupBy": "stack", "stackOrder": "asc" }),
-            &json!({ "enabled": true, "statusByCondition": { "reviewing": "in-review" } }),
         );
         assert_eq!(view.group_by, GroupBy::Stack);
         assert!(view.stack_ascending);
-        assert_eq!(view.reviewing_status.as_deref(), Some("in-review"));
         assert!(view.shows("pr") && !view.shows("pr-author"));
 
-        let defaults = CardView::from_settings(&json!(null), &json!(null), &json!(null));
+        let defaults = CardView::from_settings(&json!(null), &json!(null));
         assert_eq!(defaults.group_by, GroupBy::Status);
         assert!(defaults.shows("pr") && defaults.shows("inline-agents"));
         assert!(
@@ -1334,11 +1325,8 @@ mod tests {
         };
         assert!(!hidden.shows_status_chip(), "turned off, it never shows");
 
-        let old_alias = CardView::from_settings(
-            &json!(["status", "pr"]),
-            &json!({ "groupBy": "pr-status" }),
-            &json!(null),
-        );
+        let old_alias =
+            CardView::from_settings(&json!(["status", "pr"]), &json!({ "groupBy": "pr-status" }));
         assert!(old_alias.shows(STATUS_FIELD), "older settings say `status`");
         assert_eq!(old_alias.toggled(STATUS_FIELD), ["pr"]);
         assert!(
@@ -1350,15 +1338,6 @@ mod tests {
         );
         let all = CardView::showing_all();
         assert!(CARD_FIELDS.iter().all(|field| all.shows(field.id)));
-        let disabled_rules = CardView::from_settings(
-            &json!(null),
-            &json!(null),
-            &json!({ "enabled": false, "statusByCondition": { "reviewing": "in-review" } }),
-        );
-        assert_eq!(
-            disabled_rules.reviewing_status, None,
-            "Orca only gives reviewing its lane while the rules are on"
-        );
     }
 
     #[test]
@@ -1376,7 +1355,7 @@ mod tests {
             }
         }
 
-        let mut view = CardView::from_settings(&json!(["pr"]), &json!(null), &json!(null));
+        let mut view = CardView::from_settings(&json!(["pr"]), &json!(null));
         assert_eq!(view.toggled("ports"), ["pr", "ports"]);
         view.local_fields = Some(vec!["ports".into()]);
         assert!(view.shows("ports") && !view.shows("pr"));
@@ -2014,11 +1993,7 @@ mod tests {
 
     #[test]
     fn toggling_keeps_unknown_ids_and_order() {
-        let view = CardView::from_settings(
-            &json!(["made-up", "pr", "ports"]),
-            &json!(null),
-            &json!(null),
-        );
+        let view = CardView::from_settings(&json!(["made-up", "pr", "ports"]), &json!(null));
         assert_eq!(view.toggled("pr"), ["made-up", "ports"]);
         assert_eq!(view.toggled("stack"), ["made-up", "pr", "ports", "stack"]);
     }
@@ -2037,8 +2012,7 @@ mod tests {
             SortBy::Recent,
             "the settings default"
         );
-        let view =
-            CardView::from_settings(&json!(null), &json!({ "sortBy": "name" }), &json!(null));
+        let view = CardView::from_settings(&json!(null), &json!({ "sortBy": "name" }));
         assert_eq!(view.sort_by, SortBy::Name);
     }
 }

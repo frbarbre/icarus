@@ -637,19 +637,49 @@ async fn a_push_updates_the_next_action_without_waiting_for_the_poll() {
     assert!(pushed.elapsed() < Duration::from_secs(5));
 }
 
-fn rules_settings(armed: Option<bool>) -> Value {
-    let mut rules = json!({
-        "projects": ["widgets"],
-        "pr": {
-            "enabled": true,
-            "statusByCondition": { "draft": "in-progress", "reviewing": "in-review" },
-            "reviewInbox": { "enabled": true, "agent": "claude" },
-        },
-    });
-    if let Some(armed) = armed {
-        rules["armed"] = json!(armed);
-    }
-    fake_agent_settings(json!({ "rules": rules }))
+/// Mirrors the server's lookup closely enough to skip where no bun is installed.
+fn bun_installed() -> bool {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let shim =
+        |p: &Path| std::fs::read_link(p).is_ok_and(|t| t.file_name() == Some("mise".as_ref()));
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("bun"))
+        .any(|p| p.is_file() && !shim(&p))
+        || home.join(".bun/bin/bun").is_file()
+        || std::fs::read_dir(home.join(".local/share/mise/installs/bun"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|v| v.path().join("bin/bun").is_file())
+}
+
+fn flow_script(dir: &Path) -> PathBuf {
+    let mut options = icarus_settings::automation_template::orca_flow_defaults();
+    options["statusByCondition"] = json!({ "draft": "in-progress", "reviewing": "in-review" });
+    options["newWorkspaceStatus"] = Value::Null;
+    options["agent"] = json!("claude");
+    options["reviewInbox"]["enabled"] = json!(true);
+    options["reviewInbox"]["prompt"] = json!("Review #{{prNumber}} by {{author}}");
+    let path = dir.join("orca-flow.ts");
+    std::fs::write(
+        &path,
+        icarus_settings::automation_template::orca_flow(&options),
+    )
+    .expect("script");
+    path
+}
+
+async fn run(world: &World) -> Value {
+    let out = world
+        .request("automation.run", json!({ "project": world.project }))
+        .await;
+    out["runs"][0].clone()
+}
+
+fn flow_settings(script: &Path, armed: bool) -> Value {
+    fake_agent_settings(json!({
+        "automations": { "armed": armed, "scripts": { "widgets": script } },
+    }))
 }
 
 /// A branch someone else pushed for review, present only on the origin.
@@ -676,23 +706,35 @@ fn review_fixtures(own_head: &str, review_head: &str) -> Value {
 }
 
 #[tokio::test]
-async fn automation_tick_moves_a_status_and_creates_a_review_workspace() {
-    let world = World::new(rules_settings(Some(true)), json!({ "viewer": "me" })).await;
+async fn the_orca_flow_script_moves_a_status_and_creates_a_review_workspace() {
+    if !bun_installed() {
+        eprintln!("skipped: no bun");
+        return;
+    }
+    let scripts = tempfile::tempdir().expect("scripts");
+    let script = flow_script(scripts.path());
+    let world = World::new(flow_settings(&script, false), json!({ "viewer": "me" })).await;
     let (own, _, own_head) = world.workspace("feat-a").await;
     let review_head = push_review_branch(&world);
     world.set_fixtures(review_fixtures(&own_head, &review_head));
 
-    let tick = world.request("rules.tick", json!({})).await;
-    assert_eq!(tick["dry_run"], false, "{tick}");
-    assert_eq!(tick["errors"], json!([]), "{tick}");
+    let dry = run(&world).await;
+    assert_eq!(dry["dry_run"], true, "{dry}");
     let info = world.request("workspace.info", json!({ "id": own })).await;
-    assert_eq!(info["status"], "in-progress", "{tick}");
+    assert!(info["status"].is_null(), "{dry}");
+    assert_eq!(world.workspaces().await.len(), 1, "{dry}");
+
+    world.set_settings(flow_settings(&script, true));
+    let armed = run(&world).await;
+    assert_eq!(armed["dry_run"], false, "{armed}");
+    let info = world.request("workspace.info", json!({ "id": own })).await;
+    assert_eq!(info["status"], "in-progress", "{armed}");
 
     let workspaces = world.workspaces().await;
     let review = workspaces
         .iter()
-        .find(|w| w["name"] == "review-7-add-review-flow")
-        .unwrap_or_else(|| panic!("review workspace: {tick}"));
+        .find(|w| w["branch"] == "feature-review")
+        .unwrap_or_else(|| panic!("review workspace: {armed}"));
     assert_eq!(review["status"], "in-review");
     assert_eq!(review["branch"], "feature-review");
     assert_eq!(review["base_ref"], "origin/main");
@@ -702,144 +744,13 @@ async fn automation_tick_moves_a_status_and_creates_a_review_workspace() {
     let agent = review["agents"][0].clone();
     assert_eq!(agent["title"], "Review #7");
     let text = wait_for_agent(&world, agent["id"].as_str().expect("agent")).await;
-    assert!(
-        text.contains("echo: You are reviewing pull request #7"),
-        "{text}"
-    );
+    assert!(text.contains("echo: Review #7 by alice"), "{text}");
 
-    let second = world.request("rules.tick", json!({})).await;
-    assert_eq!(second["errors"], json!([]), "{second}");
+    let second = run(&world).await;
     assert_eq!(
         world.workspaces().await.len(),
         2,
-        "the ledger keeps the PR from being cloned twice: {second}"
-    );
-    let status = world.request("rules.status", json!({})).await;
-    assert_eq!(status["ticks"], 2);
-    assert_eq!(status["armed"], true);
-    assert_eq!(status["last_tick"]["dry_run"], false);
-}
-
-#[tokio::test]
-async fn automation_moves_worktrees_made_outside_icarus_too() {
-    let world = World::new(rules_settings(Some(true)), json!({ "viewer": "me" })).await;
-    let outside = world.repo.parent().expect("repos").join("elsewhere-feat-b");
-    git(
-        &world.repo,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feat-b",
-            outside.to_str().expect("utf8"),
-        ],
-    );
-    let adopted = world
-        .request("workspace.adopt", json!({ "path": outside }))
-        .await;
-    let id = adopted["id"].as_str().expect("id").to_owned();
-    let head = git(&outside, &["rev-parse", "HEAD"]);
-    world.set_fixtures(json!({
-        "viewer": "me",
-        "pulls": [pull(9, "feat-b", &head, json!({ "isDraft": true }))],
-    }));
-
-    let tick = world.request("rules.tick", json!({})).await;
-    assert_eq!(tick["errors"], json!([]), "{tick}");
-    let info = world.request("workspace.info", json!({ "id": id })).await;
-    assert_eq!(
-        info["status"], "in-progress",
-        "a draft outside the workspace root moves too: {tick}"
-    );
-}
-
-#[tokio::test]
-async fn deleting_a_merged_workspace_runs_the_archive_script_and_a_failure_keeps_it() {
-    let markers = tempfile::tempdir().expect("markers");
-    let marker = markers.path().join("archived.txt");
-    let mut settings = rules_settings(Some(true));
-    settings["rules"]["pr"]["onResolved"] = json!("delete");
-    settings["project"] = json!({ "hooks": { "scripts": { "archive": format!(
-        "[ \"$ORCA_WORKSPACE_NAME\" = feat-keep ] && exit 1; echo \"$ORCA_WORKSPACE_NAME\" >> '{}'",
-        marker.display()
-    ) } } });
-    let world = World::new(settings, json!({ "viewer": "me" })).await;
-    let (gone, gone_path, gone_head) = world.workspace("feat-gone").await;
-    let (kept, kept_path, kept_head) = world.workspace("feat-keep").await;
-    world.set_fixtures(json!({
-        "viewer": "me",
-        "pulls": [
-            pull(11, "feat-gone", &gone_head, json!({ "state": "MERGED" })),
-            pull(12, "feat-keep", &kept_head, json!({ "state": "MERGED" })),
-        ],
-    }));
-
-    let tick = world.request("rules.tick", json!({})).await;
-    let ids: Vec<String> = world
-        .workspaces()
-        .await
-        .iter()
-        .filter_map(|w| w["id"].as_str().map(str::to_owned))
-        .collect();
-    assert!(!ids.contains(&gone), "{tick}");
-    assert!(!gone_path.exists());
-    assert_eq!(
-        std::fs::read_to_string(&marker).expect("archive ran"),
-        "feat-gone\n"
-    );
-    assert!(
-        ids.contains(&kept),
-        "an unforced delete keeps a workspace whose archive failed: {tick}"
-    );
-    assert!(kept_path.is_dir());
-    assert!(
-        tick["errors"].to_string().contains("archive")
-            || tick.to_string().contains("archive_failed"),
-        "{tick}"
-    );
-}
-
-#[tokio::test]
-async fn unarmed_ticks_are_dry_runs_that_execute_nothing() {
-    let world = World::new(rules_settings(None), json!({ "viewer": "me" })).await;
-    let (own, _, own_head) = world.workspace("feat-a").await;
-    let review_head = push_review_branch(&world);
-    world.set_fixtures(review_fixtures(&own_head, &review_head));
-
-    let tick = world.request("rules.tick", json!({})).await;
-    assert_eq!(tick["dry_run"], true);
-    let planned: Vec<&str> = tick["planned"]
-        .as_array()
-        .expect("planned")
-        .iter()
-        .filter_map(|a| a["action"].as_str())
-        .collect();
-    assert!(planned.contains(&"set_column"), "{tick}");
-    assert!(planned.contains(&"create_workspace_from_pr"), "{tick}");
-    assert_eq!(tick["executed"], json!([]));
-    let info = world.request("workspace.info", json!({ "id": own })).await;
-    assert!(info["status"].is_null());
-    assert_eq!(world.workspaces().await.len(), 1);
-    assert_eq!(world.request("agent.list", json!({})).await, json!([]));
-
-    let explicit = world
-        .request("rules.tick", json!({ "dry_run": true }))
-        .await;
-    assert_eq!(explicit["dry_run"], true);
-    assert_eq!(world.workspaces().await.len(), 1);
-
-    let mut armed = rules_settings(Some(true));
-    armed["rules"]["pr"]["enabled"] = json!(false);
-    world.set_settings(armed);
-    let disabled = world.request("rules.tick", json!({})).await;
-    assert_eq!(disabled["skipped"], "rules are disabled");
-    assert!(
-        world
-            .requests()
-            .iter()
-            .all(|r| !r["route"].as_str().unwrap_or_default().starts_with("PUT")),
-        "a dry run makes no GitHub mutations"
+        "memory keeps the PR from being cloned twice: {second}"
     );
 }
 

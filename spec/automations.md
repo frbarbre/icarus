@@ -1,6 +1,6 @@
 # Automations: user scripts over a scope
 
-Status: phases 1–4 built (0.2.15); both engines run side by side in shadow mode. Removing the built-in rules engine (`crates/icarus-rules`, `rules.*` settings, `icarus rules`) waits for a week of agreeing shadow runs.
+Status: phases 1–4 built. The built-in rules engine, the `rules.*` settings, `icarus rules` and shadow mode are gone; `rules.*` settings are converted into `automations/orca-flow.ts` once, with a backup in `automations/rules-backup.json`.
 
 ## Why
 
@@ -190,11 +190,13 @@ Layouts stay as shorthand (`workspace layout`). The review layout becomes someth
 3. **Port and switch.** The user's Orca behaviour (statuses, review inbox, review head sync with target retarget, CI triage, next-action automation, top-bar rules) rewritten as `automations/flowbase.ts` in the user's dotfiles. Shadow mode: both engines evaluate each tick and their decisions are diffed until they agree. Then the built-in engine and the `rules.*` settings are removed, and `settings import` maps Orca's rules config to a generated starter script.
    - Accept: the script builds the review workspace exactly as today's (E2E), and a week of shadow runs shows no differing decisions.
    - Done: `inbox`, `linked_pr`, `review_pending`, `head_is_local`, `base_follows_target` in the scope; `review.workspace` (the review workspace as one action, reusing the built-in layout), `workspace.sync_to_pr_head`, `tab.open` (app applies it, queued without a window), `issue.assign`, `notification.send`; shadow mode (effects compared by key, recorded as `shadow` on the run, `automation runs --shadow`, counts in `automation status`); the port ships as `icarus automation template` rather than only in dotfiles.
-   - Deferred: `pane split|list|close` and `tab list|focus|move|close` (`review.workspace` covers the review layout); removing the rules engine and `rules.*`, and `settings import` generating a starter script, after the shadow week.
+   - Also done: `tab list|focus|move|close`, `pane split|list|close` and `tab open --pane --index --focus` (changes queue in order like `tab.open`; lists ask the open window through a `layout_query` event the app answers with `pane.answer`).
+   - Done (clean cut, no shadow week): the rules engine, `rules.*`, presets and shadow mode removed; `rules.*` from older settings or `settings import` becomes `automations/orca-flow.ts` with the projects pointed at it.
 4. **Settings and skill.** The Automations settings page, retiring the Icarus settings view, and the `icarus-automations` skill.
    - Accept: from a fresh setup, an agent using the skill produces a working, armed script for a project, Linear hook included.
-   - Done: an Automations section in the Icarus settings view (settings, prompts with a rendered preview, per-project script, last run, shadow summary, Run now (dry run), Regenerate types); `icarus skill list|get|install [--force]` with the `icarus-automations` guide, installed as a stub in `~/.agents/skills` linked from `~/.claude/skills`.
-   - Deferred: retiring the Icarus settings view and moving its pages into the main settings window; the rest of `spec/skills.md` (digest classification across releases, other agents' folders, `--local`, the Skills page).
+   - Done: an Automations section in the Icarus settings view (settings, prompts with a rendered preview, per-project script, last run, Run now (dry run), Regenerate types); `icarus skill list|get|install [--force]` with the `icarus-automations` guide, installed as a stub in `~/.agents/skills` linked from `~/.claude/skills`.
+   - Also done: the Icarus settings view is retired; its pages (Automations, Workspaces, Icarus) live in the main settings window through a `settings_ui` extension-page hook.
+   - Deferred: the rest of `spec/skills.md` (digest classification across releases, other agents' folders, `--local`, the Skills page).
 
 ## Open questions
 

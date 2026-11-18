@@ -415,7 +415,7 @@ Status of the build against [plan.md](plan.md). Updated as milestones land.
 ## Blocked on you
 
 Parked until you're back; work continues on other items.
-Nothing right now. (The macOS notification permission was granted for 0.1.1; banners checked live.)
+Nothing right now.
 
 **v0.1.0 is released** (github.com/frbarbre/icarus/releases/tag/v0.1.0): the macOS app (zip + dmg, Apple silicon, unsigned), the CLI and server for macOS (universal) and Linux (x86_64, arm64), and SHA256SUMS. The tag run built everything, but GitHub refused its release creation with a 403 that a probe couldn't reproduce from a dispatched run; `release-publish.yml` published the same built files.
 

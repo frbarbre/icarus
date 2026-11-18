@@ -1,7 +1,6 @@
 mod path;
 mod schema;
 
-use std::borrow::Cow;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,23 +15,18 @@ pub const PROJECT_LOCAL_FILE: &str = "icarus.local.json";
 pub const USER_FILE: &str = "icarus.json";
 // User settings lived here until the app took this directory for its Zed `settings.json`.
 const LEGACY_USER_FILE: &str = "settings.json";
-const PR_RULES: &str = "pr";
-// `rules.pr` was named `rules.orca_compat`; older files and keys still resolve to it.
-const LEGACY_PR_RULES: &str = "orca_compat";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Layer {
     Defaults,
-    Presets,
     User,
     Project,
     ProjectLocal,
 }
 
 impl Layer {
-    pub const ALL: [Layer; 5] = [
+    pub const ALL: [Layer; 4] = [
         Layer::Defaults,
-        Layer::Presets,
         Layer::User,
         Layer::Project,
         Layer::ProjectLocal,
@@ -41,7 +35,6 @@ impl Layer {
     pub fn name(self) -> &'static str {
         match self {
             Layer::Defaults => "defaults",
-            Layer::Presets => "presets",
             Layer::User => "user",
             Layer::Project => "project",
             Layer::ProjectLocal => "project-local",
@@ -99,37 +92,6 @@ pub enum LoadError {
     },
     #[error("{} must contain a JSON object", path.display())]
     NotObject { path: PathBuf },
-    #[error("unknown preset `{0}`")]
-    UnknownPreset(String),
-}
-
-pub struct Preset {
-    pub name: &'static str,
-    pub description: &'static str,
-    text: &'static str,
-}
-
-impl Preset {
-    pub fn document(&self) -> Value {
-        json::parse(self.text).unwrap_or_else(|_| Value::object())
-    }
-}
-
-pub const PRESETS: [Preset; 2] = [
-    Preset {
-        name: "github-pr-flow",
-        description: "Move workspaces between the default columns as their pull request progresses.",
-        text: include_str!("presets/github-pr-flow.json"),
-    },
-    Preset {
-        name: "review-inbox",
-        description: "Create a review workspace for every pull request that requests your review.",
-        text: include_str!("presets/review-inbox.json"),
-    },
-];
-
-pub fn preset(name: &str) -> Option<&'static Preset> {
-    PRESETS.iter().find(|preset| preset.name == name)
 }
 
 pub fn defaults() -> Value {
@@ -200,20 +162,6 @@ pub fn read_layer(layer: Layer, path: &Path) -> Result<Option<Value>, LoadError>
     read_document(&layer_source(layer, path))
 }
 
-/// Presets named in a settings document's `presets` list, in order.
-pub fn preset_names(doc: &Value) -> Vec<String> {
-    doc.get("presets")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 pub fn read_document(path: &Path) -> Result<Option<Value>, LoadError> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -225,7 +173,7 @@ pub fn read_document(path: &Path) -> Result<Option<Value>, LoadError> {
             });
         }
     };
-    let mut doc = json::parse(&text).map_err(|source| LoadError::Parse {
+    let doc = json::parse(&text).map_err(|source| LoadError::Parse {
         path: path.to_owned(),
         source,
     })?;
@@ -234,46 +182,12 @@ pub fn read_document(path: &Path) -> Result<Option<Value>, LoadError> {
             path: path.to_owned(),
         });
     }
-    rename_legacy_keys(&mut doc, false);
     Ok(Some(doc))
-}
-
-fn has_legacy_keys(doc: &Value) -> bool {
-    doc.get("rules")
-        .and_then(|rules| rules.get(LEGACY_PR_RULES))
-        .is_some()
-}
-
-// With both names in one file the new one wins; reads keep the old one so validation can flag it, writes drop it.
-fn rename_legacy_keys(doc: &mut Value, drop_shadowed: bool) {
-    let Some(rules) = doc
-        .as_object_mut()
-        .and_then(|doc| doc.get_mut("rules"))
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    let Some(index) = rules.get_index_of(LEGACY_PR_RULES) else {
-        return;
-    };
-    if rules.contains_key(PR_RULES) {
-        if drop_shadowed {
-            rules.shift_remove_index(index);
-        }
-        return;
-    }
-    if let Some((_, value)) = rules.shift_remove_index(index) {
-        rules.shift_insert(index, PR_RULES.to_owned(), value);
-    }
 }
 
 pub fn write_document(path: &Path, doc: &Value) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
-    }
-    let mut doc = Cow::Borrowed(doc);
-    if has_legacy_keys(&doc) {
-        rename_legacy_keys(doc.to_mut(), true);
     }
     let mut text = doc.to_pretty_string();
     text.push('\n');
@@ -301,7 +215,7 @@ impl SettingsPaths {
             Layer::User => self.user.as_deref(),
             Layer::Project => self.project.as_deref(),
             Layer::ProjectLocal => self.project_local.as_deref(),
-            Layer::Defaults | Layer::Presets => None,
+            Layer::Defaults => None,
         }
     }
 }
@@ -327,11 +241,8 @@ impl LayerStack {
         stack
     }
 
-    pub fn load(paths: &SettingsPaths, presets: &[&str]) -> Result<Self, LoadError> {
+    pub fn load(paths: &SettingsPaths) -> Result<Self, LoadError> {
         let mut stack = Self::with_defaults();
-        for name in presets {
-            stack.add_preset(name)?;
-        }
         for layer in [Layer::User, Layer::Project, Layer::ProjectLocal] {
             let Some(path) = paths.path(layer) else {
                 continue;
@@ -347,17 +258,6 @@ impl LayerStack {
             }
         }
         Ok(stack)
-    }
-
-    pub fn add_preset(&mut self, name: &str) -> Result<(), LoadError> {
-        let preset = preset(name).ok_or_else(|| LoadError::UnknownPreset(name.to_owned()))?;
-        self.push(LayerDoc {
-            layer: Layer::Presets,
-            label: format!("preset {}", preset.name),
-            origin: None,
-            doc: preset.document(),
-        });
-        Ok(())
     }
 
     // Documents of the same layer apply in the order they were pushed.

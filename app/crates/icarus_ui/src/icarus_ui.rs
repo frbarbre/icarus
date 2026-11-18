@@ -34,7 +34,7 @@ pub mod routing;
 pub mod sections;
 pub mod servers;
 pub mod session_history;
-pub mod settings_view;
+pub mod settings_pages;
 pub mod sidebar;
 pub mod source_control_settings;
 mod ssh_install;
@@ -747,7 +747,7 @@ async fn take_and_open_tab(client: Arc<Client>, request: String, cx: &mut gpui::
         cx.update(|cx| {
             let path = pending.path.clone();
             with_workspace_window(path, cx, move |workspace, window, cx| {
-                layout::add_tab(&pending, workspace, window, cx);
+                layout::apply_tab_op(&pending, workspace, window, cx);
             });
         });
     }
@@ -910,7 +910,7 @@ pub(crate) fn handle_view_event(topic: &str, payload: serde_json::Value, cx: &mu
         "review.changed" | "note.changed" => review::review_changed(cx),
         "git.changed" => changes_tab::git_changed(payload, cx),
         "ports.changed" => links::ports_changed(payload, cx),
-        "config.changed" => settings_view::config_changed(cx),
+        "config.changed" => settings_pages::config_changed(cx),
         "account.usage" => accounts::usage_changed(cx),
         "workspace.next_action" | "workspace.changed" => {
             next_action::server_event(topic, &payload, cx)
@@ -1173,6 +1173,25 @@ fn start_app_connection(cx: &mut App) {
                         };
                         take_and_open_tab(client.clone(), request.to_owned(), cx).await;
                     }
+                    "layout_query" => {
+                        let Some(path) = event.payload["path"].as_str().map(PathBuf::from) else {
+                            continue;
+                        };
+                        let layout = cx.update(|cx| {
+                            window_for_path(&path, cx)
+                                .map(|(_, workspace)| layout::describe(workspace.read(cx), cx))
+                        });
+                        let answer = serde_json::json!({
+                            "request": event.payload["request"],
+                            "layout": layout,
+                        });
+                        let client = client.clone();
+                        Tokio::spawn_result(cx, async move {
+                            client.request("pane.answer", answer).await
+                        })
+                        .await
+                        .log_err();
+                    }
                     _ => {}
                 }
             }
@@ -1243,7 +1262,7 @@ pub fn init(cx: &mut App) {
     session_history::register(cx);
     accounts::register(cx);
     remote_control::register(cx);
-    settings_view::register(cx);
+    settings_pages::register(cx);
     client_settings::init(cx);
     focus::register(cx);
     pane_nav::register(cx);
@@ -1483,7 +1502,7 @@ struct Snapshot {
     discovered: worktree_inbox::Discovered,
 }
 
-/// The snapshot's requests go out together: one round trip, not seven in a row.
+/// The snapshot's requests go out together: one round trip, not six in a row.
 async fn fetch_snapshot(client: Arc<Client>) -> Result<Snapshot> {
     let get = |key: &'static str| {
         let client = client.clone();
@@ -1493,12 +1512,11 @@ async fn fetch_snapshot(client: Arc<Client>) -> Result<Snapshot> {
                 .await
         }
     };
-    let (workspaces, statuses, card_fields, sidebar, rules, projects, inbox) = futures::join!(
+    let (workspaces, statuses, card_fields, sidebar, projects, inbox) = futures::join!(
         client.request("workspace.list", serde_json::json!({})),
         get("workspace.statuses"),
         get("workspace.cardFields"),
         get("sidebar"),
-        get("rules.pr"),
         client.request("project.list", serde_json::json!({})),
         worktree_inbox::fetch_inbox(&client),
     );
@@ -1506,7 +1524,6 @@ async fn fetch_snapshot(client: Arc<Client>) -> Result<Snapshot> {
     let statuses = statuses?;
     let card_fields = card_fields.unwrap_or_default();
     let sidebar = sidebar.unwrap_or_default();
-    let rules = rules.unwrap_or_default();
     let projects = projects.unwrap_or_default();
     let project_names = projects
         .as_array()
@@ -1524,7 +1541,7 @@ async fn fetch_snapshot(client: Arc<Client>) -> Result<Snapshot> {
         discovered,
         workspaces: serde_json::from_value(workspaces)?,
         statuses: serde_json::from_value(statuses).unwrap_or_default(),
-        view: cards::CardView::from_settings(&card_fields, &sidebar, &rules),
+        view: cards::CardView::from_settings(&card_fields, &sidebar),
         project_names,
     })
 }

@@ -3523,7 +3523,7 @@ fn row_menu(
                         }
                         submenu.action(
                             "Customize apps…",
-                            Box::new(crate::settings_view::CustomizeOpenInApps),
+                            Box::new(crate::settings_pages::CustomizeOpenInApps),
                         )
                     })
                     .id("changes-row-open-in"),

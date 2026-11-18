@@ -1,3 +1,4 @@
+pub mod automation_template;
 pub mod import;
 pub mod json;
 pub mod keymap;

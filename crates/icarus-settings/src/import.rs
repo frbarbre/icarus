@@ -624,7 +624,11 @@ pub fn import_orca(export: &OrcaExport) -> OrcaImport {
     let mut zed = appearance.settings;
     layers::deep_merge(&mut zed, &tooling);
     report.notes.extend(appearance.notes);
-    report.validation = layers::validate(&user, Some(layers::Layer::User));
+    // The server turns `rules` into an automation script right after writing the import.
+    report.validation = layers::validate(&user, Some(layers::Layer::User))
+        .into_iter()
+        .filter(|e| e.key != "rules")
+        .collect();
     for (remote, doc) in &projects {
         report.validation.extend(
             layers::validate(doc, Some(layers::Layer::ProjectLocal))

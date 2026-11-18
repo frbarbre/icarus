@@ -156,17 +156,6 @@ fn absent_hold_status_stays_absent() {
             .iter()
             .any(|n| n.contains("no holdStatus"))
     );
-
-    let mut stack = LayerStack::with_defaults();
-    stack.push(LayerDoc {
-        layer: Layer::User,
-        label: "user".into(),
-        origin: None,
-        doc: import.user.clone(),
-    });
-    let explained = stack.explain("rules.pr.holdStatus").expect("key");
-    assert_eq!(explained.value, Some(Value::Null));
-    assert_eq!(explained.winner().map(|s| s.layer), Some(Layer::Defaults));
 }
 
 #[test]
@@ -225,7 +214,8 @@ fn projects_become_documents_keyed_by_remote() {
         origin: None,
         doc: widgets.clone(),
     });
-    assert!(stack.validate().is_empty(), "{:?}", stack.validate());
+    let invalid = stack.validate();
+    assert!(invalid.iter().all(|e| e.key == "rules"), "{invalid:?}");
     assert_eq!(
         stack.get("project.portLabelsCommand").expect("key"),
         Some(Value::from("make print-urls"))

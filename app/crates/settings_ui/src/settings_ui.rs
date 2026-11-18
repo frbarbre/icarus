@@ -9,8 +9,8 @@ use editor::{Editor, EditorEvent};
 use futures::{StreamExt, channel::mpsc};
 use fuzzy::StringMatchCandidate;
 use gpui::{
-    Action, App, AsyncApp, AvailableSpace, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, Div,
-    Entity, FocusHandle, Focusable, Global, KeyContext, ListState, ReadGlobal as _, Role,
+    Action, AnyView, App, AsyncApp, AvailableSpace, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE,
+    Div, Entity, FocusHandle, Focusable, Global, KeyContext, ListState, ReadGlobal as _, Role,
     ScrollHandle, Stateful, Subscription, Task, TitlebarOptions, UniformListScrollHandle,
     WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, actions, container_query, div,
     list, point, prelude::*, px, uniform_list,
@@ -479,6 +479,7 @@ pub fn init(cx: &mut App) {
                 let window_handle = window.window_handle().downcast::<MultiWorkspace>();
                 open_settings_editor_to_page(
                     &action.page,
+                    None,
                     action.target.as_ref().map(SettingsFileTarget::from),
                     window_handle,
                     cx,
@@ -734,13 +735,24 @@ fn select_settings_file_target(
     }
 }
 
+pub fn open_settings_section(
+    page: &str,
+    section: Option<&str>,
+    workspace_handle: Option<WindowHandle<MultiWorkspace>>,
+    cx: &mut App,
+) {
+    open_settings_editor_to_page(page, section, None, workspace_handle, cx);
+}
+
 fn open_settings_editor_to_page(
     page: &str,
+    section: Option<&str>,
     target_file: Option<SettingsFileTarget>,
     workspace_handle: Option<WindowHandle<MultiWorkspace>>,
     cx: &mut App,
 ) {
     let page = page.to_string();
+    let section = section.map(str::to_string);
     open_settings_editor_with(workspace_handle, cx, move |settings_window, window, cx| {
         if let Some(target_file) = target_file {
             select_settings_file_target(target_file, settings_window, window, cx);
@@ -764,6 +776,20 @@ fn open_settings_editor_to_page(
             log::error!("settings page not found: {page}");
             return;
         };
+        let page_index = settings_window.navbar_entries[navbar_entry_index].page_index;
+        if section.is_some() {
+            // A collapsed root makes the scroll sync snap the selection back to the page.
+            settings_window.navbar_entries[navbar_entry_index].expanded = true;
+        }
+        let navbar_entry_index = section
+            .and_then(|section| {
+                settings_window.navbar_entries.iter().position(|entry| {
+                    !entry.is_root
+                        && entry.page_index == page_index
+                        && entry.title.eq_ignore_ascii_case(&section)
+                })
+            })
+            .unwrap_or(navbar_entry_index);
 
         settings_window.open_and_scroll_to_navbar_entry(
             navbar_entry_index,
@@ -1018,6 +1044,7 @@ pub struct SettingsWindow {
     /// mouse, where `focus_visible` styling would otherwise be suppressed).
     pub(crate) external_agent_add_focus_handle: FocusHandle,
     skill_creator_page: Option<(Entity<pages::SkillCreatorPage>, Subscription)>,
+    extension_pages: Vec<(&'static str, Vec<ExtensionSection>)>,
 }
 
 struct SearchDocument {
@@ -1095,6 +1122,44 @@ enum SettingsPageItem {
     SubPageLink(SubPageLink),
     DynamicItem(DynamicItem),
     ActionLink(ActionLink),
+    View(ViewItem),
+}
+
+pub struct ExtensionSection {
+    pub title: &'static str,
+    pub view: AnyView,
+}
+
+type ExtensionPageBuilder = Rc<
+    dyn Fn(Option<WindowHandle<MultiWorkspace>>, &mut Window, &mut App) -> Vec<ExtensionSection>,
+>;
+
+#[derive(Default)]
+struct ExtensionPages(Vec<(&'static str, ExtensionPageBuilder)>);
+
+impl Global for ExtensionPages {}
+
+pub fn register_extension_page(
+    title: &'static str,
+    build: impl Fn(Option<WindowHandle<MultiWorkspace>>, &mut Window, &mut App) -> Vec<ExtensionSection>
+    + 'static,
+    cx: &mut App,
+) {
+    cx.default_global::<ExtensionPages>()
+        .0
+        .push((title, Rc::new(build)));
+}
+
+#[derive(Clone)]
+struct ViewItem {
+    title: &'static str,
+    view: AnyView,
+}
+
+impl PartialEq for ViewItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.view.entity_id() == other.view.entity_id()
+    }
 }
 
 impl std::fmt::Debug for SettingsPageItem {
@@ -1113,6 +1178,7 @@ impl std::fmt::Debug for SettingsPageItem {
             SettingsPageItem::ActionLink(action_link) => {
                 write!(f, "ActionLink({})", action_link.title)
             }
+            SettingsPageItem::View(view_item) => write!(f, "View({})", view_item.title),
         }
     }
 }
@@ -1402,6 +1468,19 @@ impl SettingsPageItem {
                             }),
                         ),
                 )
+                .when(bottom_border, |this| this.child(Divider::horizontal()))
+                .into_any_element(),
+            SettingsPageItem::View(view_item) => v_flex()
+                .px_8()
+                .pt_2()
+                .map(|this| {
+                    if extra_bottom_padding {
+                        this.pb_10()
+                    } else {
+                        this.pb_4()
+                    }
+                })
+                .child(view_item.view.clone())
                 .when(bottom_border, |this| this.child(Divider::horizontal()))
                 .into_any_element(),
         }
@@ -1984,7 +2063,17 @@ impl SettingsWindow {
 
         let list_state = gpui::ListState::new(0, gpui::ListAlignment::Top, px(0.0)).measure_all();
 
+        let builders = cx
+            .try_global::<ExtensionPages>()
+            .map(|pages| pages.0.clone())
+            .unwrap_or_default();
+        let extension_pages = builders
+            .into_iter()
+            .map(|(title, build)| (title, build(original_window, window, cx)))
+            .collect();
+
         let mut this = Self {
+            extension_pages,
             title_bar,
             original_window,
 
@@ -2249,6 +2338,7 @@ impl SettingsWindow {
                             any_found_since_last_header = true;
                         }
                     }
+                    SettingsPageItem::View(_) => any_found_since_last_header = true,
                 }
             }
             if let Some(last_header) = page_filter.get_mut(header_index)
@@ -2498,6 +2588,13 @@ impl SettingsWindow {
                             action_link.title.as_ref(),
                         );
                     }
+                    SettingsPageItem::View(view_item) => {
+                        documents.push(SearchDocument {
+                            id: key_index,
+                            words: split_into_words(&[page.title, header_str, view_item.title]),
+                        });
+                        push_candidates(&mut fuzzy_match_candidates, key_index, view_item.title);
+                    }
                 }
                 push_candidates(&mut fuzzy_match_candidates, key_index, page.title);
                 push_candidates(&mut fuzzy_match_candidates, key_index, header_str);
@@ -2543,6 +2640,27 @@ impl SettingsWindow {
     fn build_ui(&mut self, window: &mut Window, cx: &mut Context<SettingsWindow>) {
         if self.pages.is_empty() {
             self.pages = page_data::settings_data(cx);
+            let extension_pages =
+                self.extension_pages
+                    .iter()
+                    .map(|(title, sections)| SettingsPage {
+                        title,
+                        items: sections
+                            .iter()
+                            .flat_map(|section| {
+                                [
+                                    SettingsPageItem::SectionHeader(section.title),
+                                    SettingsPageItem::View(ViewItem {
+                                        title: section.title,
+                                        view: section.view.clone(),
+                                    }),
+                                ]
+                            })
+                            .collect(),
+                    });
+            let after_general = self.pages.len().min(1);
+            self.pages
+                .splice(after_general..after_general, extension_pages);
             self.build_navbar(cx);
             self.setup_navbar_focus_subscriptions(window, cx);
             self.build_content_handles(window, cx);
@@ -5512,6 +5630,7 @@ pub mod test {
                 custom_agent_form: None,
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
+                extension_pages: Vec::new(),
             }
         }
     }
@@ -5652,6 +5771,7 @@ pub mod test {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            extension_pages: Vec::new(),
         };
 
         settings_window.build_filter_table();
@@ -7579,6 +7699,46 @@ pub mod test {
         );
         cx.run_until_parked();
         credentials.assert_reads(&[url; 2]);
+    }
+
+    #[gpui::test]
+    fn test_extension_page_opens_at_its_section(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            register_settings(cx);
+            release_channel::init("0.0.0".parse().expect("version"), cx);
+            crate::init(cx);
+            AppState::set_global(AppState::test(cx), cx);
+            register_extension_page(
+                "Extension",
+                |_, _, cx| {
+                    ["First", "Second"]
+                        .into_iter()
+                        .map(|title| ExtensionSection {
+                            title,
+                            view: cx.new(|_| gpui::Empty).into(),
+                        })
+                        .collect()
+                },
+                cx,
+            );
+        });
+        cx.update(|cx| open_settings_section("Extension", Some("Second"), None, cx));
+        cx.run_until_parked();
+        let settings_window = cx
+            .update(|cx| {
+                cx.windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<SettingsWindow>())
+            })
+            .expect("the settings window opens");
+        settings_window
+            .read_with(cx, |settings_window, _| {
+                assert_eq!(settings_window.pages[1].title, "Extension");
+                assert_eq!(settings_window.current_page().title, "Extension");
+                let entry = &settings_window.navbar_entries[settings_window.navbar_entry];
+                assert_eq!(entry.title, "Second");
+            })
+            .expect("settings window");
     }
 
     fn settings_window_with_items(

@@ -257,32 +257,171 @@ pub fn apply_layout(
     .detach_and_log_err(cx);
 }
 
-/// A tab the server asked the app to add (`icarus tab open`), as opposed to a whole layout.
+/// A change the server asked the app to make to a workspace's tabs or panes (`icarus tab`/`icarus pane`).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct PendingTab {
     pub workspace_id: String,
     pub path: PathBuf,
-    pub tab: Tab,
-    /// `right` or `down` opens it in a new pane split off the active one.
-    #[serde(default)]
-    pub split: Option<String>,
-    #[serde(default)]
-    pub background: bool,
+    #[serde(flatten)]
+    pub op: TabOp,
 }
 
-/// Adds `pending.tab` next to what is open, keeping every other tab.
-pub fn add_tab(
+/// Panes are named by `active`, an id like `p12`, or a path such as `left` or `0.1`; tabs by id or `active`.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum TabOp {
+    Open {
+        tab: Tab,
+        /// `right` or `down` opens it in a new pane split off the target pane.
+        #[serde(default)]
+        split: Option<String>,
+        #[serde(default)]
+        pane: Option<String>,
+        #[serde(default)]
+        index: Option<usize>,
+        #[serde(default)]
+        background: bool,
+        #[serde(default)]
+        focus: bool,
+    },
+    Focus {
+        tab: String,
+    },
+    Move {
+        tab: String,
+        pane: String,
+        #[serde(default)]
+        index: Option<usize>,
+    },
+    Close {
+        tab: String,
+    },
+    Split {
+        #[serde(default)]
+        pane: Option<String>,
+        direction: String,
+    },
+    ClosePane {
+        pane: String,
+    },
+}
+
+fn split_direction(direction: &str) -> Option<SplitDirection> {
+    match direction {
+        "right" => Some(SplitDirection::Right),
+        "down" => Some(SplitDirection::Down),
+        _ => None,
+    }
+}
+
+/// Applies a tab or pane change to `workspace`; a target that isn't there is logged and skipped.
+pub fn apply_tab_op(
     pending: &PendingTab,
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let active = workspace.active_pane().clone();
-    let previous = active.read(cx).active_item_index();
-    let pane = match pending.split.as_deref() {
-        Some("right") => workspace.split_pane(active.clone(), SplitDirection::Right, window, cx),
-        Some("down") => workspace.split_pane(active.clone(), SplitDirection::Down, window, cx),
-        _ => active.clone(),
+    match &pending.op {
+        TabOp::Open { .. } => add_tab(pending, workspace, window, cx),
+        TabOp::Split { pane, direction } => {
+            let Some(direction) = split_direction(direction) else {
+                return;
+            };
+            if let Some(pane) = resolve_pane(pane.as_deref().unwrap_or("active"), workspace) {
+                workspace.split_pane(pane, direction, window, cx);
+            }
+        }
+        TabOp::Focus { tab } => {
+            let Some((pane, item_id)) = resolve_tab(tab, workspace, cx) else {
+                return;
+            };
+            pane.update(cx, |pane, cx| {
+                let index = pane.items().position(|item| item.item_id() == item_id);
+                if let Some(index) = index {
+                    pane.activate_item(index, true, true, window, cx);
+                }
+            });
+            window.activate_window();
+        }
+        TabOp::Move { tab, pane, index } => {
+            let (Some((source, item_id)), Some(destination)) = (
+                resolve_tab(tab, workspace, cx),
+                resolve_pane(pane, workspace),
+            ) else {
+                return;
+            };
+            let end = destination.read(cx).items_len();
+            let index = index.unwrap_or(end).min(end);
+            workspace::move_item(&source, &destination, item_id, index, true, window, cx);
+        }
+        TabOp::Close { tab } => {
+            if let Some((pane, item_id)) = resolve_tab(tab, workspace, cx) {
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
+                })
+                .detach_and_log_err(cx);
+            }
+        }
+        TabOp::ClosePane { pane } => {
+            let Some(pane) = resolve_pane(pane, workspace) else {
+                return;
+            };
+            let closing = pane.update(cx, |pane, cx| {
+                pane.close_all_items(
+                    &workspace::CloseAllItems {
+                        save_intent: Some(SaveIntent::Close),
+                        close_pinned: true,
+                    },
+                    window,
+                    cx,
+                )
+            });
+            cx.spawn_in(window, async move |workspace, cx| {
+                closing.await?;
+                // A pane that was already empty doesn't remove itself.
+                workspace.update(cx, |workspace, cx| {
+                    if workspace.panes().len() > 1
+                        && workspace.panes().contains(&pane)
+                        && pane.read(cx).items_len() == 0
+                    {
+                        pane.update(cx, |_, cx| {
+                            cx.emit(workspace::pane::Event::Remove {
+                                focus_on_pane: None,
+                            })
+                        });
+                    }
+                })
+            })
+            .detach_and_log_err(cx);
+        }
+    }
+}
+
+/// Adds the requested tab next to what is open, keeping every other tab.
+fn add_tab(
+    pending: &PendingTab,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let TabOp::Open {
+        tab,
+        split,
+        pane,
+        index,
+        background,
+        focus,
+    } = &pending.op
+    else {
+        return;
+    };
+    let Some(target) = resolve_pane(pane.as_deref().unwrap_or("active"), workspace) else {
+        return;
+    };
+    let previous = target.read(cx).active_item_index();
+    let pane = match split.as_deref().and_then(split_direction) {
+        Some(direction) => workspace.split_pane(target.clone(), direction, window, cx),
+        None => target.clone(),
     };
     let mut build = Build {
         worktree_root: &pending.path,
@@ -290,26 +429,206 @@ pub fn add_tab(
         pending: Vec::new(),
         actives: Vec::new(),
     };
-    let index = pane.read(cx).items_len();
-    build.tab(&pending.tab, index, &pane, workspace, window, cx);
+    let end = pane.read(cx).items_len();
+    let index = index.unwrap_or(end).min(end);
+    let before: HashSet<EntityId> = pane.read(cx).items().map(|item| item.item_id()).collect();
+    build.tab(tab, index, &pane, workspace, window, cx);
+    let added: Vec<EntityId> = build.placed.difference(&before).copied().collect();
+    if let Some(&item_id) = added.first() {
+        place_at(&pane, item_id, index, window, cx);
+    }
     let tasks = build.pending;
-    let background = pending.background;
+    let background = *background;
+    let focus = *focus;
     cx.spawn_in(window, async move |_, cx| {
         for task in tasks {
             task.await.log_err();
         }
-        if background {
-            cx.update(|window, cx| {
-                active.update(cx, |pane, cx| {
+        cx.update(|window, cx| {
+            if background {
+                target.update(cx, |pane, cx| {
                     if previous < pane.items_len() {
                         pane.activate_item(previous, false, false, window, cx);
                     }
                 });
-            })
-            .log_err();
-        }
+            } else if focus {
+                pane.update(cx, |pane, cx| {
+                    let index = index.min(pane.items_len().saturating_sub(1));
+                    pane.activate_item(index, true, true, window, cx);
+                });
+                window.activate_window();
+            }
+        })
+        .log_err();
     })
     .detach();
+}
+
+fn resolve_pane(reference: &str, workspace: &Workspace) -> Option<Entity<Pane>> {
+    let found = if reference == "active" {
+        Some(workspace.active_pane().clone())
+    } else if let Some(id) = reference
+        .strip_prefix('p')
+        .and_then(|id| id.parse::<u64>().ok())
+    {
+        workspace
+            .panes()
+            .iter()
+            .find(|pane| pane.entity_id().as_u64() == id)
+            .cloned()
+    } else {
+        let mut member = Some(&workspace.center_pane_group().root);
+        for segment in reference.split('.') {
+            member = match member {
+                Some(Member::Axis(axis)) => {
+                    let index = match segment {
+                        "left" | "top" | "first" => Some(0),
+                        "right" | "bottom" | "last" => Some(axis.members.len().saturating_sub(1)),
+                        index => index.parse().ok(),
+                    };
+                    index.and_then(|index| axis.members.get(index))
+                }
+                // A pane that isn't split is every side of itself, and child 0.
+                Some(pane @ Member::Pane(_))
+                    if segment.parse::<usize>().is_err() || segment == "0" =>
+                {
+                    Some(pane)
+                }
+                _ => None,
+            };
+        }
+        member.map(first_pane)
+    };
+    if found.is_none() {
+        log::warn!("layout: no pane `{reference}` in this window");
+    }
+    found
+}
+
+fn first_pane(member: &Member) -> Entity<Pane> {
+    match member {
+        Member::Axis(axis) => first_pane(&axis.members[0]),
+        Member::Pane(pane) => pane.clone(),
+    }
+}
+
+fn resolve_tab(
+    reference: &str,
+    workspace: &Workspace,
+    cx: &App,
+) -> Option<(Entity<Pane>, EntityId)> {
+    let found = if reference == "active" {
+        let pane = workspace.active_pane().clone();
+        let item = pane.read(cx).active_item()?.item_id();
+        Some((pane, item))
+    } else {
+        let id = reference.parse::<u64>().ok()?;
+        workspace.panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .find(|item| item.item_id().as_u64() == id)
+                .map(|item| (pane.clone(), item.item_id()))
+        })
+    };
+    if found.is_none() {
+        log::warn!("layout: no tab `{reference}` in this window");
+    }
+    found
+}
+
+/// The window's split tree and each pane's tabs, as `tab.list` and `pane.list` report them.
+pub fn describe(workspace: &Workspace, cx: &App) -> serde_json::Value {
+    let mut panes = Vec::new();
+    let tree = describe_member(
+        &workspace.center_pane_group().root,
+        String::new(),
+        workspace.active_pane(),
+        &mut panes,
+        cx,
+    );
+    serde_json::json!({ "tree": tree, "panes": panes })
+}
+
+fn describe_member(
+    member: &Member,
+    path: String,
+    active: &Entity<Pane>,
+    panes: &mut Vec<serde_json::Value>,
+    cx: &App,
+) -> serde_json::Value {
+    match member {
+        Member::Axis(axis) => {
+            let children: Vec<_> = axis
+                .members
+                .iter()
+                .enumerate()
+                .map(|(index, child)| {
+                    let path = if path.is_empty() {
+                        index.to_string()
+                    } else {
+                        format!("{path}.{index}")
+                    };
+                    describe_member(child, path, active, panes, cx)
+                })
+                .collect();
+            let split = match axis.axis {
+                gpui::Axis::Horizontal => "row",
+                gpui::Axis::Vertical => "column",
+            };
+            serde_json::json!({ "split": split, "children": children })
+        }
+        Member::Pane(pane) => {
+            let id = format!("p{}", pane.entity_id().as_u64());
+            let pane_ref = pane.read(cx);
+            let active_index = pane_ref.active_item_index();
+            let tabs: Vec<_> = pane_ref
+                .items()
+                .enumerate()
+                .map(|(index, item)| {
+                    let mut tab = serde_json::json!({
+                        "id": item.item_id().as_u64().to_string(),
+                        "type": tab_type(item.as_ref(), cx),
+                        "title": item.tab_content_text(0, cx).to_string(),
+                        "active": index == active_index,
+                    });
+                    if let Some(path) = item.project_path(cx) {
+                        tab["path"] = path.path.as_unix_str().into();
+                    }
+                    if let Some(browser) = item.downcast::<crate::browser::BrowserTab>() {
+                        tab["url"] = browser.read(cx).url().to_string().into();
+                    }
+                    tab
+                })
+                .collect();
+            panes.push(serde_json::json!({
+                "id": id,
+                "path": if path.is_empty() { "0".to_owned() } else { path },
+                "active": pane == active,
+                "tabs": tabs,
+            }));
+            serde_json::json!({ "pane": id })
+        }
+    }
+}
+
+fn tab_type(item: &dyn workspace::ItemHandle, cx: &App) -> &'static str {
+    let kind = item.to_any_view().entity_type();
+    if cx
+        .try_global::<AgentItemType>()
+        .is_some_and(|agent| agent.0 == kind)
+    {
+        "agent"
+    } else if kind == std::any::TypeId::of::<crate::browser::BrowserTab>() {
+        "browser"
+    } else if kind == std::any::TypeId::of::<crate::diff_tab::DiffTab>() {
+        "diff"
+    } else if kind == std::any::TypeId::of::<TerminalView>() {
+        "terminal"
+    } else if kind == std::any::TypeId::of::<Editor>() {
+        "file"
+    } else {
+        "other"
+    }
 }
 
 fn build_layout(
@@ -708,6 +1027,25 @@ mod tests {
             2,
             "the agent and the file's diff tab stay"
         );
+    }
+
+    #[test]
+    fn queued_tab_and_pane_changes_read_as_ops() {
+        let pending: PendingTab = serde_json::from_value(json!({
+            "op": "open", "workspace_id": "w", "path": "/w",
+            "tab": { "type": "browser", "url": "https://x" },
+            "pane": "right", "index": 1, "focus": true, "split": null,
+        }))
+        .expect("open");
+        assert!(matches!(
+            pending.op,
+            TabOp::Open { pane: Some(ref pane), index: Some(1), focus: true, background: false, .. } if pane == "right"
+        ));
+        let pending: PendingTab = serde_json::from_value(json!({
+            "op": "close_pane", "workspace_id": "w", "path": "/w", "pane": "p3",
+        }))
+        .expect("close pane");
+        assert!(matches!(pending.op, TabOp::ClosePane { ref pane } if pane == "p3"));
     }
 
     #[test]

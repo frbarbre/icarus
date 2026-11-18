@@ -7,7 +7,6 @@ use icarus_git::LocalState;
 use icarus_protocol::RpcError;
 use icarus_rules::model::PrOperation;
 use icarus_rules::next_action::{LocalGitState, MergeStep, NextAction, next_action};
-use icarus_rules::orca_preset::{OrcaRuleConfig, normalize};
 use icarus_rules::prompts::{
     ActionPromptId, resolve_action_prompt_template, resolve_pull_request_conflicts_prompt,
 };
@@ -63,10 +62,6 @@ fn setting_str<'a>(settings: &'a Value, path: &[&str]) -> Option<&'a str> {
     setting(settings, path)
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
-}
-
-pub(crate) fn orca_config(settings: &Value) -> OrcaRuleConfig {
-    normalize(setting(settings, &["rules", "pr"]).unwrap_or(&Value::Null))
 }
 
 /// How an agent session is launched: which provider, model and command line.
@@ -251,7 +246,6 @@ impl Server {
         local: &LocalState,
         view: &PrView,
         settings: &Value,
-        orca: &OrcaRuleConfig,
     ) -> String {
         let path = workspace.path.to_string_lossy().into_owned();
         let pr = view.pr.as_ref();
@@ -269,7 +263,7 @@ impl Server {
             _ => ActionPromptId::CommitAndPush,
         };
         let template =
-            resolve_action_prompt_template(orca.action_prompts.get(&id).map(String::as_str), id);
+            resolve_action_prompt_template(setting_str(settings, &["prompts", id.key()]), id);
         let base = pr
             .map(|pr| pr.base_ref_name.clone())
             .or_else(|| {
@@ -361,14 +355,9 @@ impl Server {
             .map_err(|e| rpc("internal", e))?
             .ok_or_else(|| rpc("not_found", "project"))?;
         let settings = self.resolved_settings(Some(&project.root));
-        let orca = orca_config(&settings);
         if is_agent_step(action) {
-            let prompt = self.agent_prompt(action, &workspace, &local, &view, &settings, &orca);
-            let choice = choose_agent(
-                &settings,
-                Some(action.name()),
-                Some(&orca.review_inbox.agent),
-            );
+            let prompt = self.agent_prompt(action, &workspace, &local, &view, &settings);
+            let choice = choose_agent(&settings, Some(action.name()), None);
             let id = self
                 .start_agent_session(&workspace, choice, label(action), &prompt)
                 .await

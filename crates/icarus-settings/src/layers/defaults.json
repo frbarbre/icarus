@@ -16,27 +16,6 @@
     "sortBy": "recent",
     "projectOrderBy": "manual"
   },
-  "rules": {
-    "pr": {
-      "enabled": false,
-      "statusByCondition": {},
-      "mergingCheckName": "Reviews satisfied",
-      "newWorkspaceStatus": null,
-      "holdStatus": null,
-      "pmApprovalTeam": null,
-      "onResolved": "none",
-      "onReviewed": "none",
-      "resolveConflictsWithAgent": false,
-      "conflictPromptTemplate": "",
-      "reviewEnteredCommand": "",
-      "actionPrompts": {},
-      "reviewInbox": {
-        "enabled": false,
-        "agent": "claude",
-        "view": "chat"
-      }
-    }
-  },
   "quickCommands": [],
   "sourceControl": {
     "openIn": [{ "id": "vscode", "label": "VS Code", "command": "code" }]

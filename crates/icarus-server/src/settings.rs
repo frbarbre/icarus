@@ -1,4 +1,4 @@
-//! Layered settings over RPC: defaults < presets < user < project (`icarus.json`) < project-local.
+//! Layered settings over RPC: defaults < user < project (`icarus.json`) < project-local.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -103,13 +103,6 @@ impl Server {
             let described: Vec<String> = errors.iter().map(|e| format!("{e:?}")).collect();
             return Err(rpc("settings_invalid", described.join("; ")));
         }
-        if layer == Layer::User {
-            for name in layers::preset_names(doc) {
-                if layers::preset(&name).is_none() {
-                    return Err(rpc("settings_invalid", format!("unknown preset `{name}`")));
-                }
-            }
-        }
         let written = layers::write_document(path, doc).map_err(|e| rpc("io", e));
         settings_cache::forget(path);
         written
@@ -146,13 +139,6 @@ impl Server {
             }
         }
         let mut stack = LayerStack::with_defaults();
-        if let Some(user) = docs.iter().find(|d| d.layer == Layer::User) {
-            for name in layers::preset_names(&user.doc) {
-                stack
-                    .add_preset(&name)
-                    .map_err(|e| rpc("settings_invalid", format!("{e:?}")))?;
-            }
-        }
         for doc in docs {
             stack.push(doc);
         }
@@ -317,6 +303,8 @@ impl Server {
                         std::fs::create_dir_all(parent).map_err(|e| rpc("io", e))?;
                     }
                     layers::write_document(&user_path, &user).map_err(|e| rpc("io", e))?;
+                    settings_cache::forget(&user_path);
+                    self.migrate_rules();
                     written.push(json!({ "layer": "user", "path": user_path }));
                     if let Some(applied) = &applied {
                         if !applied.added.is_empty() {

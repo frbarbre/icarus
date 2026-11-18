@@ -877,15 +877,8 @@ impl NewWorkspaceModal {
     }
 
     fn connect_linear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = self.workspace.clone();
         cx.emit(DismissEvent);
-        window.defer(cx, move |window, cx| {
-            workspace
-                .update(cx, |workspace, cx| {
-                    crate::settings_view::open_linear_settings(workspace, window, cx)
-                })
-                .log_err();
-        });
+        window.defer(cx, crate::settings_pages::open_linear_settings);
     }
 
     pub fn linked_issue(&self) -> Option<&IssueHit> {

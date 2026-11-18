@@ -1,0 +1,29 @@
+{
+  "statusByCondition": {
+    "merged": "completed",
+    "closed": "completed",
+    "reviewing": "in-review",
+    "draft": "in-progress",
+    "changes-requested": "in-progress",
+    "merging": "in-review",
+    "review": "in-review"
+  },
+  "newWorkspaceStatus": "in-progress",
+  "newWorkspaceStatusSince": 0,
+  "onResolved": "keep",
+  "onReviewed": "keep",
+  "mergingCheckName": "Reviews satisfied",
+  "pmApprovalTeam": "",
+  "resolveConflictsWithAgent": false,
+  "conflictPrompt": "Pull request #{{prNumber}} has merge conflicts with {{baseRef}}. Fetch {{baseRef}}, merge it into {{branch}}, resolve every conflict keeping both sides' intent, run the tests, and commit the merge.",
+  "reviewEnteredCommand": "",
+  "agent": "claude",
+  "reviewInbox": {
+    "enabled": false,
+    "prompt": "You are reviewing pull request #{{prNumber}} — \"{{title}}\" by {{author}} ({{url}}). The branch {{branch}} is checked out and the diff is pointed at {{baseRef}}. Review it and leave draft comments with `icarus review comment add`.",
+    "rereviewPrompt": "You reviewed pull request #{{prNumber}} — \"{{title}}\" by {{author}} ({{url}}) before, and {{author}} has asked you to look again. The diff is pointed at {{sinceCommit}}, the commit you last reviewed. Say how each change you asked for was answered.",
+    "handled": []
+  },
+  "ciTriage": {},
+  "notify": { "ciFailed": true, "merged": true, "reviewRequested": true }
+}

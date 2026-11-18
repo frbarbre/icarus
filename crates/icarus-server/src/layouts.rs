@@ -1,8 +1,9 @@
 //! Named tab layouts (plan D32): resolved on the server, stored on the workspace, applied by the app.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use icarus_protocol::RpcError;
 use icarus_protocol::layout::{
@@ -22,6 +23,145 @@ const LEGACY_REVIEW_NAME: &str = "review_split";
 
 fn pending_key(workspace_id: &str) -> String {
     format!("layout.pending:{workspace_id}")
+}
+
+const TAB_PENDING: &str = "tab.pending:";
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ids that sort in the order they were made, so queued tab and pane changes apply in order.
+fn request_id() -> String {
+    static LAST: Mutex<u64> = Mutex::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    *last = now.max(*last + 1);
+    format!("{:016x}", *last)
+}
+
+/// Requests queued before ops existed are tab opens.
+fn with_op(mut pending: Value) -> Value {
+    if pending.get("op").is_none() {
+        pending["op"] = json!("open");
+    }
+    pending
+}
+
+type Answers = tokio::sync::mpsc::UnboundedSender<Value>;
+
+fn queries() -> std::sync::MutexGuard<'static, HashMap<String, Answers>> {
+    static QUERIES: LazyLock<Mutex<HashMap<String, Answers>>> = LazyLock::new(Default::default);
+    QUERIES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// A `layout_query` waiting for `pane.answer`; dropping it stops listening.
+struct PendingQuery(String);
+
+impl PendingQuery {
+    fn register(id: &str, sender: Answers) -> Self {
+        queries().insert(id.to_owned(), sender);
+        Self(id.to_owned())
+    }
+
+    fn answer(id: &str, layout: Value) -> bool {
+        queries()
+            .get(id)
+            .is_some_and(|sender| sender.send(layout).is_ok())
+    }
+}
+
+impl Drop for PendingQuery {
+    fn drop(&mut self) {
+        queries().remove(&self.0);
+    }
+}
+
+/// `active`, `p<id>`, or a path through the split tree: `left`, `right`, `0.1`, `right.top`.
+fn check_pane_ref(pane: &str) -> Result<(), RpcError> {
+    let word = |s: &str| {
+        matches!(s, "left" | "right" | "top" | "bottom" | "first" | "last")
+            || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let id = pane
+        .strip_prefix('p')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    if pane == "active" || id || pane.split('.').all(word) {
+        Ok(())
+    } else {
+        Err(rpc(
+            "invalid_params",
+            format!("pane `{pane}`: use active, an id like p12, or a path like left, right or 0.1"),
+        ))
+    }
+}
+
+fn check_tab_ref(tab: &str) -> Result<(), RpcError> {
+    if tab == "active" || (!tab.is_empty() && tab.bytes().all(|b| b.is_ascii_digit())) {
+        Ok(())
+    } else {
+        Err(rpc(
+            "invalid_params",
+            format!("tab `{tab}`: use an id from `tab list`, or active"),
+        ))
+    }
+}
+
+fn tab_op(
+    method: &str,
+    tab: Option<String>,
+    pane: Option<String>,
+    index: Option<usize>,
+    direction: Option<String>,
+) -> Result<Value, RpcError> {
+    let required = |value: Option<String>, name: &str| {
+        value.ok_or_else(|| rpc("invalid_params", format!("{method} needs {name}")))
+    };
+    if let Some(pane) = pane.as_deref() {
+        check_pane_ref(pane)?;
+    }
+    Ok(match method {
+        "tab.focus" | "tab.close" => {
+            let tab = required(tab, "tab")?;
+            check_tab_ref(&tab)?;
+            json!({ "op": method.trim_start_matches("tab."), "tab": tab })
+        }
+        "tab.move" => {
+            let tab = required(tab, "tab")?;
+            check_tab_ref(&tab)?;
+            json!({ "op": "move", "tab": tab, "pane": required(pane, "pane")?, "index": index })
+        }
+        "pane.split" => {
+            let direction = required(direction, "direction")?;
+            if !matches!(direction.as_str(), "right" | "down") {
+                return Err(rpc("invalid_params", "direction is right or down"));
+            }
+            json!({ "op": "split", "pane": pane, "direction": direction })
+        }
+        _ => json!({ "op": "close_pane", "pane": required(pane, "pane")? }),
+    })
+}
+
+/// `tab.list` gives each pane's tabs; `pane.list` the split tree and a summary of each pane.
+fn shape_listing(method: &str, workspace_id: &str, layout: Value) -> Value {
+    let panes = layout["panes"].as_array().cloned().unwrap_or_default();
+    if method == "tab.list" {
+        return json!({ "workspace": workspace_id, "panes": panes });
+    }
+    let panes: Vec<Value> = panes
+        .into_iter()
+        .map(|pane| {
+            let tabs = pane["tabs"].as_array().cloned().unwrap_or_default();
+            let active_tab = tabs.iter().find(|t| t["active"] == true).cloned();
+            json!({
+                "id": pane["id"],
+                "path": pane["path"],
+                "active": pane["active"],
+                "tabs": tabs.len(),
+                "active_tab": active_tab.map(|t| json!({ "id": t["id"], "type": t["type"], "title": t["title"] })),
+            })
+        })
+        .collect();
+    json!({ "workspace": workspace_id, "tree": layout["tree"], "panes": panes })
 }
 
 /// Built-in layouts overlaid with the user's and project's `layouts` settings.
@@ -290,22 +430,103 @@ impl Server {
         Ok(agent.info().id)
     }
 
-    /// Tabs added to a workspace's window. Requests wait in kv until an app window claims them, like layouts.
+    /// Queues `op` for the workspace's window and tells connected apps; it waits in kv until a window claims it.
+    fn queue_tab_op(&self, workspace: &Workspace, mut op: Value) -> Result<Value, RpcError> {
+        op["workspace_id"] = json!(workspace.id);
+        op["path"] = json!(workspace.path);
+        let id = request_id();
+        self.store
+            .kv_set(&format!("{TAB_PENDING}{id}"), &op)
+            .map_err(|e| rpc("internal", format!("{e:#}")))?;
+        let delivered = self.send_to_apps("open_tab", json!({ "request": id }));
+        Ok(json!({ "request": id, "delivered": delivered }))
+    }
+
+    /// Asks the apps for the workspace window's panes and tabs; the first app showing it answers.
+    async fn query_layout(&self, workspace: &Workspace) -> Result<Value, RpcError> {
+        let id = request_id();
+        let (sender, mut answers) = tokio::sync::mpsc::unbounded_channel();
+        let _query = PendingQuery::register(&id, sender);
+        let asked = self.send_to_apps(
+            "layout_query",
+            json!({ "request": id, "workspace_id": workspace.id, "path": workspace.path }),
+        );
+        if asked == 0 {
+            return Err(rpc("not_open", "no app is connected"));
+        }
+        let first = async {
+            for _ in 0..asked {
+                match answers.recv().await {
+                    Some(Value::Null) => continue,
+                    Some(layout) => return Some(layout),
+                    None => break,
+                }
+            }
+            None
+        };
+        tokio::time::timeout(QUERY_TIMEOUT, first)
+            .await
+            .ok()
+            .flatten()
+            .ok_or_else(|| rpc("not_open", "the workspace has no window open"))
+    }
+
+    /// Tabs and panes in a workspace's window. Changes wait in kv until an app window claims them, like layouts.
     pub(crate) async fn tabs_dispatch(
         self: &Arc<Self>,
         method: &str,
         p: Value,
     ) -> Result<Value, RpcError> {
-        const PREFIX: &str = "tab.pending:";
+        const PREFIX: &str = TAB_PENDING;
         let internal = |e: anyhow::Error| rpc("internal", format!("{e:#}"));
+        #[derive(Deserialize)]
+        struct Target {
+            workspace: String,
+            tab: Option<String>,
+            pane: Option<String>,
+            index: Option<usize>,
+            direction: Option<String>,
+        }
         match method {
+            "tab.list" | "pane.list" => {
+                let target: Target = params(p)?;
+                let workspace = self.workspace_by_key(&target.workspace)?;
+                let layout = self.query_layout(&workspace).await?;
+                Ok(shape_listing(method, &workspace.id, layout))
+            }
+            "pane.answer" => {
+                #[derive(Deserialize)]
+                struct P {
+                    request: String,
+                    #[serde(default)]
+                    layout: Value,
+                }
+                let p: P = params(p)?;
+                Ok(json!(PendingQuery::answer(&p.request, p.layout)))
+            }
+            "tab.focus" | "tab.move" | "tab.close" | "pane.split" | "pane.close" => {
+                let target: Target = params(p)?;
+                let workspace = self.workspace_by_key(&target.workspace)?;
+                let op = tab_op(
+                    method,
+                    target.tab,
+                    target.pane,
+                    target.index,
+                    target.direction,
+                )?;
+                self.queue_tab_op(&workspace, op)
+            }
             "tab.open" => {
                 #[derive(Deserialize)]
                 struct P {
                     workspace: String,
                     split: Option<String>,
+                    pane: Option<String>,
+                    index: Option<usize>,
                     #[serde(default)]
                     background: bool,
+                    #[serde(default)]
+                    focus: bool,
                     mode: Option<String>,
                     title: Option<String>,
                 }
@@ -314,6 +535,15 @@ impl Server {
                     && !matches!(split, "right" | "down")
                 {
                     return Err(rpc("invalid_params", "split is right or down"));
+                }
+                if request.background && request.focus {
+                    return Err(rpc(
+                        "invalid_params",
+                        "focus and background exclude each other",
+                    ));
+                }
+                if let Some(pane) = request.pane.as_deref() {
+                    check_pane_ref(pane)?;
                 }
                 let workspace = self.workspace_by_key(&request.workspace)?;
                 let mut tab: Tab = serde_json::from_value(p)
@@ -339,31 +569,35 @@ impl Server {
                         .await?;
                     *agent_id = created["id"].as_str().map(str::to_owned);
                 }
-                let id = format!("{}", uuid::Uuid::new_v4().simple());
-                let pending = json!({
-                    "workspace_id": workspace.id,
-                    "path": workspace.path,
-                    "tab": tab,
-                    "split": request.split,
-                    "background": request.background,
-                });
-                self.store
-                    .kv_set(&format!("{PREFIX}{id}"), &pending)
-                    .map_err(internal)?;
-                let delivered = self.send_to_apps("open_tab", json!({ "request": id }));
-                Ok(json!({ "request": id, "tab": pending["tab"], "delivered": delivered }))
-            }
-            "tab.pending" => Ok(json!(
-                self.store
-                    .kv_prefix(PREFIX)
-                    .map_err(internal)?
-                    .into_iter()
-                    .map(|(key, tab)| json!({
-                        "request": key.trim_start_matches(PREFIX),
+                let tab = json!(tab);
+                let mut queued = self.queue_tab_op(
+                    &workspace,
+                    json!({
+                        "op": "open",
                         "tab": tab,
-                    }))
-                    .collect::<Vec<_>>()
-            )),
+                        "split": request.split,
+                        "pane": request.pane,
+                        "index": request.index,
+                        "background": request.background,
+                        "focus": request.focus,
+                    }),
+                )?;
+                queued["tab"] = tab;
+                Ok(queued)
+            }
+            "tab.pending" => {
+                let mut pending = self.store.kv_prefix(PREFIX).map_err(internal)?;
+                pending.sort_by(|a, b| a.0.cmp(&b.0));
+                Ok(json!(
+                    pending
+                        .into_iter()
+                        .map(|(key, tab)| json!({
+                            "request": key.trim_start_matches(PREFIX),
+                            "tab": with_op(tab),
+                        }))
+                        .collect::<Vec<_>>()
+                ))
+            }
             "tab.take" => {
                 #[derive(Deserialize)]
                 struct P {
@@ -375,7 +609,7 @@ impl Server {
                 if pending.is_some() {
                     self.store.kv_delete(&key).map_err(internal)?;
                 }
-                Ok(pending.unwrap_or(Value::Null))
+                Ok(pending.map_or(Value::Null, with_op))
             }
             other => Err(rpc("unknown_method", other)),
         }

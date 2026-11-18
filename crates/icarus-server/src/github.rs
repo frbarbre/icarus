@@ -1572,10 +1572,6 @@ impl Server {
         Ok(meta)
     }
 
-    pub(crate) async fn stack_view(&self, repo: &RepoRef, number: u64) -> Option<StackView> {
-        self.stack_view_cached(repo, number, false).await
-    }
-
     async fn stack_view_cached(
         &self,
         repo: &RepoRef,

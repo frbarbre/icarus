@@ -787,9 +787,7 @@ fn run_action(
             Some(handler) => handler(id, workspace, window, cx),
             None => log::error!("no handler opens {id} agents"),
         },
-        MenuAction::AgentSettings => {
-            crate::settings_view::open_agent_settings(workspace, window, cx)
-        }
+        MenuAction::AgentSettings => crate::settings_pages::open_agent_settings(window, cx),
         MenuAction::OpenUrl(url) => {
             crate::browser::open_browser_tab(url, &pane, true, workspace, window, cx);
         }

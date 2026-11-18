@@ -1872,12 +1872,12 @@ fn run_icarus_dark_and_light(
     vec![(dark_name, dark), (light_name, light)]
 }
 
-/// Icarus's settings tab, filled from a fixed snapshot.
+/// Icarus's Automations settings page, filled from a fixed snapshot.
 fn run_icarus_settings_tests(
     cx: &mut VisualTestAppContext,
     update_baseline: bool,
 ) -> Vec<(&'static str, Result<TestResult>)> {
-    use icarus_ui::settings_view::{SettingsView, Snapshot, Source};
+    use icarus_ui::settings_pages::{PagePreview, Snapshot, Source};
     let resolved = serde_json::json!({
         "workspace": {
             "statuses": [
@@ -1888,15 +1888,8 @@ fn run_icarus_settings_tests(
             ],
             "cardFields": ["pr", "inline-agents", "linear-title"],
         },
-        "rules": {
-            "enabled": true,
-            "armed": false,
-            "interval_ms": 60000,
-            "pr": {
-                "enabled": true,
-                "statusByCondition": { "merged": "done", "draft": "in-progress", "review": "review" },
-            },
-        },
+        "automations": { "enabled": true, "armed": false, "interval_ms": 60000, "hold_status": "review" },
+        "prompts": { "fix-ci": "Fix the failing checks of #{{pr.number}}." },
         "agents": { "default": "claude", "remote_control": false },
         "linear": { "api_key_command": "op read op://Private/Linear/key" },
         "notifications": { "enabled": true, "sound": true },
@@ -1906,7 +1899,7 @@ fn run_icarus_settings_tests(
     });
     let mut sources = std::collections::HashMap::new();
     for key in [
-        "rules.armed",
+        "automations.armed",
         "linear.api_key_command",
         "workspace.statuses",
     ] {
@@ -1948,7 +1941,7 @@ fn run_icarus_settings_tests(
     };
     match cx.update(|cx| {
         cx.open_window(options, |window, cx| {
-            cx.new(|cx| SettingsView::preview(snapshot, window, cx))
+            cx.new(|cx| PagePreview::new("Automations", snapshot, window, cx))
         })
     }) {
         Ok(view) => {

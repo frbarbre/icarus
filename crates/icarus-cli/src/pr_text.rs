@@ -144,99 +144,10 @@ pub fn ran_next_action(v: &Value) -> String {
     }
 }
 
-fn actions(list: &Value) -> Vec<String> {
-    list.as_array()
-        .into_iter()
-        .flatten()
-        .map(|a| {
-            let action = if a["action"].is_object() {
-                &a["action"]
-            } else {
-                a
-            };
-            let kind = action["action"].as_str().unwrap_or("?");
-            let target = action["workspace_id"]
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| action["name"].as_str().map(str::to_owned))
-                .or_else(|| action["pr"]["number"].as_u64().map(|n| format!("#{n}")))
-                .unwrap_or_default();
-            let detail = action["status"]
-                .as_str()
-                .map(|s| format!(" -> {s}"))
-                .unwrap_or_default();
-            let ok = match a["ok"].as_bool() {
-                Some(true) => "  ok",
-                Some(false) => "  FAILED",
-                None => "",
-            };
-            format!("  {kind} {target}{detail}{ok}")
-        })
-        .collect()
-}
-
-pub fn tick(v: &Value) -> String {
-    let mut lines = Vec::new();
-    if let Some(reason) = v["skipped"].as_str() {
-        lines.push(format!("skipped: {reason}"));
-    } else {
-        let mode = if v["dry_run"] == Value::Bool(true) {
-            "dry run (set rules.armed to true to execute)"
-        } else {
-            "executed"
-        };
-        lines.push(format!("{mode}, {} ms", v["duration_ms"]));
-        let planned = actions(&v["planned"]);
-        lines.push(format!("planned: {}", planned.len()));
-        lines.extend(planned);
-        if v["dry_run"] != Value::Bool(true) {
-            lines.push("executed:".into());
-            lines.extend(actions(&v["executed"]));
-        }
-    }
-    for error in v["errors"].as_array().into_iter().flatten() {
-        lines.push(format!("error: {}", error.as_str().unwrap_or_default()));
-    }
-    lines.join("\n")
-}
-
-pub fn status(v: &Value) -> String {
-    let projects = v["projects"]
-        .as_array()
-        .map(|p| {
-            p.iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "none".into());
-    let mut lines = vec![format!(
-        "enabled: {}  armed: {}  every {} ms  projects: {projects}  ticks: {}",
-        v["enabled"], v["armed"], v["interval_ms"], v["ticks"],
-    )];
-    if v["last_tick"].is_object() {
-        lines.push(format!("last tick at {}:", v["last_tick"]["at_ms"]));
-        lines.push(tick(&v["last_tick"]));
-    }
-    lines.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn a_dry_run_lists_the_plan_and_says_how_to_arm() {
-        let text = tick(&json!({
-            "dry_run": true, "duration_ms": 12, "errors": ["viewer: offline"],
-            "planned": [{ "action": "set_column", "workspace_id": "ws-1", "status": "in-review" }],
-        }));
-        assert!(text.contains("rules.armed"), "{text}");
-        assert!(text.contains("set_column ws-1 -> in-review"), "{text}");
-        assert!(text.contains("error: viewer: offline"), "{text}");
-    }
 
     #[test]
     fn next_action_explains_an_unanswered_lookup() {

@@ -6,7 +6,15 @@ use clap::Subcommand;
 use icarus_client::Client;
 use serde_json::{Value, json};
 
-pub(crate) const ORCA_FLOW: &str = include_str!("../templates/orca-flow.ts");
+pub(crate) fn orca_flow() -> String {
+    let mut config = icarus_settings::automation_template::orca_flow_defaults();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    // Only workspaces made from now on get the new-workspace column, not every existing one.
+    config["newWorkspaceStatusSince"] = json!(now);
+    icarus_settings::automation_template::orca_flow(&config)
+}
 
 #[derive(Subcommand)]
 pub enum AutomationCommand {
@@ -51,9 +59,6 @@ pub enum AutomationCommand {
         /// Only runs that applied an action.
         #[arg(long)]
         acted: bool,
-        /// Only ticks where the script and the built-in rules decided differently.
-        #[arg(long)]
-        shadow: bool,
         #[arg(long)]
         limit: Option<u32>,
     },
@@ -91,6 +96,7 @@ pub enum PromptCommand {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum TabCommand {
     /// Add a tab to a workspace's window; it waits for the window if none is open.
@@ -126,15 +132,178 @@ pub enum TabCommand {
         #[arg(long)]
         command: Option<String>,
         /// Open it in a new pane split off the active one: right or down.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "pane")]
         split: Option<String>,
-        /// Keep the current tab in front.
+        /// The pane to open it in: an id like p12, active, or a path like left, right or 0.1.
         #[arg(long)]
+        pane: Option<String>,
+        /// Its position in the pane; the end by default.
+        #[arg(long)]
+        index: Option<usize>,
+        /// Keep the current tab in front.
+        #[arg(long, conflicts_with = "focus")]
         background: bool,
+        /// Move keyboard focus to the new tab and bring its window forward.
+        #[arg(long)]
+        focus: bool,
+    },
+    /// Each pane's tabs in the workspace's window, with ids for the other commands.
+    List {
+        workspace: String,
+    },
+    /// Bring a tab to the front of its pane and focus it.
+    Focus {
+        workspace: String,
+        tab: String,
+    },
+    /// Move a tab to another pane, or to a position in its own.
+    Move {
+        workspace: String,
+        tab: String,
+        #[arg(long)]
+        pane: String,
+        #[arg(long)]
+        index: Option<usize>,
+    },
+    Close {
+        workspace: String,
+        tab: String,
     },
 }
 
+#[derive(Subcommand)]
+pub enum PaneCommand {
+    /// Split a pane (the active one by default) and add an empty pane beside it.
+    Split {
+        workspace: String,
+        /// right or down.
+        #[arg(long)]
+        direction: String,
+        #[arg(long)]
+        pane: Option<String>,
+    },
+    /// The workspace window's split tree and panes, with ids and paths.
+    List { workspace: String },
+    /// Close a pane and its tabs.
+    Close { workspace: String, pane: String },
+}
+
+fn queued(v: &Value, done: &str) -> String {
+    if v["delivered"].as_u64().unwrap_or(0) > 0 {
+        done.into()
+    } else {
+        "queued: applies when the workspace's window opens".into()
+    }
+}
+
+pub async fn run_pane(cli: &super::Cli, client: &Client, command: &PaneCommand) -> Result<()> {
+    match command {
+        PaneCommand::Split {
+            workspace,
+            direction,
+            pane,
+        } => {
+            let value = client
+                .request(
+                    "pane.split",
+                    json!({ "workspace": workspace, "direction": direction, "pane": pane }),
+                )
+                .await?;
+            super::print(cli, &value, |v| queued(v, "split"));
+        }
+        PaneCommand::List { workspace } => {
+            let value = client
+                .request("pane.list", json!({ "workspace": workspace }))
+                .await?;
+            super::print(cli, &value, |v| {
+                v["panes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|p| {
+                        format!(
+                            "{}{}\t{}\t{} tabs\t{}",
+                            p["id"].as_str().unwrap_or_default(),
+                            if p["active"] == true { "*" } else { "" },
+                            p["path"].as_str().unwrap_or_default(),
+                            p["tabs"],
+                            p["active_tab"]["title"].as_str().unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        }
+        PaneCommand::Close { workspace, pane } => {
+            let value = client
+                .request(
+                    "pane.close",
+                    json!({ "workspace": workspace, "pane": pane }),
+                )
+                .await?;
+            super::print(cli, &value, |v| queued(v, "closed"));
+        }
+    }
+    Ok(())
+}
+
 pub async fn run_tab(cli: &super::Cli, client: &Client, command: &TabCommand) -> Result<()> {
+    let (method, params, done) = match command {
+        TabCommand::Open { .. } => return open_tab(cli, client, command).await,
+        TabCommand::List { workspace } => {
+            let value = client
+                .request("tab.list", json!({ "workspace": workspace }))
+                .await?;
+            super::print(cli, &value, |v| {
+                let mut lines = Vec::new();
+                for pane in v["panes"].as_array().into_iter().flatten() {
+                    lines.push(format!(
+                        "{}{} {}",
+                        pane["id"].as_str().unwrap_or_default(),
+                        if pane["active"] == true { "*" } else { "" },
+                        pane["path"].as_str().unwrap_or_default(),
+                    ));
+                    for tab in pane["tabs"].as_array().into_iter().flatten() {
+                        lines.push(format!(
+                            "  {}{}\t{}\t{}",
+                            tab["id"].as_str().unwrap_or_default(),
+                            if tab["active"] == true { "*" } else { "" },
+                            tab["type"].as_str().unwrap_or_default(),
+                            tab["title"].as_str().unwrap_or_default(),
+                        ));
+                    }
+                }
+                lines.join("\n")
+            });
+            return Ok(());
+        }
+        TabCommand::Focus { workspace, tab } => (
+            "tab.focus",
+            json!({ "workspace": workspace, "tab": tab }),
+            "focused",
+        ),
+        TabCommand::Move {
+            workspace,
+            tab,
+            pane,
+            index,
+        } => (
+            "tab.move",
+            json!({ "workspace": workspace, "tab": tab, "pane": pane, "index": index }),
+            "moved",
+        ),
+        TabCommand::Close { workspace, tab } => (
+            "tab.close",
+            json!({ "workspace": workspace, "tab": tab }),
+            "closed",
+        ),
+    };
+    let value = client.request(method, params).await?;
+    super::print(cli, &value, |v| queued(v, done));
+    Ok(())
+}
+
+async fn open_tab(cli: &super::Cli, client: &Client, command: &TabCommand) -> Result<()> {
     let TabCommand::Open {
         workspace,
         kind,
@@ -149,8 +318,14 @@ pub async fn run_tab(cli: &super::Cli, client: &Client, command: &TabCommand) ->
         title,
         command,
         split,
+        pane,
+        index,
         background,
-    } = command;
+        focus,
+    } = command
+    else {
+        return Ok(());
+    };
     let prompt = match prompt_id {
         Some(id) => client
             .request("prompt.render", json!({ "id": id, "workspace": workspace }))
@@ -175,17 +350,14 @@ pub async fn run_tab(cli: &super::Cli, client: &Client, command: &TabCommand) ->
                 "title": title,
                 "command": command,
                 "split": split,
+                "pane": pane,
+                "index": index,
                 "background": background,
+                "focus": focus,
             }),
         )
         .await?;
-    super::print(cli, &value, |v| {
-        if v["delivered"].as_u64().unwrap_or(0) > 0 {
-            "opened".into()
-        } else {
-            "queued: opens when the workspace's window does".into()
-        }
-    });
+    super::print(cli, &value, |v| queued(v, "opened"));
     Ok(())
 }
 
@@ -328,14 +500,6 @@ fn status_text(v: &Value) -> String {
             "{}: {script}; {last}",
             p["project"].as_str().unwrap_or("?")
         ));
-        let compared = p["shadow"]["compared"].as_i64().unwrap_or(0);
-        if compared > 0 {
-            lines.push(format!(
-                "  shadow: {} of {compared} ticks differed from the built-in rules since {} (automation runs --shadow)",
-                p["shadow"]["differed"],
-                when(&p["shadow"]["since_ms"])
-            ));
-        }
     }
     lines.join("\n")
 }
@@ -492,13 +656,12 @@ pub async fn run(cli: &super::Cli, client: &Client, command: &AutomationCommand)
             project,
             failed,
             acted,
-            shadow,
             limit,
         } => {
             let value = client
                 .request(
                     "automation.runs",
-                    json!({ "project": project, "failed": failed, "acted": acted, "shadow": shadow, "limit": limit }),
+                    json!({ "project": project, "failed": failed, "acted": acted, "limit": limit }),
                 )
                 .await?;
             super::print(cli, &value, runs_text);

@@ -88,7 +88,6 @@ pub struct Server {
     pub(crate) github: crate::github::GitHubService,
     pub(crate) linear: crate::linear::LinearService,
     pub(crate) updates: crate::updates::Updates,
-    pub(crate) automation: crate::automation::Automation,
     pub(crate) automations: crate::automations::Automations,
     pub(crate) ports: crate::ports::Ports,
     pub(crate) history: Arc<crate::history::HistoryIndex>,
@@ -248,7 +247,6 @@ impl Server {
                 &paths.home,
             )),
             updates: crate::updates::Updates::from_env(),
-            automation: crate::automation::Automation::default(),
             automations: crate::automations::Automations::default(),
             ports: crate::ports::Ports::default(),
             history: Arc::default(),
@@ -342,7 +340,8 @@ impl Server {
 
     pub async fn run(self: Arc<Self>, listener: UnixListener) -> Result<()> {
         crate::notifications::spawn(Arc::clone(&self));
-        crate::automation::spawn(Arc::clone(&self));
+        self.migrate_rules();
+        crate::review_steps::spawn(Arc::clone(&self));
         crate::automations::spawn(Arc::clone(&self));
         crate::ports::spawn(Arc::clone(&self));
         crate::settings::spawn(Arc::clone(&self));
@@ -1634,7 +1633,6 @@ impl Server {
             other if other.starts_with("attachment.") || other.starts_with("attach.") => {
                 self.attachments_dispatch(other, params_value).await
             }
-            other if other.starts_with("rules.") => self.rules_dispatch(other, params_value).await,
             "git.status" | "workspace.changes" => {
                 let writes = self.git_writes.load(std::sync::atomic::Ordering::SeqCst);
                 let key = format!("{method} {writes} {params_value}");
@@ -1674,6 +1672,7 @@ impl Server {
                 self.layouts_dispatch(other, params_value).await
             }
             other if other.starts_with("tab.") => self.tabs_dispatch(other, params_value).await,
+            other if other.starts_with("pane.") => self.tabs_dispatch(other, params_value).await,
             other if other.starts_with("project.") || other.starts_with("workspace.") => {
                 self.workspace_dispatch(other, params_value).await
             }

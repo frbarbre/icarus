@@ -1,7 +1,6 @@
 pub mod accounts;
 pub mod agent;
 pub mod attachments;
-pub mod automation;
 pub mod automations;
 pub mod changes;
 mod coalesce;
@@ -29,6 +28,8 @@ pub mod quick_commands;
 pub mod recipes;
 pub mod remote;
 pub mod review;
+mod review_steps;
+mod rules_migration;
 pub mod server;
 pub mod settings;
 mod settings_cache;

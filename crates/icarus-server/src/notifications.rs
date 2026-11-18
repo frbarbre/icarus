@@ -1,4 +1,4 @@
-//! Server notifications (plan D7): made from agent events, the GitHub poll and the rules' `notify`,
+//! Server notifications (plan D7): made from agent events and automation scripts,
 //! stored in `state.db` so none are lost while no client is connected, and pushed to clients live.
 
 use std::collections::BTreeMap;
@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use icarus_protocol::RpcError;
-use icarus_rules::facts::{CheckState, Facts, PrLifecycle, PullRequest};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -22,7 +21,7 @@ pub const AGENT_FAILED: &str = "agent_failed";
 pub const CI_FAILED: &str = "ci_failed";
 pub const REVIEW_REQUESTED: &str = "review_requested";
 pub const PR_MERGED: &str = "pr_merged";
-pub const RULES: &str = "rules";
+pub const AUTOMATION: &str = "automation";
 pub const UPDATE_AVAILABLE: &str = "update_available";
 
 /// Every kind has a `notifications.<kind>` toggle, on by default.
@@ -33,14 +32,14 @@ pub const KINDS: [&str; 8] = [
     CI_FAILED,
     REVIEW_REQUESTED,
     PR_MERGED,
-    RULES,
+    AUTOMATION,
     UPDATE_AVAILABLE,
 ];
 
 /// Orca's burst cooldown for agent news.
 const AGENT_WINDOW_MS: u64 = 5_000;
-/// Rules may plan the same `notify` on consecutive ticks.
-const RULES_WINDOW_MS: u64 = 10 * 60 * 1000;
+/// A script may send the same notification on consecutive runs.
+const AUTOMATION_WINDOW_MS: u64 = 10 * 60 * 1000;
 /// GitHub subjects name the exact state (head sha, merge, release), so one notification per state is enough.
 const GITHUB_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
@@ -57,7 +56,7 @@ fn now_ms() -> u64 {
 fn window_ms(kind: &str) -> u64 {
     match kind {
         CI_FAILED | REVIEW_REQUESTED | PR_MERGED | UPDATE_AVAILABLE => GITHUB_WINDOW_MS,
-        RULES => RULES_WINDOW_MS,
+        AUTOMATION => AUTOMATION_WINDOW_MS,
         _ => AGENT_WINDOW_MS,
     }
 }
@@ -168,73 +167,6 @@ fn declined(reply: &Value) -> bool {
         || reply.get("code").is_some()
 }
 
-fn pr_data(pr: &PullRequest) -> Value {
-    json!({ "repo": format!("{}/{}", pr.repo.owner, pr.repo.name), "number": pr.number, "url": pr.url })
-}
-
-/// CI failures and merges of workspaces' PRs, and review requests, from one poll's facts.
-pub fn from_facts(facts: &Facts) -> Vec<NewNotification> {
-    let Some(snapshot) = &facts.snapshot else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for workspace in &facts.workspaces {
-        let Some(link) = &workspace.pr else { continue };
-        let Some(pr) = snapshot
-            .linked
-            .iter()
-            .find(|pr| pr.match_key() == link.match_key())
-        else {
-            continue;
-        };
-        let lifecycle = pr.lifecycle();
-        if lifecycle == PrLifecycle::Merged {
-            out.push(NewNotification {
-                kind: PR_MERGED,
-                subject: pr.match_key(),
-                title: format!("#{} merged", pr.number),
-                body: clip(&pr.title),
-                workspace_id: Some(workspace.id.clone()),
-                data: pr_data(pr),
-            });
-        } else if matches!(lifecycle, PrLifecycle::Open | PrLifecycle::Draft)
-            && pr.checks_rollup == Some(CheckState::Failure)
-        {
-            let failing: Vec<&str> = pr
-                .checks
-                .iter()
-                .filter(|c| c.state() == CheckState::Failure)
-                .map(|c| c.name.as_str())
-                .collect();
-            let body = if failing.is_empty() {
-                pr.title.clone()
-            } else {
-                format!("{}: {} failing", pr.title, failing.join(", "))
-            };
-            out.push(NewNotification {
-                kind: CI_FAILED,
-                subject: format!("{}@{}", pr.match_key(), pr.head_ref_oid),
-                title: format!("CI failed on #{}", pr.number),
-                body: clip(&body),
-                workspace_id: Some(workspace.id.clone()),
-                data: pr_data(pr),
-            });
-        }
-    }
-    for pr in &snapshot.review_requested {
-        let author = pr.author.as_deref().unwrap_or("someone");
-        out.push(NewNotification {
-            kind: REVIEW_REQUESTED,
-            subject: format!("{}@{}", pr.match_key(), pr.head_ref_oid),
-            title: format!("Review requested: #{}", pr.number),
-            body: clip(&format!("{} by {author}", pr.title)),
-            workspace_id: None,
-            data: pr_data(pr),
-        });
-    }
-    out
-}
-
 /// Turns agent signals into notifications for as long as the server runs.
 pub(crate) fn spawn(server: Arc<Server>) {
     let Some(mut signals) = server.agents.take_signals() else {
@@ -329,13 +261,6 @@ impl Server {
         Some(notification)
     }
 
-    pub(crate) fn notify_facts(&self, facts: &Facts) -> usize {
-        from_facts(facts)
-            .into_iter()
-            .filter_map(|new| self.notify(new))
-            .count()
-    }
-
     fn notifications_changed(&self) {
         let unread = self.store.unread_notifications().unwrap_or_default();
         self.broadcast("notifications.changed", json!({ "unread": unread }));
@@ -356,8 +281,21 @@ impl Server {
                     body: String,
                     workspace: Option<String>,
                     subject: Option<String>,
+                    kind: Option<String>,
                 }
                 let p: P = params(p)?;
+                let kind = match p.kind.as_deref() {
+                    None => AUTOMATION,
+                    Some(kind) => [CI_FAILED, REVIEW_REQUESTED, PR_MERGED, AUTOMATION]
+                        .into_iter()
+                        .find(|k| *k == kind)
+                        .ok_or_else(|| {
+                            rpc(
+                                "invalid_params",
+                                "kind is ci_failed, review_requested, pr_merged or automation",
+                            )
+                        })?,
+                };
                 let workspace_id = match &p.workspace {
                     Some(key) => Some(self.workspace_by_key(key)?.id),
                     None => None,
@@ -366,7 +304,7 @@ impl Server {
                     format!("{}:{}", p.title, workspace_id.clone().unwrap_or_default())
                 });
                 let stored = self.notify(NewNotification {
-                    kind: "automation",
+                    kind,
                     subject,
                     title: p.title,
                     body: p.body,
@@ -436,11 +374,6 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-
-    use icarus_rules::facts::{
-        Check, CheckConclusion, CheckRunStatus, PrLink, PrState, RepoRef, Snapshot,
-        Workspace as FactWorkspace,
-    };
 
     use super::*;
     use crate::agent::AgentState;
@@ -569,73 +502,5 @@ mod tests {
             &json!({ "notifications": { "enabled": false } }),
             PR_MERGED
         ));
-    }
-
-    fn pr(number: u64, state: PrState, rollup: Option<CheckState>) -> PullRequest {
-        PullRequest {
-            repo: RepoRef::new("acme", "widgets"),
-            number,
-            title: format!("PR {number}"),
-            state,
-            head_ref_oid: format!("sha{number}"),
-            checks_rollup: rollup,
-            checks: vec![Check::run(
-                "build",
-                CheckRunStatus::Completed,
-                Some(CheckConclusion::Failure),
-                None,
-            )],
-            ..PullRequest::default()
-        }
-    }
-
-    fn workspace(id: &str, number: u64) -> FactWorkspace {
-        FactWorkspace {
-            id: id.into(),
-            pr: Some(PrLink {
-                repo: RepoRef::new("acme", "widgets"),
-                number,
-            }),
-            ..FactWorkspace::default()
-        }
-    }
-
-    #[test]
-    fn facts_yield_ci_failures_merges_and_review_requests() {
-        let mut review = pr(9, PrState::Open, None);
-        review.author = Some("alice".into());
-        let facts = Facts {
-            workspaces: vec![
-                workspace("ws-1", 1),
-                workspace("ws-2", 2),
-                workspace("ws-3", 3),
-            ],
-            snapshot: Some(Snapshot {
-                viewer_login: Some("me".into()),
-                linked: vec![
-                    pr(1, PrState::Open, Some(CheckState::Failure)),
-                    pr(2, PrState::Merged, None),
-                    pr(3, PrState::Open, Some(CheckState::Success)),
-                ],
-                review_requested: vec![review],
-                team_members: BTreeMap::new(),
-            }),
-        };
-        let found = from_facts(&facts);
-        let summary: Vec<(&str, &str, Option<&str>)> = found
-            .iter()
-            .map(|n| (n.kind, n.subject.as_str(), n.workspace_id.as_deref()))
-            .collect();
-        assert_eq!(
-            summary,
-            [
-                (CI_FAILED, "acme/widgets#1@sha1", Some("ws-1")),
-                (PR_MERGED, "acme/widgets#2", Some("ws-2")),
-                (REVIEW_REQUESTED, "acme/widgets#9@sha9", None),
-            ]
-        );
-        assert_eq!(found[0].body, "PR 1: build failing");
-        assert_eq!(found[2].body, "PR 9 by alice");
-        assert_eq!(found[1].data["url"], "");
     }
 }

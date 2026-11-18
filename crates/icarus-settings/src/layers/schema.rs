@@ -81,88 +81,6 @@ fn map_of(value: Schema) -> Schema {
     Schema::Map(Box::new(value))
 }
 
-fn status_rules_schema() -> Schema {
-    use Schema::{Bool, String as Str};
-    open(vec![
-        field("enabled", "Master switch for the PR status rules.", Bool),
-        field(
-            "statusByCondition",
-            "Column id per PR condition (merged, closed, reviewing, merge-queue, conflicts, draft, changes-requested, merging, pm-approval, review). Unmapped conditions never move a card.",
-            map_of(Str),
-        ),
-        field(
-            "mergingCheckName",
-            "Check whose success means the PR is merging.",
-            Str,
-        ),
-        field(
-            "newWorkspaceStatus",
-            "Column new workspaces start in.",
-            nullable(Str),
-        ),
-        field(
-            "holdStatus",
-            "Hold column: workspaces in it are skipped by every rule. Absent and null both mean no hold.",
-            nullable(Str),
-        ),
-        field(
-            "pmApprovalTeam",
-            "GitHub team `org/team-slug` whose approval counts as PM approval.",
-            nullable(Str),
-        ),
-        field(
-            "onResolved",
-            "`delete` removes your workspace once its PR is merged or closed.",
-            Str,
-        ),
-        field(
-            "onReviewed",
-            "`delete` removes a review workspace once you have reviewed.",
-            Str,
-        ),
-        field(
-            "resolveConflictsWithAgent",
-            "Launch an agent when your PR enters the conflicts column.",
-            Bool,
-        ),
-        field(
-            "conflictPromptTemplate",
-            "Conflict agent prompt; blank means built-in.",
-            Str,
-        ),
-        field(
-            "reviewEnteredCommand",
-            "Shell command run when a workspace enters the review column.",
-            Str,
-        ),
-        field(
-            "actionPrompts",
-            "Prompts for the top-bar actions; blank means built-in.",
-            open(vec![
-                field("commitAndPush", "", Str),
-                field("createPullRequest", "", Str),
-                field("readyForReview", "", Str),
-                field("reviewPullRequest", "", Str),
-            ]),
-        ),
-        field(
-            "reviewInbox",
-            "Auto-create review workspaces for review requests.",
-            open(vec![
-                field("enabled", "", Bool),
-                field(
-                    "agent",
-                    "Agent id for review, conflict and action prompts.",
-                    Str,
-                ),
-                field("view", "chat | terminal | claude-web | default", Str),
-                field("promptTemplate", "First-look review prompt.", Str),
-                field("rereviewPromptTemplate", "Re-review prompt.", Str),
-            ]),
-        ),
-    ])
-}
-
 fn hooks_schema() -> Schema {
     use Schema::String as Str;
     open(vec![
@@ -304,6 +222,11 @@ pub fn document_schema() -> Schema {
                 ),
                 field("projectOrderBy", "", Str),
                 field("stackOrder", "", Str),
+                field(
+                    "reviewingStatus",
+                    "Status of workspaces reviewing someone else's PR; grouping by stack lists them first.",
+                    Str,
+                ),
             ]),
         ),
         field(
@@ -314,29 +237,6 @@ pub fn document_schema() -> Schema {
                 field("visible", "", Bool),
                 field("usageMode", "", Str),
                 field("usagePercentageDisplay", "", Str),
-            ]),
-        ),
-        field(
-            "rules",
-            "Automations.",
-            closed(vec![
-                field(
-                    "pr",
-                    "Pull request rules: status moves, review inbox and agent prompts.",
-                    status_rules_schema(),
-                ),
-                field("enabled", "Run the automation loop.", Bool),
-                field(
-                    "armed",
-                    "Execute planned actions. Until true, every tick is a dry run.",
-                    Bool,
-                ),
-                field(
-                    "projects",
-                    "Projects (names or canonical remotes) the rules apply to.",
-                    array(Str),
-                ),
-                field("interval_ms", "Polling interval in milliseconds.", Integer),
             ]),
         ),
         field(
@@ -392,11 +292,6 @@ pub fn document_schema() -> Schema {
                 field("keybindings", "", map_of(Any)),
                 field("platforms", "", map_of(map_of(Any))),
             ]),
-        ),
-        field(
-            "presets",
-            "Shipped presets applied between the built-in defaults and your settings, e.g. `github-pr-flow`. Read from user settings only.",
-            array(Str),
         ),
         field(
             "theme",
@@ -605,6 +500,11 @@ pub fn document_schema() -> Schema {
                     "Script per project name or id, relative to ~/.config/icarus.",
                     map_of(Str),
                 ),
+                field(
+                    "teams",
+                    "GitHub teams (`org/team`) whose members scripts get as `scope.teams`.",
+                    array(Str),
+                ),
             ]),
         ),
         field(
@@ -670,7 +570,11 @@ pub fn document_schema() -> Schema {
                 ),
                 field("review_requested", "Someone asked for your review.", Bool),
                 field("pr_merged", "A workspace's pull request merged.", Bool),
-                field("rules", "A rule's `notify` action.", Bool),
+                field(
+                    "automation",
+                    "An automation script's `notification.send`.",
+                    Bool,
+                ),
                 field(
                     "update_available",
                     "A newer Icarus release is out (once per version).",
@@ -784,15 +688,6 @@ pub fn validate(doc: &Value, layer: Option<Layer>) -> Vec<ValidationError> {
         layer,
         &mut errors,
     );
-    let legacy = format!("rules.{}", super::LEGACY_PR_RULES);
-    for error in &mut errors {
-        if error.key == legacy {
-            error.message = format!(
-                "ignored: renamed to `rules.{}`, which this file also sets",
-                super::PR_RULES
-            );
-        }
-    }
     errors
 }
 
@@ -895,7 +790,7 @@ pub fn json_schema() -> Value {
     root.insert("title".into(), "Icarus settings".into());
     root.insert(
         "description".into(),
-        "One layer of Icarus settings: built-in defaults < presets < ~/.config/icarus/icarus.json < icarus.json < icarus.local.json. Objects merge deeply; arrays and scalars replace.".into(),
+        "One layer of Icarus settings: built-in defaults < ~/.config/icarus/icarus.json < icarus.json < icarus.local.json. Objects merge deeply; arrays and scalars replace.".into(),
     );
     if let Value::Object(body) = to_json_schema(&document_schema()) {
         root.extend(body);

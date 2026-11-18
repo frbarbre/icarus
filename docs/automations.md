@@ -31,25 +31,22 @@ Ids are lowercase letters, digits, `-` and `_`, and must stay stable: rules refe
 
 ## Turn automations on
 
-Automations need three things: the loop on, the projects they act on, and permission to act.
+An automation is a script per project. The built-in GitHub PR flow ships as one:
 
 ```sh
-icarus config set rules.enabled true
-icarus config set rules.projects '["my-repo"]'   # project names or canonical remotes
-icarus rules tick --dry-run                      # see what it would do
-icarus config set rules.armed true               # let it act
+icarus automation template > ~/.config/icarus/automations/orca-flow.ts
+icarus config set automations.scripts.my-repo automations/orca-flow.ts
+icarus automation run --project my-repo --dry-run   # see what it would do
+icarus config set automations.armed true            # let it act
 ```
 
-Until `rules.armed` is true, every run is a dry run: it plans actions and reports them, but changes nothing. Notifications are still sent. The loop runs every minute (`rules.interval_ms`). The same switches are in Settings → Automation, except the project list.
+Until `automations.armed` is true, every run is a dry run: it records the actions it would take, but changes nothing. `icarus automation status` shows each project's script and last run.
 
-```sh
-icarus rules status   # on or off, armed or not, and what the last run planned and did
-icarus rules tick     # run now
-```
+Settings from the old built-in rules (`rules.*`, from an older Icarus or an Orca import) are converted once, when the server starts or an Orca export is imported: their options go into `automations/orca-flow.ts`, the projects they covered point at it, `rules.armed`, `rules.interval_ms` and `holdStatus` become `automations.armed`, `automations.interval_ms` and `automations.hold_status`, and the old settings are saved in `~/.config/icarus/automations/rules-backup.json`.
 
-## Rules
+## The GitHub PR flow
 
-The rules live under the `rules.pr` settings key. Settings → Automation and Pull request rules edit them.
+The options sit in the `config` object at the top of the script.
 
 ### Move cards by pull request state
 
@@ -68,63 +65,28 @@ For each workspace with a pull request, the first matching condition decides its
 | `pm-approval` | Every pending reviewer is in the PM team. |
 | `review` | Anything else: an open PR waiting for review. |
 
-Map conditions to status ids in Settings → Automation, or:
-
-```json
-{
-  "rules": {
-    "pr": {
-      "enabled": true,
-      "statusByCondition": {
-        "draft": "in-progress",
-        "changes-requested": "in-progress",
-        "review": "in-review",
-        "merged": "completed"
-      }
-    }
-  }
-}
-```
-
-A condition you don't map never moves a card.
+`statusByCondition` maps conditions to status ids; a condition you don't map never moves a card.
 
 ### Other options
 
-| Setting (under `rules.pr`) | What it does |
+| Option | What it does |
 |---|---|
-| `newWorkspaceStatus` | The column new workspaces start in. |
-| `holdStatus` | A column the rules never touch. Park a workspace there to keep it as it is. |
+| `newWorkspaceStatus` | The column new workspaces (created after `newWorkspaceStatusSince`) start in. |
 | `mergingCheckName` | The check whose success means "merging". Default `Reviews satisfied`. |
-| `pmApprovalTeam` | A GitHub team (`org/team-slug`) whose approval counts as PM approval. |
+| `pmApprovalTeam` | A GitHub team (`org/team-slug`) whose approval counts as PM approval. List it in `automations.teams` too, so the scope carries its members. |
 | `onResolved` | `delete` removes your workspace once its PR merged or closed (not forced: local changes keep it). |
-| `onReviewed` | `delete` removes a review workspace once you approved or requested changes (skipped while you have unsent review comments). |
-| `resolveConflictsWithAgent` | Start an agent when your PR gets conflicts. `conflictPromptTemplate` replaces the built-in prompt. |
+| `onReviewed` | `delete` removes a review workspace once you approved or requested changes. |
+| `resolveConflictsWithAgent` | Start an agent (`agent`) with `conflictPrompt` when your PR gets conflicts. |
 | `reviewEnteredCommand` | A shell command run when a workspace enters the `review` column. |
-| `reviewInbox.enabled` | Create a review workspace for every PR that requests your review, with an agent (`reviewInbox.agent`) and a review prompt (`promptTemplate`, `rereviewPromptTemplate`). |
-| `actionPrompts` | Prompts for the next-action button's agent steps: `commitAndPush`, `createPullRequest`, `readyForReview`, `reviewPullRequest`. Blank uses the built-in prompt. |
+| `reviewInbox` | `enabled` creates a review workspace for every PR that requests your review, with an agent and `prompt` (or `rereviewPrompt` after your earlier review). `handled` lists PRs never to create again. |
+| `ciTriage` | Per project: instructions for an agent started when CI fails on your PR. |
+| `notify` | `ciFailed`, `merged` and `reviewRequested` notifications. |
 
-Review workspaces follow the PR: when its author pushes, the workspace is fast-forwarded to the new head.
+A column in `automations.hold_status` is never touched. Review workspaces follow the PR: when its author pushes, the workspace moves to the new head. The next-action button's agent prompts are the `prompts.commitAndPush`, `createPullRequest`, `readyForReview` and `reviewPullRequest` settings.
 
-Automations also notify you when CI fails on your PR, someone requests your review, or a PR merges.
+## Automation scripts
 
-### Presets
-
-Two shipped presets set up common flows. List them in your user settings:
-
-```json
-{ "presets": ["github-pr-flow", "review-inbox"] }
-```
-
-- `github-pr-flow`: drafts and changes-requested go to In progress, open PRs and merging ones to In review, and new workspaces start in In progress.
-- `review-inbox`: review requests become workspaces in In review.
-
-Presets sit between the built-in defaults and your own settings, so anything you set wins. You still need `rules.projects` and `rules.armed`.
-
-## Automation scripts (preview)
-
-A script decides instead of the rules: you write the policy, Icarus loads the facts, applies what the script returns and records every run. They will replace the rules above.
-
-The quickest start is the built-in flow as a script: `icarus automation template > ~/.config/icarus/automations/my-app.ts` writes the GitHub PR rules above (statuses by PR state, review inbox, review head sync, conflict and CI agents, notifications) with their options at the top. Or let an agent set it up: `icarus skill install` gives Claude Code the `icarus-automations` skill, which interviews you, writes the script and dry-runs it before arming.
+A script decides: you write the policy, Icarus loads the facts, applies what the script returns and records every run. Start from the template above, or let an agent set it up: `icarus skill install` gives Claude Code the `icarus-automations` skill, which interviews you, writes the script and dry-runs it before arming.
 
 Point a project at a script, relative to `~/.config/icarus` (an absolute path works too):
 
@@ -171,7 +133,6 @@ console.log(JSON.stringify(out));
 - **Safety:** with `automations.armed` off every run is a dry run. `automations.enabled: false` stops everything. A workspace in `automations.hold_status` gets no actions unless the action says `"force": true`, and a run starts at most `automations.max_agents_per_run` agents (3).
 - **Scope extras:** `scope.inbox` lists open PRs requesting your review (with the `workspace` already on each, if any). Each workspace carries `linked_pr`, `review_pending` (unsent draft comments), `head_is_local` and `base_follows_target`.
 - **Actions beyond the CLI's usual ones:** `review.workspace` checks out a PR to review with an agent and a layout, `workspace.sync_to_pr_head` moves a review workspace to the PR's head and target, `tab.open` opens a tab in the workspace's window (queued until one is open), `issue.assign` and `notification.send`.
-- **Shadow mode:** while the rules above are on, each timed run is compared with what the rules did. `icarus automation status` counts the runs that differed and `icarus automation runs --shadow` lists them; once they agree for your projects, turn the rules off.
 - **Types:** `~/.config/icarus/automations/.generated/icarus.d.ts` and `schema.json` list your status and prompt ids; they are rewritten when those settings change.
 
 Debugging: `icarus automation runs --failed`, `icarus automation show <run> --scope`, `icarus automation replay <run> [--script fixed.ts]`, and `icarus workspace button <ws> --explain` for why a button shows.

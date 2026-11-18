@@ -8,9 +8,9 @@ mod linear;
 mod notes;
 mod orca_state;
 mod ports;
+mod pr_text;
 mod recipe;
 mod review;
-mod rules;
 mod service;
 mod skill;
 mod term_attach;
@@ -137,11 +137,6 @@ enum Command {
         #[command(subcommand)]
         command: PrCommand,
     },
-    /// The automation rules: status, and a tick on demand.
-    Rules {
-        #[command(subcommand)]
-        command: RulesCommand,
-    },
     /// Automation scripts: status, runs on demand, custom events, run records and replay.
     Automation {
         #[command(subcommand)]
@@ -161,6 +156,11 @@ enum Command {
     Tab {
         #[command(subcommand)]
         command: automation::TabCommand,
+    },
+    /// Panes in a workspace's window: split, list, close.
+    Pane {
+        #[command(subcommand)]
+        command: automation::PaneCommand,
     },
     /// Attach context (PR comments, checks, files, text, agent turns) to a workspace's composer.
     Attach {
@@ -331,18 +331,6 @@ enum PrCommand {
         /// Skip the short-lived cache and ask GitHub now.
         #[arg(long)]
         refresh: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum RulesCommand {
-    /// Show whether the rules are on, and what the last tick planned and did.
-    Status,
-    /// Evaluate the rules now. Ticks are dry runs until `rules.armed` is true.
-    Tick {
-        /// Only print the planned actions.
-        #[arg(long)]
-        dry_run: bool,
     },
 }
 
@@ -2876,12 +2864,12 @@ async fn main() -> Result<()> {
                                 Duration::from_secs(120),
                             )
                             .await?;
-                        print(&cli, &value, rules::ran_next_action);
+                        print(&cli, &value, pr_text::ran_next_action);
                     } else {
                         let value = client
                             .request("workspace.next_action", json!({ "id": id }))
                             .await?;
-                        print(&cli, &value, rules::next_action);
+                        print(&cli, &value, pr_text::next_action);
                     }
                 }
                 WorkspaceCommand::Sleep { id } | WorkspaceCommand::Wake { id } => {
@@ -3061,7 +3049,7 @@ async fn main() -> Result<()> {
                             Duration::from_secs(60),
                         )
                         .await?;
-                    print(&cli, &value, rules::pr_status);
+                    print(&cli, &value, pr_text::pr_status);
                 }
                 PrCommand::Operate {
                     workspace,
@@ -3086,7 +3074,7 @@ async fn main() -> Result<()> {
                             Duration::from_secs(60),
                         )
                         .await?;
-                    print(&cli, &value, rules::previews);
+                    print(&cli, &value, pr_text::previews);
                 }
                 PrCommand::Preview {
                     workspace,
@@ -3101,8 +3089,8 @@ async fn main() -> Result<()> {
                             Duration::from_secs(60),
                         )
                         .await?;
-                    let preview =
-                        rules::pick_preview(&value, app.as_deref()).map_err(anyhow::Error::msg)?;
+                    let preview = pr_text::pick_preview(&value, app.as_deref())
+                        .map_err(anyhow::Error::msg)?;
                     let Some(url) = preview["url"].as_str() else {
                         bail!(
                             "the {} preview has no URL yet ({})",
@@ -3173,7 +3161,7 @@ async fn main() -> Result<()> {
         }
         Command::Automation {
             command: automation::AutomationCommand::Template,
-        } => print!("{}", automation::ORCA_FLOW),
+        } => print!("{}", automation::orca_flow()),
         Command::Automation { command } => {
             let client = connect(&cli).await?;
             automation::run(&cli, &client, command).await?;
@@ -3187,25 +3175,9 @@ async fn main() -> Result<()> {
             let client = connect(&cli).await?;
             automation::run_tab(&cli, &client, command).await?;
         }
-        Command::Rules { command } => {
+        Command::Pane { command } => {
             let client = connect(&cli).await?;
-            match command {
-                RulesCommand::Status => {
-                    let value = client.request("rules.status", json!({})).await?;
-                    print(&cli, &value, rules::status);
-                }
-                RulesCommand::Tick { dry_run } => {
-                    let params = if *dry_run {
-                        json!({ "dry_run": true })
-                    } else {
-                        json!({})
-                    };
-                    let value = client
-                        .request_timeout("rules.tick", params, Duration::from_secs(300))
-                        .await?;
-                    print(&cli, &value, rules::tick);
-                }
-            }
+            automation::run_pane(&cli, &client, command).await?;
         }
         Command::Agent { command } => {
             let client = connect(&cli).await?;

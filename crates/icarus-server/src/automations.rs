@@ -1,7 +1,7 @@
 //! User automation scripts (spec/automations.md): build a scope, run the project's script on it, apply
 //! the actions it returns and record the run.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -61,10 +61,17 @@ pub(crate) const METHODS: &[&str] = &[
     "note.resolve",
     "notification.clear",
     "notification.send",
+    "pane.close",
+    "pane.list",
+    "pane.split",
     "pr.operate",
     "review.request_reviewers",
     "review.set_base",
     "review.workspace",
+    "tab.close",
+    "tab.focus",
+    "tab.list",
+    "tab.move",
     "tab.open",
     "terminal.create",
     "terminal.kill",
@@ -182,6 +189,45 @@ fn script_path(config: &Config, project: &Project) -> Option<PathBuf> {
     } else {
         Some(icarus_settings::layers::config_dir()?.join(path))
     }
+}
+
+/// A real `bun` binary: a mise shim fails outside a folder whose mise config names bun, which the
+/// automations folder usually isn't.
+fn bun() -> PathBuf {
+    let is_shim = |p: &Path| {
+        std::fs::read_link(p).is_ok_and(|target| target.file_name() == Some("mise".as_ref()))
+    };
+    let on_path = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join("bun"))
+        .find(|p| p.is_file() && !is_shim(p));
+    if let Some(found) = on_path {
+        return found;
+    }
+    let home = dirs::home_dir().unwrap_or_default();
+    let installed = std::fs::read_dir(home.join(".local/share/mise/installs/bun"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path().join("bin/bun"))
+        .filter(|p| p.is_file())
+        .max_by_key(|p| {
+            p.parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|v| v.to_str())
+                .map(|v| {
+                    v.split('.')
+                        .map(|n| n.parse::<u64>().unwrap_or(0))
+                        .collect::<Vec<_>>()
+                })
+        });
+    [Some(home.join(".bun/bin/bun")), installed]
+        .into_iter()
+        .flatten()
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("bun"))
 }
 
 pub(crate) fn generated_dir() -> Option<PathBuf> {
@@ -358,7 +404,7 @@ async fn run_script(
         Some("ts" | "mts" | "js" | "mjs")
     );
     let mut command = if typescript {
-        let mut c = tokio::process::Command::new("bun");
+        let mut c = tokio::process::Command::new(bun());
         c.arg(path);
         c
     } else {
@@ -588,8 +634,21 @@ impl Server {
             list.push(self.scope_workspace(workspace, &agents).await);
         }
         let inbox = self.scope_inbox(project, &workspaces).await;
+        let mut teams = serde_json::Map::new();
+        for team in setting(settings, &["automations", "teams"])
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            match self.github.team_roster(team).await {
+                Ok(roster) => teams.extend(roster.into_iter().map(|(k, v)| (k, json!(v)))),
+                Err(error) => tracing::warn!("automation team {team}: {error}"),
+            }
+        }
         json!({
             "inbox": inbox,
+            "teams": teams,
             "project": {
                 "id": project.id,
                 "name": project.name,
@@ -602,7 +661,7 @@ impl Server {
                 "statuses": setting(settings, &["workspace", "statuses"]).cloned().unwrap_or(json!([])),
                 "prompts": setting(settings, &["prompts"]).cloned().unwrap_or(json!({})),
             },
-            "viewer": self.github.viewer(),
+            "viewer": self.github.viewer_login().await.ok(),
             "icarus_version": crate::updates::VERSION,
         })
     }
@@ -717,7 +776,7 @@ impl Server {
         value
     }
 
-    fn automation_project(&self, key: &str) -> Result<Project, RpcError> {
+    pub(crate) fn automation_project(&self, key: &str) -> Result<Project, RpcError> {
         self.store
             .project(key)
             .map_err(|e| rpc("internal", e))?
@@ -877,19 +936,7 @@ impl Server {
             })
             .collect();
         let error = output.error.clone().or(decision_error).or(memory_error);
-        let shadow = if trigger["kind"] == "tick" {
-            self.last_rules_report()
-                .filter(|report| {
-                    report["at_ms"].as_u64().unwrap_or(0) + 2 * config.interval_ms > started
-                })
-                .map_or(Value::Null, |report| {
-                    shadow_diff(&core, &json!(decision.actions), &report["planned"])
-                })
-        } else {
-            Value::Null
-        };
         let record = json!({
-            "shadow": shadow,
             "stdout": output.stdout,
             "stderr": output.stderr,
             "exit_code": output.code,
@@ -1178,8 +1225,6 @@ impl Server {
                     failed: bool,
                     #[serde(default)]
                     acted: bool,
-                    #[serde(default)]
-                    shadow: bool,
                     limit: Option<u32>,
                 }
                 let p: P = rpc_params(p)?;
@@ -1193,11 +1238,10 @@ impl Server {
                     let mut statement = db.prepare(
                         "SELECT id, project, started_ms, duration_ms, trigger, dry_run, failed, acted, record FROM runs
                          WHERE (?1 IS NULL OR project = ?1) AND (?2 = 0 OR failed = 1) AND (?3 = 0 OR acted = 1)
-                           AND (?5 = 0 OR json_extract(record, '$.shadow.agree') = 0)
                          ORDER BY started_ms DESC LIMIT ?4",
                     )?;
                     let rows = statement.query_map(
-                        params![project, p.failed, p.acted, p.limit.unwrap_or(50), p.shadow],
+                        params![project, p.failed, p.acted, p.limit.unwrap_or(50)],
                         |row| {
                             let record: Value =
                                 serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default();
@@ -1542,22 +1586,7 @@ impl Server {
                 )
                 .optional()
             })?;
-            let shadow = self.automations.with_db(&home, |db| {
-                db.query_row(
-                    "SELECT COUNT(*), COALESCE(SUM(json_extract(record, '$.shadow.agree') = 0), 0), MIN(started_ms)
-                     FROM runs WHERE project = ?1 AND json_extract(record, '$.shadow') IS NOT NULL",
-                    params![project.id],
-                    |row| {
-                        Ok(json!({
-                            "compared": row.get::<_, i64>(0)?,
-                            "differed": row.get::<_, i64>(1)?,
-                            "since_ms": row.get::<_, Option<i64>>(2)?,
-                        }))
-                    },
-                )
-            })?;
             list.push(json!({
-                "shadow": shadow,
                 "project": project.name,
                 "id": project.id,
                 "enabled": config.enabled,
@@ -1687,97 +1716,6 @@ impl Server {
         .map_err(|e| rpc("internal", e))?;
         Ok(reply)
     }
-}
-
-/// What a plan changes, as comparable keys like `status:<ws>=done` or `review:#12`.
-fn script_effects(core: &Value, actions: &Value) -> BTreeSet<String> {
-    let status_of = |id: &str| {
-        core["workspaces"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|w| w["id"] == id || w["name"] == id)
-            .map(|w| {
-                (
-                    w["id"].as_str().unwrap_or(id).to_owned(),
-                    w["status"].clone(),
-                )
-            })
-    };
-    let mut keys = BTreeSet::new();
-    for action in actions.as_array().into_iter().flatten() {
-        let p = &action["params"];
-        let workspace = p["workspace"]
-            .as_str()
-            .or(p["id"].as_str())
-            .unwrap_or_default();
-        let id = status_of(workspace).map_or(workspace.to_owned(), |(id, _)| id);
-        let key = match action["method"].as_str().unwrap_or_default() {
-            "workspace.set" if p["status"].is_string() => {
-                if status_of(workspace).is_some_and(|(_, status)| status == p["status"]) {
-                    continue;
-                }
-                format!("status:{id}={}", p["status"].as_str().unwrap_or_default())
-            }
-            "workspace.remove" => format!("delete:{id}"),
-            "review.workspace" => format!("review:#{}", p["number"]),
-            "agent.create" => format!("agent:{id}"),
-            "tab.open" if p["type"] == "agent" => format!("agent:{id}"),
-            "workspace.sync_to_pr_head" => format!("sync:{id}"),
-            "terminal.create" => format!("command:{id}"),
-            _ => continue,
-        };
-        keys.insert(key);
-    }
-    keys
-}
-
-fn rules_effects(core: &Value, planned: &Value) -> BTreeSet<String> {
-    let ours: HashSet<&str> = core["workspaces"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|w| w["id"].as_str())
-        .collect();
-    let inbox: HashSet<u64> = core["inbox"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|pr| pr["number"].as_u64())
-        .collect();
-    let mut keys = BTreeSet::new();
-    for action in planned.as_array().into_iter().flatten() {
-        let workspace = action["workspace_id"].as_str().unwrap_or_default();
-        let key = match action["action"].as_str().unwrap_or_default() {
-            "create_workspace_from_pr" => match action["pr"]["number"].as_u64() {
-                Some(number) if inbox.contains(&number) => format!("review:#{number}"),
-                _ => continue,
-            },
-            _ if !ours.contains(workspace) => continue,
-            "set_column" => format!(
-                "status:{workspace}={}",
-                action["status"].as_str().unwrap_or_default()
-            ),
-            "delete_workspace" => format!("delete:{workspace}"),
-            "launch_agent" => format!("agent:{workspace}"),
-            "sync_to_pr_head" => format!("sync:{workspace}"),
-            "run_command" => format!("command:{workspace}"),
-            _ => continue,
-        };
-        keys.insert(key);
-    }
-    keys
-}
-
-/// Where the script and the built-in rules would act differently on the same project (shadow mode).
-fn shadow_diff(core: &Value, actions: &Value, planned: &Value) -> Value {
-    let script = script_effects(core, actions);
-    let rules = rules_effects(core, planned);
-    json!({
-        "agree": script == rules,
-        "script_only": script.difference(&rules).collect::<Vec<_>>(),
-        "rules_only": rules.difference(&script).collect::<Vec<_>>(),
-    })
 }
 
 fn event(name: &str, workspace: &str, payload: Value) -> Value {
@@ -1965,7 +1903,7 @@ pub(crate) fn generated_types(statuses: &[String], prompts: &[String]) -> String
 fn prune(db: &Connection, now: u64) -> rusqlite::Result<()> {
     db.execute(
         "DELETE FROM runs WHERE started_ms < ?1
-           AND NOT ((failed = 1 OR acted = 1 OR json_extract(record, '$.shadow') IS NOT NULL) AND started_ms >= ?2)
+           AND NOT ((failed = 1 OR acted = 1) AND started_ms >= ?2)
            AND id NOT IN (SELECT r.id FROM runs r WHERE r.project = runs.project ORDER BY r.started_ms DESC LIMIT ?3)",
         params![
             now.saturating_sub(KEEP_RECENT_MS) as i64,
@@ -1983,36 +1921,6 @@ fn prune(db: &Connection, now: u64) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shadow_mode_compares_effects_not_wording() {
-        let core = json!({
-            "workspaces": [
-                { "id": "w1", "name": "one", "status": "todo" },
-                { "id": "w2", "name": "two", "status": "done" },
-            ],
-            "inbox": [{ "number": 12 }],
-        });
-        let actions = json!([
-            { "method": "workspace.set", "params": { "id": "one", "status": "in-review" } },
-            { "method": "workspace.set", "params": { "id": "w2", "status": "done" } },
-            { "method": "review.workspace", "params": { "project": "p", "number": 12 } },
-        ]);
-        let planned = json!([
-            { "action": "set_column", "workspace_id": "w1", "status": "in-review" },
-            { "action": "create_workspace_from_pr", "pr": { "number": 12 } },
-            { "action": "create_workspace_from_pr", "pr": { "number": 99 } },
-            { "action": "delete_workspace", "workspace_id": "elsewhere" },
-        ]);
-        assert_eq!(shadow_diff(&core, &actions, &planned)["agree"], true);
-        let planned = json!([{ "action": "sync_to_pr_head", "workspace_id": "w2" }]);
-        let diff = shadow_diff(&core, &actions, &planned);
-        assert_eq!(diff["rules_only"], json!(["sync:w2"]));
-        assert_eq!(
-            diff["script_only"],
-            json!(["review:#12", "status:w1=in-review"])
-        );
-    }
 
     #[test]
     fn events_name_what_changed_between_checks() {

@@ -38,6 +38,8 @@ export interface Scope {
   workspaces: Workspace[];
   /** Open PRs in this project requesting the viewer's review. */
   inbox: InboxPullRequest[] | { error: string };
+  /** Members (logins) of each team listed in `automations.teams`, keyed "org/team". */
+  teams: Record<string, string[]>;
   settings: {
     statuses: { id: StatusId; label?: string; color?: string; icon?: string }[];
     prompts: Record<PromptId, string>;

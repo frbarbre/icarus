@@ -268,7 +268,7 @@ mod tests {
             handle_request(
                 ConfigRequest {
                     op: "set".into(),
-                    key: Some("rules.armed".into()),
+                    key: Some("automations.armed".into()),
                     value: Some(json!(true)),
                     result: Some(result.clone()),
                 },

@@ -59,7 +59,15 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `workspace review --project <p> <number> [--name] [--status] [--since <sha>] [--prompt] [--provider] [--layout]` | Check out someone else's PR to review, with an agent and a layout. |
 | `workspace sync-pr-head <ws>` | Move a review workspace to its PR's head and target branch. |
 | `layout list [--project]` / `show <name>` | Tab layouts. |
-| `tab open <ws> --type agent\|browser\|diff\|explorer\|file\|terminal […] [--split right\|down] [--background]` | Open a tab in the workspace's window (queued until one is open). |
+| `tab open <ws> --type agent\|browser\|diff\|explorer\|file\|terminal […] [--pane <ref>] [--index <n>] [--split right\|down] [--focus\|--background]` | Open a tab in the workspace's window (queued until one is open). |
+| `tab list <ws>` | Each pane's tabs (id, type, title, active) in the open window. Needs the window open. |
+| `tab focus <ws> <tab>` / `tab close <ws> <tab>` | Bring a tab to the front and focus it, or close it. `<tab>` is an id from `tab list`, or `active`. Queued like `tab open`. |
+| `tab move <ws> <tab> --pane <ref> [--index <n>]` | Move a tab to another pane, or to a position in its own. |
+| `pane split <ws> --direction right\|down [--pane <ref>]` | Add an empty pane beside a pane (the active one by default). Queued like `tab open`. |
+| `pane list <ws>` | The window's split tree and panes (id, path, tab count, active tab). Needs the window open. |
+| `pane close <ws> <pane>` | Close a pane and its tabs. |
+
+A pane `<ref>` is `active`, an id from `pane list` (`p12`), or a path in the split tree: `left`/`right`/`top`/`bottom`/`first`/`last` or child indices, joined by dots (`0.1`, `right.top`). A path ending at a split means its first pane. Each command is also a server method (`tab.list`, `tab.focus`, `tab.move`, `tab.close`, `pane.split`, `pane.list`, `pane.close`), so automation scripts can return them as actions; queued changes apply in the order they were made.
 
 ### Agents
 
@@ -124,11 +132,10 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `issue show` / `open` / `search` / `refresh` / `status` | Linear issues. |
 | `issue assign <id> [--assignee <user>]` | Assign an issue (to you by default). |
 | `linear login` / `logout` / `status` | Save (from a hidden prompt or stdin), remove or check the Linear API key. See [Linear](github-and-linear.md#set-up-the-api-key). |
-| `rules status` / `tick [--dry-run]` | The built-in rules engine (replaced by automation scripts). |
 | `automation status` | Whether automations are on and armed, each project's script and last run. |
 | `automation run [--project] [--dry-run]` | Run the scripts now. |
 | `automation emit <name> [--project\|--path] [--workspace] [--payload JSON] [--env VAR…] [--dry-run]` | Send a custom event to a project's script, e.g. from Linear's "Open in coding tool" hook. |
-| `automation runs [--project] [--failed] [--acted] [--shadow] [--limit]` / `show <run> [--scope]` | Run records: trigger, script output, actions and results, and what the script saw. |
+| `automation runs [--project] [--failed] [--acted] [--limit]` / `show <run> [--scope]` | Run records: trigger, script output, actions and results, and what the script saw. |
 | `automation replay <run> [--script <path>]` | Re-run a script on a recorded scope as a dry run. |
 | `automation schema` | Regenerate `icarus.d.ts` and `schema.json`. |
 | `automation template` | Print a starter script: the built-in GitHub PR flow with its options at the top. |
