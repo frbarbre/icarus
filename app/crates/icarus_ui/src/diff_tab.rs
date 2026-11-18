@@ -1319,6 +1319,36 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn a_diff_thread_sent_to_the_agent_lands_in_the_composer(cx: &mut gpui::TestAppContext) {
+        use crate::review::tests::stub_rpc;
+
+        let (workspace, mut cx) = git_workspace(cx).await;
+        let cx = &mut cx;
+        cx.update(|_, cx| {
+            stub_rpc(cx, move |method, _| match method {
+                "review.threads" => Ok(json!({ "threads": [thread_json("T1", 1, false)] })),
+                _ => Ok(json!({})),
+            })
+        });
+        let agent = crate::github_panel::tests::real_agent_composer(&workspace, cx);
+        let tab = open(&workspace, "/project/src/app.rs", DiffBase::Uncommitted, cx);
+        cx.run_until_parked();
+        let tab = tab.await.expect("diff tab");
+        let review = tab.update(cx, |tab, cx| {
+            tab.enable_review("/project".into(), "src/app.rs".into(), cx);
+            tab.review().cloned().expect("review")
+        });
+        review.update(cx, |review, cx| review.reload(cx));
+        cx.run_until_parked();
+
+        // As the card's button and menu entry do: from inside the window's own update.
+        cx.update(|_, cx| review.update(cx, |review, cx| review.add_to_agent("T1", cx)));
+        cx.run_until_parked();
+        let text = crate::github_panel::tests::draft(&agent, cx);
+        assert!(text.contains("icarus://attachment/"), "{text:?}");
+    }
+
+    #[gpui::test]
     async fn review_comments_queue_edit_reply_resolve_and_reach_the_agent(
         cx: &mut gpui::TestAppContext,
     ) {

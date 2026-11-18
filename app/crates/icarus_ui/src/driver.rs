@@ -195,6 +195,33 @@ fn front_window(cx: &App) -> Result<AnyWindowHandle> {
         .context("no app window is open")
 }
 
+/// How long element recording outlives the last driver command; it costs every frame while on.
+const RECORDING_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Default)]
+struct DriverActivity {
+    generation: u64,
+}
+
+impl gpui::Global for DriverActivity {}
+
+fn stop_recording_when_idle(cx: &mut App) {
+    let generation = {
+        let activity = cx.default_global::<DriverActivity>();
+        activity.generation += 1;
+        activity.generation
+    };
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(RECORDING_IDLE).await;
+        cx.update(|cx| {
+            if cx.default_global::<DriverActivity>().generation == generation {
+                gpui::set_element_recording(false);
+            }
+        });
+    })
+    .detach();
+}
+
 /// The window's elements as last drawn, drawing first when recording just started or the window changed.
 fn current_elements(window: &mut Window, cx: &mut App) -> Vec<DebugElement> {
     let started = !gpui::element_recording();
@@ -203,6 +230,7 @@ fn current_elements(window: &mut Window, cx: &mut App) -> Vec<DebugElement> {
         // Cached views would otherwise reuse frames painted without their selectors.
         window.refresh();
     }
+    stop_recording_when_idle(cx);
     if started || window.needs_draw() {
         window.draw(cx).clear(cx);
         window.refresh();

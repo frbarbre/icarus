@@ -411,8 +411,18 @@ impl Server {
                     pull_request: Option<Value>,
                     pinned: Option<bool>,
                 }
+                // serde reads an explicit `null` as absent, and `null` is how a link is removed.
+                let clear_issue = p.get("issue").is_some_and(Value::is_null);
+                let clear_pr = p.get("pull_request").is_some_and(Value::is_null);
                 let p: P = params(p)?;
                 let mut workspace = self.workspace_by_key(&p.id)?;
+                if clear_issue {
+                    workspace.issue = None;
+                    self.linear.wake_poll();
+                }
+                if clear_pr {
+                    workspace.pull_request = None;
+                }
                 let pin_changed = p.pinned.is_some_and(|pinned| pinned != workspace.pinned);
                 if let Some(pinned) = p.pinned {
                     workspace.pinned = pinned;

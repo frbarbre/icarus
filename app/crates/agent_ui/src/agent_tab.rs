@@ -824,6 +824,28 @@ impl AgentComposer {
         });
     }
 
+    /// Puts an attachment chip in the workspace's composer and focuses it, or says why it can't.
+    pub fn attach_in_workspace(
+        id: String,
+        kind: String,
+        title: String,
+        workspace: &Workspace,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> anyhow::Result<()> {
+        let composer = Self::for_workspace(workspace)
+            .filter(|composer| composer.read(cx).target().is_some())
+            .context("open an agent tab first")?;
+        // Deferred: the composer reads the workspace, which the caller is updating right now.
+        window.defer(cx, move |window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.insert_attachment(id, kind, title, window, cx);
+            });
+            Self::focus(&composer, window, cx);
+        });
+        Ok(())
+    }
+
     // The composer sits outside every pane, so tab keys pressed in it would find no pane to act on
     // and fall through to the draft's own bindings (fold, delete word, typed characters).
     fn forward_to_active_pane<A: gpui::Action>(

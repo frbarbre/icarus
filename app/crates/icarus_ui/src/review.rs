@@ -3270,6 +3270,7 @@ impl ReviewCard {
             let pending = comment.id.starts_with(crate::pr_store::PENDING_PREFIX);
             let mut buttons: Vec<(&'static str, pr_comments::ClickHandler)> = Vec::new();
             let mut menu = Vec::new();
+            let mut send_button = None;
             if !pending {
                 if first {
                     let resolved = thread.is_resolved;
@@ -3312,13 +3313,15 @@ impl ReviewCard {
                     }
                 }
                 let thread_id = id.clone();
+                let send = on_review(Rc::new(move |review, _, cx| {
+                    review.add_to_agent(&thread_id, cx)
+                }));
+                send_button = (index + 1 == thread.comments.len()).then(|| send.clone());
                 menu.push(pr_comments::CommentAction {
                     label: "Send to Agent",
                     icon: IconName::Send,
                     destructive: false,
-                    handler: on_review(Rc::new(move |review, _, cx| {
-                        review.add_to_agent(&thread_id, cx)
-                    })),
+                    handler: send,
                 });
                 if let Some(url) = comment.url.clone() {
                     menu.push(pr_comments::CommentAction {
@@ -3382,6 +3385,7 @@ impl ReviewCard {
                     resolved: thread.is_resolved,
                     buttons,
                     menu,
+                    send: send_button,
                     body: self.render_body(
                         &format!("comment-{}", comment.id),
                         &comment.body,

@@ -438,6 +438,18 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             }
         }
     }
+    println!("\n--- Icarus: icarus_changes_tree ---");
+    for (name, result) in run_icarus_changes_tree_tests(workspace_window, &mut cx, update_baseline)
+    {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
     println!("\n--- Icarus: icarus_workspace_ports ---");
     for (name, result) in
         run_icarus_workspace_ports_tests(workspace_window, &mut cx, update_baseline)
@@ -1379,6 +1391,82 @@ fn hide_icarus_source_control(
         })
         .log_err();
     cx.run_until_parked();
+}
+
+/// The Changes tree at Orca's sidebar width, with the files of Orca's compact-folders screenshot.
+fn run_icarus_changes_tree_tests(
+    workspace_window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    use icarus_ui::changes_tab::{ChangesScope, Listing, SourceControlPanel};
+
+    let listing = serde_json::from_value::<Listing>(serde_json::json!({
+        "compare": { "status": "ready", "base": "origin/main" },
+        "rows": [
+            { "path": "apps/frontend/e2e/lib/slide-list-requests.ts", "status": "added", "added": 26, "committed": true },
+            { "path": "apps/frontend/e2e/pages/settings/playlist-slides-page.ts", "status": "modified", "added": 4, "committed": true },
+            { "path": "apps/frontend/e2e/tests/settings/department/in-store-slides-loading.spec.ts", "status": "added", "added": 73, "committed": true },
+            { "path": "apps/frontend/src/app/routes/_authenticated/settings/company/in-store/playlists/$playlistId.tsx", "status": "modified", "added": 5, "removed": 6, "committed": true },
+            { "path": "apps/frontend/src/app/routes/_authenticated/settings/department/$departmentId/in-store/playlists/$playlistId.tsx", "status": "modified", "added": 5, "removed": 6, "committed": true },
+            { "path": "apps/frontend/src/pages/in-store/ui/playlist-slides-page.tsx", "status": "modified", "added": 21, "removed": 14, "committed": true },
+            { "path": "apps/frontend/src/pages/in-store/ui/slide-card.tsx", "status": "modified", "added": 46, "removed": 18, "committed": true },
+            { "path": "apps/frontend/src/shared/lib/services/index.ts", "status": "modified", "added": 1, "committed": true },
+            { "path": "apps/frontend/src/shared/lib/services/playlist-slides.ts", "status": "modified", "added": 19, "removed": 2, "committed": true },
+        ],
+        "totals": { "files": 9, "added": 200, "removed": 46 },
+        "unfiltered": { "files": 9, "added": 200, "removed": 46 },
+    }));
+    let listing = match listing {
+        Ok(listing) => listing,
+        Err(error) => return vec![("icarus_changes_tree", Err(error.into()))],
+    };
+    let shown = workspace_window.update(cx, |workspace, window, cx| {
+        let source_control = cx.new(|cx| {
+            let mut panel = SourceControlPanel::preview(listing, ChangesScope::Base, None, cx);
+            panel.toggle_tree_view(cx);
+            panel
+        });
+        workspace.add_panel(source_control.clone(), window, cx);
+        workspace.open_panel::<SourceControlPanel>(window, cx);
+        let width = workspace.right_dock().read(cx).active_panel_size();
+        workspace.right_dock().update(cx, |dock, cx| {
+            dock.set_panel_size_state(
+                &source_control,
+                workspace::dock::PanelSizeState {
+                    size: Some(px(400.)),
+                    flex: None,
+                },
+                cx,
+            )
+        });
+        (source_control, width)
+    });
+    let (source_control, width) = match shown {
+        Ok(shown) => shown,
+        Err(error) => return vec![("icarus_changes_tree", Err(error))],
+    };
+    cx.run_until_parked();
+    let results = run_icarus_dark_and_light(
+        "icarus_changes_tree",
+        "icarus_changes_tree_light",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            source_control.update(cx, |panel, cx| panel.toggle_tree_view(cx));
+            if let Some(width) = width {
+                workspace.right_dock().update(cx, |dock, cx| {
+                    dock.set_panel_size_state(&source_control, width, cx)
+                });
+            }
+            workspace.remove_panel(&source_control, window, cx);
+        })
+        .log_err();
+    cx.run_until_parked();
+    results
 }
 
 fn icarus_github_empty_fixture() -> serde_json::Value {

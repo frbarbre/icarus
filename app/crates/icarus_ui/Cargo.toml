@@ -87,6 +87,7 @@ objc2-web-kit = { version = "0.3.2", default-features = false, features = [
 wry = { version = "0.57", default-features = false }
 
 [dev-dependencies]
+agent_ui = { workspace = true, features = ["test-support"] }
 db = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }

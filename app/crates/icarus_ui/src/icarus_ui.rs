@@ -213,8 +213,10 @@ pub struct ComposerAttachRequest {
     pub attachment: ComposerAttachment,
 }
 
-type ComposerAttachHandler =
-    Arc<dyn Fn(ComposerAttachment, &mut Workspace, &mut Window, &mut Context<Workspace>) + 'static>;
+type ComposerAttachHandler = Arc<
+    dyn Fn(ComposerAttachment, &mut Workspace, &mut Window, &mut Context<Workspace>) -> Result<()>
+        + 'static,
+>;
 
 struct GlobalComposerAttachHandler(ComposerAttachHandler);
 
@@ -223,36 +225,68 @@ impl gpui::Global for GlobalComposerAttachHandler {}
 /// The app crate owns the agent panel; this crate only routes attachments to the right workspace.
 pub fn set_composer_attach_handler(
     cx: &mut App,
-    handler: impl Fn(ComposerAttachment, &mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    handler: impl Fn(
+        ComposerAttachment,
+        &mut Workspace,
+        &mut Window,
+        &mut Context<Workspace>,
+    ) -> Result<()>
+    + 'static,
 ) {
     cx.set_global(GlobalComposerAttachHandler(Arc::new(handler)));
 }
 
 fn attach_to_composer(request: ComposerAttachRequest, cx: &mut App) {
-    let Some(handler) = cx
+    // Clicks and menu entries run while their window is updated, so updating it here would fail.
+    cx.defer(move |cx| {
+        let path = request.workspace_path.clone();
+        if let Err(error) = try_attach_to_composer(request, cx) {
+            show_workspace_error(&path, format!("Couldn't send to the agent: {error:#}"), cx);
+        }
+    });
+}
+
+fn try_attach_to_composer(request: ComposerAttachRequest, cx: &mut App) -> Result<()> {
+    let handler = cx
         .try_global::<GlobalComposerAttachHandler>()
         .map(|handler| handler.0.clone())
-    else {
-        log::error!("no composer attach handler registered");
-        return;
-    };
-    let Some((window_handle, workspace)) = workspace_for_path(&request.workspace_path, cx) else {
-        log::error!(
-            "no window to attach {:?} to for {}",
-            request.attachment.id,
-            request.workspace_path.display()
-        );
-        return;
-    };
-    window_handle
-        .update(cx, |multi_workspace, window, cx| {
-            multi_workspace.activate(workspace.clone(), None, window, cx);
-            window.activate_window();
-            workspace.update(cx, |workspace, cx| {
-                handler(request.attachment, workspace, window, cx);
-            });
+        .ok_or_else(|| anyhow::anyhow!("no agent composer in this build"))?;
+    let (window_handle, workspace) = workspace_for_path(&request.workspace_path, cx)
+        .ok_or_else(|| anyhow::anyhow!("no window for {}", request.workspace_path.display()))?;
+    window_handle.update(cx, |multi_workspace, window, cx| {
+        multi_workspace.activate(workspace.clone(), None, window, cx);
+        window.activate_window();
+        workspace.update(cx, |workspace, cx| {
+            handler(request.attachment, workspace, window, cx)
         })
-        .log_err();
+    })?
+}
+
+/// Toasts an error in the workspace at `path`, or the front one, after the current update.
+pub(crate) fn show_workspace_error(path: &Path, message: String, cx: &mut App) {
+    struct WorkspaceErrorToast;
+    let path = path.to_path_buf();
+    cx.defer(move |cx| {
+        let Some((window, target)) = workspace_for_path(&path, cx) else {
+            log::error!("{message}");
+            return;
+        };
+        window
+            .update(cx, |_, _, cx| {
+                target.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            workspace::notifications::NotificationId::unique::<WorkspaceErrorToast>(
+                            ),
+                            message,
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                });
+            })
+            .log_err();
+    });
 }
 
 fn multi_workspace_windows(cx: &App) -> Vec<WindowHandle<MultiWorkspace>> {

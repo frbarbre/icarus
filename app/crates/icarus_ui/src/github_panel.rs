@@ -3364,6 +3364,7 @@ impl GitHubPanel {
         let pending = comment.id.starts_with(crate::pr_store::PENDING_PREFIX);
         let mut buttons: Vec<(&'static str, pr_comments::ClickHandler)> = Vec::new();
         let mut menu = Vec::new();
+        let mut send_button = None;
         if !pending {
             if first {
                 let can_toggle = if thread.is_resolved {
@@ -3402,6 +3403,7 @@ impl GitHubPanel {
                 move |panel, _, cx| panel.send_thread_to_agent(thread_id.clone(), cx),
                 cx,
             );
+            send_button = (index + 1 == thread.comments.len()).then(|| send.clone());
             menu = self.comment_menu(
                 comment,
                 send,
@@ -3426,6 +3428,7 @@ impl GitHubPanel {
                 resolved: thread.is_resolved,
                 buttons,
                 menu,
+                send: send_button,
                 body,
                 react: (!pending).then(|| self.react_handler(cx)),
             },
@@ -3458,6 +3461,7 @@ impl GitHubPanel {
         let pending = conversation.is_pending();
         let mut buttons: Vec<(&'static str, pr_comments::ClickHandler)> = Vec::new();
         let mut menu = Vec::new();
+        let mut send_button = None;
         if !pending {
             let (id, author) = (conversation.id.clone(), conversation.author.clone());
             buttons.push((
@@ -3474,6 +3478,7 @@ impl GitHubPanel {
                 move |panel, _, cx| panel.send_conversation_to_agent(id.clone(), cx),
                 cx,
             );
+            send_button = Some(send.clone());
             menu = self.comment_menu(
                 &comment,
                 send,
@@ -3496,6 +3501,7 @@ impl GitHubPanel {
                     resolved: false,
                     buttons,
                     menu,
+                    send: send_button,
                     body,
                     react: (!pending).then(|| self.react_handler(cx)),
                 },
@@ -3903,7 +3909,7 @@ pub(crate) fn register(cx: &mut App) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn entry(json: serde_json::Value) -> StackEntry {
@@ -4680,6 +4686,154 @@ mod tests {
             "attached at once from the shown comment: {attached:?}"
         );
         assert!(crate::review::tests::calls_to(&calls, "attach.pr_comments").is_empty());
+    }
+
+    /// The app's own wiring: a real agent tab, its composer in the footer, and the app's handler.
+    pub(crate) fn real_agent_composer(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<agent_ui::agent_tab::AgentTab> {
+        cx.update(|_, cx| {
+            agent_ui::test_support::init_agent_tabs(
+                fs::FakeFs::new(cx.background_executor().clone()),
+                cx,
+            );
+            agent_ui::set_attachment_resolver(cx, crate::fetch_attachment_text);
+            crate::set_composer_attach_handler(cx, |attachment, workspace, window, cx| {
+                agent_ui::agent_tab::AgentComposer::attach_in_workspace(
+                    attachment.id,
+                    attachment.kind,
+                    attachment.title,
+                    workspace,
+                    window,
+                    cx,
+                )
+            });
+        });
+        let tab = workspace.update_in(cx, |workspace, window, cx| {
+            agent_ui::test_support::open_stub_agent_tab(workspace, window, cx)
+        });
+        cx.run_until_parked();
+        tab.expect("agent tab")
+    }
+
+    pub(crate) fn draft(
+        tab: &Entity<agent_ui::agent_tab::AgentTab>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> String {
+        cx.update(|_, cx| agent_ui::test_support::draft_text(tab, cx))
+            .expect("connected agent")
+    }
+
+    #[gpui::test]
+    async fn send_to_agent_from_a_card_puts_a_chip_in_the_composer(cx: &mut gpui::TestAppContext) {
+        let (workspace, panel, calls, mut cx) = panel_in_workspace(cx).await;
+        let cx = &mut cx;
+        let tab = real_agent_composer(&workspace, cx);
+        panel.update(cx, |panel, cx| {
+            let conversation: Vec<pr_comments::ConversationComment> =
+                serde_json::from_value(serde_json::json!([
+                    { "id": "IC_9", "kind": "comment", "database_id": 9, "author": "martin",
+                      "body": "Please split this up", "url": "https://github.com/o/r/pull/7#issuecomment-9" },
+                ]))
+                .expect("conversation");
+            let threads: Vec<ReviewThread> =
+                serde_json::from_value(panel_fixture()["threads"].clone()).expect("threads");
+            panel.store.update(cx, |store, cx| {
+                store.set_loaded("/project", Some(threads), Some(conversation), None, None, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        let menu_entry =
+            |panel: &Entity<GitHubPanel>, conversation: bool, cx: &mut gpui::VisualTestContext| {
+                panel.update(cx, |panel, cx| {
+                    let send = if conversation {
+                        panel.handler(
+                            |panel, _, cx| panel.send_conversation_to_agent("IC_9".into(), cx),
+                            cx,
+                        )
+                    } else {
+                        panel.handler(
+                            |panel, _, cx| panel.send_thread_to_agent("T1".into(), cx),
+                            cx,
+                        )
+                    };
+                    let comment = crate::review::ThreadComment {
+                        id: "IC_9".into(),
+                        ..Default::default()
+                    };
+                    let mut menu = panel.comment_menu(&comment, send, false, false, cx);
+                    assert_eq!(menu[0].label, "Send to Agent");
+                    menu.remove(0).handler
+                })
+            };
+        // As the menu and the card's button do: from inside the window's own update.
+        let send = menu_entry(&panel, true, cx);
+        cx.update(|window, cx| send(window, cx));
+        cx.run_until_parked();
+        let text = draft(&tab, cx);
+        assert!(
+            text.contains("icarus://attachment/"),
+            "the conversation comment lands as a chip: {text:?}"
+        );
+
+        let send = menu_entry(&panel, false, cx);
+        cx.update(|window, cx| send(window, cx));
+        cx.run_until_parked();
+        let text = draft(&tab, cx);
+        assert_eq!(
+            text.matches("icarus://attachment/").count(),
+            2,
+            "the thread lands too: {text:?}"
+        );
+        assert!(
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids().is_empty()),
+            "both chips resolved from the local text"
+        );
+        let attached = cx.update(|_, cx| crate::pr_store::local_attachment_texts(cx));
+        assert!(
+            attached
+                .iter()
+                .any(|text| text.contains("Please split this up"))
+        );
+        assert!(attached.iter().any(|text| text.starts_with("src/app.rs:2")));
+        assert!(
+            crate::review::tests::calls_to(&calls, "attach.pr_comments").is_empty(),
+            "nothing asks the server"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_send_to_agent_that_fails_says_so(cx: &mut gpui::TestAppContext) {
+        let (workspace, panel, _calls, mut cx) = panel_in_workspace(cx).await;
+        let cx = &mut cx;
+        cx.update(|_, cx| {
+            crate::set_composer_attach_handler(cx, |_, _, _, _| {
+                Err(anyhow::anyhow!("open an agent tab first"))
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            let threads: Vec<ReviewThread> =
+                serde_json::from_value(panel_fixture()["threads"].clone()).expect("threads");
+            panel.store.update(cx, |store, cx| {
+                store.set_loaded("/project", Some(threads), None, None, None, cx)
+            });
+        });
+        let toasts = |cx: &mut gpui::VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                let count = workspace.notification_ids().len();
+                workspace.clear_all_notifications(cx);
+                count
+            })
+        };
+        for thread in ["T1", "missing"] {
+            panel.update(cx, |panel, cx| {
+                panel.send_thread_to_agent(thread.into(), cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(toasts(cx), 1, "sending {thread} shows why it failed");
+        }
     }
 
     #[gpui::test]

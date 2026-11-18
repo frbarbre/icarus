@@ -21,6 +21,7 @@ test-support = [
     "reqwest_client",
     "workspace/test-support",
     "agent/test-support",
+    "language_model/test-support",
 ]
 audio = ["dep:audio"]
 unit-eval = []

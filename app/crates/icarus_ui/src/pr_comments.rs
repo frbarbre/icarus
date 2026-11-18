@@ -551,6 +551,8 @@ pub struct CommentParts {
     pub resolved: bool,
     pub buttons: Vec<(&'static str, ClickHandler)>,
     pub menu: Vec<CommentAction>,
+    /// Always shown, unlike `buttons`, so the agent hand-off is never hidden behind hover.
+    pub send: Option<ClickHandler>,
     pub body: AnyElement,
     pub react: Option<ReactHandler>,
 }
@@ -771,6 +773,20 @@ pub fn render_comment(mut parts: CommentParts, cx: &App) -> AnyElement {
         cx,
     );
     let toolbar = hover_toolbar(&mut parts, &group);
+    let send = parts.send.take().map(|handler| {
+        Button::new(
+            SharedString::from(format!("{}-send", parts.id)),
+            "Send to agent",
+        )
+        .start_icon(
+            Icon::new(IconName::Send)
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+        )
+        .label_size(px_rems(10.))
+        .tooltip(Tooltip::text("Attach to the agent's next prompt"))
+        .on_click(move |_, window, cx| handler(window, cx))
+    });
     let header = if parts.first {
         let location = parts.location.take();
         let has_location = location.is_some();
@@ -843,7 +859,16 @@ pub fn render_comment(mut parts: CommentParts, cx: &App) -> AnyElement {
                 .text_size(rems(ORCA_TEXT / 16.))
                 .line_height(gpui::relative(1.625))
                 .child(parts.body)
-                .children(reactions),
+                .map(|column| match send {
+                    Some(send) => column.child(
+                        h_flex()
+                            .items_end()
+                            .gap_2()
+                            .child(div().flex_1().min_w_0().children(reactions))
+                            .child(div().flex_none().pt_2().child(send)),
+                    ),
+                    None => column.children(reactions),
+                }),
         )
         .into_any_element()
 }

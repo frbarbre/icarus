@@ -2,7 +2,7 @@
 //! names, linked Linear issues, diff notes and agent notes, matched to Icarus workspaces.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -338,6 +338,59 @@ pub fn plan(
     result
 }
 
+/// Orca's data folder; `ICARUS_ORCA_DATA_DIR` points elsewhere (tests).
+fn orca_data_dir() -> Option<PathBuf> {
+    match std::env::var_os("ICARUS_ORCA_DATA_DIR") {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => dirs::data_dir().map(|d| d.join("orca")),
+    }
+}
+
+fn read_profile(path: &Path) -> rusqlite::Result<Vec<OrcaWorktree>> {
+    // Read-only, so Orca's own database (and its write-ahead log) is never changed.
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let document = |domain: &str| -> rusqlite::Result<Value> {
+        let payload: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM profile_state_documents WHERE domain = ?1",
+                [domain],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(payload
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default())
+    };
+    Ok(parse(&document("worktreeMeta")?, &document("repos")?))
+}
+
+/// Every worktree entry in this machine's Orca profiles; unreadable profiles are skipped.
+pub(crate) fn read_local_profiles() -> Vec<OrcaWorktree> {
+    let Some(entries) =
+        orca_data_dir().and_then(|dir| std::fs::read_dir(dir.join("profiles")).ok())
+    else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path().join("profile-state.db"))
+        .filter(|path| path.is_file())
+        .flat_map(|path| {
+            read_profile(&path).unwrap_or_else(|error| {
+                tracing::debug!("reading Orca profile {}: {error}", path.display());
+                Vec::new()
+            })
+        })
+        .collect()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -401,6 +454,12 @@ impl Server {
                     }
                 }
             }
+            // Newly linked issues need their details now, not at the next timed poll.
+            self.linear.wake_poll();
+            self.broadcast(
+                "workspace.changed",
+                json!({ "workspaces": plan.matched.iter().map(|m| m.workspace_id.clone()).collect::<Vec<_>>(), "source": "orca" }),
+            );
         }
         value["dry_run"] = json!(p.dry_run);
         Ok(value)

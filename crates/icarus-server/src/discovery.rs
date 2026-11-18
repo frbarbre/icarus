@@ -618,6 +618,8 @@ impl Server {
             self.github.wake_poll();
             self.linear.wake_poll();
         }
+        let server = Arc::clone(self);
+        tokio::spawn(async move { server.link_discovered().await });
         changed
     }
 

@@ -1,8 +1,8 @@
 //! Linear, kept minimal (plan D12): issue titles and details for cards, issue lookups, and naming workspaces made from an issue.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use icarus_linear::{
@@ -10,11 +10,13 @@ use icarus_linear::{
     LinearError, LinearRequest, LinearResponse, Transport, normalize_identifier,
 };
 use icarus_protocol::RpcError;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::linear_key::{KeyStore, valid_key};
 use crate::server::{Server, params, rpc, to_value};
+use crate::state::{ORIGIN_ADOPTED, Workspace};
 
 const ISSUE_TTL: Duration = Duration::from_secs(60);
 const CREATE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -22,6 +24,8 @@ const VIEWER_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_POLL_MS: u64 = 300_000;
 const MIN_POLL_MS: u64 = 1_000;
 const SEARCH_LIMIT: usize = 20;
+const LINK_RETRY: Duration = Duration::from_secs(30 * 60);
+const LINK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The transport the server uses: Linear's API, or a fixture directory when `ICARUS_LINEAR_FIXTURES` is set.
 pub enum ServerLinear {
@@ -51,6 +55,9 @@ pub struct LinearService {
     stored_loaded: tokio::sync::Mutex<bool>,
     viewer: Mutex<Option<(KeySource, String)>>,
     poll: tokio::sync::Notify,
+    /// Workspaces made elsewhere that were checked for an issue link, and when.
+    link_tried: Mutex<HashMap<String, Instant>>,
+    linking: tokio::sync::Mutex<()>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -76,6 +83,8 @@ impl LinearService {
             stored_loaded: tokio::sync::Mutex::new(false),
             viewer: Mutex::new(None),
             poll: tokio::sync::Notify::new(),
+            link_tried: Mutex::new(HashMap::new()),
+            linking: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -166,6 +175,74 @@ pub(crate) fn linear_issue_id(issue: &Value) -> Option<String> {
     normalize_identifier(issue["id"].as_str()?).ok()
 }
 
+/// Linear identifiers in a branch or folder name, in order: `feature/e-7356-fix` → `E-7356`.
+pub(crate) fn identifiers_in(text: &str) -> Vec<String> {
+    static PATTERN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b([A-Za-z]{1,10})-(\d{1,9})\b").expect("valid pattern"));
+    PATTERN
+        .captures_iter(text)
+        .map(|c| format!("{}-{}", c[1].to_ascii_uppercase(), &c[2]))
+        .collect()
+}
+
+fn link_candidates(workspace: &Workspace) -> Vec<String> {
+    let folder = workspace
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let mut ids: Vec<String> = Vec::new();
+    for text in [
+        workspace.branch.clone(),
+        folder,
+        Some(workspace.name.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for id in identifiers_in(&text) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Fills the issue, title and status a workspace lacks; returns whether anything changed.
+fn fill_links(
+    workspace: &mut Workspace,
+    issue_id: Option<&str>,
+    orca: Option<&crate::orca_state::Matched>,
+    found: &BTreeMap<String, Option<Issue>>,
+) -> bool {
+    let mut dirty = false;
+    if workspace.issue.is_none()
+        && let Some(id) = issue_id
+    {
+        workspace.issue = Some(json!({ "provider": "linear", "id": id }));
+        dirty = true;
+    }
+    let issue_title = workspace
+        .issue
+        .as_ref()
+        .and_then(linear_issue_id)
+        .and_then(|id| found.get(&id).cloned().flatten())
+        .map(|issue| issue.title);
+    if workspace.title.is_none()
+        && let Some(title) = orca.and_then(|m| m.title.clone()).or(issue_title)
+    {
+        workspace.title = Some(title);
+        dirty = true;
+    }
+    if workspace.status.is_none()
+        && let Some(status) = orca.and_then(|m| m.status.clone())
+    {
+        workspace.status = Some(status);
+        dirty = true;
+    }
+    dirty
+}
+
 fn poll_interval(settings: &Value) -> Duration {
     let ms = settings["linear"]["poll_interval_ms"]
         .as_u64()
@@ -181,6 +258,7 @@ fn linear_rpc(error: LinearError) -> RpcError {
 /// Wake-ups closer together than this share one poll.
 const POLL_GAP: Duration = Duration::from_secs(2);
 const ISSUE_CACHE_KEY: &str = "linear.issue_cache";
+const LINKED_KEY: &str = "linear.auto_linked:";
 
 /// Refreshes linked issues while a client is connected: at once when one connects or worktrees
 /// change, then every `linear.poll_interval_ms`.
@@ -334,6 +412,132 @@ impl Server {
         Ok(json!({ "refreshed": found.len(), "changed": changed_workspaces }))
     }
 
+    /// Links worktrees made elsewhere to their issue: Orca's own link first, else an identifier in
+    /// the branch or folder name that Linear confirms. Fills only fields the workspace lacks.
+    pub(crate) async fn link_discovered(&self) {
+        let Ok(_running) = self.linear.linking.try_lock() else {
+            return;
+        };
+        let Ok(workspaces) = self.store.workspaces(None) else {
+            return;
+        };
+        let candidates: Vec<Workspace> = {
+            let tried = lock(&self.linear.link_tried);
+            workspaces
+                .into_iter()
+                .filter(|w| {
+                    w.issue.is_none()
+                        && (w.discovery.discovered || w.discovery.origin == ORIGIN_ADOPTED)
+                        && tried.get(&w.id).is_none_or(|at| at.elapsed() >= LINK_RETRY)
+                })
+                .collect()
+        };
+        // Linked once already: a link the user removed since stays removed.
+        let candidates: Vec<Workspace> = candidates
+            .into_iter()
+            .filter(|w| {
+                !matches!(
+                    self.store.kv_get(&format!("{LINKED_KEY}{}", w.id)),
+                    Ok(Some(_))
+                )
+            })
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        {
+            let mut tried = lock(&self.linear.link_tried);
+            for workspace in &candidates {
+                tried.insert(workspace.id.clone(), Instant::now());
+            }
+        }
+        let projects = self.store.projects().unwrap_or_default();
+        let orca = tokio::task::spawn_blocking(crate::orca_state::read_local_profiles)
+            .await
+            .unwrap_or_default();
+        let mut from_orca: HashMap<String, crate::orca_state::Matched> =
+            crate::orca_state::plan(&orca, &candidates, &projects, &HashSet::new())
+                .matched
+                .into_iter()
+                .map(|m| (m.workspace_id.clone(), m))
+                .collect();
+        let wanted: Vec<(&Workspace, Option<String>, Vec<String>)> = candidates
+            .iter()
+            .map(|w| {
+                let orca_issue = from_orca
+                    .get(&w.id)
+                    .and_then(|m| normalize_identifier(m.linear.as_deref()?).ok());
+                let inferred = if orca_issue.is_some() {
+                    Vec::new()
+                } else {
+                    link_candidates(w)
+                };
+                (w, orca_issue, inferred)
+            })
+            .collect();
+        let mut ids: Vec<String> = wanted
+            .iter()
+            .flat_map(|(_, orca, inferred)| orca.iter().chain(inferred))
+            .cloned()
+            .collect();
+        ids.sort();
+        ids.dedup();
+        let found = if ids.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.linear_sync_settings().await;
+            match tokio::time::timeout(LINK_TIMEOUT, self.linear.fetch(&ids)).await {
+                Ok(Ok((found, _))) => {
+                    self.save_issue_cache();
+                    found
+                }
+                Ok(Err(LinearError::NotConfigured)) => BTreeMap::new(),
+                Ok(Err(error)) => {
+                    tracing::debug!("linking worktrees to Linear issues: {error}");
+                    BTreeMap::new()
+                }
+                Err(_) => {
+                    tracing::debug!("linking worktrees to Linear issues timed out");
+                    BTreeMap::new()
+                }
+            }
+        };
+        let mut changed = Vec::new();
+        for (workspace, orca_issue, inferred) in wanted {
+            let orca = from_orca.remove(&workspace.id);
+            let issue_id = orca_issue.or_else(|| {
+                inferred
+                    .into_iter()
+                    .find(|id| matches!(found.get(id), Some(Some(_))))
+            });
+            let Ok(Some(mut fresh)) = self.store.workspace(&workspace.id) else {
+                continue;
+            };
+            if !fill_links(&mut fresh, issue_id.as_deref(), orca.as_ref(), &found) {
+                continue;
+            }
+            let written = self
+                .store
+                .update_workspace(&fresh)
+                .and_then(|()| match fresh.issue {
+                    Some(_) => self
+                        .store
+                        .kv_set(&format!("{LINKED_KEY}{}", fresh.id), &json!(true)),
+                    None => Ok(()),
+                });
+            match written {
+                Ok(()) => changed.push(fresh.id),
+                Err(error) => tracing::warn!("linking {} to its issue: {error:#}", fresh.name),
+            }
+        }
+        if !changed.is_empty() {
+            self.broadcast(
+                "workspace.changed",
+                json!({ "workspaces": changed, "source": "linear" }),
+            );
+        }
+    }
+
     pub(crate) async fn linear_dispatch(&self, method: &str, p: Value) -> Result<Value, RpcError> {
         match method {
             "issue.search" => return self.issue_search(p).await,
@@ -452,6 +656,7 @@ impl Server {
         let keys = self.linear.client.keys();
         keys.set_stored(Some(key));
         keys.reset_backoff().await;
+        lock(&self.linear.link_tried).clear();
         *lock(&self.linear.viewer) = Some((KeySource::Stored, name.clone()));
         self.broadcast("config.changed", json!({ "source": "linear" }));
         let mut status = self.linear_status().await?;
@@ -530,6 +735,92 @@ fn issue_json(issue: &Issue, stale: bool) -> Result<Value, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifiers_come_from_branch_and_folder_names() {
+        assert_eq!(identifiers_in("feature/e-7356-failfronte"), ["E-7356"]);
+        assert_eq!(identifiers_in("e-7358"), ["E-7358"]);
+        assert_eq!(identifiers_in("abc-12-then-xy-3"), ["ABC-12", "XY-3"]);
+        assert!(identifiers_in("fix/money-field-test-time").is_empty());
+        assert!(identifiers_in("e-12abc").is_empty());
+        assert!(identifiers_in("abcdefghijk-12").is_empty());
+    }
+
+    fn bare_workspace() -> Workspace {
+        Workspace {
+            id: "ws-1".into(),
+            project_id: "p".into(),
+            name: "abc-12-x".into(),
+            path: PathBuf::from("/w/abc-12-x"),
+            branch: Some("feature/abc-12-x".into()),
+            base_ref: None,
+            status: None,
+            title: None,
+            issue: None,
+            pull_request: None,
+            created_at_ms: 0,
+            pinned: false,
+            manual_order: None,
+            activity_at_ms: None,
+            discovery: Default::default(),
+        }
+    }
+
+    fn found_issue(identifier: &str, title: &str) -> BTreeMap<String, Option<Issue>> {
+        let issue: Issue = serde_json::from_value(json!({
+            "id": "uuid", "identifier": identifier, "title": title, "description": null,
+            "state": null, "priority": null, "priority_label": null, "assignee": null,
+            "url": "https://linear.app/x", "branch_name": null, "updated_at": null, "team_key": null,
+        }))
+        .expect("issue");
+        BTreeMap::from([(identifier.to_owned(), Some(issue))])
+    }
+
+    #[test]
+    fn links_fill_only_what_the_workspace_lacks() {
+        let found = found_issue("ABC-12", "Fix the login page");
+        let mut workspace = bare_workspace();
+        assert!(fill_links(&mut workspace, Some("ABC-12"), None, &found));
+        assert_eq!(
+            workspace.issue,
+            Some(json!({ "provider": "linear", "id": "ABC-12" }))
+        );
+        assert_eq!(workspace.title.as_deref(), Some("Fix the login page"));
+
+        let mut set_by_user = bare_workspace();
+        set_by_user.issue = Some(json!({ "provider": "linear", "id": "XYZ-1" }));
+        set_by_user.title = Some("Mine".into());
+        set_by_user.status = Some("done".into());
+        let orca = crate::orca_state::Matched {
+            workspace_id: "ws-1".into(),
+            workspace: "abc-12-x".into(),
+            matched_by: "path",
+            status: Some("in-review".into()),
+            title: Some("From Orca".into()),
+            linear: Some("ABC-12".into()),
+            notes: 0,
+            replies: 0,
+            notes_already_imported: 0,
+            drafts: 0,
+            drafts_already_imported: 0,
+            review_summary: false,
+            new_notes: Vec::new(),
+            new_drafts: Vec::new(),
+            summary_text: None,
+        };
+        assert!(!fill_links(
+            &mut set_by_user,
+            Some("ABC-12"),
+            Some(&orca),
+            &found
+        ));
+        assert_eq!(
+            set_by_user.issue,
+            Some(json!({ "provider": "linear", "id": "XYZ-1" }))
+        );
+        assert_eq!(set_by_user.title.as_deref(), Some("Mine"));
+        assert_eq!(set_by_user.status.as_deref(), Some("done"));
+    }
 
     #[test]
     fn only_linear_links_with_valid_identifiers_count() {

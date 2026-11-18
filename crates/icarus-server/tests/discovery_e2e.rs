@@ -543,3 +543,146 @@ async fn the_main_checkout_is_listed_as_the_primary_workspace_and_cannot_be_remo
     );
     assert_eq!(fixture.names(false).await, ["widgets"], "and stays listed");
 }
+
+fn linear_issue(identifier: &str, title: &str) -> String {
+    json!({
+        "id": format!("uuid-{identifier}"),
+        "identifier": identifier,
+        "title": title,
+        "description": null,
+        "priority": 0,
+        "priorityLabel": "No priority",
+        "url": format!("https://linear.app/acme/issue/{}", identifier.to_lowercase()),
+        "branchName": identifier.to_lowercase(),
+        "updatedAt": "2026-11-14T10:00:00.000Z",
+        "state": { "name": "In Progress", "type": "started", "color": "#f2c94c" },
+        "assignee": null,
+        "labels": { "nodes": [] },
+        "team": { "key": "ABC" },
+    })
+    .to_string()
+}
+
+fn orca_profile(data_dir: &Path, worktree_meta: &Value) {
+    let profile = data_dir.join("profiles").join("p1");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let db = rusqlite::Connection::open(profile.join("profile-state.db")).expect("create db");
+    db.execute_batch(
+        "CREATE TABLE profile_state_documents (domain TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL, domain_version INTEGER NOT NULL, revision INTEGER NOT NULL, updated_at INTEGER NOT NULL, content_hash TEXT NOT NULL);",
+    )
+    .expect("schema");
+    db.execute(
+        "INSERT INTO profile_state_documents VALUES ('worktreeMeta', ?1, 1, 1, 0, 'h')",
+        [worktree_meta.to_string()],
+    )
+    .expect("seed");
+}
+
+#[tokio::test]
+async fn worktrees_made_elsewhere_get_their_linear_issue_from_orca_or_their_name() {
+    let home = tempfile::tempdir().expect("home");
+    let home = std::fs::canonicalize(home.path()).expect("canonical home");
+    let dirs = tempfile::tempdir().expect("dirs");
+    let dirs = std::fs::canonicalize(dirs.path()).expect("canonical");
+    let repo = dirs.join("widgets");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("readme.md"), "hello\n").expect("write");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+
+    let linear = dirs.join("linear");
+    std::fs::create_dir_all(&linear).expect("linear fixtures");
+    std::fs::write(
+        linear.join("ABC-12.json"),
+        linear_issue("ABC-12", "Fix the login page"),
+    )
+    .expect("issue");
+    std::fs::write(
+        linear.join("ABC-77.json"),
+        linear_issue("ABC-77", "Orca's issue"),
+    )
+    .expect("issue");
+    // Under Icarus's own root, so the discovered worktrees are shown.
+    let elsewhere = home.join("workspaces").join("widgets");
+    let orca_made = elsewhere.join("orca-made");
+    let orca = dirs.join("orca-data");
+    orca_profile(
+        &orca,
+        &json!({
+            format!("r1::{}", orca_made.display()): {
+                "linkedLinearIssue": "ABC-77",
+                "workspaceStatus": "in-review",
+            },
+        }),
+    );
+
+    let _server = start_server_with(
+        &home,
+        &[
+            ("ICARUS_LINEAR_FIXTURES", linear.clone().into_os_string()),
+            ("LINEAR_API_KEY", "lin_api_fixture".into()),
+            ("ICARUS_ORCA_DATA_DIR", orca.into_os_string()),
+        ],
+    );
+    let (client, _events) = Client::connect(&home, "test").await.expect("connect");
+    let project = client
+        .request("project.add", json!({ "path": repo }))
+        .await
+        .expect("add project");
+    let fixture = Fixture {
+        client,
+        project: project["id"].as_str().expect("id").to_owned(),
+    };
+
+    add_worktree(&repo, &elsewhere.join("abc12"), Some("feature/abc-12-x"));
+    add_worktree(&repo, &elsewhere.join("unknown"), Some("feature/zzz-99-y"));
+    add_worktree(&repo, &orca_made, Some("orca-made"));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (abc12, from_orca) = loop {
+        let abc12 = fixture.by_name("abc12").await;
+        let from_orca = fixture.by_name("orca-made").await;
+        if abc12["issue"]["id"].is_string()
+            && from_orca["issue"]["id"].is_string()
+            && abc12["title"].is_string()
+            && from_orca["title"].is_string()
+        {
+            break (abc12, from_orca);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worktrees were not linked: {abc12} {from_orca}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(abc12["issue"]["id"], "ABC-12", "inferred from the branch");
+    assert_eq!(abc12["title"], "Fix the login page");
+    assert_eq!(from_orca["issue"]["id"], "ABC-77", "Orca's own link");
+    assert_eq!(from_orca["status"], "in-review");
+    assert_eq!(from_orca["title"], "Orca's issue");
+    let unknown = fixture.by_name("unknown").await;
+    assert!(
+        unknown["issue"].is_null(),
+        "Linear doesn't know ZZZ-99: {unknown}"
+    );
+    assert!(unknown["title"].is_null());
+
+    fixture
+        .request(
+            "workspace.set",
+            json!({ "id": abc12["id"], "issue": null, "title": "Mine" }),
+        )
+        .await;
+    fixture.list(true).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let abc12 = fixture.by_name("abc12").await;
+    assert!(
+        abc12["issue"].is_null(),
+        "a link the user removed stays removed: {abc12}"
+    );
+    assert_eq!(abc12["title"], "Mine");
+}

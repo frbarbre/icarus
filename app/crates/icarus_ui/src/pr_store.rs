@@ -637,6 +637,33 @@ impl PrReviewStore {
 
 /// Adds a thread to the workspace's agent composer from what is shown, without asking anyone.
 pub fn send_thread_to_agent(workspace: &str, thread: &str, cx: &mut App) -> Option<String> {
+    let attachment = thread_attachment(workspace, thread, cx);
+    attach_or_toast(workspace, attachment, cx)
+}
+
+/// Adds a conversation comment or review summary to the workspace's agent composer.
+pub fn send_conversation_to_agent(workspace: &str, comment: &str, cx: &mut App) -> Option<String> {
+    let attachment = conversation_attachment(workspace, comment, cx);
+    attach_or_toast(workspace, attachment, cx)
+}
+
+fn attach_or_toast(
+    workspace: &str,
+    attachment: Option<(String, String)>,
+    cx: &mut App,
+) -> Option<String> {
+    let Some((title, text)) = attachment else {
+        show_failure(
+            workspace,
+            "Couldn't send to the agent: the comment is no longer loaded",
+            cx,
+        );
+        return None;
+    };
+    Some(attach_local(workspace, "pr-comment", title, text, cx))
+}
+
+fn thread_attachment(workspace: &str, thread: &str, cx: &mut App) -> Option<(String, String)> {
     let store = PrReviewStore::global(cx);
     let thread = store.read(cx).data(workspace)?.thread(thread)?.clone();
     let first = thread.comments.first()?;
@@ -645,12 +672,14 @@ pub fn send_thread_to_agent(workspace: &str, thread: &str, cx: &mut App) -> Opti
         first.author.as_deref().unwrap_or("ghost"),
         thread_location(&thread)
     );
-    let text = thread_text(&thread);
-    Some(attach_local(workspace, "pr-comment", title, text, cx))
+    Some((title, thread_text(&thread)))
 }
 
-/// Adds a conversation comment or review summary to the workspace's agent composer.
-pub fn send_conversation_to_agent(workspace: &str, comment: &str, cx: &mut App) -> Option<String> {
+fn conversation_attachment(
+    workspace: &str,
+    comment: &str,
+    cx: &mut App,
+) -> Option<(String, String)> {
     let store = PrReviewStore::global(cx);
     let entry = store
         .read(cx)
@@ -674,7 +703,7 @@ pub fn send_conversation_to_agent(workspace: &str, comment: &str, cx: &mut App) 
     }
     text.push('\n');
     text.push_str(entry.body.trim());
-    Some(attach_local(workspace, "pr-comment", title, text, cx))
+    Some((title, text))
 }
 
 fn thread_location(thread: &ReviewThread) -> String {
@@ -753,25 +782,5 @@ fn attach_local(workspace: &str, kind: &str, title: String, text: String, cx: &m
 }
 
 fn show_failure(workspace: &str, message: &str, cx: &mut App) {
-    struct PrReviewToast;
-    let Some((window, target)) = crate::workspace_for_path(std::path::Path::new(workspace), cx)
-    else {
-        log::warn!("review change failed: {message}");
-        return;
-    };
-    let message = message.to_owned();
-    window
-        .update(cx, |_, _window, cx| {
-            target.update(cx, |workspace, cx| {
-                workspace.show_toast(
-                    workspace::Toast::new(
-                        workspace::notifications::NotificationId::unique::<PrReviewToast>(),
-                        message,
-                    )
-                    .autohide(),
-                    cx,
-                );
-            });
-        })
-        .log_err();
+    crate::show_workspace_error(std::path::Path::new(workspace), message.to_owned(), cx);
 }

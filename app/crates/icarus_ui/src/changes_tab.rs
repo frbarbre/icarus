@@ -623,6 +623,11 @@ impl Facet {
     }
 }
 
+const TREE_ROW_HEIGHT: f32 = 24.;
+const TREE_INDENT: f32 = 12.;
+const TREE_FOLDER_PADDING: f32 = 8.;
+const TREE_FILE_PADDING: f32 = 20.;
+
 /// One line of the Changes tree: a folder, or a file by its index in the listing's rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeEntry {
@@ -640,6 +645,8 @@ pub enum TreeEntry {
 }
 
 /// The rows as a folder tree, folders before files at each level, skipping what folded folders hide.
+/// A chain of folders that each hold only one folder shows as one row (Orca's compact folders),
+/// named `a/b/c` and folded by the path of its last folder.
 pub fn tree_entries(paths: &[&str], collapsed: &collections::HashSet<String>) -> Vec<TreeEntry> {
     #[derive(Default)]
     struct Folder {
@@ -669,6 +676,15 @@ pub fn tree_entries(paths: &[&str], collapsed: &collections::HashSet<String>) ->
         out: &mut Vec<TreeEntry>,
     ) {
         for (name, child) in &folder.folders {
+            let mut name = name.clone();
+            let mut child = child;
+            while child.files.is_empty() && child.folders.len() == 1 {
+                let Some((next_name, next)) = child.folders.iter().next() else {
+                    break;
+                };
+                name = format!("{name}/{next_name}");
+                child = next;
+            }
             let path = if prefix.is_empty() {
                 name.clone()
             } else {
@@ -677,7 +693,7 @@ pub fn tree_entries(paths: &[&str], collapsed: &collections::HashSet<String>) ->
             let folded = collapsed.contains(&path);
             out.push(TreeEntry::Folder {
                 path: path.clone(),
-                name: name.clone(),
+                name,
                 depth,
                 files: child.count,
                 collapsed: folded,
@@ -2396,11 +2412,18 @@ impl SourceControlPanel {
         let rows = self.rows().to_vec();
         range
             .filter_map(|index| rows.get(index).cloned().map(|row| (index, row)))
-            .map(|(index, row)| self.render_row(index, &row, cx))
+            .map(|(index, row)| self.render_row(index, &row, None, cx))
             .collect()
     }
 
-    fn render_row(&self, index: usize, row: &Row, cx: &mut Context<Self>) -> AnyElement {
+    /// `depth` is the row's level in the tree view, `None` in the flat list.
+    fn render_row(
+        &self,
+        index: usize,
+        row: &Row,
+        depth: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let path = Path::new(&row.path);
         let name = path
             .file_name()
@@ -2428,9 +2451,12 @@ impl SourceControlPanel {
             .debug_selector(|| format!("scm-row:{}", row.path))
             .group("changes-row")
             .relative()
-            .h(px(26.))
-            .px_2()
-            .gap_1p5()
+            .h(px(TREE_ROW_HEIGHT))
+            .pl(px(depth.map_or(8., |depth| {
+                depth as f32 * TREE_INDENT + TREE_FILE_PADDING
+            })))
+            .pr(px(12.))
+            .gap_1()
             .w_full()
             .cursor_pointer()
             .when(selected, |this| {
@@ -2473,22 +2499,27 @@ impl SourceControlPanel {
                         )
                     }),
             )
-            .when_some(row.added.filter(|added| *added > 0), |this, added| {
-                this.child(
-                    Label::new(format!("+{added}"))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Created),
-                )
-            })
-            .when_some(
-                row.removed.filter(|removed| *removed > 0),
-                |this, removed| {
-                    this.child(
-                        Label::new(format!("−{removed}"))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Deleted),
-                    )
-                },
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap(px(3.))
+                    .when_some(row.added.filter(|added| *added > 0), |this, added| {
+                        this.child(
+                            Label::new(format!("+{added}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Created),
+                        )
+                    })
+                    .when_some(
+                        row.removed.filter(|removed| *removed > 0),
+                        |this, removed| {
+                            this.child(
+                                Label::new(format!("-{removed}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Deleted),
+                            )
+                        },
+                    ),
             )
             .children(crate::pr_comments::open_thread_badge(
                 index,
@@ -2529,9 +2560,10 @@ impl SourceControlPanel {
                         .absolute()
                         .top_0()
                         .bottom_0()
-                        .right(px(40.))
-                        .pl_1()
-                        .gap_0p5()
+                        .right_0()
+                        .pl_2()
+                        .pr(px(12.))
+                        .gap_1p5()
                         .bg(cx.theme().colors().element_hover)
                         .invisible()
                         .group_hover("changes-row", |style| style.visible())
@@ -2575,29 +2607,30 @@ impl SourceControlPanel {
                         }),
                 )
             })
-            .when(local_scope(&self.scope), |this| {
+            .when_some(staged, |this, label| {
                 this.child(
                     div()
                         .id(("changes-row-staged", index))
-                        .w(px(12.))
                         .flex_none()
-                        .when_some(staged, |this, label| {
-                            this.tooltip(Tooltip::text(label)).child(
-                                Icon::new(if label == "Staged" {
-                                    IconName::Check
-                                } else {
-                                    IconName::Dash
-                                })
-                                .size(IconSize::XSmall)
-                                .color(Color::Created),
-                            )
-                        }),
+                        .tooltip(Tooltip::text(label))
+                        .child(
+                            Icon::new(if label == "Staged" {
+                                IconName::Check
+                            } else {
+                                IconName::Dash
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Created),
+                        ),
                 )
             })
             .child(
-                Label::new(status_letter(&row.status))
-                    .size(LabelSize::XSmall)
-                    .color(color),
+                div().w(px(16.)).flex_none().flex().justify_center().child(
+                    Label::new(status_letter(&row.status))
+                        .size(LabelSize::XSmall)
+                        .weight(FontWeight::BOLD)
+                        .color(color),
+                ),
             );
         right_click_menu(("changes-row-menu", index))
             .trigger(move |_, _, _| element)
@@ -3975,11 +4008,14 @@ impl SourceControlPanel {
                     files,
                     collapsed,
                 } => {
+                    let icon = FileIcons::get_folder_icon(!collapsed, Path::new(&path), cx)
+                        .unwrap_or_else(|| IconName::Folder.path().into());
                     h_flex()
                         .id(SharedString::from(format!("changes-folder-{path}")))
-                        .h(px(26.))
-                        .pl(px(8. + depth as f32 * 12.))
-                        .pr_2()
+                        .debug_selector(|| format!("scm-folder:{path}"))
+                        .h(px(TREE_ROW_HEIGHT))
+                        .pl(px(depth as f32 * TREE_INDENT + TREE_FOLDER_PADDING))
+                        .pr(px(12.))
                         .gap_1()
                         .w_full()
                         .cursor_pointer()
@@ -3994,15 +4030,33 @@ impl SourceControlPanel {
                             .color(Color::Muted),
                         )
                         .child(
-                            Icon::new(IconName::Folder)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
+                            div()
+                                .flex_none()
+                                .debug_selector({
+                                    let icon = icon.clone();
+                                    move || format!("scm-folder-icon:{icon}")
+                                })
+                                .child(
+                                    Icon::from_path(icon)
+                                        .size(IconSize::Medium)
+                                        .color(Color::Muted),
+                                ),
                         )
-                        .child(Label::new(name).size(LabelSize::Small).truncate())
                         .child(
-                            Label::new(files.to_string())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
+                            div().flex_1().min_w_0().child(
+                                Label::new(name)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                        )
+                        .child(
+                            div().w(px(16.)).flex_none().flex().justify_center().child(
+                                Label::new(files.to_string())
+                                    .size(LabelSize::XSmall)
+                                    .weight(FontWeight::BOLD)
+                                    .color(Color::Muted),
+                            ),
                         )
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.toggle_folder(&path, cx)
@@ -4010,10 +4064,7 @@ impl SourceControlPanel {
                         .into_any_element()
                 }
                 TreeEntry::File { index, depth } => match rows.get(index) {
-                    Some(row) => div()
-                        .pl(px(depth as f32 * 12. + 12.))
-                        .child(self.render_row(index, row, cx))
-                        .into_any_element(),
+                    Some(row) => self.render_row(index, row, Some(depth), cx),
                     None => div().into_any_element(),
                 },
             })
@@ -5228,6 +5279,127 @@ mod tests {
         );
         let folded = tree_entries(&paths, &["src/ui".to_owned()].into_iter().collect());
         assert_eq!(folded.len(), 4, "a folded folder hides its files");
+    }
+
+    #[test]
+    fn single_folder_chains_compact_into_one_row() {
+        let paths = [
+            "apps/web/e2e/lib/requests.ts",
+            "apps/web/src/pages/a.tsx",
+            "apps/web/src/pages/b.tsx",
+            "apps/web/src/shared/lib/x.ts",
+            "apps/web/src/shared/y.ts",
+        ];
+        let folder = |path: &str, name: &str, depth, files| TreeEntry::Folder {
+            path: path.into(),
+            name: name.into(),
+            depth,
+            files,
+            collapsed: false,
+        };
+        assert_eq!(
+            tree_entries(&paths, &Default::default()),
+            [
+                folder("apps/web", "apps/web", 0, 5),
+                folder("apps/web/e2e/lib", "e2e/lib", 1, 1),
+                TreeEntry::File { index: 0, depth: 2 },
+                folder("apps/web/src", "src", 1, 4),
+                folder("apps/web/src/pages", "pages", 2, 2),
+                TreeEntry::File { index: 1, depth: 3 },
+                TreeEntry::File { index: 2, depth: 3 },
+                folder("apps/web/src/shared", "shared", 2, 2),
+                folder("apps/web/src/shared/lib", "lib", 3, 1),
+                TreeEntry::File { index: 3, depth: 4 },
+                TreeEntry::File { index: 4, depth: 3 },
+            ],
+            "a folder with two children, or with files, ends the chain"
+        );
+        let folded = tree_entries(
+            &paths,
+            &["apps/web/e2e/lib".to_owned()].into_iter().collect(),
+        );
+        assert_eq!(
+            folded.get(1),
+            Some(&TreeEntry::Folder {
+                path: "apps/web/e2e/lib".into(),
+                name: "e2e/lib".into(),
+                depth: 1,
+                files: 1,
+                collapsed: true
+            }),
+            "a compact row folds by its full path"
+        );
+        assert_eq!(folded.len(), 10);
+        let unchanged = tree_entries(&paths, &["apps/web/e2e".to_owned()].into_iter().collect());
+        assert_eq!(
+            unchanged.len(),
+            11,
+            "a folder hidden inside a compact row has no fold of its own"
+        );
+    }
+
+    #[gpui::test]
+    async fn tree_folders_use_the_icon_themes_named_folder_icons(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let directory = |name: &str| theme::DirectoryIcons {
+                collapsed: Some(format!("/themes/{name}.svg").into()),
+                expanded: Some(format!("/themes/{name}-open.svg").into()),
+            };
+            let icon_theme = theme::IconTheme {
+                id: "material".into(),
+                name: "Material".into(),
+                appearance: theme::Appearance::Dark,
+                directory_icons: directory("folder"),
+                named_directory_icons: [("lib".to_owned(), directory("folder-lib"))]
+                    .into_iter()
+                    .collect(),
+                chevron_icons: theme::ChevronIcons {
+                    collapsed: None,
+                    expanded: None,
+                },
+                file_stems: Default::default(),
+                file_suffixes: Default::default(),
+                file_icons: Default::default(),
+            };
+            theme::GlobalTheme::update_icon_theme(cx, Arc::new(icon_theme));
+        });
+        let listing: Listing = serde_json::from_value(json!({
+            "compare": { "status": "ready", "base": "origin/main" },
+            "rows": [
+                { "path": "e2e/lib/requests.ts", "status": "added", "added": 26 },
+                { "path": "src/app.rs", "status": "modified", "added": 1 },
+            ],
+            "totals": { "files": 2, "added": 27, "removed": 0 },
+        }))
+        .expect("listing");
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            SourceControlPanel::preview(listing, ChangesScope::Base, None, cx)
+        });
+        panel.update(cx, |panel, cx| panel.toggle_tree_view(cx));
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("scm-folder:e2e/lib").is_some());
+        assert!(
+            cx.debug_bounds("scm-folder-icon:/themes/folder-lib-open.svg")
+                .is_some(),
+            "the compact `e2e/lib` row takes its last folder's open icon"
+        );
+        assert!(
+            cx.debug_bounds("scm-folder-icon:/themes/folder-open.svg")
+                .is_some(),
+            "an unnamed folder gets the theme's folder icon"
+        );
+        panel.update(cx, |panel, cx| panel.toggle_folder("e2e/lib", cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("scm-folder-icon:/themes/folder-lib.svg")
+                .is_some(),
+            "a folded folder shows the closed icon"
+        );
     }
 
     #[gpui::test]

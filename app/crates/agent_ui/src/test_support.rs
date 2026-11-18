@@ -103,6 +103,47 @@ where
     }
 }
 
+/// Readies agent tabs over a test workspace whose settings and theme are already set up.
+pub fn init_agent_tabs(fs: std::sync::Arc<dyn fs::Fs>, cx: &mut App) {
+    set_stub_agent_connection(StubAgentConnection::new());
+    cx.set_global(acp_thread::StubSessionCounter(
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    editor::init(cx);
+    release_channel::init("0.0.0".parse().expect("version"), cx);
+    agent_panel::init(cx);
+    crate::terminal_thread_metadata_store::TerminalThreadMetadataStore::init_global(cx);
+    <dyn fs::Fs>::set_global(fs, cx);
+    agent::ThreadStore::init_global(cx);
+    language_model::LanguageModelRegistry::test(cx);
+    crate::thread_metadata_store::init(cx);
+    crate::agent_tab::init(cx);
+}
+
+/// Opens a stub agent tab, as a user's Claude tab, so the workspace footer has a composer.
+pub fn open_stub_agent_tab(
+    workspace: &mut workspace::Workspace,
+    window: &mut Window,
+    cx: &mut Context<workspace::Workspace>,
+) -> Option<Entity<crate::agent_tab::AgentTab>> {
+    if crate::agent_tab::AgentComposer::for_workspace(workspace).is_none() {
+        crate::agent_tab::install(workspace, window, cx);
+    }
+    let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+    panel.update(cx, |panel, cx| {
+        panel.select_agent(crate::Agent::Stub, window, cx)
+    });
+    workspace.add_panel(panel, window, cx);
+    crate::agent_tab::open_agent_tab(workspace, None, None, false, window, cx)
+}
+
+/// The tab's draft as typed, attachment chips included as their links.
+pub fn draft_text(tab: &Entity<crate::agent_tab::AgentTab>, cx: &App) -> Option<String> {
+    let thread_view = tab.read(cx).thread_view(cx)?;
+    let text = thread_view.read(cx).message_editor.read(cx).text(cx);
+    Some(text)
+}
+
 pub fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);

@@ -8479,7 +8479,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-client"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -8495,7 +8495,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-protocol"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -8504,7 +8504,7 @@ dependencies = [
 
 [[package]]
 name = "icarus-settings"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "indexmap 2.14.2",
  "serde",
@@ -8518,6 +8518,7 @@ version = "0.1.0"
 dependencies = [
  "acp_thread",
  "agent_servers",
+ "agent_ui",
  "anyhow",
  "base64 0.22.1",
  "block2 0.6.2",

@@ -786,24 +786,14 @@ fn main() {
         });
         agent_ui::agent_tab::init(cx);
         icarus_ui::set_composer_attach_handler(cx, |attachment, workspace, window, cx| {
-            let Some(composer) = agent_ui::agent_tab::AgentComposer::for_workspace(workspace)
-            else {
-                log::error!("no agent composer to attach {:?} to", attachment.id);
-                return;
-            };
-            // Deferred: the composer updates the workspace's items, which is being updated right now.
-            window.defer(cx, move |window, cx| {
-                composer.update(cx, |composer, cx| {
-                    composer.insert_attachment(
-                        attachment.id,
-                        attachment.kind,
-                        attachment.title,
-                        window,
-                        cx,
-                    );
-                });
-                agent_ui::agent_tab::AgentComposer::focus(&composer, window, cx);
-            });
+            agent_ui::agent_tab::AgentComposer::attach_in_workspace(
+                attachment.id,
+                attachment.kind,
+                attachment.title,
+                workspace,
+                window,
+                cx,
+            )
         });
         icarus_ui::set_layout_applied_handler(cx, |workspace, window, cx| {
             if let Some(composer) = agent_ui::agent_tab::AgentComposer::for_workspace(workspace) {
