@@ -52,10 +52,14 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `workspace layout <ws> <layout>` | Rearrange the workspace's tabs. |
 | `workspace changes <ws> [--uncommitted]` | Changed files against the base. |
 | `workspace turns <ws>` | Recorded agent turns. |
-| `workspace next-action <ws> [--run]` | Show or run the next step. |
+| `workspace next-action <ws> [--run] [--button <id>]` | Show or run the next step. With an automation script deciding the buttons, `--run` clicks one. |
+| `workspace button <ws> [--explain]` | The workspace's buttons and whether the built-in resolver or a script run decided them; `--explain` shows what that run saw (PR state, draft, checks). |
 | `workspace sleep` / `wake <ws>` | Park and restart a workspace. |
 | `workspace remove <ws> [--force] [--keep-branch] [--delete-worktree] [--delete-branch] [--skip-archive] [--allow-failed-archive]` | Remove a workspace. A worktree Icarus didn't create is only hidden unless `--delete-worktree`. |
+| `workspace review --project <p> <number> [--name] [--status] [--since <sha>] [--prompt] [--provider] [--layout]` | Check out someone else's PR to review, with an agent and a layout. |
+| `workspace sync-pr-head <ws>` | Move a review workspace to its PR's head and target branch. |
 | `layout list [--project]` / `show <name>` | Tab layouts. |
+| `tab open <ws> --type agent\|browser\|diff\|explorer\|file\|terminal […] [--split right\|down] [--background]` | Open a tab in the workspace's window (queued until one is open). |
 
 ### Agents
 
@@ -115,11 +119,23 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `review comment add` / `list` / `edit` / `rm` / `clear` / `edit-published` / `delete-published` | Review comments. |
 | `review reply` / `resolve` / `unresolve` / `react` / `upload` | Threads, reactions, media. |
 | `pr status <ws> [--refresh]` | The workspace's pull request. |
+| `pr operate <ws> <operation>` | Act on it directly: `ready`, `merge`, `enable_auto_merge`, `disable_auto_merge`, `add_to_merge_queue`, `dequeue`, `merge_stack`, `enable_stack_auto_merge`, `disable_stack_auto_merge`. |
 | `pr previews <ws>` / `preview <ws> [--app] [--browser]` | Preview deployments. |
 | `issue show` / `open` / `search` / `refresh` / `status` | Linear issues. |
+| `issue assign <id> [--assignee <user>]` | Assign an issue (to you by default). |
 | `linear login` / `logout` / `status` | Save (from a hidden prompt or stdin), remove or check the Linear API key. See [Linear](github-and-linear.md#set-up-the-api-key). |
-| `rules status` / `tick [--dry-run]` | Automations. |
+| `rules status` / `tick [--dry-run]` | The built-in rules engine (replaced by automation scripts). |
+| `automation status` | Whether automations are on and armed, each project's script and last run. |
+| `automation run [--project] [--dry-run]` | Run the scripts now. |
+| `automation emit <name> [--project\|--path] [--workspace] [--payload JSON] [--env VAR…] [--dry-run]` | Send a custom event to a project's script, e.g. from Linear's "Open in coding tool" hook. |
+| `automation runs [--project] [--failed] [--acted] [--shadow] [--limit]` / `show <run> [--scope]` | Run records: trigger, script output, actions and results, and what the script saw. |
+| `automation replay <run> [--script <path>]` | Re-run a script on a recorded scope as a dry run. |
+| `automation schema` | Regenerate `icarus.d.ts` and `schema.json`. |
+| `automation template` | Print a starter script: the built-in GitHub PR flow with its options at the top. |
+| `skill list` / `get <name>` / `install [name…] [--force]` | Agent skills shipped with Icarus, e.g. `icarus-automations`. Install writes a stub to `~/.agents/skills` and links it from `~/.claude/skills`. |
+| `prompt list [--project]` / `render <id> --workspace <ws>` | Prompt templates, and one rendered against a workspace. |
 | `notifications [--unread] [--limit]` / `read <id>\|--all` / `clear` | Notifications. |
+| `notifications send <title> [--body] [--workspace]` | Post one. |
 
 ### Settings and the app
 

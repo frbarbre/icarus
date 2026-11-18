@@ -348,6 +348,33 @@ impl Server {
     ) -> Result<Value, RpcError> {
         let internal = |e: anyhow::Error| rpc("internal", format!("{e:#}"));
         match method {
+            "notification.send" => {
+                #[derive(Deserialize)]
+                struct P {
+                    title: String,
+                    #[serde(default)]
+                    body: String,
+                    workspace: Option<String>,
+                    subject: Option<String>,
+                }
+                let p: P = params(p)?;
+                let workspace_id = match &p.workspace {
+                    Some(key) => Some(self.workspace_by_key(key)?.id),
+                    None => None,
+                };
+                let subject = p.subject.unwrap_or_else(|| {
+                    format!("{}:{}", p.title, workspace_id.clone().unwrap_or_default())
+                });
+                let stored = self.notify(NewNotification {
+                    kind: "automation",
+                    subject,
+                    title: p.title,
+                    body: p.body,
+                    workspace_id,
+                    data: json!({}),
+                });
+                Ok(json!({ "sent": stored.is_some(), "notification": stored }))
+            }
             "notification.list" => {
                 #[derive(Deserialize)]
                 struct P {

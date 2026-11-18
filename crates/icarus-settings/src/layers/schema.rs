@@ -571,6 +571,48 @@ pub fn document_schema() -> Schema {
         ),
         field("project", "Per-project settings.", project_schema()),
         field(
+            "automations",
+            "User scripts that decide statuses, agents and buttons (`icarus automation`).",
+            closed(vec![
+                field(
+                    "enabled",
+                    "Kill switch: false stops every automation run.",
+                    Bool,
+                ),
+                field(
+                    "armed",
+                    "Apply the actions scripts return; off means every run is a dry run.",
+                    Bool,
+                ),
+                field("interval_ms", "Time between ticks.", Integer),
+                field(
+                    "max_agents_per_run",
+                    "Agents one run may start; actions beyond it fail.",
+                    Integer,
+                ),
+                field(
+                    "hold_status",
+                    "Workspaces in this column get no actions unless the action says `force`.",
+                    nullable(Str),
+                ),
+                field(
+                    "default_project",
+                    "Project for `automation emit` without --project or --path.",
+                    nullable(Str),
+                ),
+                field(
+                    "scripts",
+                    "Script per project name or id, relative to ~/.config/icarus.",
+                    map_of(Str),
+                ),
+            ]),
+        ),
+        field(
+            "prompts",
+            "Prompt templates by id; `{{path}}` substitutes from the automation scope.",
+            map_of(Str),
+        ),
+        field(
             "ports",
             "Ports & services: how a workspace's listening ports are named and classified.",
             ports_schema(),

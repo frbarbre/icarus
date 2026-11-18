@@ -17,6 +17,14 @@ pub enum NotificationsCommand {
     },
     /// Delete every notification.
     Clear,
+    /// Send one, e.g. from an automation script.
+    Send {
+        title: String,
+        #[arg(long, default_value = "")]
+        body: String,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -114,6 +122,25 @@ pub async fn notifications(
             let value = client.request("notification.clear", json!({})).await?;
             print(cli, &value, |v| {
                 format!("cleared {}", v["cleared"].as_u64().unwrap_or(0))
+            });
+        }
+        Some(NotificationsCommand::Send {
+            title,
+            body,
+            workspace,
+        }) => {
+            let value = client
+                .request(
+                    "notification.send",
+                    json!({ "title": title, "body": body, "workspace": workspace }),
+                )
+                .await?;
+            print(cli, &value, |v| {
+                if v["sent"] == true {
+                    "sent".into()
+                } else {
+                    "not sent (automation notifications are off)".into()
+                }
             });
         }
     }

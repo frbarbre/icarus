@@ -39,6 +39,28 @@ pub async fn take_layout(
     Ok(Some(serde_json::from_value(value)?))
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct TabRequest {
+    pub request: String,
+    pub tab: PendingTab,
+}
+
+pub async fn pending_tabs(client: Arc<Client>) -> anyhow::Result<Vec<TabRequest>> {
+    let value = client.request("tab.pending", serde_json::json!({})).await?;
+    Ok(serde_json::from_value(value)?)
+}
+
+/// Claims a tab request; `None` when another window already took it.
+pub async fn take_tab(client: Arc<Client>, request: String) -> anyhow::Result<Option<PendingTab>> {
+    let value = client
+        .request("tab.take", serde_json::json!({ "request": request }))
+        .await?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_value(value)?))
+}
+
 pub async fn pending_layouts(client: Arc<Client>) -> anyhow::Result<Vec<PendingLayout>> {
     let value = client
         .request("workspace.pending_layouts", serde_json::json!({}))
@@ -233,6 +255,61 @@ pub fn apply_layout(
         })
     })
     .detach_and_log_err(cx);
+}
+
+/// A tab the server asked the app to add (`icarus tab open`), as opposed to a whole layout.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct PendingTab {
+    pub workspace_id: String,
+    pub path: PathBuf,
+    pub tab: Tab,
+    /// `right` or `down` opens it in a new pane split off the active one.
+    #[serde(default)]
+    pub split: Option<String>,
+    #[serde(default)]
+    pub background: bool,
+}
+
+/// Adds `pending.tab` next to what is open, keeping every other tab.
+pub fn add_tab(
+    pending: &PendingTab,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let active = workspace.active_pane().clone();
+    let previous = active.read(cx).active_item_index();
+    let pane = match pending.split.as_deref() {
+        Some("right") => workspace.split_pane(active.clone(), SplitDirection::Right, window, cx),
+        Some("down") => workspace.split_pane(active.clone(), SplitDirection::Down, window, cx),
+        _ => active.clone(),
+    };
+    let mut build = Build {
+        worktree_root: &pending.path,
+        placed: HashSet::default(),
+        pending: Vec::new(),
+        actives: Vec::new(),
+    };
+    let index = pane.read(cx).items_len();
+    build.tab(&pending.tab, index, &pane, workspace, window, cx);
+    let tasks = build.pending;
+    let background = pending.background;
+    cx.spawn_in(window, async move |_, cx| {
+        for task in tasks {
+            task.await.log_err();
+        }
+        if background {
+            cx.update(|window, cx| {
+                active.update(cx, |pane, cx| {
+                    if previous < pane.items_len() {
+                        pane.activate_item(previous, false, false, window, cx);
+                    }
+                });
+            })
+            .log_err();
+        }
+    })
+    .detach();
 }
 
 fn build_layout(

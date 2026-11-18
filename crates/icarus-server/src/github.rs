@@ -1272,6 +1272,69 @@ impl Server {
                 }
                 Ok(value)
             }
+            "pr.operate" => {
+                #[derive(Deserialize)]
+                struct OperateParams {
+                    workspace: String,
+                    operation: String,
+                }
+                let op: OperateParams = params(p)?;
+                let workspace = self
+                    .store
+                    .workspace(&op.workspace)
+                    .map_err(|e| rpc("internal", e))?
+                    .ok_or_else(|| rpc("not_found", format!("workspace {}", op.workspace)))?;
+                let branch = local_branch(&workspace).await;
+                let view = self.pr_view(&workspace, branch.as_deref(), true).await;
+                let (Some(repo), Some(details), Some(pr)) = (&view.repo, &view.details, &view.pr)
+                else {
+                    return Err(rpc("no_pr", "this workspace has no pull request"));
+                };
+                let client = &self.github.client;
+                let operation = match op.operation.as_str() {
+                    "merge" => Some(PrOperation::Merge),
+                    "enable_auto_merge" => Some(PrOperation::EnableAutoMerge),
+                    "disable_auto_merge" => Some(PrOperation::DisableAutoMerge),
+                    "add_to_merge_queue" => Some(PrOperation::AddToMergeQueue),
+                    "merge_stack" => Some(PrOperation::MergeStack),
+                    "disable_stack_auto_merge" => Some(PrOperation::DisableStackAutoMerge),
+                    _ => None,
+                };
+                let result = match (op.operation.as_str(), operation) {
+                    (_, Some(operation)) => {
+                        self.run_pr_operation(repo, details, pr, view.metadata.as_ref(), operation)
+                            .await
+                    }
+                    ("ready", None) => client
+                        .mark_ready_for_review(&details.node_id)
+                        .await
+                        .map(|()| json!({ "operation": "ready", "draft": false }))
+                        .map_err(|e| e.to_string()),
+                    ("dequeue", None) => client
+                        .dequeue(&details.node_id)
+                        .await
+                        .map(|()| json!({ "operation": "dequeue", "queued": false }))
+                        .map_err(|e| e.to_string()),
+                    ("enable_stack_auto_merge", None) => match pr.stack.as_ref() {
+                        Some(stack) => {
+                            self.enable_stack_auto_merge(repo, pr.number, stack.number, None)
+                        }
+                        None => Err("not in a stack".to_owned()),
+                    },
+                    (other, None) => {
+                        return Err(rpc(
+                            "invalid_params",
+                            format!(
+                                "unknown operation {other}: use ready, merge, enable_auto_merge, disable_auto_merge, add_to_merge_queue, dequeue, merge_stack, enable_stack_auto_merge or disable_stack_auto_merge"
+                            ),
+                        ));
+                    }
+                }
+                .map_err(|e| rpc("github_failed", e))?;
+                self.github.forget_stacks();
+                self.schedule_pr_refresh(&workspace.id, crate::pr_refresh::RefreshReason::Action);
+                Ok(result)
+            }
             "pr.previews" => {
                 let key: WorkspaceKey = params(p)?;
                 let workspace = self

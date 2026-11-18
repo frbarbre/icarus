@@ -431,6 +431,9 @@ pub(crate) fn spawn(server: Arc<Server>) {
                 .unwrap_or_default();
             if last.as_ref().is_some_and(|last| *last != current) {
                 server.broadcast("config.changed", json!({}));
+                if let Err(error) = server.write_automation_types(false) {
+                    tracing::warn!("automation types: {}", error.message);
+                }
             }
             last = Some(current);
         }

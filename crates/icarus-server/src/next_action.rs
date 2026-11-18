@@ -49,7 +49,7 @@ fn is_agent_step(action: NextAction) -> bool {
     !matches!(action, NextAction::Merge(_))
 }
 
-fn action_json(action: Option<NextAction>) -> Value {
+pub(crate) fn action_json(action: Option<NextAction>) -> Value {
     action.map_or(Value::Null, |action| {
         json!({ "kind": action.name(), "label": label(action), "agent_step": is_agent_step(action) })
     })
@@ -155,7 +155,7 @@ impl Server {
             .map_err(|e| rpc("git_failed", format!("{e:#}")))
     }
 
-    async fn resolve_next(
+    pub(crate) async fn resolve_next(
         self: &Arc<Self>,
         workspace: &Workspace,
     ) -> Result<(Option<NextAction>, LocalState, PrView), RpcError> {
@@ -182,13 +182,25 @@ impl Server {
         workspace: &Workspace,
     ) -> Result<Value, RpcError> {
         let (action, local, view) = self.resolve_next(workspace).await?;
-        Ok(json!({
+        let mut reply = json!({
             "workspace": workspace.id,
             "action": action_json(action),
             "local": local,
             "known": view.known,
             "error": view.error,
-        }))
+            "decided_by": "built-in",
+        });
+        if let Some(buttons) = self.automations.buttons(&workspace.id) {
+            reply["suggested_action"] = reply["action"].take();
+            reply["action"] = buttons
+                .list
+                .first()
+                .map(crate::automations::button_action)
+                .unwrap_or(Value::Null);
+            reply["buttons"] = json!(buttons.list);
+            reply["decided_by"] = json!(buttons.run);
+        }
+        Ok(reply)
     }
 
     /// Starts a new agent session in the workspace and sends it the prompt.
@@ -318,6 +330,11 @@ impl Server {
             id: String,
             #[serde(default)]
             selected: bool,
+            /// A script button's id; the main one when absent.
+            button: Option<String>,
+            /// Run the built-in step even when a script decides the buttons (a script's own action).
+            #[serde(default)]
+            builtin: bool,
         }
         let p: P = params(p)?;
         let workspace = self
@@ -330,6 +347,11 @@ impl Server {
                 self.note_selected(&workspace).await;
             }
             return self.next_action_reply(&workspace).await;
+        }
+        if !p.builtin
+            && let Some(buttons) = self.automations.buttons(&workspace.id)
+        {
+            return self.run_script_button(&workspace, &buttons, p.button).await;
         }
         let (action, local, view) = self.resolve_next(&workspace).await?;
         let action = action.ok_or_else(|| rpc("no_action", "nothing to do for this workspace"))?;

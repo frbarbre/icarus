@@ -89,6 +89,7 @@ pub struct Server {
     pub(crate) linear: crate::linear::LinearService,
     pub(crate) updates: crate::updates::Updates,
     pub(crate) automation: crate::automation::Automation,
+    pub(crate) automations: crate::automations::Automations,
     pub(crate) ports: crate::ports::Ports,
     pub(crate) history: Arc<crate::history::HistoryIndex>,
     pub(crate) creates: crate::create::Creates,
@@ -248,6 +249,7 @@ impl Server {
             )),
             updates: crate::updates::Updates::from_env(),
             automation: crate::automation::Automation::default(),
+            automations: crate::automations::Automations::default(),
             ports: crate::ports::Ports::default(),
             history: Arc::default(),
             creates: crate::create::Creates::default(),
@@ -341,6 +343,7 @@ impl Server {
     pub async fn run(self: Arc<Self>, listener: UnixListener) -> Result<()> {
         crate::notifications::spawn(Arc::clone(&self));
         crate::automation::spawn(Arc::clone(&self));
+        crate::automations::spawn(Arc::clone(&self));
         crate::ports::spawn(Arc::clone(&self));
         crate::settings::spawn(Arc::clone(&self));
         crate::linear::spawn(Arc::clone(&self));
@@ -464,6 +467,7 @@ impl Server {
         let mut authenticated = false;
         let mut remote = false;
         let mut client_id: Option<String> = None;
+        let mut automation_run: Option<String> = None;
         let subscriptions: Subscriptions = Arc::default();
         let mut lanes: HashMap<String, mpsc::UnboundedSender<Call>> = HashMap::new();
         let result = async {
@@ -522,6 +526,9 @@ impl Server {
                                 clients.len() == 1
                             };
                             client_id = Some(id.clone());
+                            automation_run = client_name
+                                .strip_prefix("icarus-automation:")
+                                .map(str::to_owned);
                             // Cards show pull requests and issues: fetch them as soon as someone looks.
                             if first || client_name == "icarus-app" {
                                 self.github.wake_poll();
@@ -533,6 +540,25 @@ impl Server {
                                 client_id: id,
                                 token: issued_token,
                                 paired_client_id,
+                            });
+                        }
+                        // A script's own `icarus` calls: recorded against its run, held in a dry run.
+                        ClientMessage::Request { id, method, params }
+                            if authenticated
+                                && automation_run.is_some()
+                                && crate::automations::watched(&method) =>
+                        {
+                            let server = Arc::clone(&self);
+                            let outbound = outbound.clone();
+                            let run = automation_run.clone().unwrap_or_default();
+                            tokio::spawn(async move {
+                                let (result, error) =
+                                    match server.script_call(&run, &method, params).await {
+                                        Ok(value) => (Some(value), None),
+                                        Err(error) => (None, Some(error)),
+                                    };
+                                let _ =
+                                    outbound.send(ServerMessage::Response { id, result, error });
                             });
                         }
                         // Off the connection's loop, so `workspace.create_cancel` can reach a slow create.
@@ -547,6 +573,7 @@ impl Server {
                                         Ok(value) => (Some(value), None),
                                         Err(error) => (None, Some(error)),
                                     };
+                                server.automations.observe("workspace.changed");
                                 let _ =
                                     outbound.send(ServerMessage::Response { id, result, error });
                             });
@@ -1570,6 +1597,16 @@ impl Server {
             "workspace.next_action" | "workspace.run_next_action" => {
                 self.next_action_dispatch(method, params_value).await
             }
+            other
+                if other.starts_with("automation.")
+                    || other.starts_with("prompt.")
+                    || other == "workspace.button" =>
+            {
+                self.automations_dispatch(other, params_value).await
+            }
+            other @ ("review.workspace" | "workspace.sync_to_pr_head") => {
+                self.review_steps_dispatch(other, params_value).await
+            }
             "agent.history" | "agent.resume" => self.history_dispatch(method, params_value).await,
             other if other.starts_with("recipe.") => {
                 self.recipes_dispatch(other, params_value).await
@@ -1636,6 +1673,7 @@ impl Server {
             other if other.starts_with("layout.") => {
                 self.layouts_dispatch(other, params_value).await
             }
+            other if other.starts_with("tab.") => self.tabs_dispatch(other, params_value).await,
             other if other.starts_with("project.") || other.starts_with("workspace.") => {
                 self.workspace_dispatch(other, params_value).await
             }
@@ -1645,6 +1683,31 @@ impl Server {
             }
             other => Err(rpc("unknown_method", other)),
         }
+    }
+
+    /// A method called by the server itself (an automation's action), with no client to stream to.
+    pub(crate) fn call_internal<'a>(
+        self: &'a Arc<Self>,
+        method: &'a str,
+        params: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RpcError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let (outbound, _inbound) = mpsc::unbounded_channel();
+            let subscriptions: Subscriptions = Arc::default();
+            self.dispatch(method, params, &outbound, &subscriptions)
+                .await
+        })
+    }
+
+    /// Connected app windows; CLI connections don't count.
+    pub(crate) fn app_count(&self) -> usize {
+        self.clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, name, _)| name == "icarus-app")
+            .count()
     }
 
     fn terminal(
@@ -1756,6 +1819,7 @@ impl Server {
 
     /// Sends an event to every connected client; returns how many received it.
     pub(crate) fn broadcast(&self, topic: &str, payload: Value) -> usize {
+        self.automations.observe(topic);
         let clients = self.clients.lock().unwrap_or_else(|p| p.into_inner());
         clients
             .iter()

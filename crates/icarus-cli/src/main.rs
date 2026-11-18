@@ -1,5 +1,6 @@
 mod acp;
 mod attach;
+mod automation;
 mod extras;
 mod git_ops;
 mod issue;
@@ -11,6 +12,7 @@ mod recipe;
 mod review;
 mod rules;
 mod service;
+mod skill;
 mod term_attach;
 mod theme;
 mod update;
@@ -139,6 +141,26 @@ enum Command {
     Rules {
         #[command(subcommand)]
         command: RulesCommand,
+    },
+    /// Automation scripts: status, runs on demand, custom events, run records and replay.
+    Automation {
+        #[command(subcommand)]
+        command: automation::AutomationCommand,
+    },
+    /// Prompt templates from settings: list and render against a workspace.
+    Prompt {
+        #[command(subcommand)]
+        command: automation::PromptCommand,
+    },
+    /// Agent skills that ship with Icarus.
+    Skill {
+        #[command(subcommand)]
+        command: skill::SkillCommand,
+    },
+    /// Tabs in a workspace's window.
+    Tab {
+        #[command(subcommand)]
+        command: automation::TabCommand,
     },
     /// Attach context (PR comments, checks, files, text, agent turns) to a workspace's composer.
     Attach {
@@ -277,6 +299,12 @@ fn change_letter(status: &str) -> &'static str {
 
 #[derive(Subcommand)]
 enum PrCommand {
+    /// Act on a workspace's pull request directly: ready, merge, enable_auto_merge, disable_auto_merge,
+    /// add_to_merge_queue, dequeue, merge_stack, enable_stack_auto_merge, disable_stack_auto_merge.
+    Operate {
+        workspace: String,
+        operation: String,
+    },
     /// Show the pull request of a workspace's branch.
     Status {
         workspace: String,
@@ -982,6 +1010,39 @@ enum WorkspaceCommand {
         id: String,
         #[arg(long)]
         run: bool,
+        /// With --run: which of a script's buttons (its id); the main one by default.
+        #[arg(long, requires = "run")]
+        button: Option<String>,
+    },
+    /// The workspace's buttons and who decided them; --explain adds what the deciding run saw.
+    Button {
+        id: String,
+        #[arg(long)]
+        explain: bool,
+    },
+    /// Create a review workspace for a PR in your review inbox, as the review inbox does.
+    Review {
+        #[arg(long)]
+        project: String,
+        number: u64,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        /// Diff against this commit instead of the PR base (a re-review).
+        #[arg(long)]
+        since: Option<String>,
+        /// Start a review agent with this prompt.
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        layout: Option<String>,
+    },
+    /// Move a review workspace to its PR's head and base, as review head sync does.
+    SyncPrHead {
+        id: String,
     },
     /// Park the workspace: its agents sleep and its terminals' processes stop, keeping their scrollback.
     Sleep {
@@ -1258,7 +1319,12 @@ async fn open_target(
 }
 
 async fn connect(cli: &Cli) -> Result<std::sync::Arc<Client>> {
-    Ok(open(cli, "icarus-cli").await?.0)
+    // Inside an automation run the server records this CLI's calls against the run (and holds them in a dry run).
+    let name = match std::env::var("ICARUS_RUN_ID") {
+        Ok(run) if !run.is_empty() => format!("icarus-automation:{run}"),
+        _ => "icarus-cli".to_owned(),
+    };
+    Ok(open(cli, &name).await?.0)
 }
 
 fn host_name() -> String {
@@ -2739,12 +2805,74 @@ async fn main() -> Result<()> {
                         )
                     });
                 }
-                WorkspaceCommand::NextAction { id, run } => {
+                WorkspaceCommand::Review {
+                    project,
+                    number,
+                    name,
+                    status,
+                    since,
+                    prompt,
+                    provider,
+                    layout,
+                } => {
+                    let agent = prompt
+                        .as_ref()
+                        .map(|prompt| json!({ "prompt": prompt, "provider": provider }));
+                    let value = client
+                        .request_timeout(
+                            "review.workspace",
+                            json!({
+                                "project": project,
+                                "number": number,
+                                "name": name,
+                                "status": status,
+                                "since": since,
+                                "agent": agent,
+                                "layout": layout,
+                            }),
+                            Duration::from_secs(300),
+                        )
+                        .await?;
+                    print(&cli, &value, |v| {
+                        format!("created {}", v["workspace"].as_str().unwrap_or("?"))
+                    });
+                }
+                WorkspaceCommand::SyncPrHead { id } => {
+                    let value = client
+                        .request_timeout(
+                            "workspace.sync_to_pr_head",
+                            json!({ "id": id }),
+                            Duration::from_secs(120),
+                        )
+                        .await?;
+                    print(&cli, &value, |v| v.to_string());
+                }
+                WorkspaceCommand::Button { id, explain } => {
+                    let value = client
+                        .request_timeout(
+                            "workspace.button",
+                            json!({ "id": id }),
+                            Duration::from_secs(60),
+                        )
+                        .await?;
+                    print(&cli, &value, |v| {
+                        let text = automation::button_text(v);
+                        if *explain {
+                            text
+                        } else {
+                            text.lines()
+                                .take_while(|l| !l.starts_with("  status then"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    });
+                }
+                WorkspaceCommand::NextAction { id, run, button } => {
                     if *run {
                         let value = client
                             .request_timeout(
                                 "workspace.run_next_action",
-                                json!({ "id": id }),
+                                json!({ "id": id, "button": button }),
                                 Duration::from_secs(120),
                             )
                             .await?;
@@ -2935,6 +3063,21 @@ async fn main() -> Result<()> {
                         .await?;
                     print(&cli, &value, rules::pr_status);
                 }
+                PrCommand::Operate {
+                    workspace,
+                    operation,
+                } => {
+                    let value = client
+                        .request_timeout(
+                            "pr.operate",
+                            json!({ "workspace": workspace, "operation": operation }),
+                            Duration::from_secs(120),
+                        )
+                        .await?;
+                    print(&cli, &value, |v| {
+                        format!("{}: done", v["operation"].as_str().unwrap_or(operation))
+                    });
+                }
                 PrCommand::Previews { workspace, refresh } => {
                     let value = client
                         .request_timeout(
@@ -3027,6 +3170,22 @@ async fn main() -> Result<()> {
                     });
                 }
             }
+        }
+        Command::Automation {
+            command: automation::AutomationCommand::Template,
+        } => print!("{}", automation::ORCA_FLOW),
+        Command::Automation { command } => {
+            let client = connect(&cli).await?;
+            automation::run(&cli, &client, command).await?;
+        }
+        Command::Prompt { command } => {
+            let client = connect(&cli).await?;
+            automation::run_prompt(&cli, &client, command).await?;
+        }
+        Command::Skill { command } => skill::run(&cli, command)?,
+        Command::Tab { command } => {
+            let client = connect(&cli).await?;
+            automation::run_tab(&cli, &client, command).await?;
         }
         Command::Rules { command } => {
             let client = connect(&cli).await?;

@@ -30,6 +30,12 @@ pub enum IssueCommand {
     },
     /// Refresh linked issues now (all, or one), re-running `linear.api_key_command` if it failed.
     Refresh { id: Option<String> },
+    /// Assign an issue: to you, or to a Linear user id.
+    Assign {
+        id: String,
+        #[arg(long)]
+        assignee: Option<String>,
+    },
     /// Whether Linear is configured on the server.
     Status,
 }
@@ -68,6 +74,18 @@ pub async fn run(cli: &super::Cli, client: &Client, command: &IssueCommand) -> R
                 )
                 .await?;
             super::print(cli, &value, search_text);
+        }
+        IssueCommand::Assign { id, assignee } => {
+            let value = client
+                .request_timeout(
+                    "issue.assign",
+                    json!({ "id": id, "assignee": assignee }),
+                    timeout,
+                )
+                .await?;
+            super::print(cli, &value, |v| {
+                format!("assigned {}", v["id"].as_str().unwrap_or("?"))
+            });
         }
         IssueCommand::Refresh { id } => {
             let value = client

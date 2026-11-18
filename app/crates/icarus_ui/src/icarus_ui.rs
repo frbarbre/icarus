@@ -726,6 +726,31 @@ async fn apply_pending_for_open_windows(client: Arc<Client>, cx: &mut gpui::Asyn
             cx.update(|cx| open_layout(pending, cx));
         }
     }
+    let Some(tabs) = Tokio::spawn_result(cx, layout::pending_tabs(client.clone()))
+        .await
+        .log_err()
+    else {
+        return;
+    };
+    for candidate in tabs {
+        let open = cx.update(|cx| window_for_path(&candidate.tab.path, cx).is_some());
+        if open {
+            take_and_open_tab(client.clone(), candidate.request, cx).await;
+        }
+    }
+}
+
+/// Claims a tab request (so only one window applies it) and adds the tab, opening its workspace's window if needed.
+async fn take_and_open_tab(client: Arc<Client>, request: String, cx: &mut gpui::AsyncApp) {
+    let taken = Tokio::spawn_result(cx, layout::take_tab(client, request)).await;
+    if let Some(Some(pending)) = taken.log_err() {
+        cx.update(|cx| {
+            let path = pending.path.clone();
+            with_workspace_window(path, cx, move |workspace, window, cx| {
+                layout::add_tab(&pending, workspace, window, cx);
+            });
+        });
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1141,6 +1166,12 @@ fn start_app_connection(cx: &mut App) {
                         if let Some(Some(pending)) = taken.log_err() {
                             cx.update(|cx| open_layout(pending, cx));
                         }
+                    }
+                    "open_tab" => {
+                        let Some(request) = event.payload["request"].as_str() else {
+                            continue;
+                        };
+                        take_and_open_tab(client.clone(), request.to_owned(), cx).await;
                     }
                     _ => {}
                 }

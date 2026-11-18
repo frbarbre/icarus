@@ -2,6 +2,7 @@ pub mod accounts;
 pub mod agent;
 pub mod attachments;
 pub mod automation;
+pub mod automations;
 pub mod changes;
 mod coalesce;
 pub mod codex;

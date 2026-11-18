@@ -538,12 +538,51 @@ impl Server {
         }
     }
 
+    async fn issue_assign(&self, p: Value) -> Result<Value, RpcError> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            /// A Linear user id; without it the issue goes to the API key's owner.
+            assignee: Option<String>,
+        }
+        let p: P = params(p)?;
+        let identifier = normalize_identifier(&p.id).map_err(|e| rpc("invalid_params", e))?;
+        let failed = |e: icarus_linear::LinearError| rpc(e.code(), e.to_string());
+        let assignee = match p.assignee {
+            Some(id) => id,
+            None => self
+                .linear
+                .client
+                .query("query { viewer { id } }", json!({}))
+                .await
+                .map_err(failed)?["viewer"]["id"]
+                .as_str()
+                .ok_or_else(|| rpc("linear_error", "Linear returned no viewer id"))?
+                .to_owned(),
+        };
+        let reply = self
+            .linear
+            .client
+            .query(
+                "mutation($id: String!, $assignee: String) { issueUpdate(id: $id, input: { assigneeId: $assignee }) { success } }",
+                json!({ "id": identifier, "assignee": assignee }),
+            )
+            .await
+            .map_err(failed)?;
+        Ok(json!({
+            "id": identifier,
+            "assignee": assignee,
+            "success": reply["issueUpdate"]["success"],
+        }))
+    }
+
     pub(crate) async fn linear_dispatch(&self, method: &str, p: Value) -> Result<Value, RpcError> {
         match method {
             "issue.search" => return self.issue_search(p).await,
             "linear.status" => return self.linear_status().await,
             "linear.set_api_key" => return self.linear_set_key(p).await,
             "linear.clear_api_key" => return self.linear_clear_key().await,
+            "issue.assign" => return self.issue_assign(p).await,
             _ => {}
         }
         #[derive(Deserialize)]

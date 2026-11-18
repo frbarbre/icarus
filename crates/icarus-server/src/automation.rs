@@ -171,6 +171,127 @@ impl Server {
         }
     }
 
+    /// The rules engine's review steps as methods, so automation scripts can call them.
+    pub(crate) async fn review_steps_dispatch(
+        self: &Arc<Self>,
+        method: &str,
+        p: Value,
+    ) -> Result<Value, RpcError> {
+        match method {
+            "review.workspace" => {
+                #[derive(Deserialize)]
+                struct AgentP {
+                    provider: Option<String>,
+                    prompt: String,
+                    title: Option<String>,
+                }
+                #[derive(Deserialize)]
+                struct P {
+                    project: String,
+                    number: u64,
+                    name: Option<String>,
+                    title: Option<String>,
+                    status: Option<String>,
+                    since: Option<String>,
+                    agent: Option<AgentP>,
+                    layout: Option<String>,
+                }
+                let p: P = params(p)?;
+                let project = self
+                    .store
+                    .project(&p.project)
+                    .map_err(|e| rpc("internal", e))?
+                    .ok_or_else(|| rpc("not_found", format!("project {}", p.project)))?;
+                let repo = repo_ref(&project)
+                    .ok_or_else(|| rpc("invalid_params", "the project has no GitHub remote"))?;
+                let inbox = self
+                    .github
+                    .review_inbox(std::slice::from_ref(&repo))
+                    .await
+                    .map_err(|e| rpc("github_error", e.to_string()))?;
+                let pr = inbox
+                    .pulls
+                    .into_iter()
+                    .map(|d| d.pr)
+                    .find(|pr| pr.number == p.number)
+                    .ok_or_else(|| {
+                        rpc(
+                            "not_found",
+                            format!("#{} is not in your review inbox", p.number),
+                        )
+                    })?;
+                let name = p.name.unwrap_or_else(|| format!("review-{}", p.number));
+                let title = p.title.unwrap_or_else(|| pr.title.clone());
+                let settings = self.resolved_settings(Some(&project.root));
+                let agent = p.agent.map(|a| AgentLaunch {
+                    agent: a.provider,
+                    prompt: a.prompt,
+                    view: icarus_rules::model::AgentView::Default,
+                    background: true,
+                    title: a.title.unwrap_or_else(|| format!("Review #{}", p.number)),
+                    launch_source: "automation".to_owned(),
+                });
+                let targets = [Target { project, repo }];
+                let mut created = self
+                    .create_review_workspace(
+                        &targets,
+                        &pr,
+                        p.since.as_deref(),
+                        &name,
+                        &title,
+                        p.status.as_deref(),
+                        agent.as_ref(),
+                        &settings,
+                    )
+                    .await
+                    .map_err(|e| rpc("create_failed", e))?;
+                if let (Some(layout), Some(id)) = (p.layout, created["workspace"].as_str()) {
+                    let workspace = self.workspace_by_key(id)?;
+                    created["layout"] = match self
+                        .apply_layout(&workspace, &layout, Some(pr.url.clone()))
+                        .await
+                    {
+                        Ok(applied) => applied,
+                        Err(error) => json!({ "error": error.message }),
+                    };
+                }
+                Ok(created)
+            }
+            "workspace.sync_to_pr_head" => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                }
+                let p: P = params(p)?;
+                let workspace = self.workspace_by_key(&p.id)?;
+                let (_, _, view) = self.resolve_next(&workspace).await?;
+                let pr = view
+                    .pr
+                    .ok_or_else(|| rpc("not_found", "the workspace has no pull request"))?;
+                let branch = workspace
+                    .branch
+                    .clone()
+                    .ok_or_else(|| rpc("invalid_params", "the workspace has no branch"))?;
+                let (path, head) = (workspace.path.clone(), pr.head_ref_oid.clone());
+                let mut decision = tokio::task::spawn_blocking(move || {
+                    sync_to_head(Path::new(&path), &branch, &head)
+                })
+                .await
+                .map_err(|e| rpc("internal", e))?
+                .map_err(|e| rpc("sync_failed", e))?;
+                if let Some(base_ref) = self
+                    .retarget_base(&workspace.id, &pr.base_ref_name)
+                    .await
+                    .map_err(|e| rpc("sync_failed", e))?
+                {
+                    decision["base_ref"] = json!(base_ref);
+                }
+                Ok(decision)
+            }
+            other => Err(rpc("unknown_method", other)),
+        }
+    }
+
     pub(crate) async fn rules_dispatch(
         self: &Arc<Self>,
         method: &str,
@@ -347,6 +468,15 @@ impl Server {
         report["executed"] = json!(executed);
         report["errors"] = json!(errors);
         Ok(self.finish_tick(report, started))
+    }
+
+    /// The rules loop's last report, for comparing its plan with an automation script's (shadow mode).
+    pub(crate) fn last_rules_report(&self) -> Option<Value> {
+        self.automation
+            .last
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn finish_tick(&self, mut report: Value, started: u64) -> Value {

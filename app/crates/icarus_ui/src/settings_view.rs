@@ -93,6 +93,8 @@ struct Field {
     help: &'static str,
     control: Control,
     placeholder: Option<&'static str>,
+    /// What a toggle shows when no layer sets it.
+    default_on: bool,
 }
 
 const fn field(
@@ -107,6 +109,7 @@ const fn field(
         help,
         control,
         placeholder: None,
+        default_on: false,
     }
 }
 
@@ -114,6 +117,13 @@ impl Field {
     const fn placeholder(self, placeholder: &'static str) -> Self {
         Field {
             placeholder: Some(placeholder),
+            ..self
+        }
+    }
+
+    const fn on_by_default(self) -> Self {
+        Field {
+            default_on: true,
             ..self
         }
     }
@@ -135,6 +145,60 @@ const AGENTS: &[Field] = &[
         Control::Toggle,
     ),
 ];
+
+const AUTOMATIONS: &[Field] = &[
+    field(
+        "automations.enabled",
+        "Run automation scripts",
+        "Kill switch: off stops every automation run.",
+        Control::Toggle,
+    )
+    .on_by_default(),
+    field(
+        "automations.armed",
+        "Apply script actions",
+        "Until on, every run is a dry run.",
+        Control::Toggle,
+    ),
+    field(
+        "automations.interval_ms",
+        "Tick interval (ms)",
+        "Time between scheduled runs.",
+        Control::Integer,
+    )
+    .placeholder("60000"),
+    field(
+        "automations.max_agents_per_run",
+        "Agents per run",
+        "Agents one run may start; actions beyond it fail.",
+        Control::Integer,
+    )
+    .placeholder("3"),
+    field(
+        "automations.hold_status",
+        "Hold column",
+        "Workspaces in this column get no actions unless the action says force.",
+        Control::Status,
+    ),
+];
+
+const PROMPTS: &str = "prompts";
+const SCRIPTS: &str = "automations.scripts";
+
+/// One prompt template in the prompts editor.
+struct PromptRow {
+    id: String,
+    template: Entity<Editor>,
+    _subscription: Subscription,
+}
+
+/// One project's script path in the automations section.
+struct ScriptRow {
+    project_id: String,
+    saved: String,
+    path: Entity<Editor>,
+    _subscription: Subscription,
+}
 
 const AUTOMATION: &[Field] = &[
     field(
@@ -413,6 +477,21 @@ pub struct SettingsView {
     linear_key: Entity<Editor>,
     linear_busy: bool,
     linear_error: Option<String>,
+    /// The server's `automation.status`.
+    automation: Option<Value>,
+    automation_error: Option<String>,
+    /// The outcome of the last button pressed, by project id (or `schema`).
+    automation_notes: HashMap<String, String>,
+    automation_busy: Option<String>,
+    script_rows: Vec<ScriptRow>,
+    prompt_rows: Vec<PromptRow>,
+    prompt_name: Entity<Editor>,
+    prompt_renaming: Option<String>,
+    /// The previewed prompt's id and its rendering or error.
+    prompt_preview: Option<(String, Result<String, String>)>,
+    /// Workspaces to preview prompts against, as (id, name).
+    workspaces: Vec<(String, String)>,
+    preview_workspace: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -447,6 +526,78 @@ pub fn linear_summary(status: Option<&Value>) -> String {
         Some("command") => format!("{who} (from the key command)"),
         _ => who,
     }
+}
+
+/// One line on an `automation.run` reply for a single project.
+pub fn dry_run_summary(reply: &Value) -> String {
+    let Some(run) = reply["runs"].as_array().and_then(|runs| runs.first()) else {
+        return "Nothing ran: the project has no script.".to_owned();
+    };
+    if let Some(error) = run["error"].as_str() {
+        return format!("Dry run failed: {error}");
+    }
+    let results = run["results"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let errors = results
+        .iter()
+        .filter(|result| result["ok"].as_bool() == Some(false))
+        .count();
+    format!(
+        "Dry run: {} action{}, {errors} error{}",
+        results.len(),
+        if results.len() == 1 { "" } else { "s" },
+        if errors == 1 { "" } else { "s" },
+    )
+}
+
+fn ago(since_ms: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default();
+    let minutes = (now - since_ms).max(0) / 60_000;
+    match minutes {
+        0 => "just now".to_owned(),
+        1..=59 => format!("{minutes} min ago"),
+        60..=1439 => format!("{} h ago", minutes / 60),
+        _ => format!("{} d ago", minutes / 1440),
+    }
+}
+
+/// One line on a project's last run and its shadow comparison with the built-in rules.
+pub fn run_summary(project: &Value) -> String {
+    let last = &project["last_run"];
+    let last = match last["started_ms"].as_i64() {
+        None => "Never run".to_owned(),
+        Some(started) => {
+            let outcome = if last["failed"].as_bool() == Some(true) {
+                "failed"
+            } else if last["acted"].as_bool() == Some(true) {
+                "acted"
+            } else {
+                "no changes"
+            };
+            let dry = if last["dry_run"].as_bool() == Some(true) {
+                ", dry run"
+            } else {
+                ""
+            };
+            format!("Last run {}: {outcome}{dry}", ago(started))
+        }
+    };
+    let shadow = &project["shadow"];
+    let compared = shadow["compared"].as_i64().unwrap_or(0);
+    if compared == 0 {
+        return last;
+    }
+    let differed = shadow["differed"].as_i64().unwrap_or(0);
+    let since = shadow["since_ms"]
+        .as_i64()
+        .map(|since| format!(" since {}", ago(since)))
+        .unwrap_or_default();
+    format!("{last} · shadow: {differed} of {compared} ticks differed from the rules{since}")
 }
 
 #[derive(Default)]
@@ -492,6 +643,7 @@ impl SettingsView {
         let mut editors = HashMap::new();
         let mut subscriptions = Vec::new();
         for field in [
+            AUTOMATIONS,
             AUTOMATION,
             RULE_OPTIONS,
             ACTION_PROMPTS,
@@ -549,6 +701,11 @@ impl SettingsView {
             editor.set_placeholder_text("lin_api_…", window, cx);
             editor
         });
+        let prompt_name = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("New prompt id", window, cx);
+            editor
+        });
         let mut view = Self {
             workspace,
             focus_handle: cx.focus_handle(),
@@ -570,6 +727,17 @@ impl SettingsView {
             linear_key,
             linear_busy: false,
             linear_error: None,
+            automation: None,
+            automation_error: None,
+            automation_notes: HashMap::new(),
+            automation_busy: None,
+            script_rows: Vec::new(),
+            prompt_rows: Vec::new(),
+            prompt_name,
+            prompt_renaming: None,
+            prompt_preview: None,
+            workspaces: Vec::new(),
+            preview_workspace: None,
             _subscriptions: subscriptions,
         };
         let handle = window.window_handle();
@@ -673,10 +841,12 @@ impl SettingsView {
 
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.load_linear(window, cx);
+        self.load_automation(window, cx);
         let client = self.client.clone();
         let root = self.root.clone();
         let keys: Vec<&'static str> = [
             AGENTS,
+            AUTOMATIONS,
             AUTOMATION,
             RULE_OPTIONS,
             ACTION_PROMPTS,
@@ -801,6 +971,7 @@ impl SettingsView {
         }
         self.snapshot = Some(snapshot);
         self.sync_open_in_rows(window, cx);
+        self.sync_prompt_rows(window, cx);
         if let Some(block) = self.reveal.take() {
             self.scroll_handle.scroll_to_top_of_item(block);
         }
@@ -982,6 +1153,345 @@ impl SettingsView {
             apps.remove(index);
             self.write_open_in(apps, window, cx);
         }
+    }
+
+    fn load_automation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let status = request(self.client.clone(), "automation.status", json!({}), cx);
+        let workspaces = request(self.client.clone(), "workspace.list", json!({}), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let status = match status {
+                Some(task) => Some(task.await),
+                None => None,
+            };
+            let workspaces = match workspaces {
+                Some(task) => task.await.ok(),
+                None => None,
+            };
+            this.update_in(cx, |this, window, cx| {
+                match status {
+                    Some(Ok(status)) => {
+                        this.automation = Some(status);
+                        this.automation_error = None;
+                    }
+                    Some(Err(error)) => this.automation_error = Some(format!("{error:#}")),
+                    None => {}
+                }
+                if let Some(list) = workspaces.as_ref().and_then(Value::as_array) {
+                    this.workspaces = list
+                        .iter()
+                        .filter_map(|workspace| {
+                            Some((
+                                workspace["id"].as_str()?.to_owned(),
+                                workspace["name"].as_str().unwrap_or_default().to_owned(),
+                            ))
+                        })
+                        .collect();
+                }
+                this.sync_script_rows(window, cx);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn automation_projects(&self) -> Vec<Value> {
+        self.automation
+            .as_ref()
+            .and_then(|status| status["projects"].as_array())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn sync_script_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typing = self
+            .script_rows
+            .iter()
+            .any(|row| row.path.focus_handle(cx).is_focused(window));
+        if typing {
+            return;
+        }
+        let saved: Vec<(String, String, String)> = self
+            .automation_projects()
+            .iter()
+            .filter_map(|project| {
+                Some((
+                    project["id"].as_str()?.to_owned(),
+                    project["project"].as_str().unwrap_or_default().to_owned(),
+                    project["script"].as_str().unwrap_or_default().to_owned(),
+                ))
+            })
+            .collect();
+        let current: Vec<(&str, &str)> = self
+            .script_rows
+            .iter()
+            .map(|row| (row.project_id.as_str(), row.saved.as_str()))
+            .collect();
+        let incoming: Vec<(&str, &str)> = saved
+            .iter()
+            .map(|(id, _, script)| (id.as_str(), script.as_str()))
+            .collect();
+        if current == incoming {
+            return;
+        }
+        self.script_rows = saved
+            .into_iter()
+            .map(|(project_id, name, script)| {
+                let path = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text("No script", window, cx);
+                    editor.set_text(script.as_str(), window, cx);
+                    editor
+                });
+                let subscription = {
+                    let project_id = project_id.clone();
+                    cx.subscribe_in(&path, window, move |this, editor, event, window, cx| {
+                        if matches!(event, EditorEvent::Blurred) {
+                            let text = editor.read(cx).text(cx);
+                            this.commit_script(&project_id, &name, text.trim(), window, cx);
+                        }
+                    })
+                };
+                ScriptRow {
+                    project_id,
+                    saved: script,
+                    path,
+                    _subscription: subscription,
+                }
+            })
+            .collect();
+    }
+
+    fn commit_script(
+        &mut self,
+        project_id: &str,
+        name: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let unchanged = self
+            .script_rows
+            .iter()
+            .any(|row| row.project_id == project_id && row.saved == text);
+        if unchanged {
+            return;
+        }
+        // A dot in the project name would split the settings key; the server also takes the id.
+        let project = if name.is_empty() || name.contains('.') {
+            project_id
+        } else {
+            name
+        };
+        let value = (!text.is_empty()).then(|| json!(text));
+        // Script paths are relative to ~/.config/icarus, so they belong in the user's settings.
+        self.write_to(
+            Scope::User,
+            &format!("{SCRIPTS}.{project}"),
+            value,
+            window,
+            cx,
+        );
+    }
+
+    fn run_automation(
+        &mut self,
+        note: String,
+        method: &'static str,
+        params: Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = request(self.client.clone(), method, params, cx) else {
+            self.automation_error = Some("Not connected to the Icarus server.".into());
+            cx.notify();
+            return;
+        };
+        self.automation_busy = Some(note.clone());
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                this.automation_busy = None;
+                let text = match (method, result) {
+                    (_, Err(error)) => format!("Failed: {error:#}"),
+                    ("automation.run", Ok(reply)) => dry_run_summary(&reply),
+                    (_, Ok(_)) => "Types regenerated.".to_owned(),
+                };
+                this.automation_notes.insert(note, text);
+                this.load_automation(window, cx);
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    pub fn dry_run(&mut self, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let params = json!({ "project": project_id, "dry_run": true });
+        self.run_automation(project_id, "automation.run", params, window, cx);
+    }
+
+    pub fn regenerate_types(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_automation("schema".into(), "automation.schema", json!({}), window, cx);
+    }
+
+    fn prompts(&self) -> Vec<(String, String)> {
+        let mut prompts: Vec<(String, String)> = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| lookup(&snapshot.resolved, PROMPTS))
+            .and_then(Value::as_object)
+            .map(|prompts| {
+                prompts
+                    .iter()
+                    .map(|(id, template)| {
+                        (id.clone(), template.as_str().unwrap_or_default().to_owned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        prompts.sort();
+        prompts
+    }
+
+    fn sync_prompt_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typing = self
+            .prompt_rows
+            .iter()
+            .any(|row| row.template.focus_handle(cx).is_focused(window));
+        if typing {
+            return;
+        }
+        let saved = self.prompts();
+        let current: Vec<(String, String)> = self
+            .prompt_rows
+            .iter()
+            .map(|row| (row.id.clone(), row.template.read(cx).text(cx)))
+            .collect();
+        if current == saved {
+            return;
+        }
+        self.prompt_rows = saved
+            .into_iter()
+            .map(|(id, text)| {
+                let template = cx.new(|cx| {
+                    let mut editor = Editor::auto_height(1, 8, window, cx);
+                    editor.set_soft_wrap();
+                    editor.set_placeholder_text(
+                        "Template, e.g. Fix the checks of #{{pr.number}}",
+                        window,
+                        cx,
+                    );
+                    editor.set_text(text, window, cx);
+                    editor
+                });
+                let subscription = {
+                    let id = id.clone();
+                    cx.subscribe_in(&template, window, move |this, editor, event, window, cx| {
+                        if matches!(event, EditorEvent::Blurred) {
+                            let text = editor.read(cx).text(cx);
+                            this.commit_prompt(&id, text, window, cx);
+                        }
+                    })
+                };
+                PromptRow {
+                    id,
+                    template,
+                    _subscription: subscription,
+                }
+            })
+            .collect();
+    }
+
+    fn commit_prompt(
+        &mut self,
+        id: &str,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let unchanged = self
+            .prompts()
+            .iter()
+            .any(|(saved_id, saved)| saved_id == id && *saved == text);
+        if !unchanged {
+            self.write(&format!("{PROMPTS}.{id}"), Some(json!(text)), window, cx);
+        }
+    }
+
+    pub fn add_or_rename_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = slug(self.prompt_name.read(cx).text(cx).trim());
+        if id.is_empty() {
+            return;
+        }
+        let prompts = self.prompts();
+        let renaming = self.prompt_renaming.take();
+        if renaming.as_deref() == Some(id.as_str()) {
+            self.prompt_name
+                .update(cx, |editor, cx| editor.set_text("", window, cx));
+            return;
+        }
+        if prompts.iter().any(|(existing, _)| *existing == id) {
+            self.error = Some(format!("A prompt named \"{id}\" already exists."));
+            cx.notify();
+            return;
+        }
+        let template = renaming
+            .as_ref()
+            .and_then(|old| prompts.iter().find(|(existing, _)| existing == old))
+            .map(|(_, template)| template.clone())
+            .unwrap_or_default();
+        self.prompt_name
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
+        self.write(
+            &format!("{PROMPTS}.{id}"),
+            Some(json!(template)),
+            window,
+            cx,
+        );
+        if let Some(old) = renaming {
+            self.write(&format!("{PROMPTS}.{old}"), None, window, cx);
+        }
+    }
+
+    fn remove_prompt(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.write(&format!("{PROMPTS}.{id}"), None, window, cx);
+    }
+
+    /// Renders what the editor holds now, so a preview doesn't wait for the save.
+    pub fn preview_prompt(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self
+            .preview_workspace
+            .clone()
+            .or_else(|| self.workspaces.first().map(|(id, _)| id.clone()))
+        else {
+            self.prompt_preview = Some((id, Err("No workspace to preview against.".into())));
+            cx.notify();
+            return;
+        };
+        let mut params = json!({ "id": id, "workspace": workspace });
+        if let Some(row) = self.prompt_rows.iter().find(|row| row.id == id) {
+            params["template"] = json!(row.template.read(cx).text(cx));
+        }
+        let Some(task) = request(self.client.clone(), "prompt.render", params, cx) else {
+            self.prompt_preview = Some((id, Err("Not connected to the Icarus server.".into())));
+            cx.notify();
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.prompt_preview = Some((
+                    id,
+                    result
+                        .map(|reply| reply["prompt"].as_str().unwrap_or_default().to_owned())
+                        .map_err(|error| format!("{error:#}")),
+                ));
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
     }
 
     fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
@@ -1341,7 +1851,10 @@ impl SettingsView {
         let weak = cx.entity().downgrade();
         let control: AnyElement = match field.control {
             Control::Toggle => {
-                let on = value.as_ref().and_then(Value::as_bool).unwrap_or(false);
+                let on = value
+                    .as_ref()
+                    .and_then(Value::as_bool)
+                    .unwrap_or(field.default_on);
                 Switch::new(SharedString::from(format!("switch-{key}")), on.into())
                     .on_click(move |state, window, cx| {
                         let on = *state == ToggleState::Selected;
@@ -1988,6 +2501,301 @@ impl SettingsView {
             })
     }
 
+    fn render_automation_projects(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let projects = self.automation_projects();
+        let running = self
+            .automation
+            .as_ref()
+            .map(|status| status["running"].as_bool() == Some(true));
+        let busy = self.automation_busy.clone();
+        let field = |editor: &Entity<Editor>, cx: &App| {
+            div()
+                .w(px(260.))
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(editor.clone())
+        };
+        v_flex()
+            .child(
+                h_flex()
+                    .py_1p5()
+                    .gap_4()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(Label::new("Scripts per project"))
+                            .child(
+                                Label::new(match running {
+                                    None => "Checking…".to_owned(),
+                                    Some(true) => "A run is in progress. Paths are relative to ~/.config/icarus and saved in your settings.".to_owned(),
+                                    Some(false) => "Paths are relative to ~/.config/icarus and saved in your settings.".to_owned(),
+                                })
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_none()
+                            .children(self.automation_notes.get("schema").map(|note| {
+                                Label::new(note.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                            }))
+                            .child(
+                                ui::Button::new("automation-schema", "Regenerate types")
+                                    .label_size(LabelSize::Small)
+                                    .disabled(busy.as_deref() == Some("schema"))
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.regenerate_types(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .when_some(self.automation_error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
+            .when(self.automation.is_some() && projects.is_empty(), |this| {
+                this.child(
+                    Label::new("No projects yet.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .children(projects.iter().enumerate().map(|(index, project)| {
+                let project_id = project["id"].as_str().unwrap_or_default().to_owned();
+                let name = project["project"].as_str().unwrap_or("Project").to_owned();
+                let missing = project["script"].is_string()
+                    && project["script_exists"].as_bool() != Some(true);
+                let row = self
+                    .script_rows
+                    .iter()
+                    .find(|row| row.project_id == project_id);
+                let note = self.automation_notes.get(&project_id).cloned();
+                let running = busy.as_deref() == Some(project_id.as_str());
+                v_flex()
+                    .py_1()
+                    .child(
+                        h_flex()
+                            .gap_4()
+                            .justify_between()
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .child(Label::new(name))
+                                    .child(
+                                        Label::new(run_summary(project))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .flex_none()
+                                    .children(row.map(|row| field(&row.path, cx)))
+                                    .child(
+                                        ui::Button::new(
+                                            SharedString::from(format!("automation-run-{index}")),
+                                            if running { "Running…" } else { "Run now (dry run)" },
+                                        )
+                                        .label_size(LabelSize::Small)
+                                        .disabled(running || project["script"].is_null())
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.dry_run(project_id.clone(), window, cx)
+                                        })),
+                                    ),
+                            ),
+                    )
+                    .when(missing, |this| {
+                        this.child(
+                            Label::new("The script file doesn't exist.")
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        )
+                    })
+                    .children(note.map(|note| {
+                        Label::new(note).size(LabelSize::Small).color(Color::Muted)
+                    }))
+            }))
+    }
+
+    fn render_prompts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = self
+            .preview_workspace
+            .as_ref()
+            .and_then(|id| self.workspaces.iter().find(|(existing, _)| existing == id))
+            .or_else(|| self.workspaces.first())
+            .map_or_else(|| "No workspaces".to_owned(), |(_, name)| name.clone());
+        let workspaces = self.workspaces.clone();
+        let weak = cx.entity().downgrade();
+        v_flex()
+            .child(
+                h_flex()
+                    .py_1p5()
+                    .gap_4()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(Label::new("Prompt templates"))
+                            .child(
+                                Label::new(
+                                    "Scripts start agents with these by id; {{path}} substitutes from \
+                                     the automation scope, e.g. {{workspace.name}} or {{pr.number}}.",
+                                )
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        PopoverMenu::new("prompt-preview-workspace")
+                            .trigger(
+                                ui::Button::new("prompt-preview-workspace-button", workspace)
+                                    .label_size(LabelSize::Small)
+                                    .end_icon(
+                                        ui::Icon::new(IconName::ChevronDown)
+                                            .size(ui::IconSize::XSmall),
+                                    ),
+                            )
+                            .menu(move |window, cx| {
+                                let weak = weak.clone();
+                                let workspaces = workspaces.clone();
+                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    for (id, name) in workspaces {
+                                        let weak = weak.clone();
+                                        menu = menu.entry(name, None, move |_, cx| {
+                                            weak.update(cx, |view, cx| {
+                                                view.preview_workspace = Some(id.clone());
+                                                cx.notify();
+                                            })
+                                            .log_err();
+                                        });
+                                    }
+                                    menu
+                                }))
+                            }),
+                    ),
+            )
+            .when(self.prompt_rows.is_empty(), |this| {
+                this.child(
+                    Label::new("No prompts.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .children(self.prompt_rows.iter().map(|row| {
+                let id = row.id.clone();
+                let element_id = |suffix: &str| SharedString::from(format!("prompt-{suffix}-{id}"));
+                let preview = self
+                    .prompt_preview
+                    .as_ref()
+                    .filter(|(previewed, _)| *previewed == id)
+                    .map(|(_, result)| result.clone());
+                let (id_preview, id_rename, id_remove) = (id.clone(), id.clone(), id.clone());
+                v_flex()
+                    .py_1()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_start()
+                            .justify_between()
+                            .child(Label::new(id.clone()).size(LabelSize::Small))
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .flex_none()
+                                    .child(
+                                        div()
+                                            .w(px(420.))
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .border_1()
+                                            .border_color(cx.theme().colors().border_variant)
+                                            .child(row.template.clone()),
+                                    )
+                                    .child(
+                                        ui::Button::new(element_id("preview"), "Preview")
+                                            .label_size(LabelSize::Small)
+                                            .on_click(cx.listener(move |view, _, window, cx| {
+                                                view.preview_prompt(id_preview.clone(), window, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        IconButton::new(element_id("rename"), IconName::Pencil)
+                                            .icon_size(ui::IconSize::XSmall)
+                                            .tooltip(Tooltip::text("Rename"))
+                                            .on_click(cx.listener(move |view, _, window, cx| {
+                                                view.prompt_renaming = Some(id_rename.clone());
+                                                let id = id_rename.clone();
+                                                view.prompt_name.update(cx, |editor, cx| {
+                                                    editor.set_text(id, window, cx)
+                                                });
+                                                window.focus(&view.prompt_name.focus_handle(cx), cx);
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        IconButton::new(element_id("remove"), IconName::Trash)
+                                            .icon_size(ui::IconSize::XSmall)
+                                            .tooltip(Tooltip::text("Remove"))
+                                            .on_click(cx.listener(move |view, _, window, cx| {
+                                                view.remove_prompt(&id_remove, window, cx)
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .children(preview.map(|preview| match preview {
+                        Ok(text) => div()
+                            .mt_1()
+                            .p_2()
+                            .rounded_sm()
+                            .bg(cx.theme().colors().surface_background)
+                            .child(Label::new(text).size(LabelSize::Small))
+                            .into_any_element(),
+                        Err(error) => Label::new(error)
+                            .size(LabelSize::Small)
+                            .color(Color::Error)
+                            .into_any_element(),
+                    }))
+            }))
+            .child(
+                h_flex()
+                    .pt_1()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(260.))
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(self.prompt_name.clone()),
+                    )
+                    .child(
+                        ui::Button::new(
+                            "prompt-add",
+                            if self.prompt_renaming.is_some() {
+                                "Rename"
+                            } else {
+                                "Add prompt"
+                            },
+                        )
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.add_or_rename_prompt(window, cx)
+                        })),
+                    ),
+            )
+    }
+
     fn render_cards(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let shown: Vec<String> = self
             .snapshot
@@ -2033,6 +2841,7 @@ impl Render for SettingsView {
                 .collect::<Vec<_>>()
         };
         let agents = rows(AGENTS, self, cx);
+        let automations = rows(AUTOMATIONS, self, cx);
         let automation = rows(AUTOMATION, self, cx);
         let rule_options = rows(RULE_OPTIONS, self, cx);
         let action_prompts = rows(ACTION_PROMPTS, self, cx);
@@ -2121,6 +2930,16 @@ impl Render for SettingsView {
                     })
                     .child(Self::section("STATUSES", cx))
                     .child(self.render_statuses(cx))
+                    .child(Self::section("AUTOMATIONS", cx))
+                    .children(automations)
+                    .child(self.render_automation_projects(cx))
+                    .child(Self::section("PROMPTS", cx))
+                    .child(self.render_prompts(cx))
+                    .child(
+                        div()
+                            .pt_6()
+                            .child(Label::new("Built-in rules (being replaced by automation scripts)")),
+                    )
                     .child(Self::section("AUTOMATION", cx))
                     .children(automation)
                     .child(
@@ -2946,6 +3765,25 @@ mod tests {
         assert_eq!(lookup(&value, "a.b.c"), Some(&json!(3)));
         assert_eq!(lookup(&value, "a.x"), None);
         assert_eq!(lookup(&value, "n"), None);
+    }
+
+    #[test]
+    fn a_dry_run_counts_actions_and_errors() {
+        let reply =
+            json!({ "runs": [{ "error": null, "results": [{ "ok": true }, { "ok": false }] }] });
+        assert_eq!(dry_run_summary(&reply), "Dry run: 2 actions, 1 error");
+        let failed = json!({ "runs": [{ "error": "exit 1", "results": [] }] });
+        assert_eq!(dry_run_summary(&failed), "Dry run failed: exit 1");
+        assert_eq!(
+            dry_run_summary(&json!({ "runs": [] })),
+            "Nothing ran: the project has no script."
+        );
+    }
+
+    #[test]
+    fn a_project_without_runs_says_so() {
+        let project = json!({ "last_run": null, "shadow": { "compared": 0, "differed": 0, "since_ms": null } });
+        assert_eq!(run_summary(&project), "Never run");
     }
 
     #[test]

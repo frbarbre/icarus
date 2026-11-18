@@ -290,6 +290,97 @@ impl Server {
         Ok(agent.info().id)
     }
 
+    /// Tabs added to a workspace's window. Requests wait in kv until an app window claims them, like layouts.
+    pub(crate) async fn tabs_dispatch(
+        self: &Arc<Self>,
+        method: &str,
+        p: Value,
+    ) -> Result<Value, RpcError> {
+        const PREFIX: &str = "tab.pending:";
+        let internal = |e: anyhow::Error| rpc("internal", format!("{e:#}"));
+        match method {
+            "tab.open" => {
+                #[derive(Deserialize)]
+                struct P {
+                    workspace: String,
+                    split: Option<String>,
+                    #[serde(default)]
+                    background: bool,
+                    mode: Option<String>,
+                    title: Option<String>,
+                }
+                let request: P = params(p.clone())?;
+                if let Some(split) = request.split.as_deref()
+                    && !matches!(split, "right" | "down")
+                {
+                    return Err(rpc("invalid_params", "split is right or down"));
+                }
+                let workspace = self.workspace_by_key(&request.workspace)?;
+                let mut tab: Tab = serde_json::from_value(p)
+                    .map_err(|e| rpc("invalid_params", format!("tab: {e}")))?;
+                // The agent starts here, so it runs even before a window shows its tab.
+                if let Tab::Agent {
+                    prompt,
+                    provider,
+                    agent_id: agent_id @ None,
+                } = &mut tab
+                {
+                    let created = self
+                        .call_internal(
+                            "agent.create",
+                            json!({
+                                "workspace": workspace.id,
+                                "prompt": prompt.take(),
+                                "provider": provider.take(),
+                                "mode": request.mode,
+                                "title": request.title,
+                            }),
+                        )
+                        .await?;
+                    *agent_id = created["id"].as_str().map(str::to_owned);
+                }
+                let id = format!("{}", uuid::Uuid::new_v4().simple());
+                let pending = json!({
+                    "workspace_id": workspace.id,
+                    "path": workspace.path,
+                    "tab": tab,
+                    "split": request.split,
+                    "background": request.background,
+                });
+                self.store
+                    .kv_set(&format!("{PREFIX}{id}"), &pending)
+                    .map_err(internal)?;
+                let delivered = self.send_to_apps("open_tab", json!({ "request": id }));
+                Ok(json!({ "request": id, "tab": pending["tab"], "delivered": delivered }))
+            }
+            "tab.pending" => Ok(json!(
+                self.store
+                    .kv_prefix(PREFIX)
+                    .map_err(internal)?
+                    .into_iter()
+                    .map(|(key, tab)| json!({
+                        "request": key.trim_start_matches(PREFIX),
+                        "tab": tab,
+                    }))
+                    .collect::<Vec<_>>()
+            )),
+            "tab.take" => {
+                #[derive(Deserialize)]
+                struct P {
+                    request: String,
+                }
+                let p: P = params(p)?;
+                let key = format!("{PREFIX}{}", p.request);
+                let pending = self.store.kv_get(&key).map_err(internal)?;
+                if pending.is_some() {
+                    self.store.kv_delete(&key).map_err(internal)?;
+                }
+                Ok(pending.unwrap_or(Value::Null))
+            }
+            other => Err(rpc("unknown_method", other)),
+        }
+    }
+
     pub(crate) async fn layouts_dispatch(
         self: &Arc<Self>,
         method: &str,
