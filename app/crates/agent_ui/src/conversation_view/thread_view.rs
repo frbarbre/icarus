@@ -478,12 +478,6 @@ pub(crate) fn compact_tool_summary<'a>(
 
 pub(crate) fn toggle_verbose_setting(fs: Arc<dyn Fs>, cx: &mut App) {
     let verbose = !AgentSettings::get_global(cx).verbose;
-    // Apply in memory first so every open thread flips this frame, not after the file round-trip.
-    cx.update_global::<SettingsStore, _>(|store, cx| {
-        store.update_user_settings(cx, |settings| {
-            settings.agent.get_or_insert_default().verbose = Some(verbose);
-        });
-    });
     update_settings_file(fs, cx, move |settings, _| {
         settings.agent.get_or_insert_default().verbose = Some(verbose);
     });
