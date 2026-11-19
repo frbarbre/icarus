@@ -87,7 +87,6 @@ impl UsageWindow {
             "session" => "Session",
             "weekly" => "Weekly",
             "fable" => "Fable",
-            "monthly" => "Monthly",
             other => other,
         }
     }
@@ -152,7 +151,7 @@ impl ProviderUsage {
         }
     }
 
-    /// The status bar's "percent label" pairs; a monthly window only shows when it is the only kind.
+    /// The status bar's "percent label" pairs.
     pub fn strip_sections(&self, now_ms: u64, compact: bool) -> Vec<(u32, String)> {
         if compact {
             return self
@@ -160,13 +159,8 @@ impl ProviderUsage {
                 .map(|w| vec![(w.percent(), w.strip_label(now_ms))])
                 .unwrap_or_default();
         }
-        let has_short = self
-            .windows
-            .iter()
-            .any(|w| w.key == "session" || w.key == "weekly");
         self.windows
             .iter()
-            .filter(|w| w.key != "monthly" || !has_short)
             .map(|w| (w.percent(), w.strip_label(now_ms)))
             .collect()
     }
@@ -176,7 +170,6 @@ pub(crate) fn provider_name(provider: &str) -> &str {
     match provider {
         "claude" => "Claude",
         "codex" => "Codex",
-        "cursor" => "Cursor",
         other => other,
     }
 }
@@ -955,11 +948,7 @@ fn provider_menu(
         .separator();
     for window in &usage.windows {
         let window = window.clone();
-        let title = if usage.provider == "cursor" {
-            "Plan".to_owned()
-        } else {
-            window.title().to_owned()
-        };
+        let title = window.title().to_owned();
         menu = menu.custom_row(move |_, cx| {
             v_flex()
                 .w_full()
@@ -1205,35 +1194,21 @@ mod tests {
         );
         assert_eq!(usage.strip_sections(0, true), [(11, "6d 8h".to_owned())]);
         assert_eq!(usage.headline().map(|w| w.key.as_str()), Some("weekly"));
-
-        let mut cursor = failed("cursor", "x");
-        cursor.failure = None;
-        cursor.windows = vec![window("monthly", 25.0, 43_200, None)];
-        assert_eq!(cursor.strip_sections(0, false), [(25, "30d".to_owned())]);
-        let mut mixed = claude(1.0);
-        mixed.windows.push(window("monthly", 90.0, 43_200, None));
-        assert_eq!(
-            mixed.strip_sections(0, false).len(),
-            3,
-            "monthly only shows alone"
-        );
     }
 
     #[test]
     fn providers_without_a_login_stay_hidden_and_the_roster_sorts_by_use() {
-        let expired = failed("cursor", "expired");
+        let expired = failed("codex", "expired");
         assert!(expired.worth_showing());
         assert_eq!(expired.status_label(), "Sign-in expired");
-        assert!(!failed("cursor", "no_login").worth_showing());
+        assert!(!failed("codex", "no_login").worth_showing());
 
-        let mut codex = claude(80.0);
-        codex.provider = "codex".into();
-        let usage = [claude(2.0), failed("cursor", "no_login"), expired, codex];
+        let usage = [failed("codex", "no_login"), expired, claude(2.0)];
         let order: Vec<&str> = roster_order(&usage)
             .iter()
             .map(|u| u.provider.as_str())
             .collect();
-        assert_eq!(order, ["codex", "claude", "cursor"]);
+        assert_eq!(order, ["claude", "codex"]);
     }
 
     fn source(

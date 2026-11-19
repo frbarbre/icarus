@@ -1902,7 +1902,6 @@ fn icarus_usage_fixture() -> (
             { "key": "session", "used_percent": 64, "window_minutes": 300, "resets_at_ms": at(95) },
             { "key": "weekly", "used_percent": 87, "window_minutes": 10080, "resets_at_ms": at(2 * 1440 + 180) },
         ] },
-        { "provider": "cursor", "failure": "expired", "error": "Cursor sign-in expired — run `cursor-agent login` again" },
     ]);
     let accounts = serde_json::json!([
         { "id": "system", "provider": "claude", "label": "System login", "default": false },

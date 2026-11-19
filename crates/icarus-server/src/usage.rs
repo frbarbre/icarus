@@ -18,7 +18,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 pub const FRESH_FOR_MS: u64 = 3 * 60 * 1000;
 pub const SESSION_MINUTES: u64 = 300;
 pub const WEEK_MINUTES: u64 = 10_080;
-pub const PROVIDERS: [&str; 3] = ["claude", "codex", "cursor"];
+pub const PROVIDERS: [&str; 2] = ["claude", "codex"];
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Window {
@@ -79,8 +79,7 @@ pub fn usage(
     }
     let fetched = match provider {
         "claude" => fetch_claude(home),
-        "codex" => fetch_codex(home),
-        _ => fetch_cursor(now_ms),
+        _ => fetch_codex(home),
     };
     let usage = settle(provider, account, fetched, previous, now_ms);
     if let Ok(mut cache) = cache().lock() {
@@ -482,123 +481,6 @@ fn fetch_codex(home: Option<&Path>) -> Fetched {
     Ok(parse_codex(&body))
 }
 
-// Cursor
-
-fn cursor_token() -> Option<String> {
-    keychain("cursor-access-token", "cursor-user")
-        .or_else(|| {
-            let auth = std::fs::read_to_string(home_dir().join(".cursor/auth.json")).ok()?;
-            let auth: Value = serde_json::from_str(&auth).ok()?;
-            auth["accessToken"]
-                .as_str()
-                .filter(|t| !t.is_empty())
-                .map(str::to_owned)
-        })
-        .or_else(|| {
-            let db = home_dir()
-                .join("Library/Application Support/Cursor/User/globalStorage/state.vscdb");
-            let connection = rusqlite::Connection::open_with_flags(
-                db,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .ok()?;
-            connection
-                .query_row(
-                    "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-                .filter(|t| !t.is_empty())
-        })
-}
-
-fn jwt_claims(token: &str) -> Option<Value> {
-    use base64::Engine as _;
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn percent_encode(text: &str) -> String {
-    text.bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
-}
-
-pub fn parse_cursor(body: &Value) -> (Option<String>, Vec<Window>) {
-    let plan = &body["individualUsage"]["plan"];
-    let used = match (plan["used"].as_f64(), plan["limit"].as_f64()) {
-        (Some(used), Some(limit)) if limit > 0.0 => Some(used / limit * 100.0),
-        _ => plan["totalPercentUsed"].as_f64(),
-    };
-    let start = timestamp_ms(&body["billingCycleStart"]);
-    let end = timestamp_ms(&body["billingCycleEnd"]);
-    let windows = used
-        .filter(|_| plan["enabled"].as_bool() != Some(false))
-        .map(|used| Window {
-            key: "monthly",
-            used_percent: clamp_percent(used),
-            window_minutes: match (start, end) {
-                (Some(start), Some(end)) if end > start => (end - start) / 60_000,
-                _ => 30 * 24 * 60,
-            },
-            resets_at_ms: end,
-        })
-        .into_iter()
-        .collect();
-    (
-        body["membershipType"].as_str().and_then(plan_label),
-        windows,
-    )
-}
-
-fn fetch_cursor(now_ms: u64) -> Fetched {
-    let token = cursor_token().ok_or((
-        Failure::NoLogin,
-        "No Cursor sign-in on this computer — sign in to Cursor or run `cursor-agent login`"
-            .to_owned(),
-    ))?;
-    let expired = (
-        Failure::Expired,
-        "Cursor sign-in expired — run `cursor-agent login` again".to_owned(),
-    );
-    let claims = jwt_claims(&token).ok_or_else(|| expired.clone())?;
-    if claims["exp"]
-        .as_u64()
-        .is_some_and(|exp| exp.saturating_mul(1000) <= now_ms)
-    {
-        return Err(expired);
-    }
-    let subject = claims["sub"].as_str().ok_or_else(|| expired.clone())?;
-    let cookie = format!(
-        "WorkosCursorSessionToken={}%3A%3A{token}",
-        percent_encode(subject)
-    );
-    let body = get_json(
-        "https://cursor.com/api/usage-summary",
-        &[
-            ("Cookie", &cookie),
-            ("Accept", "application/json"),
-            ("Origin", "https://cursor.com"),
-            ("Referer", "https://cursor.com/dashboard"),
-        ],
-    )
-    .map_err(|(failure, error)| match failure {
-        Failure::Expired => expired.clone(),
-        _ => (failure, error),
-    })?;
-    Ok(parse_cursor(&body))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,21 +540,6 @@ mod tests {
             "secondary_window": null,
         } }));
         assert_eq!(weekly_only[0].key, "weekly");
-    }
-
-    #[test]
-    fn cursor_usage_is_the_plan_share_of_the_billing_cycle() {
-        let (plan, windows) = parse_cursor(&json!({
-            "membershipType": "pro",
-            "billingCycleStart": "1790000000000",
-            "billingCycleEnd": 1_792_592_000_000u64,
-            "individualUsage": { "plan": { "enabled": true, "used": 500, "limit": 2000, "totalPercentUsed": 99 } },
-        }));
-        assert_eq!(plan.as_deref(), Some("Pro"));
-        assert_eq!(windows[0].key, "monthly");
-        assert_eq!(windows[0].used_percent, 25.0);
-        assert_eq!(windows[0].window_minutes, 43_200);
-        assert_eq!(windows[0].resets_at_ms, Some(1_792_592_000_000));
     }
 
     #[test]
@@ -749,7 +616,6 @@ mod tests {
         assert_eq!(claude_keychain_service(None), "Claude Code-credentials");
         let managed = claude_keychain_service(Some(Path::new("/x")));
         assert_eq!(managed.len(), "Claude Code-credentials-".len() + 8);
-        assert_eq!(percent_encode("auth0|user_1"), "auth0%7Cuser_1");
         assert_eq!(plan_label("max-20x").as_deref(), Some("Max 20x"));
     }
 }
