@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use gpui::{
-    Action, AnyWindowHandle, App, ClipboardItem, Context, Entity, Global, Render, Subscription,
-    Task, WeakEntity, Window,
+    Action, App, ClipboardItem, Context, Entity, EntityId, Global, Render, Subscription, Task,
+    WeakEntity, Window,
 };
 use gpui_tokio::Tokio;
 use icarus_client::Client;
@@ -368,9 +368,10 @@ fn project_paths(project: &WeakEntity<Project>, cx: &App) -> Vec<PathBuf> {
 
 /// Each window's links, so the keybindings act on the window they were pressed in.
 #[derive(Default)]
-struct WorkspaceLinksByWindow(HashMap<AnyWindowHandle, WeakEntity<WorkspaceLinks>>);
+/// Keyed by project: a window holds one title bar, and so one set of links, per workspace.
+struct WorkspaceLinksByProject(HashMap<EntityId, WeakEntity<WorkspaceLinks>>);
 
-impl Global for WorkspaceLinksByWindow {}
+impl Global for WorkspaceLinksByProject {}
 
 /// A preview of the title bar's links, for visual tests: `now` (RFC 3339), `workspace_id`,
 /// `pull_request_url`, `ports` as `ports.list` returns them and `previews` as `pr.previews` does.
@@ -396,12 +397,11 @@ pub struct WorkspaceLinks {
 }
 
 impl WorkspaceLinks {
-    pub fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let handle = window.window_handle();
+    pub fn new(project: Entity<Project>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let weak_self = cx.entity().downgrade();
-        cx.default_global::<WorkspaceLinksByWindow>()
-            .0
-            .insert(handle, weak_self);
+        let registered = &mut cx.default_global::<WorkspaceLinksByProject>().0;
+        registered.retain(|_, links| links.upgrade().is_some());
+        registered.insert(project.entity_id(), weak_self);
         let mut links = Self::empty(cx);
         if !crate::enabled(cx) {
             return links;
@@ -659,9 +659,9 @@ impl Render for WorkspaceLinks {
     }
 }
 
-pub fn links_for_window(window: &Window, cx: &App) -> Option<Entity<WorkspaceLinks>> {
-    cx.try_global::<WorkspaceLinksByWindow>()
-        .and_then(|links| links.0.get(&window.window_handle()))
+pub fn links_for_project(project: &Entity<Project>, cx: &App) -> Option<Entity<WorkspaceLinks>> {
+    cx.try_global::<WorkspaceLinksByProject>()
+        .and_then(|links| links.0.get(&project.entity_id()))
         .and_then(WeakEntity::upgrade)
 }
 
@@ -679,8 +679,8 @@ fn show_message(
 
 const NO_WORKSPACE: &str = "This window isn't an Icarus workspace.";
 
-fn open_frontend(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let Some(links) = links_for_window(window, cx) else {
+fn open_frontend(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+    let Some(links) = links_for_project(workspace.project(), cx) else {
         show_message(workspace, NO_WORKSPACE, cx);
         return;
     };
@@ -725,7 +725,7 @@ fn open_frontend(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
 }
 
 fn open_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let Some(links) = links_for_window(window, cx) else {
+    let Some(links) = links_for_project(workspace.project(), cx) else {
         show_message(workspace, NO_WORKSPACE, cx);
         return;
     };
@@ -743,12 +743,8 @@ fn open_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut Context
     }
 }
 
-fn pull_request_url(
-    workspace: &mut Workspace,
-    window: &Window,
-    cx: &mut Context<Workspace>,
-) -> Option<String> {
-    let Some(links) = links_for_window(window, cx) else {
+fn pull_request_url(workspace: &mut Workspace, cx: &mut Context<Workspace>) -> Option<String> {
+    let Some(links) = links_for_project(workspace.project(), cx) else {
         show_message(workspace, NO_WORKSPACE, cx);
         return None;
     };
@@ -762,19 +758,19 @@ fn pull_request_url(
 pub(crate) fn register(cx: &mut App) {
     PortsStore::global(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
-        workspace.register_action(|workspace, _: &OpenFrontend, window, cx| {
-            open_frontend(workspace, window, cx);
+        workspace.register_action(|workspace, _: &OpenFrontend, _, cx| {
+            open_frontend(workspace, cx);
         });
         workspace.register_action(|workspace, _: &OpenPreview, window, cx| {
             open_preview(workspace, window, cx);
         });
-        workspace.register_action(|workspace, _: &OpenPullRequest, window, cx| {
-            if let Some(url) = pull_request_url(workspace, window, cx) {
+        workspace.register_action(|workspace, _: &OpenPullRequest, _, cx| {
+            if let Some(url) = pull_request_url(workspace, cx) {
                 cx.open_url(&url);
             }
         });
-        workspace.register_action(|workspace, _: &CopyPullRequestUrl, window, cx| {
-            if let Some(url) = pull_request_url(workspace, window, cx) {
+        workspace.register_action(|workspace, _: &CopyPullRequestUrl, _, cx| {
+            if let Some(url) = pull_request_url(workspace, cx) {
                 cx.write_to_clipboard(ClipboardItem::new_string(url));
                 show_message(workspace, "Copied the pull request URL.", cx);
             }

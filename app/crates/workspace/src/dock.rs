@@ -657,6 +657,10 @@ impl Dock {
         cx.notify();
     }
 
+    pub fn workspace(&self) -> &WeakEntity<Workspace> {
+        &self.workspace
+    }
+
     pub fn zoom_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for entry in &mut self.panel_entries {
             if entry.panel.is_zoomed(window, cx) {

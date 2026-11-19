@@ -107,7 +107,11 @@ fn check_dot_color(state: CheckState) -> Option<Color> {
 }
 
 /// The strip above the right dock, shown only while one of the sidebar's panels is the active one.
-fn render_switcher(dock: &Dock, window: &mut Window, cx: &mut Context<Dock>) -> Option<AnyElement> {
+fn render_switcher(
+    dock: &Dock,
+    _window: &mut Window,
+    cx: &mut Context<Dock>,
+) -> Option<AnyElement> {
     let active = dock.active_panel_index()?;
     let tabs = visible_tabs(dock, cx);
     if !tabs.iter().any(|(index, _)| *index == active) {
@@ -117,8 +121,16 @@ fn render_switcher(dock: &Dock, window: &mut Window, cx: &mut Context<Dock>) -> 
         .panel::<GitHubPanel>()
         .and_then(|panel| panel.read(cx).checks_state())
         .and_then(check_dot_color);
-    let links = crate::links::links_for_window(window, cx);
-    let next_action = crate::NextActionButton::for_window(window, cx);
+    let project = dock
+        .workspace()
+        .upgrade()
+        .map(|workspace| workspace.read(cx).project().clone());
+    let links = project
+        .as_ref()
+        .and_then(|project| crate::links::links_for_project(project, cx));
+    let next_action = project
+        .as_ref()
+        .and_then(|project| crate::NextActionButton::for_project(project, cx));
     Some(
         h_flex()
             .h(Tab::container_height(cx))

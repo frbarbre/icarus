@@ -7,7 +7,7 @@ use anyhow::Result;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{
-    AnyWindowHandle, App, Context, Entity, Global, Render, Subscription, Task, WeakEntity, Window,
+    App, Context, Entity, EntityId, Global, Render, Subscription, Task, WeakEntity, Window,
 };
 use gpui_tokio::Tokio;
 use icarus_client::Client;
@@ -34,9 +34,10 @@ struct NextActionReply {
     action: Option<NextAction>,
 }
 
-/// Each window's button, so the keybinding runs the step of the window it was pressed in.
+/// Each project's button: a window holds one title bar per workspace, so the keybinding runs the
+/// step of the workspace it was pressed in.
 #[derive(Default)]
-struct NextActionButtons(HashMap<AnyWindowHandle, WeakEntity<NextActionButton>>);
+struct NextActionButtons(HashMap<EntityId, WeakEntity<NextActionButton>>);
 
 impl Global for NextActionButtons {}
 
@@ -101,9 +102,9 @@ impl NextActionButton {
     pub fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let handle = window.window_handle();
         let weak_self = cx.entity().downgrade();
-        cx.default_global::<NextActionButtons>()
-            .0
-            .insert(handle, weak_self);
+        let buttons = &mut cx.default_global::<NextActionButtons>().0;
+        buttons.retain(|_, button| button.upgrade().is_some());
+        buttons.insert(project.entity_id(), weak_self);
         if !crate::enabled(cx) {
             return Self::idle(None);
         }
@@ -220,16 +221,16 @@ impl NextActionButton {
         self.action.as_ref()
     }
 
-    /// Makes `button` the one the sidebar strip shows in `window` (previews and visual tests).
-    pub fn show_in_window(button: &Entity<Self>, window: &Window, cx: &mut App) {
+    /// Makes `button` the one the sidebar strip shows for `project` (previews and visual tests).
+    pub fn show_for_project(button: &Entity<Self>, project: &Entity<Project>, cx: &mut App) {
         cx.default_global::<NextActionButtons>()
             .0
-            .insert(window.window_handle(), button.downgrade());
+            .insert(project.entity_id(), button.downgrade());
     }
 
-    pub fn for_window(window: &Window, cx: &App) -> Option<Entity<Self>> {
+    pub fn for_project(project: &Entity<Project>, cx: &App) -> Option<Entity<Self>> {
         cx.try_global::<NextActionButtons>()
-            .and_then(|buttons| buttons.0.get(&window.window_handle()))
+            .and_then(|buttons| buttons.0.get(&project.entity_id()))
             .and_then(WeakEntity::upgrade)
     }
 
@@ -319,11 +320,8 @@ pub(crate) fn server_event(topic: &str, payload: &serde_json::Value, cx: &mut Ap
 
 pub(crate) fn register(cx: &mut App) {
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
-        workspace.register_action(|_workspace, _: &RunNextAction, window, cx| {
-            let handle = window.window_handle();
-            let button = cx
-                .try_global::<NextActionButtons>()
-                .and_then(|buttons| buttons.0.get(&handle).and_then(WeakEntity::upgrade));
+        workspace.register_action(|workspace, _: &RunNextAction, window, cx| {
+            let button = NextActionButton::for_project(workspace.project(), cx);
             if let Some(button) = button {
                 button.update(cx, |button, cx| button.run(window, cx));
             }

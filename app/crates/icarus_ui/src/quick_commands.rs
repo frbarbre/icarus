@@ -12,7 +12,7 @@ use anyhow::{Context as _, Result};
 use collections::HashSet;
 use editor::Editor;
 use gpui::{
-    AnyWindowHandle, App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    App, ClipboardItem, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, Global, PromptLevel, Render, Task, TaskExt as _, WeakEntity, Window,
 };
 use gpui_tokio::Tokio;
@@ -423,7 +423,8 @@ fn project_paths(project: &WeakEntity<Project>, cx: &App) -> Vec<PathBuf> {
 
 /// Each window's button, so ⌃P opens the menu of the window it was pressed in.
 #[derive(Default)]
-struct QuickCommandsButtons(HashMap<AnyWindowHandle, WeakEntity<QuickCommandsButton>>);
+/// Keyed by project: a window holds one title bar, and so one button, per workspace.
+struct QuickCommandsButtons(HashMap<EntityId, WeakEntity<QuickCommandsButton>>);
 
 impl Global for QuickCommandsButtons {}
 
@@ -437,11 +438,11 @@ pub struct QuickCommandsButton {
 }
 
 impl QuickCommandsButton {
-    pub fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(project: Entity<Project>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let this = cx.entity().downgrade();
-        cx.default_global::<QuickCommandsButtons>()
-            .0
-            .insert(window.window_handle(), this);
+        let buttons = &mut cx.default_global::<QuickCommandsButtons>().0;
+        buttons.retain(|_, button| button.upgrade().is_some());
+        buttons.insert(project.entity_id(), this);
         let mut button = Self {
             project: Some(project.downgrade()),
             target: None,
@@ -1074,7 +1075,7 @@ pub(crate) fn register(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenQuickCommandsMenu, window, cx| {
             let button = cx
                 .try_global::<QuickCommandsButtons>()
-                .and_then(|buttons| buttons.0.get(&window.window_handle()))
+                .and_then(|buttons| buttons.0.get(&workspace.project().entity_id()))
                 .and_then(WeakEntity::upgrade)
                 .filter(|button| !button.read(cx).commands().is_empty());
             if let Some(button) = button {

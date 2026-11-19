@@ -1356,7 +1356,7 @@ fn show_icarus_review_in_source_control(
                     agent_step: false,
                 })
             });
-            icarus_ui::NextActionButton::show_in_window(&next, window, cx);
+            icarus_ui::NextActionButton::show_for_project(&next, workspace.project(), cx);
             let width = workspace.right_dock().read(cx).active_panel_size();
             // On the dock alone, so the width isn't saved for later windows.
             workspace.right_dock().update(cx, |dock, cx| {
@@ -3101,7 +3101,6 @@ fn run_icarus_workspaces_stack_tests(
             panel.set_workspaces(workspaces, cx);
             let mut view = icarus_ui::cards::CardView::showing_all();
             view.group_by = icarus_ui::cards::GroupBy::Stack;
-            view.reviewing_status = Some("Reviewing".into());
             panel.set_view(view, cx);
             panel.set_project_names(
                 [("proj-demo".to_string(), "acme/app".to_string())]
