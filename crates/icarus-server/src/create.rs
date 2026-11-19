@@ -192,6 +192,25 @@ pub(crate) async fn branch_exists(repo: &Path, branch: &str) -> bool {
     .await
 }
 
+/// `origin/<branch>` when the branch was already pushed, e.g. created by hand for the issue.
+async fn pushed_branch(repo: &Path, branch: &str) -> Option<String> {
+    if let Err(error) = git(repo, &["fetch", "--quiet", "--no-tags", "origin", branch]).await {
+        tracing::debug!("origin has no {branch}: {error}");
+    }
+    let upstream = format!("origin/{branch}");
+    git_ok(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{upstream}"),
+        ],
+    )
+    .await
+    .then_some(upstream)
+}
+
 /// Fetches what the plan needs and adds the worktree.
 pub(crate) async fn add_worktree(plan: &WorktreePlan) -> Result<(), RpcError> {
     let failed = |e: String| rpc("git_failed", e);
@@ -232,10 +251,30 @@ pub(crate) async fn add_worktree(plan: &WorktreePlan) -> Result<(), RpcError> {
         std::fs::create_dir_all(parent).map_err(|e| failed(e.to_string()))?;
     }
     let path = plan.path.to_string_lossy();
+    let pushed = if plan.branch_existed || plan.pr.is_some() {
+        None
+    } else {
+        pushed_branch(&plan.repo, &plan.branch).await
+    };
     if plan.branch_existed {
         git(&plan.repo, &["worktree", "add", &path, &plan.branch])
             .await
             .map_err(failed)?;
+    } else if let Some(upstream) = &pushed {
+        git(
+            &plan.repo,
+            &[
+                "worktree",
+                "add",
+                "--track",
+                "-b",
+                &plan.branch,
+                &path,
+                upstream,
+            ],
+        )
+        .await
+        .map_err(failed)?;
     } else {
         git(
             &plan.repo,
@@ -477,5 +516,60 @@ mod tests {
         let result = or_cancelled(&flag, std::future::pending::<Result<(), RpcError>>()).await;
         assert_eq!(result.map_err(|e| e.code), Err("cancelled".to_owned()));
         creates.finish("c1");
+    }
+
+    #[tokio::test]
+    async fn a_branch_pushed_by_hand_is_checked_out_instead_of_restarted_from_the_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |cwd: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let author = dir.path().join("author");
+        std::fs::create_dir(&author).expect("mkdir");
+        run(dir.path(), &["init", "-q", "--bare", "origin.git"]);
+        run(&author, &["init", "-q"]);
+        run(&author, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        run(&author, &["remote", "add", "origin", "../origin.git"]);
+        run(&author, &["push", "-q", "origin", "main"]);
+        run(&author, &["checkout", "-q", "-b", "someone/feature"]);
+        run(
+            &author,
+            &["commit", "-q", "--allow-empty", "-m", "feature work"],
+        );
+        run(&author, &["push", "-q", "origin", "someone/feature"]);
+        run(dir.path(), &["clone", "-q", "origin.git", "repo"]);
+
+        let repo = dir.path().join("repo");
+        let plan = WorktreePlan {
+            repo: repo.clone(),
+            path: dir.path().join("ws"),
+            branch: "someone/feature".into(),
+            start: "origin/main".into(),
+            fetch: Some("origin/main".into()),
+            pr: None,
+            branch_existed: false,
+        };
+        add_worktree(&plan).await.expect("add");
+
+        let ws = plan.path.as_path();
+        let head = git(ws, &["log", "-1", "--format=%s"]).await.expect("log");
+        assert_eq!(head.trim(), "feature work");
+        let upstream = git(ws, &["rev-parse", "--abbrev-ref", "@{u}"])
+            .await
+            .expect("u");
+        assert_eq!(upstream.trim(), "origin/someone/feature");
     }
 }
