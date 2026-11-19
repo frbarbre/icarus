@@ -12,6 +12,8 @@ type Config = {
   /** The column for a new workspace without one, for workspaces created at or after `newWorkspaceStatusSince` (epoch ms). */
   newWorkspaceStatus: string | null;
   newWorkspaceStatusSince: number;
+  /** Cards in this column are left alone: no moves, deletes, agents or notifications. */
+  holdStatus: string | null;
   /** Delete the workspace when its PR merges or closes (only when its checkout is at the PR's head). */
   onResolved: "keep" | "delete";
   /** Delete a review workspace once you've approved or requested changes and sent your drafts. */
@@ -119,6 +121,10 @@ function reviewDone(ws: Workspace, pr: PullRequest) {
   );
 }
 
+function held(ws: Workspace): boolean {
+  return !!config.holdStatus && ws.status === config.holdStatus;
+}
+
 /** The first matching condition, in Orca's order; `hold` keeps the current column. */
 function condition(ws: Workspace, pr: PullRequest): { name: Condition | "hold"; remove?: boolean } {
   const mapped = (name: Condition) => config.statusByCondition[name] != null;
@@ -146,6 +152,7 @@ function condition(ws: Workspace, pr: PullRequest): { name: Condition | "hold"; 
 }
 
 for (const ws of scope.workspaces) {
+  if (held(ws)) continue;
   const pr = ws.pr;
   if (!pr) {
     if (config.newWorkspaceStatus && !ws.status && ws.created_ms >= config.newWorkspaceStatusSince) {
@@ -237,7 +244,7 @@ if (trigger.kind === "event") {
   for (const event of "events" in trigger ? trigger.events : []) {
     const ws = scope.workspaces.find((w) => w.id === event.workspace);
     const pr = ws?.pr;
-    if (!ws || !pr) continue;
+    if (!ws || !pr || held(ws)) continue;
     if (event.name === "checks.failed") {
       const failed = pr.checks.filter((c) => checkState(c) === "failure");
       const mine = !authoredBySomeoneElse(pr);

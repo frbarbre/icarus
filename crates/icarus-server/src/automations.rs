@@ -141,7 +141,6 @@ struct Config {
     armed: bool,
     interval_ms: u64,
     max_agents: u64,
-    hold: Option<String>,
     default_project: Option<String>,
     scripts: BTreeMap<String, String>,
 }
@@ -158,9 +157,6 @@ fn config(settings: &Value) -> Config {
         max_agents: get("max_agents_per_run")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_MAX_AGENTS),
-        hold: get("hold_status")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
         default_project: get("default_project")
             .and_then(Value::as_str)
             .map(str::to_owned),
@@ -348,8 +344,6 @@ struct Action {
     method: String,
     #[serde(default)]
     params: Value,
-    #[serde(default)]
-    force: bool,
 }
 
 fn action_workspace(action: &Action) -> Option<String> {
@@ -915,13 +909,12 @@ impl Server {
         };
         let outcomes = || results.iter().chain(&cli_calls).filter_map(|r| r.get("ok"));
         let acted = outcomes().any(|ok| ok == &Value::Bool(true));
-        // The hold column is the user's choice, so a held action doesn't fail the run.
         let failed = output.error.is_some()
             || decision_error.is_some()
             || results
                 .iter()
                 .chain(&cli_calls)
-                .any(|r| r["ok"] == false && r["held"] != true);
+                .any(|r| r["ok"] == false);
         let mut memory_after = memory_before.clone();
         let mut memory_error = None;
         if let Some(memory) = &decision.memory {
@@ -1093,12 +1086,6 @@ impl Server {
                 .filter(|w| failed_workspaces.contains(&w.id))
             {
                 refuse(format!("skipped: an earlier action on {} failed", w.name))
-            } else if let Some(w) = workspace
-                .as_ref()
-                .filter(|w| !action.force && config.hold.is_some() && w.status == config.hold)
-            {
-                result["held"] = json!(true);
-                refuse(format!("skipped: {} is in the hold column", w.name))
             } else if AGENT_METHODS.contains(&action.method.as_str())
                 && agents_started >= config.max_agents
             {
@@ -1688,7 +1675,6 @@ impl Server {
                     "properties": {
                         "method": { "$ref": "#/$defs/Method" },
                         "params": { "type": "object" },
-                        "force": { "type": "boolean" },
                     },
                 },
                 "Button": {
@@ -2043,7 +2029,6 @@ mod tests {
         let action = |method: &str, params: Value| Action {
             method: method.into(),
             params,
-            force: false,
         };
         assert_eq!(
             action_workspace(&action("workspace.set", json!({ "id": "w1" }))),

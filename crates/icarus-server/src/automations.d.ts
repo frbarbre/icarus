@@ -170,8 +170,6 @@ export interface PullRequest {
 export interface Action {
   method: Method;
   params?: Record<string, any> & { prompt_id?: PromptId };
-  /** Act on a workspace in the hold column anyway. */
-  force?: boolean;
 }
 
 export interface Button {

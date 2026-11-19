@@ -251,37 +251,11 @@ async fn a_script_decides_statuses_and_buttons_and_its_runs_replay() {
     assert_eq!(emitted["trigger"]["name"], "linear.open_issue");
     assert_eq!(emitted["trigger"]["payload"]["issue"], "ABC-1");
 
-    settings["automations"]["hold_status"] = json!("todo");
-    write_settings(repo.path(), &settings);
-    client
-        .request(
-            "workspace.set",
-            json!({ "id": workspace, "status": "todo" }),
-        )
-        .await
-        .expect("hold");
-    let held = client
-        .request("automation.run", json!({ "project": project["id"] }))
-        .await
-        .expect("held run");
-    let result = &held["runs"][0]["results"][0];
-    assert_eq!(result["ok"], false, "{held}");
-    assert_eq!(result["held"], true, "{held}");
-    assert_eq!(
-        held["runs"][0]["failed"], false,
-        "a held action isn't a failure: {held}"
-    );
-    assert!(
-        result["error"].as_str().is_some_and(|e| e.contains("hold")),
-        "{result}"
-    );
-    assert_eq!(status(&client, &workspace).await, "todo");
-
     let runs = client
         .request("automation.runs", json!({ "project": project["id"] }))
         .await
         .expect("runs");
-    assert_eq!(runs["runs"].as_array().map(Vec::len), Some(5));
+    assert_eq!(runs["runs"].as_array().map(Vec::len), Some(4));
     let failed = client
         .request(
             "automation.runs",

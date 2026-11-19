@@ -10,6 +10,7 @@
   },
   "newWorkspaceStatus": "in-progress",
   "newWorkspaceStatusSince": 0,
+  "holdStatus": null,
   "onResolved": "keep",
   "onReviewed": "keep",
   "mergingCheckName": "Reviews satisfied",

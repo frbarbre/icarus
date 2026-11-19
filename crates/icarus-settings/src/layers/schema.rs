@@ -486,11 +486,6 @@ pub fn document_schema() -> Schema {
                     Integer,
                 ),
                 field(
-                    "hold_status",
-                    "Workspaces in this column get no actions unless the action says `force`.",
-                    nullable(Str),
-                ),
-                field(
                     "default_project",
                     "Project for `automation emit` without --project or --path.",
                     nullable(Str),

@@ -42,7 +42,7 @@ icarus config set automations.armed true            # let it act
 
 Until `automations.armed` is true, every run is a dry run: it records the actions it would take, but changes nothing. `icarus automation status` shows each project's script and last run.
 
-Settings from the old built-in rules (`rules.*`, from an older Icarus or an Orca import) are converted once, when the server starts or an Orca export is imported: their options go into `automations/orca-flow.ts`, the projects they covered point at it, `rules.armed`, `rules.interval_ms` and `holdStatus` become `automations.armed`, `automations.interval_ms` and `automations.hold_status`, and the old settings are saved in `~/.config/icarus/automations/rules-backup.json`.
+Settings from the old built-in rules (`rules.*`, from an older Icarus or an Orca import) are converted once, when the server starts or an Orca export is imported: their options go into `automations/orca-flow.ts`, the projects they covered point at it, `rules.armed` and `rules.interval_ms` become `automations.armed` and `automations.interval_ms`, and the old settings are saved in `~/.config/icarus/automations/rules-backup.json`.
 
 ## The GitHub PR flow
 
@@ -72,6 +72,7 @@ For each workspace with a pull request, the first matching condition decides its
 | Option | What it does |
 |---|---|
 | `newWorkspaceStatus` | The column new workspaces (created after `newWorkspaceStatusSince`) start in. |
+| `holdStatus` | A column whose cards the script leaves alone; Orca's `holdStatus` on import. |
 | `mergingCheckName` | The check whose success means "merging". Default `Reviews satisfied`. |
 | `pmApprovalTeam` | A GitHub team (`org/team-slug`) whose approval counts as PM approval. List it in `automations.teams` too, so the scope carries its members. |
 | `onResolved` | `delete` removes your workspace once its PR merged or closed (not forced: local changes keep it). |
@@ -82,7 +83,7 @@ For each workspace with a pull request, the first matching condition decides its
 | `ciTriage` | Per project: instructions for an agent started when CI fails on your PR. |
 | `notify` | `ciFailed`, `merged` and `reviewRequested` notifications. |
 
-A column in `automations.hold_status` is never touched. Review workspaces follow the PR: when its author pushes, the workspace moves to the new head. The next-action button's agent prompts are the `prompts.commitAndPush`, `createPullRequest`, `readyForReview` and `reviewPullRequest` settings.
+Cards in the `holdStatus` column are skipped by the script and never touched. Review workspaces follow the PR: when its author pushes, the workspace moves to the new head. The next-action button's agent prompts are the `prompts.commitAndPush`, `createPullRequest`, `readyForReview` and `reviewPullRequest` settings.
 
 ## Automation scripts
 
@@ -130,7 +131,7 @@ console.log(JSON.stringify(out));
 - **Actions** are server methods, the same ones the CLI calls (`Method` in the generated types lists them). `prompt_id` in an action's params renders that prompt for its workspace into `prompt`. A script may also run `icarus …` itself; those calls are recorded with the run.
 - **Buttons:** a workspace listed in `buttons` shows the script's buttons instead of the built-in next step; a click is a `button` event run on a fresh scope. Leave a workspace out to keep the built-in step, which every workspace also carries as `suggested_action`.
 - **Memory:** return `memory` and you get it back as `scope.memory` next run. `scope.previous` is the scope of the last run that changed something.
-- **Safety:** with `automations.armed` off every run is a dry run. `automations.enabled: false` stops everything. A workspace in `automations.hold_status` gets no actions unless the action says `"force": true`, and a run starts at most `automations.max_agents_per_run` agents (3).
+- **Safety:** with `automations.armed` off every run is a dry run. `automations.enabled: false` stops everything. A run starts at most `automations.max_agents_per_run` agents (3).
 - **Scope extras:** `scope.inbox` lists open PRs requesting your review (with the `workspace` already on each, if any). Each workspace carries `linked_pr`, `review_pending` (unsent draft comments), `head_is_local` and `base_follows_target`.
 - **Actions beyond the CLI's usual ones:** `review.workspace` checks out a PR to review with an agent and a layout, `workspace.sync_to_pr_head` moves a review workspace to the PR's head and target, `tab.open` opens a tab in the workspace's window (queued until one is open), `issue.assign` and `notification.send`.
 - **Types:** `~/.config/icarus/automations/.generated/icarus.d.ts` and `schema.json` list your status and prompt ids; they are rewritten when those settings change.

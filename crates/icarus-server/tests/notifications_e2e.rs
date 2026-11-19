@@ -341,7 +341,7 @@ async fn old_rules_settings_become_the_orca_flow_script_at_startup() {
     assert!(user.get("presets").is_none(), "{user}");
     assert_eq!(user["notifications"], json!({ "automation": true }));
     assert_eq!(user["automations"]["armed"], true);
-    assert_eq!(user["automations"]["hold_status"], "todo");
+    assert!(user["automations"].get("hold_status").is_none(), "{user}");
     assert_eq!(user["prompts"]["commitAndPush"], "Commit it");
     assert_eq!(user["sidebar"]["reviewingStatus"], "in-review");
 
@@ -349,6 +349,7 @@ async fn old_rules_settings_become_the_orca_flow_script_at_startup() {
     let script = std::fs::read_to_string(automations.join("orca-flow.ts")).expect("script");
     assert!(script.contains(r#""merged": "completed""#), "{script}");
     assert!(script.contains("acme/widgets#4"), "{script}");
+    assert!(script.contains(r#""holdStatus": "todo""#), "{script}");
     let backup = std::fs::read_to_string(automations.join("rules-backup.json")).expect("backup");
     assert!(backup.contains("holdStatus"));
 

@@ -50,6 +50,7 @@ pub(crate) fn script_config(
         .collect();
     config["statusByCondition"] = Value::Object(statuses);
     config["newWorkspaceStatus"] = json!(text(&pr["newWorkspaceStatus"]));
+    config["holdStatus"] = json!(text(&pr["holdStatus"]));
     config["newWorkspaceStatusSince"] = json!(
         pr["newWorkspaceStatusSince"]
             .as_f64()
@@ -90,6 +91,13 @@ impl Server {
     /// rule projects at it and removes `rules`.
     pub(crate) fn migrate_rules(&self) {
         let settings = self.resolved_settings(None);
+        // Hold moved into the script's own options (`holdStatus`); the schema no longer has the key.
+        if let Some(hold) = setting(&settings, &["automations", "hold_status"]) {
+            tracing::info!("automations.hold_status {hold} removed; scripts read their own holdStatus now");
+            if let Err(error) = strip_user_keys(&["automations.hold_status"]) {
+                tracing::warn!("removing automations.hold_status: {error}");
+            }
+        }
         let toggle = setting(&settings, &["notifications", "rules"]).cloned();
         let rules = setting(&settings, &["rules"]).cloned();
         let presets = setting(&settings, &["presets"]).is_some();
@@ -208,9 +216,6 @@ impl Server {
         if let Some(interval) = rules["interval_ms"].as_u64() {
             set("automations.interval_ms", Some(json!(interval)))?;
         }
-        if let Some(hold) = text(&pr["holdStatus"]) {
-            set("automations.hold_status", Some(json!(hold)))?;
-        }
         if let Some(status) = text(&pr["statusByCondition"]["reviewing"])
             && setting(settings, &["sidebar", "reviewingStatus"]).is_none()
         {
@@ -284,6 +289,7 @@ mod tests {
             "onResolved": "delete",
             "onReviewed": "none",
             "pmApprovalTeam": "acme/pm",
+            "holdStatus": "parked",
             "reviewInbox": { "enabled": true, "agent": "codex", "promptTemplate": "Look at #{{prNumber}}" },
         });
         let config = script_config(&pr, vec!["acme/app#4".into()], Map::new(), 7);
@@ -295,6 +301,7 @@ mod tests {
         assert_eq!(config["onReviewed"], "keep");
         assert_eq!(config["newWorkspaceStatusSince"], 7);
         assert_eq!(config["pmApprovalTeam"], "acme/pm");
+        assert_eq!(config["holdStatus"], "parked");
         assert_eq!(config["agent"], "codex");
         assert_eq!(config["reviewInbox"]["prompt"], "Look at #{{prNumber}}");
         assert_eq!(

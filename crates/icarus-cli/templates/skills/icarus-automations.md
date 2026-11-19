@@ -16,7 +16,7 @@ Icarus no longer has built-in rules. When it finds `rules` in the user settings 
 
 ## Actions a script can return
 
-Any server method the user could run through the CLI, e.g. `workspace.set` (status), `workspace.remove`, `agent.create` (with `prompt_id` to use a saved prompt), `terminal.create`, `review.workspace` (check out a PR to review, with an agent and the review layout), `workspace.sync_to_pr_head`, `tab.open`, `issue.assign`, `notification.send`. Cards in the hold column are left alone unless the action sets `force: true`.
+Any server method the user could run through the CLI, e.g. `workspace.set` (status), `workspace.remove`, `agent.create` (with `prompt_id` to use a saved prompt), `terminal.create`, `review.workspace` (check out a PR to review, with an agent and the review layout), `workspace.sync_to_pr_head`, `tab.open`, `issue.assign`, `notification.send`.
 
 ## Events from outside Icarus
 
