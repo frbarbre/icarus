@@ -237,6 +237,55 @@ pub fn set_composer_attach_handler(
     cx.set_global(GlobalComposerAttachHandler(Arc::new(handler)));
 }
 
+/// Payload of the `composer.draft` event: text for an agent's draft, left unsent.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ComposerDraftRequest {
+    pub workspace_path: PathBuf,
+    pub agent_id: String,
+    pub text: String,
+}
+
+type ComposerDraftHandler = Arc<
+    dyn Fn(String, String, &mut Workspace, &mut Window, &mut Context<Workspace>) -> Result<()>
+        + 'static,
+>;
+
+struct GlobalComposerDraftHandler(ComposerDraftHandler);
+
+impl gpui::Global for GlobalComposerDraftHandler {}
+
+pub fn set_composer_draft_handler(
+    cx: &mut App,
+    handler: impl Fn(String, String, &mut Workspace, &mut Window, &mut Context<Workspace>) -> Result<()>
+    + 'static,
+) {
+    cx.set_global(GlobalComposerDraftHandler(Arc::new(handler)));
+}
+
+fn draft_in_composer(request: ComposerDraftRequest, cx: &mut App) {
+    let Some(handler) = cx
+        .try_global::<GlobalComposerDraftHandler>()
+        .map(|handler| handler.0.clone())
+    else {
+        log::error!("no composer draft handler registered");
+        return;
+    };
+    let path = request.workspace_path.clone();
+    with_workspace_window(path.clone(), cx, move |workspace, window, cx| {
+        request_agent_tab(
+            Some(request.agent_id.clone()),
+            None,
+            true,
+            workspace,
+            window,
+            cx,
+        );
+        if let Err(error) = handler(request.agent_id, request.text, workspace, window, cx) {
+            show_workspace_error(&path, format!("Couldn't fill the composer: {error:#}"), cx);
+        }
+    });
+}
+
 fn attach_to_composer(request: ComposerAttachRequest, cx: &mut App) {
     // Clicks and menu entries run while their window is updated, so updating it here would fail.
     cx.defer(move |cx| {
@@ -1067,6 +1116,14 @@ fn start_app_connection(cx: &mut App) {
                             continue;
                         };
                         cx.update(|cx| attach_to_composer(request, cx));
+                    }
+                    "composer.draft" => {
+                        let Some(request) =
+                            serde_json::from_value::<ComposerDraftRequest>(event.payload).log_err()
+                        else {
+                            continue;
+                        };
+                        cx.update(|cx| draft_in_composer(request, cx));
                     }
                     "client.capture" => {
                         let Some(request) =

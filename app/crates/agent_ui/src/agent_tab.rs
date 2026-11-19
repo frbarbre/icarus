@@ -627,6 +627,8 @@ pub struct AgentComposer {
     /// Focus asked for before the target's conversation loaded, with what had focus then; given once
     /// it has loaded, unless focus has moved on since.
     pending_focus: Option<Option<FocusHandle>>,
+    /// Text for an agent's draft, typed in and focused once that agent's tab is the loaded target.
+    pending_draft: Option<(String, String)>,
     _target_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -653,6 +655,7 @@ impl AgentComposer {
             observed_thread_view: None,
             ensure_scheduled: false,
             pending_focus: None,
+            pending_draft: None,
             _target_subscriptions: Vec::new(),
             _subscriptions: vec![subscription],
         }
@@ -854,6 +857,48 @@ impl AgentComposer {
         Ok(())
     }
 
+    /// Types `text` into `agent_id`'s draft without sending it, and focuses it, once its tab has loaded.
+    pub fn draft_in_workspace(
+        agent_id: String,
+        text: String,
+        workspace: &Workspace,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> anyhow::Result<()> {
+        let composer = Self::for_workspace(workspace).context("no agent composer")?;
+        window.defer(cx, move |window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.pending_draft = Some((agent_id, text));
+                composer.apply_pending_draft(window, cx);
+                cx.notify();
+            });
+        });
+        Ok(())
+    }
+
+    fn apply_pending_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((agent_id, _)) = &self.pending_draft else {
+            return;
+        };
+        let Some(tab) = self.target() else {
+            return;
+        };
+        if tab.read(cx).agent_id(cx).as_ref() != Some(agent_id) {
+            return;
+        }
+        let Some(thread_view) = tab.read(cx).thread_view(cx) else {
+            return;
+        };
+        let Some((_, text)) = self.pending_draft.take() else {
+            return;
+        };
+        let message_editor = thread_view.read(cx).message_editor.clone();
+        window.defer(cx, move |window, cx| {
+            message_editor.update(cx, |editor, cx| editor.insert_text(&text, window, cx));
+            message_editor.focus_handle(cx).focus(window, cx);
+        });
+    }
+
     // The composer sits outside every pane, so tab keys pressed in it would find no pane to act on
     // and fall through to the draft's own bindings (fold, delete word, typed characters).
     fn forward_to_active_pane<A: gpui::Action>(
@@ -880,6 +925,7 @@ impl AgentComposer {
 
 impl Render for AgentComposer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_pending_draft(window, cx);
         if self.pending_focus.is_some()
             && let Some(thread_view) = self.target_thread_view(cx)
             && let Some(focused_at_request) = self.pending_focus.take()

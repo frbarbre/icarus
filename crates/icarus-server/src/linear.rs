@@ -560,20 +560,13 @@ impl Server {
                 .ok_or_else(|| rpc("linear_error", "Linear returned no viewer id"))?
                 .to_owned(),
         };
-        let reply = self
+        let success = self
             .linear
             .client
-            .query(
-                "mutation($id: String!, $assignee: String) { issueUpdate(id: $id, input: { assigneeId: $assignee }) { success } }",
-                json!({ "id": identifier, "assignee": assignee }),
-            )
+            .assign(&identifier, &assignee)
             .await
             .map_err(failed)?;
-        Ok(json!({
-            "id": identifier,
-            "assignee": assignee,
-            "success": reply["issueUpdate"]["success"],
-        }))
+        Ok(json!({ "id": identifier, "assignee": assignee, "success": success }))
     }
 
     pub(crate) async fn linear_dispatch(&self, method: &str, p: Value) -> Result<Value, RpcError> {

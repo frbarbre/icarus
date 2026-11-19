@@ -11,11 +11,18 @@ struct Skill {
     guide: &'static str,
 }
 
-const SKILLS: &[Skill] = &[Skill {
-    name: "icarus-automations",
-    description: "Set up, change or debug an Icarus automation script: the per-project script that moves cards between statuses, starts agents and shows card buttons. Use when the user wants something to happen automatically in Icarus, or asks why an automation did or didn't act.",
-    guide: include_str!("../templates/skills/icarus-automations.md"),
-}];
+const SKILLS: &[Skill] = &[
+    Skill {
+        name: "icarus-automations",
+        description: "Set up, change or debug an Icarus automation script: the per-project script that moves cards between statuses, starts agents and shows card buttons. Use when the user wants something to happen automatically in Icarus, or asks why an automation did or didn't act.",
+        guide: include_str!("../templates/skills/icarus-automations.md"),
+    },
+    Skill {
+        name: "icarus-linear",
+        description: "Read, search or assign Linear issues from an Icarus workspace (ICARUS_WORKSPACE_ID is set) with the `icarus issue` CLI. Use whenever work starts from a Linear issue in Icarus; prefer it over Orca's Linear CLI or a Linear connector there.",
+        guide: include_str!("../templates/skills/icarus-linear.md"),
+    },
+];
 
 #[derive(Subcommand)]
 pub enum SkillCommand {

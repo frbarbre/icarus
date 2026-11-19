@@ -795,6 +795,11 @@ fn main() {
                 cx,
             )
         });
+        icarus_ui::set_composer_draft_handler(cx, |agent_id, text, workspace, window, cx| {
+            agent_ui::agent_tab::AgentComposer::draft_in_workspace(
+                agent_id, text, workspace, window, cx,
+            )
+        });
         icarus_ui::set_layout_applied_handler(cx, |workspace, window, cx| {
             if let Some(composer) = agent_ui::agent_tab::AgentComposer::for_workspace(workspace) {
                 agent_ui::agent_tab::AgentComposer::focus(&composer, window, cx);

@@ -121,13 +121,8 @@ impl<T: Transport> Linear<T> {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now() + wait);
     }
 
-    /// Runs a read-only query and returns its `data`, or `{data, errors}` when `partial` allows errors next to data.
+    /// Runs a request and returns its `data`, or `{data, errors}` when `partial` allows errors next to data.
     async fn execute(&self, request: &LinearRequest, partial: bool) -> Result<Value> {
-        if !request.query.trim_start().starts_with("query") {
-            return Err(LinearError::Malformed(
-                "only queries are sent to Linear".into(),
-            ));
-        }
         let mut retried = false;
         loop {
             if let Some(wait) = self.blocked() {
@@ -215,8 +210,27 @@ impl<T: Transport> Linear<T> {
 
     /// A read-only GraphQL query (e.g. `viewer`); mutations are refused.
     pub async fn query(&self, query: &str, variables: Value) -> Result<Value> {
+        if !query.trim_start().starts_with("query") {
+            return Err(LinearError::Malformed(
+                "only queries are sent to Linear".into(),
+            ));
+        }
         self.execute(&LinearRequest::new(query, variables), false)
             .await
+    }
+
+    /// Assigns the issue to `assignee`; the only write Icarus makes to Linear.
+    pub async fn assign(&self, identifier: &str, assignee: &str) -> Result<bool> {
+        let data = self
+            .execute(
+                &LinearRequest::new(
+                    "mutation AssignIssue($id: String!, $assignee: String) { issueUpdate(id: $id, input: { assigneeId: $assignee }) { success } }",
+                    serde_json::json!({ "id": identifier, "assignee": assignee }),
+                ),
+                false,
+            )
+            .await?;
+        Ok(data["issueUpdate"]["success"] == true)
     }
 
     pub async fn issue(&self, identifier: &str) -> Result<Issue> {
@@ -509,6 +523,25 @@ mod tests {
         let found = linear.issues(&ids).await.expect("batch");
         assert_eq!(found.len(), BATCH_MAX + 1);
         assert_eq!(linear.transport().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn assigning_sends_the_one_mutation_while_queries_stay_read_only() {
+        let linear = client(FakeLinear::new().on(
+            "AssignIssue",
+            LinearResponse::ok(json!({ "data": { "issueUpdate": { "success": true } } })),
+        ));
+        assert!(linear.assign("ABC-1", "user-1").await.expect("assign"));
+        assert!(matches!(
+            linear
+                .query(
+                    "mutation Drop { issueDelete(id: \"x\") { success } }",
+                    json!({})
+                )
+                .await,
+            Err(LinearError::Malformed(_))
+        ));
+        assert_eq!(linear.transport().count(), 1);
     }
 
     #[tokio::test]

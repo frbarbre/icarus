@@ -628,24 +628,42 @@ impl Server {
     /// Everything the script sees, apart from the trigger, time, memory and previous scope.
     async fn automation_scope(self: &Arc<Self>, project: &Project, settings: &Value) -> Value {
         let workspaces = self.store.workspaces(Some(&project.id)).unwrap_or_default();
-        let agents = self.agents.list();
-        let mut list = Vec::new();
-        for workspace in &workspaces {
-            list.push(self.scope_workspace(workspace, &agents).await);
+        let agents = Arc::new(self.agents.list());
+        // Each workspace's git and PR lookups take a few hundred ms; one after another they made every run slow.
+        let mut pending = tokio::task::JoinSet::new();
+        for (index, workspace) in workspaces.iter().cloned().enumerate() {
+            let (server, agents) = (self.clone(), agents.clone());
+            pending
+                .spawn(async move { (index, server.scope_workspace(&workspace, &agents).await) });
         }
-        let inbox = self.scope_inbox(project, &workspaces).await;
-        let mut teams = serde_json::Map::new();
-        for team in setting(settings, &["automations", "teams"])
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            match self.github.team_roster(team).await {
-                Ok(roster) => teams.extend(roster.into_iter().map(|(k, v)| (k, json!(v)))),
-                Err(error) => tracing::warn!("automation team {team}: {error}"),
+        let teams = async {
+            let mut teams = serde_json::Map::new();
+            for team in setting(settings, &["automations", "teams"])
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                match self.github.team_roster(team).await {
+                    Ok(roster) => teams.extend(roster.into_iter().map(|(k, v)| (k, json!(v)))),
+                    Err(error) => tracing::warn!("automation team {team}: {error}"),
+                }
+            }
+            teams
+        };
+        let (inbox, teams, viewer) = tokio::join!(
+            self.scope_inbox(project, &workspaces),
+            teams,
+            self.github.viewer_login()
+        );
+        let mut list = vec![Value::Null; workspaces.len()];
+        while let Some(joined) = pending.join_next().await {
+            match joined {
+                Ok((index, value)) => list[index] = value,
+                Err(error) => tracing::warn!("automation scope: {error}"),
             }
         }
+        list.retain(|value| !value.is_null());
         json!({
             "inbox": inbox,
             "teams": teams,
@@ -661,7 +679,7 @@ impl Server {
                 "statuses": setting(settings, &["workspace", "statuses"]).cloned().unwrap_or(json!([])),
                 "prompts": setting(settings, &["prompts"]).cloned().unwrap_or(json!({})),
             },
-            "viewer": self.github.viewer_login().await.ok(),
+            "viewer": viewer.ok(),
             "icarus_version": crate::updates::VERSION,
         })
     }

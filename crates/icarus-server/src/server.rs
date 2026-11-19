@@ -810,6 +810,8 @@ impl Server {
                     env: BTreeMap<String, String>,
                     /// Sent as the first message once the agent is up.
                     prompt: Option<String>,
+                    /// Put in the agent's composer unsent, with its workspace brought to the front.
+                    draft: Option<String>,
                     /// Account id or label; `system` for the provider's own login.
                     account: Option<String>,
                     /// Claude Code's Remote Control; default `agents.remote_control`.
@@ -820,10 +822,26 @@ impl Server {
                     #[serde(default = "default_true")]
                     offer_tab: bool,
                 }
-                let p: P = params(params_value)?;
-                let cwd = match p.cwd {
-                    Some(cwd) => cwd,
-                    None => dirs::home_dir().ok_or_else(|| rpc("invalid_params", "no cwd"))?,
+                let mut p: P = params(params_value)?;
+                let workspace = match &p.workspace {
+                    Some(key) => Some(
+                        self.store
+                            .workspace(key)
+                            .map_err(|e| rpc("internal", e))?
+                            .ok_or_else(|| rpc("not_found", format!("workspace {key}")))?,
+                    ),
+                    None => None,
+                };
+                if let Some(ws) = &workspace {
+                    p.workspace = Some(ws.id.clone());
+                }
+                let workspace_path = workspace.as_ref().map(|ws| ws.path.clone());
+                let cwd = match (p.cwd.take(), workspace) {
+                    (Some(cwd), _) => cwd,
+                    (None, Some(ws)) => ws.path,
+                    (None, None) => {
+                        dirs::home_dir().ok_or_else(|| rpc("invalid_params", "no cwd"))?
+                    }
                 };
                 if !cwd.is_dir() {
                     return Err(rpc(
@@ -870,7 +888,16 @@ impl Server {
                     .create(options)
                     .await
                     .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
-                if p.offer_tab {
+                let drafted = match (p.draft, &workspace_path) {
+                    (Some(text), Some(path)) => {
+                        self.send_to_apps(
+                            "composer.draft",
+                            json!({ "workspace_path": path, "agent_id": thread.info().id, "text": text }),
+                        ) > 0
+                    }
+                    _ => false,
+                };
+                if p.offer_tab && !drafted {
                     self.offer_agent_tab(&thread.info());
                 }
                 if let Some(prompt) = p.prompt {

@@ -2246,6 +2246,10 @@ fn delete_workspace(
                 Err(error) => error,
             };
             let code = error_code(&error);
+            // An earlier delete of the same workspace finished first.
+            if code.as_deref() == Some("not_found") {
+                return cx.update(|_, cx| refresh_panel(&workspace, cx));
+            }
             if !code
                 .as_deref()
                 .is_some_and(|code| FORCEABLE.contains(&code))

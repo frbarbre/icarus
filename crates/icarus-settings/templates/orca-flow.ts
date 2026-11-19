@@ -291,23 +291,31 @@ if (scope.trigger?.kind === "event" && scope.trigger.name === "linear.open_issue
   const issue = env.LINEAR_ISSUE_IDENTIFIER;
   // The name doubles as the dev server's <name>.localhost label, so it stays the short issue id.
   const name = lower(issue ?? env.LINEAR_ISSUE_BRANCH_NAME ?? "linear-task");
+  const branch = env.LINEAR_ISSUE_BRANCH_NAME;
   const existing = scope.workspaces.find((ws) => lower(ws.name) === name);
-  if (issue) actions.push({ method: "issue.assign", params: { id: issue } });
   if (!existing) {
     actions.push({
       method: "workspace.create",
-      params: { project: scope.project.id, name, ...(issue ? { issue } : {}), agent: false },
-    });
-    actions.push({
-      method: "agent.create",
       params: {
-        workspace: name,
-        provider: config.agent,
-        mode: "plan",
-        prompt: env.LINEAR_PROMPT || `Work on ${issue ?? "this issue"}.`,
+        project: scope.project.id,
+        name,
+        ...(branch ? { branch } : {}),
+        ...(issue ? { issue } : {}),
+        agent: false,
       },
     });
   }
+  // A draft, not a prompt: the app brings the workspace up with the text in the composer, unsent.
+  actions.push({
+    method: "agent.create",
+    params: {
+      workspace: existing?.id ?? name,
+      provider: config.agent,
+      mode: "plan",
+      draft: env.LINEAR_PROMPT || `Work on ${issue ?? "this issue"}.`,
+    },
+  });
+  if (issue) actions.push({ method: "issue.assign", params: { id: issue } });
 }
 
 // Inbox entries stay while the PR still asks for a review, so a deleted review workspace isn't recreated.

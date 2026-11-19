@@ -1097,6 +1097,93 @@ async fn agents_the_server_starts_for_a_workspace_are_offered_to_the_app_as_tabs
 }
 
 #[tokio::test]
+async fn an_agent_with_a_draft_starts_in_its_named_workspace_and_leaves_the_text_unsent() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let repo = tempfile::tempdir().expect("repo");
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    git(repo.path(), &["config", "user.email", "t@example.com"]);
+    git(repo.path(), &["config", "user.name", "T"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.path().join("readme.md"), "hello\n").expect("write");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "init"]);
+    let _server = start_server(home.path());
+    let fake = env!("CARGO_BIN_EXE_icarus-fake-agent");
+    let (client, _events) = Client::connect(home.path(), "test").await.expect("connect");
+    let project = client
+        .request("project.add", json!({ "path": repo.path() }))
+        .await
+        .expect("add project");
+    let workspace = client
+        .request(
+            "workspace.create",
+            json!({ "project": project["id"], "name": "e-12", "branch": "feature/e-12-fix", "agent": false }),
+        )
+        .await
+        .expect("create workspace");
+    assert_eq!(workspace["branch"], "feature/e-12-fix");
+    let path = workspace["path"].as_str().expect("path").to_owned();
+
+    let unseen = client
+        .request(
+            "agent.create",
+            json!({ "workspace": "e-12", "command": [fake], "draft": "Fix E-12" }),
+        )
+        .await
+        .expect("create without an app");
+    assert_eq!(
+        unseen["workspace"], workspace["id"],
+        "the name resolves to the workspace"
+    );
+    assert_eq!(
+        std::fs::canonicalize(unseen["cwd"].as_str().expect("cwd")).expect("cwd"),
+        std::fs::canonicalize(&path).expect("path"),
+        "it starts in the workspace's folder, not the home folder"
+    );
+    let taken = client
+        .request("workspace.take_agent_tabs", json!({ "id": path }))
+        .await
+        .expect("take");
+    assert_eq!(
+        taken["agents"],
+        json!([unseen["id"]]),
+        "with no app to take the draft, the agent is still offered as a tab"
+    );
+
+    let (_app, mut app_events) = Client::connect(home.path(), "icarus-app")
+        .await
+        .expect("app");
+    let info = client
+        .request(
+            "agent.create",
+            json!({ "workspace": "e-12", "command": [fake], "draft": "Fix E-12" }),
+        )
+        .await
+        .expect("create");
+    let draft = next_event(&mut app_events, "composer.draft").await;
+    assert_eq!(draft["agent_id"], info["id"]);
+    assert_eq!(draft["text"], "Fix E-12");
+    assert_eq!(draft["workspace_path"], json!(path));
+    let idle = client
+        .request(
+            "agent.wait",
+            json!({ "id": info["id"], "timeout_ms": 5000 }),
+        )
+        .await
+        .expect("wait");
+    assert_eq!(idle["turns"], 0, "the draft is never sent: {idle}");
+    let taken = client
+        .request("workspace.take_agent_tabs", json!({ "id": path }))
+        .await
+        .expect("take");
+    assert_eq!(
+        taken["agents"],
+        json!([]),
+        "the app opens the drafted agent's tab itself"
+    );
+}
+
+#[tokio::test]
 async fn capture_requests_reach_only_the_app() {
     let home = tempfile::tempdir().expect("tempdir");
     let _server = start_server(home.path());

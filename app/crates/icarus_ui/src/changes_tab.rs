@@ -1265,6 +1265,8 @@ impl SourceControlPanel {
                     Err(error) => {
                         this.refreshing = None;
                         this.error = Some(format!("{error:#}").into());
+                        // A workspace deleted and recreated at this path has a new id; look it up again.
+                        this.icarus_workspace = None;
                         None
                     }
                 }
