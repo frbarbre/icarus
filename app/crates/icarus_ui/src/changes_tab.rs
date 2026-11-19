@@ -3654,8 +3654,9 @@ fn open_row(
         .detach();
         return;
     }
-    if let Some(sha) = sha {
-        open_commit_view(sha, Some(&row.path), workspace, window, cx);
+    match sha {
+        Some(sha) => open_commit_view(sha, Some(&row.path), workspace, window, cx),
+        None => log::warn!("can't open {}: the listing has no turn or commit", row.path),
     }
 }
 
@@ -3668,6 +3669,7 @@ fn open_commit_view(
     cx: &mut Context<Workspace>,
 ) {
     let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
+        log::warn!("can't open {sha} in the commit view: the project has no active repository");
         return;
     };
     CommitView::open(
