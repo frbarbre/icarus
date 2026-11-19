@@ -3195,9 +3195,11 @@ async fn main() -> Result<()> {
                     account,
                     remote_control,
                 } => {
-                    let cwd = match cwd {
-                        Some(cwd) => cwd.clone(),
-                        None => std::env::current_dir()?,
+                    // With a workspace the server starts the agent in the workspace's folder.
+                    let cwd = match (cwd, workspace) {
+                        (Some(cwd), _) => Some(cwd.clone()),
+                        (None, Some(_)) => None,
+                        (None, None) => Some(std::env::current_dir()?),
                     };
                     let value = client
                         .request(

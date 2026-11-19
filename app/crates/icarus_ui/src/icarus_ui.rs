@@ -1337,10 +1337,22 @@ pub fn init(cx: &mut App) {
         if window.is_some() {
             // A workspace opened after its layout was stored (e.g. the app was closed) applies it now.
             cx.spawn(async move |workspace, cx| {
-                for _ in 0..20 {
-                    let ready = workspace
-                        .read_with(cx, |workspace, cx| !workspace.root_paths(cx).is_empty())
-                        .unwrap_or(false);
+                // Queued layouts are skipped until window_for_path finds the workspace, and saved
+                // tabs still restoring would replace them.
+                for _ in 0..240 {
+                    let Some(this) = workspace.upgrade() else {
+                        return;
+                    };
+                    let ready = cx.update(|cx| {
+                        let loading = cx
+                            .try_global::<LoadingWorkspaces>()
+                            .is_some_and(|loading| loading.0.contains(&this.entity_id()));
+                        !loading
+                            && this.read(cx).root_paths(cx).iter().any(|root| {
+                                window_for_path(root, cx).is_some_and(|(_, found)| found == this)
+                            })
+                    });
+                    drop(this);
                     if ready {
                         break;
                     }
