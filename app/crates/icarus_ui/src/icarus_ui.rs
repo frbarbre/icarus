@@ -2377,26 +2377,26 @@ impl WorkspacesPanel {
             cards::GroupBy::Stack => {
                 // Why: a stack lane is ordered by stack position, so pins don't reorder it.
                 return group_by_stack(&workspaces, &self.status_order, self.view.stack_ascending)
-                .into_iter()
-                .map(|mut group| {
-                    if !matches!(group.lane, StackLane::Stack { .. }) {
-                        pinned_first(&mut group.workspaces);
-                    }
-                    group
-                })
-                .map(|group| match group.lane {
-                    StackLane::Stack { number, .. } => (
-                        Icon::new(IconName::ListTree)
-                            .size(IconSize::Small)
-                            .color(Color::Accent),
-                        format!("Stack #{number}"),
-                        group.workspaces,
-                    ),
-                    StackLane::None => {
-                        (no_status_icon(), "Not in a stack".into(), group.workspaces)
-                    }
-                })
-                .collect();
+                    .into_iter()
+                    .map(|mut group| {
+                        if !matches!(group.lane, StackLane::Stack { .. }) {
+                            pinned_first(&mut group.workspaces);
+                        }
+                        group
+                    })
+                    .map(|group| match group.lane {
+                        StackLane::Stack { number, .. } => (
+                            Icon::new(IconName::ListTree)
+                                .size(IconSize::Small)
+                                .color(Color::Accent),
+                            format!("Stack #{number}"),
+                            group.workspaces,
+                        ),
+                        StackLane::None => {
+                            (no_status_icon(), "Not in a stack".into(), group.workspaces)
+                        }
+                    })
+                    .collect();
             }
             cards::GroupBy::Project => self
                 .project_groups()
@@ -2714,6 +2714,8 @@ impl WorkspacesPanel {
         let path = workspace.path.clone();
         let view = self.view.clone();
         let shown = self.shows_workspace(&workspace.path, cx);
+        let deleting = lifecycle::is_deleting(&workspace.id, cx);
+        let deleting_id = workspace.id.clone();
         let inactive = self.is_inactive(workspace);
         let title = match (&workspace.issue, &workspace.title, &workspace.branch) {
             (None, None, Some(branch)) if inactive => branch.clone(),
@@ -2780,7 +2782,11 @@ impl WorkspacesPanel {
                 key,
                 workspace.display_title(),
                 card,
-                move |panel, window, cx| panel.open_workspace(path.clone(), window, cx),
+                move |panel, window, cx| {
+                    if !lifecycle::is_deleting(&deleting_id, cx) {
+                        panel.open_workspace(path.clone(), window, cx)
+                    }
+                },
                 cx,
             )
             .child(
@@ -2835,8 +2841,29 @@ impl WorkspacesPanel {
                         workspace.setup.as_ref().and_then(SetupSummary::badge),
                         |row, badge| row.child(render_setup_badge(&workspace.id, badge)),
                     )
-                    .child(self.render_card_meta(workspace, cx)),
+                    .map(|row| {
+                        if deleting {
+                            row.child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        Icon::new(IconName::ArrowCircle)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted)
+                                            .with_rotate_animation(2),
+                                    )
+                                    .child(
+                                        Label::new("Deleting…")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                        } else {
+                            row.child(self.render_card_meta(workspace, cx))
+                        }
+                    }),
             )
+            .when(deleting, |card| card.opacity(0.5).cursor_default())
             .when(!chips.is_empty(), |card| {
                 card.child(
                     h_flex()

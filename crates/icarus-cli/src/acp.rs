@@ -229,6 +229,8 @@ pub fn event_to_updates(event: &Value, mode: Mode, tools: &mut ToolState) -> Vec
     }
 }
 
+/// Matches the editor's `acp_thread::TYPED_ANSWER_OPTION_ID`.
+const TYPED_ANSWER: &str = "answer:other";
 const MODE_OPTION: &str = "mode";
 const MODEL_OPTION: &str = "model";
 /// Icarus's own command: Claude Code has no Remote Control in headless mode, so Icarus restarts it with it.
@@ -444,6 +446,13 @@ pub fn permission_request(
             options.push(json!({ "optionId": id, "name": label, "kind": "allow_once" }));
             answers.push((id, "allow".to_string(), Some(json!({ asked: label }))));
         }
+        // The editor shows this one as a text field and sends what was typed in `_meta.answer`.
+        options.push(json!({ "optionId": TYPED_ANSWER, "name": "Other", "kind": "allow_once" }));
+        answers.push((
+            TYPED_ANSWER.into(),
+            "allow".into(),
+            Some(json!({ asked: "" })),
+        ));
         options.push(json!({ "optionId": "deny", "name": "Dismiss", "kind": "reject_once" }));
         answers.push(("deny".into(), "deny".into(), None));
     } else {
@@ -573,7 +582,22 @@ impl Bridge {
                 .then(|| outcome["optionId"].as_str())
                 .flatten()
                 .and_then(|id| answers.iter().find(|(option, _, _)| option == id));
+            let typed = outcome["_meta"]["answer"].as_str().map(str::trim);
             let (decision, answers) = match chosen {
+                Some((id, _, Some(Value::Object(asked)))) if id == TYPED_ANSWER => {
+                    match typed.filter(|text| !text.is_empty()) {
+                        Some(text) => (
+                            "allow",
+                            Some(Value::Object(
+                                asked
+                                    .keys()
+                                    .map(|question| (question.clone(), json!(text)))
+                                    .collect(),
+                            )),
+                        ),
+                        None => ("deny", None),
+                    }
+                }
                 Some((_, decision, answers)) => (decision.as_str(), answers.clone()),
                 None => ("deny", None),
             };
@@ -1202,6 +1226,10 @@ mod tests {
         assert_eq!(params["toolCall"]["title"], "Which base?");
         assert_eq!(answers[1].0, "answer:1");
         assert_eq!(answers[1].2, Some(json!({ "Which base?": "dev" })));
+        assert_eq!(
+            answers[2].0, TYPED_ANSWER,
+            "a typed answer comes last before dismissing"
+        );
         assert_eq!(answers.last().map(|a| a.1.as_str()), Some("deny"));
     }
 

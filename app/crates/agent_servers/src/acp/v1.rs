@@ -10207,9 +10207,21 @@ fn permission_outcome_to_v1(
             acp::RequestPermissionOutcome::Cancelled
         }
         acp_thread::RequestPermissionOutcome::Selected(outcome) => {
-            acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
-                acp::PermissionOptionId::new(outcome.option_id.0),
-            ))
+            let answer = match outcome.params {
+                Some(acp_thread::SelectedPermissionParams::Answer { text }) => {
+                    Some(serde_json::Map::from_iter([(
+                        "answer".to_string(),
+                        serde_json::Value::String(text),
+                    )]))
+                }
+                _ => None,
+            };
+            acp::RequestPermissionOutcome::Selected(
+                acp::SelectedPermissionOutcome::new(acp::PermissionOptionId::new(
+                    outcome.option_id.0,
+                ))
+                .meta(answer),
+            )
         }
     }
 }

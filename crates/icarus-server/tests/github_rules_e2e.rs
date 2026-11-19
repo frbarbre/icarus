@@ -638,8 +638,18 @@ async fn run(world: &World) -> Value {
 }
 
 fn flow_settings(script: &Path, armed: bool) -> Value {
+    let statuses = [
+        "in-progress",
+        "in-review",
+        "completed",
+        "draft",
+        "changes-requested",
+        "done",
+    ]
+    .map(|id| json!({ "id": id, "label": id }));
     fake_agent_settings(json!({
         "automations": { "armed": armed, "scripts": { "widgets": script } },
+        "workspace": { "statuses": statuses },
     }))
 }
 
@@ -730,6 +740,28 @@ fn changes_requested_by(login: &str) -> Value {
     json!({ "latestReviews": { "nodes": [
         { "state": "CHANGES_REQUESTED", "author": { "login": login } },
     ] } })
+}
+
+#[tokio::test]
+async fn options_naming_a_status_settings_dont_have_fail_the_run() {
+    if !bun_installed() {
+        eprintln!("skipped: no bun");
+        return;
+    }
+    let scripts = tempfile::tempdir().expect("scripts");
+    let script = scripts.path().join("orca-flow.ts");
+    write_flow(&script, json!({ "review": "renamed-column" }));
+    let world = World::new(flow_settings(&script, true), json!({ "viewer": "me" })).await;
+    world.workspace("feat-a").await;
+
+    let out = run(&world).await;
+    assert_eq!(out["failed"], true, "{out}");
+    assert!(
+        out["stderr"]
+            .as_str()
+            .is_some_and(|stderr| stderr.contains("no status \"renamed-column\" in settings")),
+        "{out}"
+    );
 }
 
 #[tokio::test]

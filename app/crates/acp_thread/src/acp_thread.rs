@@ -1972,8 +1972,17 @@ impl From<&ResolvedLocation> for AgentLocation {
 
 #[derive(Debug, Clone)]
 pub enum SelectedPermissionParams {
-    Terminal { patterns: Vec<String> },
+    Terminal {
+        patterns: Vec<String>,
+    },
+    /// What the user typed for an agent's question instead of picking an offered answer.
+    Answer {
+        text: String,
+    },
 }
+
+/// The option an agent offers for a question when it takes a typed answer; it is shown as a text field.
+pub const TYPED_ANSWER_OPTION_ID: &str = "answer:other";
 
 #[derive(Debug, Clone)]
 pub struct SelectedPermissionOutcome {

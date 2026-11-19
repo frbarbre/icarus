@@ -151,15 +151,13 @@ fn wanted_definition(server: &Path, home: &Path) -> Result<(PathBuf, String)> {
     Ok((service_path()?, text))
 }
 
-/// Starts the installed service's server again, re-installing only when its definition changed.
+/// Starts the installed service's server again (on Linux re-installing only when its definition changed).
 pub fn start_again(server: &Path, home: &Path) -> Result<()> {
     let (path, wanted) = wanted_definition(server, home)?;
     let current = std::fs::read_to_string(&path).ok();
     if cfg!(target_os = "macos") {
-        let target = format!("{}/{LABEL}", gui_domain()?);
-        if current.as_deref() == Some(wanted.as_str()) && launchd_loaded(&target) {
-            return run("launchctl", &["kickstart", &target]);
-        }
+        // launchd pins a loaded job to the binary it first launched; an upgraded, ad-hoc signed binary
+        // fails that check and is killed (Launch Constraint Violation), so the job is always reloaded.
         install(server, home).map(drop)
     } else {
         if current.as_deref() != Some(wanted.as_str()) {
@@ -173,10 +171,7 @@ pub fn start_again(server: &Path, home: &Path) -> Result<()> {
 /// Kills whatever the service runs and starts it fresh; the way out when a handoff went wrong.
 pub fn kickstart(server: &Path, home: &Path) -> Result<()> {
     if cfg!(target_os = "macos") {
-        let target = format!("{}/{LABEL}", gui_domain()?);
-        if launchd_loaded(&target) {
-            return run("launchctl", &["kickstart", "-k", &target]);
-        }
+        // Bootout stops whatever the job runs; reloading also renews launchd's pin on the binary.
         install(server, home).map(drop)
     } else {
         run("systemctl", &["--user", "restart", "icarus-server.service"])

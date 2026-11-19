@@ -1,19 +1,24 @@
 // The GitHub PR flow that Orca's workspace status rules ran, as an automation script.
 // The options below are yours to change; `automations.scripts.<project>` points a project at this file.
-import type { Action, Button, Decision, InboxPullRequest, PullRequest, Scope, Workspace } from "./.generated/icarus";
+import type {
+  Action, Button, Decision, InboxPullRequest, PromptId, PullRequest, Scope, StatusId, Workspace,
+} from "./.generated/icarus";
 
-type Condition =
-  | "merged" | "closed" | "reviewing" | "merge-queue" | "conflicts" | "draft"
-  | "changes-requested" | "merging" | "pm-approval" | "review";
+// This script's own names for the PR states it works out below; Icarus has no list of them.
+const CONDITIONS = [
+  "merged", "closed", "reviewing", "merge-queue", "conflicts", "draft",
+  "changes-requested", "merging", "pm-approval", "review",
+] as const;
+type Condition = (typeof CONDITIONS)[number];
 
 type Config = {
   /** The column each PR condition moves a card to; a missing condition never moves cards. */
-  statusByCondition: Partial<Record<Condition, string>>;
+  statusByCondition: Partial<Record<Condition, StatusId>>;
   /** The column for a new workspace without one, for workspaces created at or after `newWorkspaceStatusSince` (epoch ms). */
-  newWorkspaceStatus: string | null;
+  newWorkspaceStatus: StatusId | null;
   newWorkspaceStatusSince: number;
   /** Cards in this column are left alone: no moves, deletes, agents or notifications. */
-  holdStatus: string | null;
+  holdStatus: StatusId | null;
   /** Delete the workspace when its PR merges or closes (only when its checkout is at the PR's head). */
   onResolved: "keep" | "delete";
   /** Delete a review workspace once you've approved or requested changes and sent your drafts. */
@@ -51,7 +56,31 @@ const MAX_CREATE_ATTEMPTS = 3;
 const MAX_TRIAGES_PER_PR = 3;
 const DAY = 86_400_000;
 
+const PROMPT_BY_STEP = {
+  "commit-and-push": "commitAndPush",
+  "create-pull-request": "createPullRequest",
+  "ready-for-review": "readyForReview",
+} as const satisfies Record<string, PromptId>;
+
 const scope: Scope = await Bun.stdin.json();
+
+// Bun runs this without type-checking, so a status or prompt renamed in settings since it was written fails here.
+{
+  const statusIds = new Set<string>(scope.settings.statuses.map((s) => s.id));
+  const problems = [
+    ...Object.keys(config.statusByCondition)
+      .filter((name) => !(CONDITIONS as readonly string[]).includes(name))
+      .map((name) => `statusByCondition has no condition "${name}"`),
+    ...[...Object.values(config.statusByCondition), config.newWorkspaceStatus, config.holdStatus]
+      .filter((id) => id != null && !statusIds.has(id))
+      .map((id) => `no status "${id}" in settings`),
+    ...Object.values(PROMPT_BY_STEP)
+      .filter((id) => !(id in scope.settings.prompts))
+      .map((id) => `no prompt "${id}" in settings`),
+  ];
+  if (problems.length) throw new Error(`orca-flow options are out of date: ${problems.join("; ")}`);
+}
+
 const now = scope.now;
 const viewer = (scope.viewer ?? "").toLowerCase();
 type Memory = {
@@ -362,12 +391,6 @@ function nextStep(ws: Workspace): Button | null {
   if (ws.head_is_local && ws.merge_step) return { id: "merge", label: MERGE_LABELS[ws.merge_step.step] };
   return null;
 }
-
-const PROMPT_BY_STEP = {
-  "commit-and-push": "commitAndPush",
-  "create-pull-request": "createPullRequest",
-  "ready-for-review": "readyForReview",
-} as const;
 
 function runStep(ws: Workspace, step: Button) {
   const pr = ws.pr;

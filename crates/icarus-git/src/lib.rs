@@ -539,7 +539,28 @@ pub fn remove_worktree(
         .and_then(|w| w.branch);
     let path_str = path.to_string_lossy();
     if force {
-        git(repo, &["worktree", "remove", "--force", &path_str])?;
+        // `git worktree remove` deletes every file before returning (half a minute with node_modules);
+        // a rename is instant, and the files go in the background.
+        let trash = path.with_file_name(format!(
+            ".icarus-trash-{}-{}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        if std::fs::rename(path, &trash).is_ok() {
+            if let Err(error) = git(repo, &["worktree", "prune"]) {
+                std::fs::rename(&trash, path).ok();
+                return Err(error.into());
+            }
+            std::thread::spawn(move || {
+                if let Err(error) = std::fs::remove_dir_all(&trash) {
+                    tracing::warn!("deleting {}: {error}", trash.display());
+                }
+            });
+        } else {
+            git(repo, &["worktree", "remove", "--force", &path_str])?;
+        }
     } else {
         git(repo, &["worktree", "remove", &path_str])?;
     }

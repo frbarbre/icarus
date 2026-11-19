@@ -2113,6 +2113,54 @@ pub fn run_bulk_action(
         .detach();
 }
 
+#[derive(Default)]
+struct DeletingWorkspaces(collections::HashSet<String>);
+
+impl gpui::Global for DeletingWorkspaces {}
+
+pub(crate) fn is_deleting(id: &str, cx: &App) -> bool {
+    cx.try_global::<DeletingWorkspaces>()
+        .is_some_and(|deleting| deleting.0.contains(id))
+}
+
+/// The card next to the shown one in sidebar order (after it, else before it), skipping cards being deleted.
+fn neighbour_to_show(workspace: &WeakEntity<Workspace>, cx: &App) -> Option<PathBuf> {
+    let panel = workspace.upgrade()?.read(cx).panel::<WorkspacesPanel>(cx)?;
+    let panel = panel.read(cx);
+    let cards: Vec<WorkspaceSummary> = panel
+        .sections(cx)
+        .into_iter()
+        .flat_map(|(_, _, cards)| cards)
+        .collect();
+    let shown = cards
+        .iter()
+        .position(|card| panel.shows_workspace(&card.path, cx))?;
+    let (before, after) = cards.split_at(shown);
+    after
+        .iter()
+        .skip(1)
+        .chain(before.iter().rev())
+        .find(|card| !is_deleting(&card.id, cx))
+        .map(|card| card.path.clone())
+}
+
+/// Drops a deleted workspace's tabs from its window; its folder is gone.
+fn close_deleted_workspace(path: &Path, cx: &mut App) -> Option<Task<Result<bool>>> {
+    let (window, deleted) = crate::window_for_path(path, cx)?;
+    window
+        .update(cx, |multi_workspace, window, cx| {
+            // KeepProject would reopen the repo when the deleted workspace is still shown; CloseProject
+            // drops every workspace grouped with it, which is only safe when nothing else is shown.
+            let intent = if multi_workspace.workspace() == &deleted {
+                workspace::RemovalIntent::CloseProject
+            } else {
+                workspace::RemovalIntent::KeepProject
+            };
+            multi_workspace.remove([deleted], intent, window, cx)
+        })
+        .log_err()
+}
+
 /// Force-deletes without asking: the user deletes on purpose, so local changes and unsent comments go too.
 fn delete_workspaces(
     targets: Vec<(ServerRef, WorkspaceSummary)>,
@@ -2120,8 +2168,31 @@ fn delete_workspaces(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let deleting = &mut cx.default_global::<DeletingWorkspaces>().0;
+    for (_, summary) in &targets {
+        deleting.insert(summary.id.clone());
+    }
+    let shown_is_deleted = workspace.upgrade().is_some_and(|shown| {
+        let roots = shown.read(cx).root_paths(cx);
+        targets.iter().any(|(server, summary)| {
+            *server == ServerRef::Primary && roots.iter().any(|root| root.as_ref() == summary.path)
+        })
+    });
+    let navigated = if shown_is_deleted && let Some(neighbour) = neighbour_to_show(&workspace, cx) {
+        let (shown, navigated) = futures::channel::oneshot::channel();
+        crate::with_workspace_window(neighbour, cx, move |_, _, _| {
+            shown.send(()).ok();
+        });
+        Some(navigated)
+    } else {
+        None
+    };
+    cx.refresh_windows();
     window
         .spawn(cx, async move |cx| {
+            if let Some(navigated) = navigated {
+                navigated.await.ok();
+            }
             let mut failures = Vec::new();
             for (server, summary) in targets {
                 let removed = cx
@@ -2134,6 +2205,25 @@ fn delete_workspaces(
                         )
                     })?
                     .await;
+                let closed = cx.update(|_, cx| {
+                    let deleted = removed.as_ref().map_or_else(
+                        |error| error_code(error).as_deref() == Some("not_found"),
+                        |_| true,
+                    );
+                    // A deleted id stays marked so its card can't flash back before the list refreshes.
+                    if !deleted {
+                        cx.default_global::<DeletingWorkspaces>()
+                            .0
+                            .remove(&summary.id);
+                        cx.refresh_windows();
+                    }
+                    (deleted && server == ServerRef::Primary)
+                        .then(|| close_deleted_workspace(&summary.path, cx))
+                        .flatten()
+                })?;
+                if let Some(closed) = closed {
+                    closed.await.log_err();
+                }
                 let Err(error) = removed else {
                     continue;
                 };

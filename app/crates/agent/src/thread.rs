@@ -7096,6 +7096,7 @@ impl ToolCallEventStream {
                     });
                 });
             }
+            Some(acp_thread::SelectedPermissionParams::Answer { .. }) => {}
             None => {
                 let tool = tool.to_string();
                 cx.update(|cx| {

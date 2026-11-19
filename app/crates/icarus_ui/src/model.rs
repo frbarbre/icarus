@@ -406,10 +406,7 @@ impl WorkspaceSummary {
 /// Which lane a workspace takes when the list is grouped by stack.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StackLane {
-    Stack {
-        project_id: String,
-        number: u64,
-    },
+    Stack { project_id: String, number: u64 },
     None,
 }
 

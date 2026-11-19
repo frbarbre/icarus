@@ -361,6 +361,13 @@ fn remove_refuses_dirty_worktrees_unless_forced() {
     remove_worktree(&repo.root, &wt_path, true, true).expect("forced remove");
     assert!(!wt_path.exists());
     assert_eq!(list_worktrees(&repo.root).expect("list").len(), 1);
+    assert!(
+        git_read(&repo.root, &["branch", "--list", "w2"])
+            .expect("branches")
+            .trim()
+            .is_empty(),
+        "the branch goes with it"
+    );
 }
 
 #[test]

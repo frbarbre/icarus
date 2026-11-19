@@ -360,6 +360,17 @@ struct Action {
     params: Value,
 }
 
+/// A status the action sets that settings don't define; the server would store it and no column would show the card.
+fn unknown_status<'a>(action: &'a Action, scope: &Value) -> Option<&'a str> {
+    let status = action
+        .params
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| action.method.starts_with("workspace.") && !status.is_empty())?;
+    let statuses = scope["settings"]["statuses"].as_array()?;
+    (!statuses.iter().any(|known| known["id"] == status)).then_some(status)
+}
+
 fn action_workspace(action: &Action) -> Option<String> {
     let params = &action.params;
     params
@@ -1100,6 +1111,8 @@ impl Server {
                 .filter(|w| failed_workspaces.contains(&w.id))
             {
                 refuse(format!("skipped: an earlier action on {} failed", w.name))
+            } else if let Some(status) = unknown_status(&action, scope) {
+                refuse(format!("no status {status} in settings"))
             } else if AGENT_METHODS.contains(&action.method.as_str())
                 && agents_started >= config.max_agents
             {
@@ -2061,6 +2074,18 @@ mod tests {
             action_workspace(&action("agent.send", json!({ "id": "a1" }))),
             None
         );
+    }
+
+    #[test]
+    fn a_status_missing_from_settings_is_refused() {
+        let scope = json!({ "settings": { "statuses": [{ "id": "todo" }] } });
+        let set = |status: &str| Action {
+            method: "workspace.set".into(),
+            params: json!({ "id": "w", "status": status }),
+        };
+        assert_eq!(unknown_status(&set("todo"), &scope), None);
+        assert_eq!(unknown_status(&set(""), &scope), None, "clearing a status");
+        assert_eq!(unknown_status(&set("in-review"), &scope), Some("in-review"));
     }
 
     #[test]

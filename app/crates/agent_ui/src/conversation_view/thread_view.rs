@@ -955,6 +955,7 @@ pub struct ThreadView {
     pub new_server_version_available: Option<SharedString>,
     pub resumed_without_history: bool,
     elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
+    typed_answers: HashMap<PermissionRequestId, Entity<Editor>>,
     pub _cancel_task: Option<Task<()>>,
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
@@ -1503,6 +1504,7 @@ impl ThreadView {
             is_loading_contents: false,
             new_server_version_available: None,
             elicitation_form_states: HashMap::default(),
+            typed_answers: HashMap::default(),
             _cancel_task: None,
             _save_task: None,
             _draft_resolve_task: None,
@@ -3621,6 +3623,59 @@ impl ThreadView {
                 .ok();
         }
         cx.notify();
+    }
+
+    /// Keeps a text field for each pending question that takes a typed answer.
+    fn sync_typed_answers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let asking: Vec<PermissionRequestId> = self
+            .thread
+            .read(cx)
+            .pending_permission_requests()
+            .filter(|request| {
+                matches!(request.legacy_options(), Some(PermissionOptions::Flat(options))
+                if options.iter().any(|option| {
+                    option.option_id.0.as_ref() == acp_thread::TYPED_ANSWER_OPTION_ID
+                }))
+            })
+            .map(|request| request.id)
+            .collect();
+        self.typed_answers.retain(|id, _| asking.contains(id));
+        for id in asking {
+            self.typed_answers.entry(id).or_insert_with(|| {
+                cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text("Type your own answer…", window, cx);
+                    editor
+                })
+            });
+        }
+    }
+
+    fn send_typed_answer(
+        &mut self,
+        session_id: acp_v2::SessionId,
+        request_id: PermissionRequestId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.typed_answers.get(&request_id) else {
+            return;
+        };
+        let text = editor.read(cx).text(cx).trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.authorize_permission_request(
+            session_id,
+            request_id,
+            SelectedPermissionOutcome::new(
+                acp_thread::TYPED_ANSWER_OPTION_ID.into(),
+                acp_v2::PermissionOptionKind::AllowOnce,
+            )
+            .params(Some(acp_thread::SelectedPermissionParams::Answer { text })),
+            window,
+            cx,
+        );
     }
 
     pub fn allow_always(&mut self, _: &AllowAlways, window: &mut Window, cx: &mut Context<Self>) {
@@ -10264,8 +10319,28 @@ impl ThreadView {
         let tool_output_display = if is_open {
             match tool_call.status() {
                 ToolCallStatus::WaitingForConfirmation => {
+                    // A question only fits the one-line header cut off, so it is written out in full.
+                    let questions: Vec<String> = tool_call
+                        .raw_input
+                        .as_ref()
+                        .and_then(|input| input.get("questions"))
+                        .and_then(|questions| questions.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|question| question.get("question")?.as_str())
+                        .map(str::to_owned)
+                        .collect();
                     let confirmation_content = v_flex()
                         .w_full()
+                        .when(!questions.is_empty(), |this| {
+                            this.child(
+                                v_flex().px_2().py_1p5().gap_1().children(
+                                    questions.into_iter().map(|question| {
+                                        Label::new(question).size(LabelSize::Small)
+                                    }),
+                                ),
+                            )
+                        })
                         .children(tool_call.content().iter().enumerate().map(
                             |(content_ix, content)| {
                                 div()
@@ -11888,6 +11963,7 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> Div {
         let mut seen_kinds: ArrayVec<acp_v2::PermissionOptionKind, 3, u8> = ArrayVec::new();
+        let answer_session_id = session_id.clone();
 
         div()
             .p_1()
@@ -11896,103 +11972,152 @@ impl ThreadView {
             .w_full()
             .v_flex()
             .gap_0p5()
-            .children(options.iter().map(move |option| {
-                let option_id = SharedString::from(option.option_id.0.clone());
-                Button::new((option_id, entry_ix), option.name.clone())
-                    .map(|this| {
-                        // The sandbox-fallback prompt offers a "Retry" option
-                        // that re-attempts creating the sandbox; it isn't an
-                        // allow/deny choice, so give it its own icon and no
-                        // keybinding.
-                        let is_retry = option.option_id.0.as_ref()
-                            == acp_thread::SANDBOX_FALLBACK_RETRY_OPTION_ID;
-                        let (icon, action) = if is_retry {
-                            (
-                                Icon::new(IconName::RotateCcw)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                                None,
-                            )
-                        } else {
-                            match &option.kind {
-                                acp_v2::PermissionOptionKind::AllowOnce => (
-                                    Icon::new(IconName::Check)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Success),
-                                    Some(&AllowOnce as &dyn Action),
-                                ),
-                                acp_v2::PermissionOptionKind::AllowAlways => (
-                                    Icon::new(IconName::CheckDouble)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Success),
-                                    if option.option_id.0.as_ref()
-                                        == acp_thread::SandboxPermission::AllowThread.as_id()
-                                    {
-                                        None
-                                    } else {
-                                        Some(&AllowAlways as &dyn Action)
-                                    },
-                                ),
-                                acp_v2::PermissionOptionKind::RejectOnce => (
-                                    Icon::new(IconName::Close)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Error),
-                                    Some(&RejectOnce as &dyn Action),
-                                ),
-                                acp_v2::PermissionOptionKind::RejectAlways | _ => (
-                                    Icon::new(IconName::Close)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Error),
-                                    None,
-                                ),
-                            }
-                        };
-
-                        // An "allow" choice is disabled while a surprising-Unicode
-                        // warning is unacknowledged; "deny"/"retry" stay enabled.
-                        let is_allow = matches!(
-                            option.kind,
-                            acp_v2::PermissionOptionKind::AllowOnce
-                                | acp_v2::PermissionOptionKind::AllowAlways
-                        ) && !is_retry;
-                        let disabled = allow_disabled && is_allow;
-
-                        let this = this.start_icon(icon).disabled(disabled);
-
-                        let Some(action) = action else {
-                            return this;
-                        };
-
-                        if !is_first || disabled || seen_kinds.contains(&option.kind) {
-                            return this;
-                        }
-
-                        seen_kinds.push(option.kind.clone()).unwrap();
-
-                        this.key_binding(
-                            KeyBinding::for_action_in(action, focus_handle, cx)
-                                .map(|kb| kb.size(rems_from_px(12_f32))),
-                        )
+            .children(
+                options
+                    .iter()
+                    .filter(|option| {
+                        option.option_id.0.as_ref() != acp_thread::TYPED_ANSWER_OPTION_ID
                     })
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener({
-                        let option_id = option.option_id.clone();
-                        let option_kind = option.kind.clone();
+                    .map(move |option| {
+                        let option_id = SharedString::from(option.option_id.0.clone());
+                        Button::new((option_id, entry_ix), option.name.clone())
+                            .map(|this| {
+                                // The sandbox-fallback prompt offers a "Retry" option
+                                // that re-attempts creating the sandbox; it isn't an
+                                // allow/deny choice, so give it its own icon and no
+                                // keybinding.
+                                let is_retry = option.option_id.0.as_ref()
+                                    == acp_thread::SANDBOX_FALLBACK_RETRY_OPTION_ID;
+                                let (icon, action) = if is_retry {
+                                    (
+                                        Icon::new(IconName::RotateCcw)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                        None,
+                                    )
+                                } else {
+                                    match &option.kind {
+                                        acp_v2::PermissionOptionKind::AllowOnce => (
+                                            Icon::new(IconName::Check)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Success),
+                                            Some(&AllowOnce as &dyn Action),
+                                        ),
+                                        acp_v2::PermissionOptionKind::AllowAlways => (
+                                            Icon::new(IconName::CheckDouble)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Success),
+                                            if option.option_id.0.as_ref()
+                                                == acp_thread::SandboxPermission::AllowThread
+                                                    .as_id()
+                                            {
+                                                None
+                                            } else {
+                                                Some(&AllowAlways as &dyn Action)
+                                            },
+                                        ),
+                                        acp_v2::PermissionOptionKind::RejectOnce => (
+                                            Icon::new(IconName::Close)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Error),
+                                            Some(&RejectOnce as &dyn Action),
+                                        ),
+                                        acp_v2::PermissionOptionKind::RejectAlways | _ => (
+                                            Icon::new(IconName::Close)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Error),
+                                            None,
+                                        ),
+                                    }
+                                };
+
+                                // An "allow" choice is disabled while a surprising-Unicode
+                                // warning is unacknowledged; "deny"/"retry" stay enabled.
+                                let is_allow = matches!(
+                                    option.kind,
+                                    acp_v2::PermissionOptionKind::AllowOnce
+                                        | acp_v2::PermissionOptionKind::AllowAlways
+                                ) && !is_retry;
+                                let disabled = allow_disabled && is_allow;
+
+                                let this = this.start_icon(icon).disabled(disabled);
+
+                                let Some(action) = action else {
+                                    return this;
+                                };
+
+                                if !is_first || disabled || seen_kinds.contains(&option.kind) {
+                                    return this;
+                                }
+
+                                seen_kinds.push(option.kind.clone()).unwrap();
+
+                                this.key_binding(
+                                    KeyBinding::for_action_in(action, focus_handle, cx)
+                                        .map(|kb| kb.size(rems_from_px(12_f32))),
+                                )
+                            })
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener({
+                                let option_id = option.option_id.clone();
+                                let option_kind = option.kind.clone();
+                                let session_id = session_id.clone();
+                                move |this, _, window, cx| {
+                                    this.authorize_permission_request(
+                                        session_id.clone(),
+                                        request_id,
+                                        SelectedPermissionOutcome::new(
+                                            option_id.clone(),
+                                            option_kind.clone(),
+                                        ),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }))
+                    }),
+            )
+            .when_some(
+                self.typed_answers.get(&request_id).cloned(),
+                |this, editor| {
+                    let session_id = answer_session_id;
+                    let submit = {
                         let session_id = session_id.clone();
-                        move |this, _, window, cx| {
-                            this.authorize_permission_request(
-                                session_id.clone(),
-                                request_id,
-                                SelectedPermissionOutcome::new(
-                                    option_id.clone(),
-                                    option_kind.clone(),
-                                ),
-                                window,
-                                cx,
-                            );
-                        }
-                    }))
-            }))
+                        cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                            this.send_typed_answer(session_id.clone(), request_id, window, cx);
+                        })
+                    };
+                    this.child(
+                        h_flex()
+                            .gap_1()
+                            .px_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px_1p5()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border_variant)
+                                    .on_action(submit)
+                                    .child(editor),
+                            )
+                            .child(
+                                Button::new(("send-typed-answer", entry_ix), "Send")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.send_typed_answer(
+                                            session_id.clone(),
+                                            request_id,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    )
+                },
+            )
     }
 
     fn render_diff_loading(&self, cx: &Context<Self>) -> AnyElement {
@@ -14452,6 +14577,7 @@ impl Render for ThreadView {
         // current availability of feedback/sharing, which can change between
         // renders (settings, connection state, feature flags).
         self.sync_local_commands(cx);
+        self.sync_typed_answers(window, cx);
 
         let root = v_flex()
             .key_context("AcpThread")
