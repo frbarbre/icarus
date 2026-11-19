@@ -1,16 +1,12 @@
-//! The next-action button (plan §7d): one next step per workspace, run as a new agent session or a GitHub call.
+//! The workspace button: what the project's automation script returned for it, run on click; and
+//! `workspace.merge`, which takes the merge step GitHub allows for the workspace's PR.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use icarus_git::LocalState;
 use icarus_protocol::RpcError;
 use icarus_rules::model::PrOperation;
-use icarus_rules::next_action::{LocalGitState, MergeStep, NextAction, next_action};
-use icarus_rules::prompts::{
-    ActionPromptId, resolve_action_prompt_template, resolve_pull_request_conflicts_prompt,
-};
-use icarus_rules::template::{Variables, render_action_prompt};
+use icarus_rules::next_action::{MergeStep, merge_step};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -20,39 +16,13 @@ use crate::pr_refresh::RefreshReason;
 use crate::server::{Server, params, rpc};
 use crate::state::Workspace;
 
-const PR_TEMPLATES: [&str; 5] = [
+pub(crate) const PR_TEMPLATES: [&str; 5] = [
     ".github/pull_request_template.md",
     ".github/PULL_REQUEST_TEMPLATE.md",
     "pull_request_template.md",
     "PULL_REQUEST_TEMPLATE.md",
     "docs/pull_request_template.md",
 ];
-
-pub(crate) fn label(action: NextAction) -> &'static str {
-    match action {
-        NextAction::ResolveConflicts => "Resolve conflicts",
-        NextAction::CreatePullRequest => "Create PR",
-        NextAction::CommitAndPush => "Commit & push",
-        NextAction::ReadyForReview => "Ready for review",
-        NextAction::Merge(MergeStep::Merge) => "Merge",
-        NextAction::Merge(MergeStep::EnableAutoMerge) => "Turn on auto-merge",
-        NextAction::Merge(MergeStep::DisableAutoMerge) => "Turn off auto-merge",
-        NextAction::Merge(MergeStep::AddToMergeQueue) => "Add to merge queue",
-        NextAction::Merge(MergeStep::MergeStack { .. }) => "Merge stack",
-        NextAction::Merge(MergeStep::EnableStackAutoMerge) => "Turn on stack auto-merge",
-        NextAction::Merge(MergeStep::DisableStackAutoMerge) => "Turn off stack auto-merge",
-    }
-}
-
-fn is_agent_step(action: NextAction) -> bool {
-    !matches!(action, NextAction::Merge(_))
-}
-
-pub(crate) fn action_json(action: Option<NextAction>) -> Value {
-    action.map_or(Value::Null, |action| {
-        json!({ "kind": action.name(), "label": label(action), "agent_step": is_agent_step(action) })
-    })
-}
 
 pub(crate) fn setting<'a>(settings: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter().try_fold(settings, |value, key| value.get(*key))
@@ -87,28 +57,19 @@ pub(crate) fn configured_command(settings: &Value, provider: &str) -> Option<Vec
 
 /// The provider for a session that names none: `agents.default`, else Claude Code.
 pub(crate) fn default_provider(settings: &Value) -> String {
-    choose_agent(settings, None, None).provider
+    choose_agent(settings, None).provider
 }
 
-/// The first configured provider wins; `agents.commands.<provider>` overrides its command line.
-pub(crate) fn choose_agent(
-    settings: &Value,
-    kind: Option<&str>,
-    preferred: Option<&str>,
-) -> AgentChoice {
-    let step = kind.and_then(|kind| setting_str(settings, &["actions", kind, "agent"]));
-    let provider = step
-        .or_else(|| setting_str(settings, &["agents", "default"]))
+/// `agents.default`, else `preferred`, else Claude Code; `agents.commands.<provider>` overrides its command line.
+pub(crate) fn choose_agent(settings: &Value, preferred: Option<&str>) -> AgentChoice {
+    let provider = setting_str(settings, &["agents", "default"])
         .or(preferred.filter(|p| !p.trim().is_empty()))
         .unwrap_or("claude")
         .to_owned();
     let command = configured_command(settings, &provider);
-    let model = kind
-        .and_then(|kind| setting_str(settings, &["actions", kind, "model"]))
-        .map(str::to_owned);
     AgentChoice {
         provider,
-        model,
+        model: None,
         command,
         remote_control: remote_control_default(settings),
     }
@@ -119,26 +80,16 @@ pub(crate) fn remote_control_default(settings: &Value) -> bool {
     setting(settings, &["agents", "remote_control"]).and_then(Value::as_bool) == Some(true)
 }
 
-fn base_name(base: &str) -> &str {
-    base.strip_prefix("origin/").unwrap_or(base)
-}
-
-fn template_rule(worktree: &Path) -> String {
-    match PR_TEMPLATES.iter().find(|p| worktree.join(p).is_file()) {
-        Some(path) => format!("Fill in the repository's pull request template ({path})."),
-        None => "There is no pull request template; describe what changed and why, and how it was tested.".to_owned(),
+fn merge_label(step: &MergeStep) -> &'static str {
+    match step {
+        MergeStep::Merge => "Merge",
+        MergeStep::EnableAutoMerge => "Turn on auto-merge",
+        MergeStep::DisableAutoMerge => "Turn off auto-merge",
+        MergeStep::AddToMergeQueue => "Add to merge queue",
+        MergeStep::MergeStack { .. } => "Merge stack",
+        MergeStep::EnableStackAutoMerge => "Turn on stack auto-merge",
+        MergeStep::DisableStackAutoMerge => "Turn off stack auto-merge",
     }
-}
-
-fn local_conflict_prompt(path: &str) -> String {
-    format!(
-        "A merge or rebase in this worktree ({path}) stopped on conflicts.\n\n\
-         - Start with git status to see the operation in progress and the unmerged paths.\n\
-         - Resolve each conflict by reading both sides and the surrounding code; do not take ours or theirs wholesale unless that is clearly right.\n\
-         - Stage each resolved path and continue the operation (git merge --continue or git rebase --continue) until it completes.\n\
-         - Do not abort the operation, reset, stash or push.\n\n\
-         Reply with the decision for each file and the final git status."
-    )
 }
 
 impl Server {
@@ -150,25 +101,17 @@ impl Server {
             .map_err(|e| rpc("git_failed", format!("{e:#}")))
     }
 
-    pub(crate) async fn resolve_next(
+    /// The worktree's git state and its pull request, as far as GitHub has answered.
+    pub(crate) async fn local_and_pr(
         self: &Arc<Self>,
         workspace: &Workspace,
-    ) -> Result<(Option<NextAction>, LocalState, PrView), RpcError> {
+    ) -> Result<(LocalState, PrView), RpcError> {
         let local = self.local_state(workspace).await?;
         self.note_local_state(workspace, &local);
         let view = self
             .pr_view(workspace, local.branch.as_deref(), false)
             .await;
-        let git = LocalGitState {
-            has_uncommitted_changes: local.has_uncommitted_changes,
-            has_upstream: local.upstream.is_some(),
-            unpushed_commits: local.unpushed_commits,
-            has_local_conflicts: local.has_local_conflicts,
-            is_default_branch: local.is_default_branch,
-            head_oid: local.head_oid.clone(),
-        };
-        let action = next_action(&git, view.pr.as_ref(), view.known);
-        Ok((action, local, view))
+        Ok((local, view))
     }
 
     /// What `workspace.next_action` answers, and what the `workspace.next_action` event carries.
@@ -176,17 +119,17 @@ impl Server {
         self: &Arc<Self>,
         workspace: &Workspace,
     ) -> Result<Value, RpcError> {
-        let (action, local, view) = self.resolve_next(workspace).await?;
+        let (local, view) = self.local_and_pr(workspace).await?;
         let mut reply = json!({
             "workspace": workspace.id,
-            "action": action_json(action),
+            "action": null,
+            "buttons": [],
             "local": local,
             "known": view.known,
             "error": view.error,
-            "decided_by": "built-in",
+            "decided_by": null,
         });
         if let Some(buttons) = self.automations.buttons(&workspace.id) {
-            reply["suggested_action"] = reply["action"].take();
             reply["action"] = buttons
                 .list
                 .first()
@@ -239,81 +182,6 @@ impl Server {
         Ok(agent.id().to_owned())
     }
 
-    fn agent_prompt(
-        &self,
-        action: NextAction,
-        workspace: &Workspace,
-        local: &LocalState,
-        view: &PrView,
-        settings: &Value,
-    ) -> String {
-        let path = workspace.path.to_string_lossy().into_owned();
-        let pr = view.pr.as_ref();
-        if action == NextAction::ResolveConflicts {
-            return match pr.filter(|_| !local.has_local_conflicts) {
-                Some(pr) => {
-                    resolve_pull_request_conflicts_prompt(Some(&pr.base_ref_name), &[], Some(&path))
-                }
-                None => local_conflict_prompt(&path),
-            };
-        }
-        let id = match action {
-            NextAction::CreatePullRequest => ActionPromptId::CreatePullRequest,
-            NextAction::ReadyForReview => ActionPromptId::ReadyForReview,
-            _ => ActionPromptId::CommitAndPush,
-        };
-        let template =
-            resolve_action_prompt_template(setting_str(settings, &["prompts", id.key()]), id);
-        let base = pr
-            .map(|pr| pr.base_ref_name.clone())
-            .or_else(|| {
-                workspace
-                    .base_ref
-                    .as_deref()
-                    .map(|b| base_name(b).to_owned())
-            })
-            .unwrap_or_default();
-        let draft = setting(settings, &["actions", action.name(), "draft"])
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let mut vars = Variables::new();
-        let mut set = |k: &str, v: String| {
-            vars.insert(k.to_owned(), v);
-        };
-        set(
-            "branch",
-            local
-                .branch
-                .clone()
-                .or_else(|| workspace.branch.clone())
-                .unwrap_or_default(),
-        );
-        set("baseRef", base);
-        set("worktreePath", path);
-        set(
-            "draftMode",
-            if draft {
-                "as a draft"
-            } else {
-                "ready for review"
-            }
-            .to_owned(),
-        );
-        set("templateRule", template_rule(&workspace.path));
-        set(
-            "prInstructions",
-            setting_str(settings, &["actions", action.name(), "instructions"])
-                .unwrap_or_default()
-                .to_owned(),
-        );
-        if let Some(pr) = pr {
-            set("prNumber", pr.number.to_string());
-            set("prUrl", pr.url.clone());
-            set("prTitle", pr.title.clone());
-        }
-        render_action_prompt(template, &vars)
-    }
-
     pub(crate) async fn next_action_dispatch(
         self: &Arc<Self>,
         method: &str,
@@ -326,9 +194,6 @@ impl Server {
             selected: bool,
             /// A script button's id; the main one when absent.
             button: Option<String>,
-            /// Run the built-in step even when a script decides the buttons (a script's own action).
-            #[serde(default)]
-            builtin: bool,
         }
         let p: P = params(p)?;
         let workspace = self
@@ -336,49 +201,43 @@ impl Server {
             .workspace(&p.id)
             .map_err(|e| rpc("internal", e))?
             .ok_or_else(|| rpc("not_found", format!("workspace {}", p.id)))?;
-        if method == "workspace.next_action" {
-            if p.selected {
-                self.note_selected(&workspace).await;
+        match method {
+            "workspace.next_action" => {
+                if p.selected {
+                    self.note_selected(&workspace).await;
+                }
+                self.next_action_reply(&workspace).await
             }
-            return self.next_action_reply(&workspace).await;
+            "workspace.merge" => self.take_merge_step(&workspace).await,
+            _ => {
+                let buttons = self.automations.buttons(&workspace.id).ok_or_else(|| {
+                    rpc(
+                        "no_action",
+                        "no automation script gave this workspace a button",
+                    )
+                })?;
+                self.run_script_button(&workspace, &buttons, p.button).await
+            }
         }
-        if !p.builtin
-            && let Some(buttons) = self.automations.buttons(&workspace.id)
-        {
-            return self.run_script_button(&workspace, &buttons, p.button).await;
-        }
-        let (action, local, view) = self.resolve_next(&workspace).await?;
-        let action = action.ok_or_else(|| rpc("no_action", "nothing to do for this workspace"))?;
-        let project = self
-            .store
-            .project(&workspace.project_id)
-            .map_err(|e| rpc("internal", e))?
-            .ok_or_else(|| rpc("not_found", "project"))?;
-        let settings = self.resolved_settings(Some(&project.root));
-        if is_agent_step(action) {
-            let prompt = self.agent_prompt(action, &workspace, &local, &view, &settings);
-            let choice = choose_agent(&settings, Some(action.name()), None);
-            let id = self
-                .start_agent_session(&workspace, choice, label(action), &prompt)
-                .await
-                .map_err(|e| rpc("spawn_failed", format!("{e:#}")))?;
-            self.note_action_agent(&id);
-            return Ok(
-                json!({ "action": action_json(Some(action)), "started_agent": id, "github": null }),
-            );
-        }
+    }
+
+    /// Runs the merge step GitHub allows for the workspace's PR (the scope's `merge_step`).
+    async fn take_merge_step(self: &Arc<Self>, workspace: &Workspace) -> Result<Value, RpcError> {
+        let (_, view) = self.local_and_pr(workspace).await?;
         let (Some(repo), Some(details), Some(pr)) = (&view.repo, &view.details, &view.pr) else {
             return Err(rpc("no_pull_request", "the pull request is not known"));
         };
-        let result = match action {
-            NextAction::Merge(MergeStep::EnableStackAutoMerge) => {
+        let step = merge_step(pr)
+            .ok_or_else(|| rpc("no_action", "the pull request can't be merged now"))?;
+        let result = match step {
+            MergeStep::EnableStackAutoMerge => {
                 let stack = pr
                     .stack
                     .as_ref()
                     .ok_or_else(|| rpc("github_failed", "not in a stack"))?;
                 self.enable_stack_auto_merge(repo, pr.number, stack.number, None)
             }
-            NextAction::Merge(step) => {
+            step => {
                 let operation = match step {
                     MergeStep::Merge => PrOperation::Merge,
                     MergeStep::EnableAutoMerge => PrOperation::EnableAutoMerge,
@@ -390,12 +249,11 @@ impl Server {
                 self.run_pr_operation(repo, details, pr, view.metadata.as_ref(), operation)
                     .await
             }
-            _ => Err("not a GitHub step".to_owned()),
         }
         .map_err(|e| rpc("github_failed", e))?;
         self.github.forget_stacks();
         self.schedule_pr_refresh(&workspace.id, RefreshReason::Action);
-        Ok(json!({ "action": action_json(Some(action)), "started_agent": null, "github": result }))
+        Ok(json!({ "step": step, "label": merge_label(&step), "github": result }))
     }
 }
 
@@ -404,33 +262,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_prefers_the_step_then_the_default_then_the_rule() {
+    fn provider_prefers_the_default_then_the_caller() {
         let settings = json!({
-            "actions": { "merge": { "agent": "codex" } },
-            "agents": { "default": "claude", "commands": { "codex": ["fake-codex"] } },
+            "agents": { "default": "codex", "commands": { "codex": ["fake-codex"] } },
         });
-        let step = choose_agent(&settings, Some("merge"), Some("other"));
-        assert_eq!(step.provider, "codex");
-        assert_eq!(step.command, Some(vec!["fake-codex".to_owned()]));
-        assert_eq!(
-            choose_agent(&settings, Some("commit-and-push"), Some("other")).provider,
-            "claude"
-        );
-        assert_eq!(
-            choose_agent(&json!({}), None, Some("codex")).provider,
-            "codex"
-        );
-        assert_eq!(choose_agent(&json!({}), None, None).provider, "claude");
-    }
-
-    #[test]
-    fn every_step_has_the_contract_label() {
-        assert_eq!(label(NextAction::CreatePullRequest), "Create PR");
-        assert_eq!(
-            label(NextAction::Merge(MergeStep::EnableStackAutoMerge)),
-            "Turn on stack auto-merge"
-        );
-        assert!(is_agent_step(NextAction::CommitAndPush));
-        assert!(!is_agent_step(NextAction::Merge(MergeStep::Merge)));
+        let choice = choose_agent(&settings, Some("other"));
+        assert_eq!(choice.provider, "codex");
+        assert_eq!(choice.command, Some(vec!["fake-codex".to_owned()]));
+        assert_eq!(choose_agent(&json!({}), Some("codex")).provider, "codex");
+        assert_eq!(choose_agent(&json!({}), None).provider, "claude");
     }
 }

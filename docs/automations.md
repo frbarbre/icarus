@@ -78,12 +78,17 @@ For each workspace with a pull request, the first matching condition decides its
 | `onResolved` | `delete` removes your workspace once its PR merged or closed (not forced: local changes keep it). |
 | `onReviewed` | `delete` removes a review workspace once you approved or requested changes. |
 | `resolveConflictsWithAgent` | Start an agent (`agent`) with `conflictPrompt` when your PR gets conflicts. |
+| `localConflictPrompt` | What the **Resolve conflicts** button tells the agent when a merge or rebase in the worktree stopped on conflicts (`conflictPrompt` is used for a PR's conflicts). |
+| `createPullRequestDraft` | **Create PR** opens the pull request as a draft. |
+| `prInstructions` | Extra lines for the **Create PR** agent (`{{prInstructions}}` in its prompt). |
 | `reviewEnteredCommand` | A shell command run when a workspace enters the `review` column. |
 | `reviewInbox` | `enabled` creates a review workspace for every PR that requests your review, with an agent and `prompt` (or `rereviewPrompt` after your earlier review). `handled` lists PRs never to create again. |
 | `ciTriage` | Per project: instructions for an agent started when CI fails on your PR. |
 | `notify` | `ciFailed`, `merged` and `reviewRequested` notifications. |
 
-Cards in the `holdStatus` column are skipped by the script and never touched. Review workspaces follow the PR: when its author pushes, the workspace moves to the new head. The next-action button's agent prompts are the `prompts.commitAndPush`, `createPullRequest`, `readyForReview` and `reviewPullRequest` settings.
+Cards in the `holdStatus` column are skipped by the script and never touched. Review workspaces follow the PR: when its author pushes, the workspace moves to the new head.
+
+The script also decides the title bar's next-step button (`nextStep` in the template): **Resolve conflicts**, **Create PR**, **Commit & push**, **Ready for review**, or the PR's merge step (`workspace.merge`). A click starts an agent with the `prompts.commitAndPush`, `createPullRequest` or `readyForReview` setting, handing it to the workspace's unused agent if there is one. Icarus has no next step of its own: a project without a script shows no button.
 
 ## Automation scripts
 
@@ -127,9 +132,9 @@ if (t.kind === "event" && t.name === "button" && t.payload.id === "ready") {
 console.log(JSON.stringify(out));
 ```
 
-- **Events:** within about two seconds of a change, the script runs with `trigger.kind: "event"`: `workspace.created`, `workspace.status_changed`, `pr.opened`, `pr.state_changed` (`DRAFT`/`OPEN`/`MERGED`/`CLOSED`), `pr.head_changed`, `pr.base_changed`, `checks.changed`, `checks.failed` (with the failed check names), `review.requested`, `review.submitted`, `git.pushed`, `agent.finished`, `agent.waiting` and `linear.changed`. One burst of changes is one run; `trigger.events` lists all of them. Changes your script makes come back as events too, so act only when something still needs doing. Nothing is detected while no app window is open.
-- **Actions** are server methods, the same ones the CLI calls (`Method` in the generated types lists them). `prompt_id` in an action's params renders that prompt for its workspace into `prompt`. A script may also run `icarus …` itself; those calls are recorded with the run.
-- **Buttons:** a workspace listed in `buttons` shows the script's buttons instead of the built-in next step; a click is a `button` event run on a fresh scope. Leave a workspace out to keep the built-in step, which every workspace also carries as `suggested_action`.
+- **Events:** within about two seconds of a change, the script runs with `trigger.kind: "event"`: `workspace.created`, `workspace.status_changed`, `pr.opened`, `pr.state_changed` (`DRAFT`/`OPEN`/`MERGED`/`CLOSED`), `pr.head_changed`, `pr.base_changed`, `checks.changed`, `checks.failed` (with the failed check names), `review.requested`, `review.submitted`, `git.pushed`, `git.changed` (the worktree's commits, changes or conflicts), `agent.finished`, `agent.waiting` and `linear.changed`. One burst of changes is one run; `trigger.events` lists all of them. Changes your script makes come back as events too, so act only when something still needs doing. Nothing is detected while no app window is open.
+- **Actions** are server methods, the same ones the CLI calls (`Method` in the generated types lists them). `prompt_id` in an action's params renders that prompt for its workspace into `prompt`, with `prompt_vars` as extra `{{name}}` values. `agent.create` with `reuse_unused: true` gives the prompt to the workspace's untouched agent of that provider instead of starting another. A script may also run `icarus …` itself; those calls are recorded with the run.
+- **Buttons:** `buttons` gives a workspace its title bar buttons, the first being the one ⌘⌥Enter runs; a click is a `button` event run on a fresh scope. A workspace left out shows none. Each workspace carries `merge_step` (what GitHub lets its PR do next, run by `workspace.merge`) and `pr_template`.
 - **Memory:** return `memory` and you get it back as `scope.memory` next run. `scope.previous` is the scope of the last run that changed something.
 - **Safety:** with `automations.armed` off every run is a dry run. `automations.enabled: false` stops everything. A run starts at most `automations.max_agents_per_run` agents (3).
 - **Scope extras:** `scope.inbox` lists open PRs requesting your review (with the `workspace` already on each, if any). Each workspace carries `linked_pr`, `review_pending` (unsent draft comments), `head_is_local` and `base_follows_target`.

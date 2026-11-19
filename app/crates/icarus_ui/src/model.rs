@@ -406,8 +406,6 @@ impl WorkspaceSummary {
 /// Which lane a workspace takes when the list is grouped by stack.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StackLane {
-    /// Someone else's pull request (the status the rules give `reviewing`), stacked or not.
-    Reviewing,
     Stack {
         project_id: String,
         number: u64,
@@ -421,32 +419,24 @@ pub struct StackGroup {
     pub workspaces: Vec<WorkspaceSummary>,
 }
 
-/// Orca's stack grouping: reviewing first, then newest stack first (each listed from the PR
-/// furthest from main down, or up when `ascending`), then everything outside a stack in status order.
+/// Newest stack first (each listed from the PR furthest from main down, or up when `ascending`),
+/// then everything outside a stack in status order.
 pub fn group_by_stack(
     workspaces: &[WorkspaceSummary],
     status_order: &[String],
-    reviewing_status: Option<&str>,
     ascending: bool,
 ) -> Vec<StackGroup> {
-    let lane_of = |workspace: &WorkspaceSummary| {
-        if reviewing_status.is_some() && workspace.status.as_deref() == reviewing_status {
-            return StackLane::Reviewing;
-        }
-        match workspace.stack() {
-            Some(stack) => StackLane::Stack {
-                project_id: workspace.project_id.clone(),
-                number: stack.number,
-            },
-            None => StackLane::None,
-        }
+    let lane_of = |workspace: &WorkspaceSummary| match workspace.stack() {
+        Some(stack) => StackLane::Stack {
+            project_id: workspace.project_id.clone(),
+            number: stack.number,
+        },
+        None => StackLane::None,
     };
-    let mut reviewing = Vec::new();
     let mut stacks: BTreeMap<(u64, String), Vec<WorkspaceSummary>> = BTreeMap::new();
     let mut loose = Vec::new();
     for workspace in workspaces {
         match lane_of(workspace) {
-            StackLane::Reviewing => reviewing.push(workspace.clone()),
             StackLane::Stack { project_id, number } => stacks
                 .entry((number, project_id))
                 .or_default()
@@ -464,12 +454,6 @@ pub fn group_by_stack(
     };
     loose.sort_by_key(|workspace| status_rank(workspace));
     let mut groups = Vec::new();
-    if !reviewing.is_empty() {
-        groups.push(StackGroup {
-            lane: StackLane::Reviewing,
-            workspaces: reviewing,
-        });
-    }
     for ((number, project_id), mut items) in stacks.into_iter().rev() {
         items.sort_by_key(|workspace| position(workspace));
         if !ascending {
@@ -943,7 +927,7 @@ mod tests {
             number,
         };
         assert_eq!(
-            names(&group_by_stack(&workspaces, &[], None, false)),
+            names(&group_by_stack(&workspaces, &[], false)),
             [
                 (stack(9), vec!["other"]),
                 (stack(7), vec!["top", "middle", "bottom"]),
@@ -951,36 +935,30 @@ mod tests {
             ]
         );
         assert_eq!(
-            names(&group_by_stack(&workspaces, &[], None, true))[1],
+            names(&group_by_stack(&workspaces, &[], true))[1],
             (stack(7), vec!["bottom", "middle", "top"]),
             "ascending lists a stack from the PR on main up"
         );
     }
 
     #[test]
-    fn reviewing_comes_first_even_when_stacked_and_the_rest_follow_status_order() {
+    fn stacks_come_first_and_the_rest_follow_status_order() {
         let workspaces = [
             workspace("done", Some("completed")),
             stacked("top", Some("in-review"), 7, 3),
             workspace("waiting", Some("todo")),
             stacked("middle", None, 7, 2),
         ];
-        let groups = group_by_stack(
-            &workspaces,
-            &["todo".into(), "completed".into()],
-            Some("in-review"),
-            false,
-        );
+        let groups = group_by_stack(&workspaces, &["todo".into(), "completed".into()], false);
         assert_eq!(
             names(&groups),
             [
-                (StackLane::Reviewing, vec!["top"]),
                 (
                     StackLane::Stack {
                         project_id: "p".into(),
                         number: 7
                     },
-                    vec!["middle"]
+                    vec!["top", "middle"]
                 ),
                 (StackLane::None, vec!["waiting", "done"]),
             ]
@@ -989,7 +967,7 @@ mod tests {
 
     #[test]
     fn without_pr_data_everything_is_outside_a_stack() {
-        let groups = group_by_stack(&[workspace("a", None)], &[], None, false);
+        let groups = group_by_stack(&[workspace("a", None)], &[], false);
         assert_eq!(names(&groups), [(StackLane::None, vec!["a"])]);
     }
 

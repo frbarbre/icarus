@@ -821,6 +821,9 @@ impl Server {
                     /// Whether the app opens a tab for it in its workspace; an agent tab creating its own says no.
                     #[serde(default = "default_true")]
                     offer_tab: bool,
+                    /// Hand the prompt to the workspace's untouched agent of this provider instead, if it has one.
+                    #[serde(default)]
+                    reuse_unused: bool,
                 }
                 let mut p: P = params(params_value)?;
                 let workspace = match &p.workspace {
@@ -862,6 +865,28 @@ impl Server {
                         "invalid_params",
                         format!("{provider} has no mode {mode}"),
                     ));
+                }
+                if p.reuse_unused
+                    && let Some(workspace_id) = &p.workspace
+                    && let Some(agent) = self
+                        .agents
+                        .list()
+                        .into_iter()
+                        .find(|agent| {
+                            agent.workspace.as_deref() == Some(workspace_id.as_str())
+                                && agent.turns == 0
+                                && agent.provider == provider
+                        })
+                        .and_then(|info| self.agents.get(&info.id))
+                {
+                    self.offer_agent_tab(&agent.info());
+                    if let Some(prompt) = &p.prompt {
+                        agent
+                            .send(prompt, &[])
+                            .await
+                            .map_err(|e| rpc("send_failed", format!("{e:#}")))?;
+                    }
+                    return to_value(agent.info());
                 }
                 let command = p
                     .command
@@ -1620,7 +1645,7 @@ impl Server {
                 }
                 Ok(json!({ "killed": true }))
             }
-            "workspace.next_action" | "workspace.run_next_action" => {
+            "workspace.next_action" | "workspace.run_next_action" | "workspace.merge" => {
                 self.next_action_dispatch(method, params_value).await
             }
             other

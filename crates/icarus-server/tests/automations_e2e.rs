@@ -126,7 +126,7 @@ async fn a_script_decides_statuses_and_buttons_and_its_runs_replay() {
         .expect("workspace id")
         .to_owned();
     write_script(&script, &workspace, &scopes);
-    let mut settings = json!({
+    let settings = json!({
         "agents": { "commands": { "claude": [fake] } },
         "automations": { "armed": true, "scripts": { project_name.clone(): script } },
         "prompts": { "fix": "Fix {{workspace.name}}" },
@@ -153,7 +153,8 @@ async fn a_script_decides_statuses_and_buttons_and_its_runs_replay() {
         .await
         .expect("next");
     assert_eq!(
-        next["decided_by"], "built-in",
+        next["decided_by"],
+        Value::Null,
         "a dry run's buttons aren't shown"
     );
 
@@ -371,7 +372,9 @@ async fn generated_types_follow_the_status_and_prompt_settings() {
     loop {
         let text = std::fs::read_to_string(&types).expect("types");
         if text.contains("export type StatusId = \"triage\";")
-            && text.contains("export type PromptId = \"fix-checks\";")
+            && text.lines().any(|line| {
+                line.starts_with("export type PromptId") && line.contains("\"fix-checks\"")
+            })
         {
             break;
         }

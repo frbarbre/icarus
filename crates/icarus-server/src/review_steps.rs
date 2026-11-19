@@ -155,7 +155,7 @@ impl Server {
                 }
                 let p: P = params(p)?;
                 let workspace = self.workspace_by_key(&p.id)?;
-                let (_, _, view) = self.resolve_next(&workspace).await?;
+                let (_, view) = self.local_and_pr(&workspace).await?;
                 let pr = view
                     .pr
                     .ok_or_else(|| rpc("not_found", "the workspace has no pull request"))?;
@@ -222,7 +222,7 @@ impl Server {
         agent: &ReviewAgent,
     ) -> Result<String, String> {
         let settings = self.resolved_settings(Some(&workspace.path));
-        let choice = choose_agent(&settings, None, agent.provider.as_deref());
+        let choice = choose_agent(&settings, agent.provider.as_deref());
         let title = agent.title.as_deref().unwrap_or("Review");
         self.start_agent_session(workspace, choice, title, &agent.prompt)
             .await

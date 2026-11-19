@@ -222,11 +222,6 @@ pub fn document_schema() -> Schema {
                 ),
                 field("projectOrderBy", "", Str),
                 field("stackOrder", "", Str),
-                field(
-                    "reviewingStatus",
-                    "Status of workspaces reviewing someone else's PR; grouping by stack lists them first.",
-                    Str,
-                ),
             ]),
         ),
         field(
@@ -254,14 +249,6 @@ pub fn document_schema() -> Schema {
                     Bool,
                 ),
             ]),
-        ),
-        field(
-            "actions",
-            "Per next-action overrides keyed by action kind (agent, prompt).",
-            Schema::Map(Box::new(open(vec![
-                field("agent", "Provider for this step.", Str),
-                field("prompt", "Prompt template for this step.", Str),
-            ]))),
         ),
         field(
             "layouts",

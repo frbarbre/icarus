@@ -192,8 +192,6 @@ pub struct CardView {
     pub stack_ascending: bool,
     /// This app's own fields (`client.json`), which win over `fields` when set.
     pub local_fields: Option<Vec<String>>,
-    /// `sidebar.reviewingStatus`: the status for someone else's PR; stack grouping lists it first.
-    pub reviewing_status: Option<String>,
 }
 
 impl Default for CardView {
@@ -204,7 +202,6 @@ impl Default for CardView {
             sort_by: SortBy::default(),
             stack_ascending: false,
             local_fields: None,
-            reviewing_status: None,
         }
     }
 }
@@ -253,10 +250,6 @@ impl CardView {
                 .unwrap_or_default(),
             stack_ascending: sidebar["stackOrder"].as_str() == Some("asc"),
             local_fields: None,
-            reviewing_status: sidebar["reviewingStatus"]
-                .as_str()
-                .filter(|status| !status.is_empty())
-                .map(str::to_owned),
         }
     }
 

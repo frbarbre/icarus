@@ -52,8 +52,8 @@ Commands that work on a workspace take its id, name or path. `git`, `notes` and 
 | `workspace layout <ws> <layout>` | Rearrange the workspace's tabs. |
 | `workspace changes <ws> [--uncommitted]` | Changed files against the base. |
 | `workspace turns <ws>` | Recorded agent turns. |
-| `workspace next-action <ws> [--run] [--button <id>]` | Show or run the next step. With an automation script deciding the buttons, `--run` clicks one. |
-| `workspace button <ws> [--explain]` | The workspace's buttons and whether the built-in resolver or a script run decided them; `--explain` shows what that run saw (PR state, draft, checks). |
+| `workspace next-action <ws> [--run] [--button <id>]` | Show the automation script's next step for the workspace; `--run` clicks it (or `--button`). |
+| `workspace button <ws> [--explain]` | The workspace's buttons and the script run that decided them; `--explain` shows what that run saw (PR state, draft, checks). |
 | `workspace sleep` / `wake <ws>` | Park and restart a workspace. |
 | `workspace remove <ws> [--force] [--keep-branch] [--delete-worktree] [--delete-branch] [--skip-archive] [--allow-failed-archive]` | Remove a workspace. A worktree Icarus didn't create is only hidden unless `--delete-worktree`. |
 | `workspace review --project <p> <number> [--name] [--status] [--since <sha>] [--prompt] [--provider] [--layout]` | Check out someone else's PR to review, with an agent and a layout. |

@@ -16,7 +16,11 @@ Icarus no longer has built-in rules. When it finds `rules` in the user settings 
 
 ## Actions a script can return
 
-Any server method the user could run through the CLI, e.g. `workspace.set` (status), `workspace.remove`, `agent.create` (with `prompt_id` to use a saved prompt), `terminal.create`, `review.workspace` (check out a PR to review, with an agent and the review layout), `workspace.sync_to_pr_head`, `tab.open`, `issue.assign`, `notification.send`.
+Any server method the user could run through the CLI, e.g. `workspace.set` (status), `workspace.remove`, `agent.create` (with `prompt_id` and `prompt_vars` to use a saved prompt, `reuse_unused` to hand it to the workspace's untouched agent), `workspace.merge` (the PR's `merge_step`), `terminal.create`, `review.workspace` (check out a PR to review, with an agent and the review layout), `workspace.sync_to_pr_head`, `tab.open`, `issue.assign`, `notification.send`.
+
+## Buttons
+
+Icarus has no behaviour of its own here: the title bar button (⌘⌥Enter) is the first of `buttons[workspace.id]`, and a workspace without buttons shows none. The template's `nextStep` gives Orca's next step (resolve conflicts, create PR, commit & push, ready for review, merge); change it there. A click runs the script with a `button` event whose `payload.id` is the button's id, and the script returns what to do. Policies like a column the script must leave alone (`holdStatus`) are script options too, never Icarus settings.
 
 ## Events from outside Icarus
 

@@ -788,21 +788,13 @@ pub fn button_text(v: &Value) -> String {
             } else {
                 lines.push("  pr: none".into());
             }
-            lines.push(format!(
-                "  built-in step then: {}",
-                then["suggested_action"]["label"].as_str().unwrap_or("none")
-            ));
-            lines.push(format!(
-                "  built-in step now: {}",
-                v["suggested_action"]["label"].as_str().unwrap_or("none")
-            ));
+            lines.push(format!("  merge_step then: {}", then["merge_step"]));
             lines.push(format!(
                 "replay it: icarus automation replay {}",
                 v["run"].as_str().unwrap_or("?")
             ));
         }
-        _ => lines
-            .push("decided by the built-in resolver (no script buttons for this workspace)".into()),
+        _ => lines.push("no button: the project's script gave this workspace none".into()),
     }
     lines.join("\n")
 }

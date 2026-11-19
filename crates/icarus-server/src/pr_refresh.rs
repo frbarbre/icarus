@@ -48,6 +48,7 @@ pub(crate) struct PrRefreshes {
     /// Workspaces whose refresh query is out now, so a selection can't start a second one.
     running: HashSet<String>,
     synced_heads: HashMap<String, (Option<String>, bool)>,
+    local_states: HashMap<String, LocalState>,
     action_agents: HashSet<String>,
 }
 
@@ -160,11 +161,23 @@ impl Server {
     pub(crate) fn note_local_state(self: &Arc<Self>, workspace: &Workspace, local: &LocalState) {
         let synced = local.upstream.is_some() && local.unpushed_commits == 0;
         let seen = (local.head_oid.clone(), synced);
-        let previous = lock(&self.github.refreshes)
-            .synced_heads
-            .insert(workspace.id.clone(), seen.clone());
+        let (previous, previous_local) = {
+            let mut refreshes = lock(&self.github.refreshes);
+            (
+                refreshes
+                    .synced_heads
+                    .insert(workspace.id.clone(), seen.clone()),
+                refreshes
+                    .local_states
+                    .insert(workspace.id.clone(), local.clone()),
+            )
+        };
         if synced && previous.is_some_and(|previous| previous != seen) {
             self.schedule_pr_refresh(&workspace.id, RefreshReason::PostPush);
+        }
+        // Edits in a terminal or by an agent change no Icarus state, so the scripts would not hear of them.
+        if previous_local.is_some_and(|previous| &previous != local) {
+            self.automations.observe(crate::gitops::GIT_CHANGED_TOPIC);
         }
     }
 

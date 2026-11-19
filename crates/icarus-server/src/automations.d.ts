@@ -25,6 +25,7 @@ export type EventName =
   | "review.requested"
   | "review.submitted"
   | "git.pushed"
+  | "git.changed"
   | "agent.finished"
   | "agent.waiting";
 
@@ -72,8 +73,14 @@ export interface Workspace {
   pr: PullRequest | null;
   pr_known?: boolean;
   pr_error?: string;
-  /** The built-in next step (the same as Orca's); return it as a button to keep the default. */
-  suggested_action: { kind: string; label: string; agent_step: boolean } | null;
+  /** What GitHub lets the PR do next to merge; `workspace.merge` takes this step. */
+  merge_step:
+    | { step: "merge" | "enable_auto_merge" | "disable_auto_merge" | "add_to_merge_queue" }
+    | { step: "merge_stack"; target: number; count: number; via_merge_queue: boolean }
+    | { step: "enable_stack_auto_merge" | "disable_stack_auto_merge" }
+    | null;
+  /** The repository's pull request template in this worktree, if it has one. */
+  pr_template: string | null;
   agents: Agent[];
   /** The PR the workspace was created from, if any. */
   linked_pr: { number: number; [key: string]: any } | null;
@@ -169,7 +176,8 @@ export interface PullRequest {
 /** One server method call; `icarus <command> --help` documents each method's params. */
 export interface Action {
   method: Method;
-  params?: Record<string, any> & { prompt_id?: PromptId };
+  /** `prompt_id` renders that prompt into `prompt`; `prompt_vars` adds top-level `{{name}}` values to it. */
+  params?: Record<string, any> & { prompt_id?: PromptId; prompt_vars?: Record<string, string | number> };
 }
 
 export interface Button {
@@ -186,6 +194,6 @@ export interface Button {
 export interface Decision {
   actions?: Action[];
   memory?: any;
-  /** Per workspace id; the first is the main button. `[]` shows none; leaving a workspace out keeps the built-in. */
+  /** Per workspace id; the first is the main button. A workspace left out, or given `[]`, shows none. */
   buttons?: Record<string, Button[]>;
 }

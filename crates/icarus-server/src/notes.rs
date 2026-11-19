@@ -969,7 +969,7 @@ impl Server {
         let worktree = workspace.path.clone();
         let before = snapshot(&worktree).await;
 
-        let choice = choose_agent(&settings, None, None);
+        let choice = choose_agent(&settings, None);
         let mut options = AgentOptions {
             provider: choice.provider,
             cwd: workspace.path.clone(),

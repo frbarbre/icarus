@@ -378,7 +378,7 @@ icarus workspace layout new-page review   # rearrange an existing workspace
 
 ## The next-action button
 
-The title bar's next-action button shows the workspace's next step and runs it: **Commit & push**, **Create PR**, **Ready for review**, **Resolve conflicts**, **Merge**, **Add to merge queue**, **Turn on auto-merge**, **Merge stack**, and so on. Steps that need code changes go to the agent with a prompt (you can change the prompts in Settings → Top bar action prompts); merge steps call GitHub directly.
+The title bar's next-action button shows the button the project's automation script gave the workspace and runs it. The template script offers **Commit & push**, **Create PR**, **Ready for review**, **Resolve conflicts**, **Merge**, **Add to merge queue**, **Turn on auto-merge**, **Merge stack**, and so on: steps that need code changes go to the agent with a prompt (Settings → Top bar action prompts), merge steps call GitHub directly. Without a script there is no button; see [automations](automations.md).
 
 Press ⌘⌥Enter (Ctrl+Alt+Enter on Linux), or:
 

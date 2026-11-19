@@ -117,22 +117,16 @@ pub fn pick_preview<'a>(v: &'a Value, app: Option<&str>) -> Result<&'a Value, St
 
 pub fn next_action(v: &Value) -> String {
     match v["action"]["label"].as_str() {
-        Some(label) => {
-            let how = if v["action"]["agent_step"] == Value::Bool(true) {
-                "starts a new agent session"
-            } else {
-                "calls GitHub"
-            };
-            format!(
-                "{label}  ({}; {how})",
-                v["action"]["kind"].as_str().unwrap_or_default()
-            )
-        }
+        Some(label) => format!(
+            "{label}  ({}; decided by run {})",
+            v["action"]["kind"].as_str().unwrap_or_default(),
+            v["decided_by"].as_str().unwrap_or("?")
+        ),
         None if v["known"] == Value::Bool(false) => format!(
             "nothing yet: the pull request lookup has not answered ({})",
             v["error"].as_str().unwrap_or("unknown")
         ),
-        None => "nothing to do".into(),
+        None => "no button: the project's automation script gave this workspace none".into(),
     }
 }
 
@@ -153,9 +147,9 @@ mod tests {
     fn next_action_explains_an_unanswered_lookup() {
         assert_eq!(
             next_action(
-                &json!({ "action": { "kind": "merge", "label": "Merge", "agent_step": false } })
+                &json!({ "action": { "kind": "script:merge", "label": "Merge" }, "decided_by": "run-1" })
             ),
-            "Merge  (merge; calls GitHub)"
+            "Merge  (script:merge; decided by run run-1)"
         );
         assert!(next_action(&json!({ "action": null, "known": false })).starts_with("nothing yet"));
         assert_eq!(

@@ -2376,12 +2376,7 @@ impl WorkspacesPanel {
                 .collect(),
             cards::GroupBy::Stack => {
                 // Why: a stack lane is ordered by stack position, so pins don't reorder it.
-                return group_by_stack(
-                    &workspaces,
-                    &self.status_order,
-                    self.view.reviewing_status.as_deref(),
-                    self.view.stack_ascending,
-                )
+                return group_by_stack(&workspaces, &self.status_order, self.view.stack_ascending)
                 .into_iter()
                 .map(|mut group| {
                     if !matches!(group.lane, StackLane::Stack { .. }) {
@@ -2390,14 +2385,6 @@ impl WorkspacesPanel {
                     group
                 })
                 .map(|group| match group.lane {
-                    StackLane::Reviewing => {
-                        let id = self.view.reviewing_status.clone().unwrap_or_default();
-                        (
-                            self.status_icon(&id, cx),
-                            self.status_label(&id),
-                            group.workspaces,
-                        )
-                    }
                     StackLane::Stack { number, .. } => (
                         Icon::new(IconName::ListTree)
                             .size(IconSize::Small)

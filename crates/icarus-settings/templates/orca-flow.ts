@@ -23,6 +23,12 @@ type Config = {
   pmApprovalTeam: string;
   resolveConflictsWithAgent: boolean;
   conflictPrompt: string;
+  /** For the "Resolve conflicts" button when a merge or rebase in the worktree stopped on conflicts. */
+  localConflictPrompt: string;
+  /** The "Create PR" button opens it as a draft. */
+  createPullRequestDraft: boolean;
+  /** Extra lines for the "Create PR" agent, as `{{prInstructions}}`. */
+  prInstructions: string;
   /** Run in a terminal when a card enters the review column. */
   reviewEnteredCommand: string;
   agent: string;
@@ -331,6 +337,85 @@ for (const ledger of [memory.created, memory.attempts]) {
 }
 for (const [key, at] of Object.entries(memory.triaged)) if (now - at > 7 * DAY) delete memory.triaged[key];
 for (const [key, value] of Object.entries(memory.triageStarts)) if (now - value.at > 7 * DAY) delete memory.triageStarts[key];
+
+const MERGE_LABELS: Record<NonNullable<Workspace["merge_step"]>["step"], string> = {
+  merge: "Merge",
+  enable_auto_merge: "Turn on auto-merge",
+  disable_auto_merge: "Turn off auto-merge",
+  add_to_merge_queue: "Add to merge queue",
+  merge_stack: "Merge stack",
+  enable_stack_auto_merge: "Turn on stack auto-merge",
+  disable_stack_auto_merge: "Turn off stack auto-merge",
+};
+
+/** The title bar's next step, in Orca's order. */
+function nextStep(ws: Workspace): Button | null {
+  const git = ws.git;
+  if (!git) return null;
+  const pr = ws.pr;
+  if (git.conflicts) return { id: "resolve-conflicts", label: "Resolve conflicts" };
+  if (!pr && ws.pr_known === true && !git.default_branch) return { id: "create-pull-request", label: "Create PR" };
+  if (git.uncommitted || (git.upstream && git.ahead > 0)) return { id: "commit-and-push", label: "Commit & push" };
+  if (!pr || pr.state !== "OPEN") return null;
+  if (pr.mergeable === "CONFLICTING") return { id: "resolve-conflicts", label: "Resolve conflicts" };
+  if (pr.is_draft) return { id: "ready-for-review", label: "Ready for review" };
+  if (ws.head_is_local && ws.merge_step) return { id: "merge", label: MERGE_LABELS[ws.merge_step.step] };
+  return null;
+}
+
+const PROMPT_BY_STEP = {
+  "commit-and-push": "commitAndPush",
+  "create-pull-request": "createPullRequest",
+  "ready-for-review": "readyForReview",
+} as const;
+
+function runStep(ws: Workspace, step: Button) {
+  const pr = ws.pr;
+  const branch = ws.git?.branch ?? ws.branch ?? "";
+  const baseRef = pr?.base_ref_name ?? (ws.base ?? "").replace(/^origin\//, "");
+  if (step.id === "merge") {
+    actions.push({ method: "workspace.merge", params: { id: ws.id } });
+    return;
+  }
+  if (step.id === "resolve-conflicts") {
+    const prompt = pr && !ws.git?.conflicts
+      ? fill(config.conflictPrompt, { prNumber: pr.number, baseRef, branch, worktreePath: ws.path })
+      : fill(config.localConflictPrompt, { worktreePath: ws.path });
+    actions.push({ method: "agent.create", params: { workspace: ws.id, provider: config.agent, title: step.label, reuse_unused: true, prompt } });
+    return;
+  }
+  const promptId = PROMPT_BY_STEP[step.id as keyof typeof PROMPT_BY_STEP];
+  if (!promptId) return;
+  actions.push({
+    method: "agent.create",
+    params: {
+      workspace: ws.id,
+      provider: config.agent,
+      title: step.label,
+      reuse_unused: true,
+      prompt_id: promptId,
+      prompt_vars: {
+        branch,
+        baseRef,
+        worktreePath: ws.path,
+        draftMode: config.createPullRequestDraft ? "as a draft" : "ready for review",
+        templateRule: ws.pr_template
+          ? `Fill in the repository's pull request template (${ws.pr_template}).`
+          : "There is no pull request template; describe what changed and why, and how it was tested.",
+        prInstructions: config.prInstructions,
+        ...(pr ? { prNumber: pr.number, prUrl: pr.url, prTitle: pr.title } : {}),
+      },
+    },
+  });
+}
+
+for (const ws of scope.workspaces) {
+  const step = nextStep(ws);
+  buttons[ws.id] = step ? [step] : [];
+  if (step && trigger.kind === "event" && trigger.name === "button" && trigger.workspace === ws.id && trigger.payload?.id === step.id) {
+    runStep(ws, step);
+  }
+}
 
 const decision: Decision = { actions, memory, buttons };
 console.log(JSON.stringify(decision));

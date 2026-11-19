@@ -343,7 +343,7 @@ async fn old_rules_settings_become_the_orca_flow_script_at_startup() {
     assert_eq!(user["automations"]["armed"], true);
     assert!(user["automations"].get("hold_status").is_none(), "{user}");
     assert_eq!(user["prompts"]["commitAndPush"], "Commit it");
-    assert_eq!(user["sidebar"]["reviewingStatus"], "in-review");
+    assert!(user["sidebar"].get("reviewingStatus").is_none(), "{user}");
 
     let automations = world.config.path().join("automations");
     let script = std::fs::read_to_string(automations.join("orca-flow.ts")).expect("script");

@@ -17,6 +17,9 @@
   "pmApprovalTeam": "",
   "resolveConflictsWithAgent": false,
   "conflictPrompt": "Pull request #{{prNumber}} has merge conflicts with {{baseRef}}. Fetch {{baseRef}}, merge it into {{branch}}, resolve every conflict keeping both sides' intent, run the tests, and commit the merge.",
+  "localConflictPrompt": "A merge or rebase in this worktree ({{worktreePath}}) stopped on conflicts.\n\n- Start with git status to see the operation in progress and the unmerged paths.\n- Resolve each conflict by reading both sides and the surrounding code; do not take ours or theirs wholesale unless that is clearly right.\n- Stage each resolved path and continue the operation (git merge --continue or git rebase --continue) until it completes.\n- Do not abort the operation, reset, stash or push.\n\nReply with the decision for each file and the final git status.",
+  "createPullRequestDraft": false,
+  "prInstructions": "",
   "reviewEnteredCommand": "",
   "agent": "claude",
   "reviewInbox": {

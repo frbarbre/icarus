@@ -270,9 +270,11 @@ impl NextActionButton {
     }
 }
 
-/// Orca's icon per step: merge steps a merge, commit & push an upload, ready for review a check.
+/// Orca's icon per step, by the script button's id: merge steps a merge, commit & push an upload,
+/// ready for review a check.
 fn next_action_icon(kind: &str) -> IconName {
-    match kind.replace('_', "-").as_str() {
+    let id = kind.strip_prefix("script:").unwrap_or(kind);
+    match id.replace('_', "-").as_str() {
         "commit-and-push" => IconName::Upload,
         "ready-for-review" => IconName::CircleCheck,
         "create-pull-request" => IconName::PullRequest,

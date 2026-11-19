@@ -43,7 +43,7 @@ struct World {
     settings: PathBuf,
     _server: ServerProcess,
     client: Arc<Client>,
-    events: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<icarus_client::Event>>,
+    _events: tokio::sync::mpsc::UnboundedReceiver<icarus_client::Event>,
     project: String,
 }
 
@@ -126,25 +126,7 @@ impl World {
             settings: settings_path,
             _server: ServerProcess { child },
             client,
-            events: tokio::sync::Mutex::new(events),
-        }
-    }
-
-    /// The first `workspace.next_action` event for `workspace` whose step is `kind`.
-    async fn next_action_event(&self, workspace: &str, kind: &str, within: Duration) -> Value {
-        let mut events = self.events.lock().await;
-        let deadline = tokio::time::Instant::now() + within;
-        loop {
-            let event = tokio::time::timeout_at(deadline, events.recv())
-                .await
-                .unwrap_or_else(|_| panic!("no {kind} next action for {workspace} in {within:?}"))
-                .expect("events");
-            if event.topic == "workspace.next_action"
-                && event.payload["workspace"] == workspace
-                && event.payload["action"]["kind"] == kind
-            {
-                return event.payload;
-            }
+            _events: events,
         }
     }
 
@@ -428,39 +410,22 @@ async fn pr_previews_come_from_deployments_and_ride_along_in_pr_status() {
     assert_eq!(found["primary"]["app"], "insights");
 }
 
-#[tokio::test]
-async fn a_pr_turned_draft_after_it_was_read_offers_ready_for_review() {
-    let world = World::new(json!({}), json!({ "viewer": "me" })).await;
-    let (id, _, head) = world.workspace("later-draft").await;
-    let fixtures = |draft: bool| {
-        json!({
-            "viewer": "me",
-            "repo": { "squashMergeAllowed": true, "autoMergeAllowed": true, "mergeQueue": { "id": "MQ_1" } },
-            "pulls": [pull(7, "later-draft", &head, json!({ "isDraft": draft }))],
-        })
-    };
-    world.set_fixtures(fixtures(false));
-    assert_eq!(
-        world.next_action(&id).await["action"]["kind"],
-        "add-to-merge-queue"
-    );
-
-    world.set_fixtures(fixtures(true));
-    world
-        .client
-        .request("pr.status", json!({ "workspace": id, "refresh": true }))
-        .await
-        .expect("refresh");
-
-    assert_eq!(
-        world.next_action(&id).await["action"]["kind"],
-        "ready-for-review"
-    );
+/// The template script's next step, after a manual run decides the buttons.
+async fn scripted_step(world: &World, id: &str) -> Value {
+    let run = run(world).await;
+    assert!(run["error"].is_null(), "{run}");
+    world.next_action(id).await
 }
 
 #[tokio::test]
-async fn next_action_resolves_each_step() {
-    let world = World::new(json!({}), json!({ "viewer": "me" })).await;
+async fn the_template_script_offers_each_next_step() {
+    if !bun_installed() {
+        eprintln!("skipped: no bun");
+        return;
+    }
+    let scripts = tempfile::tempdir().expect("scripts");
+    let script = flow_script(scripts.path());
+    let world = World::new(flow_settings(&script, true), json!({ "viewer": "me" })).await;
     let (no_pr, _, _) = world.workspace("no-pr").await;
     let (dirty, dirty_path, dirty_head) = world.workspace("dirty").await;
     let (draft, _, draft_head) = world.workspace("draft").await;
@@ -478,41 +443,42 @@ async fn next_action_resolves_each_step() {
         ],
     }));
 
-    let expect = |value: &Value, kind: &str, label: &str, agent: bool| {
-        assert_eq!(value["action"]["kind"], kind, "{value}");
+    let expect = |value: &Value, id: &str, label: &str| {
+        assert_eq!(value["action"]["kind"], format!("script:{id}"), "{value}");
         assert_eq!(value["action"]["label"], label, "{value}");
-        assert_eq!(value["action"]["agent_step"], agent, "{value}");
     };
-    let none = world.next_action(&no_pr).await;
-    expect(&none, "create-pull-request", "Create PR", true);
+    let none = scripted_step(&world, &no_pr).await;
+    expect(&none, "create-pull-request", "Create PR");
     assert_eq!(none["local"]["branch"], "no-pr");
-    assert_eq!(none["local"]["has_uncommitted_changes"], false);
     let dirty = world.next_action(&dirty).await;
-    expect(&dirty, "commit-and-push", "Commit & push", true);
+    expect(&dirty, "commit-and-push", "Commit & push");
     assert_eq!(dirty["local"]["has_uncommitted_changes"], true);
     expect(
         &world.next_action(&draft).await,
         "ready-for-review",
         "Ready for review",
-        true,
     );
     expect(
         &world.next_action(&conflict).await,
         "resolve-conflicts",
         "Resolve conflicts",
-        true,
     );
     expect(
         &world.next_action(&queue).await,
-        "add-to-merge-queue",
+        "merge",
         "Add to merge queue",
-        false,
     );
 }
 
 #[tokio::test]
-async fn run_next_action_starts_an_agent_or_calls_github() {
-    let world = World::new(fake_agent_settings(json!({})), json!({ "viewer": "me" })).await;
+async fn clicking_the_next_step_starts_an_agent_or_merges() {
+    if !bun_installed() {
+        eprintln!("skipped: no bun");
+        return;
+    }
+    let scripts = tempfile::tempdir().expect("scripts");
+    let script = flow_script(scripts.path());
+    let world = World::new(flow_settings(&script, true), json!({ "viewer": "me" })).await;
     let (draft, _, draft_head) = world.workspace("draft").await;
     let (ready, _, ready_head) = world.workspace("ready").await;
     world.set_fixtures(json!({
@@ -523,11 +489,13 @@ async fn run_next_action_starts_an_agent_or_calls_github() {
         ],
     }));
 
+    assert_eq!(
+        scripted_step(&world, &draft).await["action"]["kind"],
+        "script:ready-for-review"
+    );
     let ran = world
         .request("workspace.run_next_action", json!({ "id": draft }))
         .await;
-    assert_eq!(ran["action"]["kind"], "ready-for-review");
-    assert!(ran["github"].is_null());
     let agent = ran["started_agent"].as_str().expect("agent id").to_owned();
     let text = wait_for_agent(&world, &agent).await;
     assert!(
@@ -544,15 +512,17 @@ async fn run_next_action_starts_an_agent_or_calls_github() {
         .await;
     assert_ne!(
         again["started_agent"], agent,
-        "every run starts a new session"
+        "a used session is not reused"
     );
 
-    assert_eq!(world.next_action(&ready).await["action"]["kind"], "merge");
+    assert_eq!(
+        world.next_action(&ready).await["action"]["kind"],
+        "script:merge"
+    );
     let merged = world
         .request("workspace.run_next_action", json!({ "id": ready }))
         .await;
-    assert!(merged["started_agent"].is_null());
-    assert_eq!(merged["github"]["merged"], true, "{merged}");
+    assert!(merged["started_agent"].is_null(), "{merged}");
     let request = world
         .requests()
         .into_iter()
@@ -580,60 +550,51 @@ async fn a_push_updates_the_next_action_without_waiting_for_the_poll() {
         git(&feat_path, &["commit", "-q", "-m", name]);
         git(&feat_path, &["rev-parse", "HEAD"])
     };
+    let targeted = || {
+        world
+            .snapshot_queries()
+            .into_iter()
+            .filter(|vars| vars["b0"] == "feat" && vars.get("b1").is_none())
+            .count()
+    };
+    let wait_for_query = |after: usize| async move {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while targeted() <= after {
+            assert!(
+                Instant::now() < deadline,
+                "no single-PR query after the push"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
     let head = commit("one.txt");
-    assert_ne!(world.next_action(&feat).await["action"]["kind"], "merge");
+    world.next_action(&feat).await;
     world.set_fixtures(json!({ "viewer": "me", "pulls": [pull(9, "feat", &head, json!({}))] }));
 
+    let before = targeted();
     let pushed = Instant::now();
     world
         .request("git.push", json!({ "workspace": feat }))
         .await;
-    let event = world
-        .next_action_event(&feat, "merge", Duration::from_secs(6))
-        .await;
+    wait_for_query(before).await;
     let took = pushed.elapsed();
     assert!(
         took >= Duration::from_secs(2) && took < Duration::from_secs(5),
         "after GitHub's post-push delay, not the 60 s poll: {took:?}"
     );
-    assert_eq!(event["local"]["unpushed_commits"], 0);
-    let targeted = world
-        .snapshot_queries()
-        .into_iter()
-        .filter(|vars| vars["b0"] == "feat" && vars.get("b1").is_none())
-        .count();
-    assert!(
-        targeted >= 1,
-        "one single-PR query: {:?}",
-        world.snapshot_queries()
-    );
-
     let status = world
         .request("pr.status", json!({ "workspace": feat }))
         .await;
-    let button = world.next_action(&feat).await;
     assert_eq!(status["pull_request"]["number"], 9, "{status}");
-    assert_eq!(
-        button["action"]["kind"], "merge",
-        "the panel and the button read one copy"
-    );
 
     // A push the server didn't run (an agent's, a terminal's) shows up the next time it reads git.
-    let head = commit("two.txt");
-    world.set_fixtures(json!({
-        "viewer": "me",
-        "pulls": [pull(9, "feat", &head, json!({ "isDraft": true }))],
-    }));
-    assert_eq!(
-        world.next_action(&feat).await["action"]["kind"],
-        "commit-and-push"
-    );
+    commit("two.txt");
+    world.next_action(&feat).await;
+    let before = targeted();
     git(&feat_path, &["push", "-q"]);
     let pushed = Instant::now();
     world.next_action(&feat).await;
-    world
-        .next_action_event(&feat, "ready-for-review", Duration::from_secs(6))
-        .await;
+    wait_for_query(before).await;
     assert!(pushed.elapsed() < Duration::from_secs(5));
 }
 

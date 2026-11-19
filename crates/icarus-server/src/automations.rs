@@ -35,7 +35,7 @@ const KEEP_RECENT_MS: u64 = 24 * 3600 * 1000;
 const KEEP_RECENT_RUNS: i64 = 500;
 const KEEP_NOTABLE_MS: u64 = 7 * 24 * 3600 * 1000;
 /// Methods that start an agent, counted against `automations.max_agents_per_run`.
-const AGENT_METHODS: &[&str] = &["agent.create", "workspace.run_next_action"];
+const AGENT_METHODS: &[&str] = &["agent.create"];
 /// A script can't drive the engine itself, the server's lifecycle, or event streams it can't read.
 const DENIED_PREFIXES: &[&str] = &["automation.", "server.", "client.drive"];
 const DENIED_SUFFIXES: &[&str] = &[".attach", ".detach", ".wait", ".events"];
@@ -78,8 +78,8 @@ pub(crate) const METHODS: &[&str] = &[
     "terminal.write",
     "workspace.create",
     "workspace.layout",
+    "workspace.merge",
     "workspace.remove",
-    "workspace.run_next_action",
     "workspace.set",
     "workspace.set_unread",
     "workspace.sleep",
@@ -270,6 +270,20 @@ pub(crate) fn render_template(template: &str, context: &Value) -> String {
 }
 
 /// What a prompt template sees for one workspace.
+/// The `prompts` setting, with the shipped step prompts (`commitAndPush`, …) for ids it leaves out.
+fn prompts_with_defaults(settings: &Value) -> Value {
+    let mut prompts = setting(settings, &["prompts"])
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for id in icarus_rules::prompts::ActionPromptId::ALL {
+        let custom = prompts.get(id.key()).and_then(Value::as_str);
+        let template = icarus_rules::prompts::resolve_action_prompt_template(custom, id).to_owned();
+        prompts.insert(id.key().to_owned(), json!(template));
+    }
+    Value::Object(prompts)
+}
+
 fn prompt_context(scope: &Value, workspace: &Value) -> Value {
     json!({
         "project": scope.get("project"),
@@ -671,7 +685,7 @@ impl Server {
             "workspaces": list,
             "settings": {
                 "statuses": setting(settings, &["workspace", "statuses"]).cloned().unwrap_or(json!([])),
-                "prompts": setting(settings, &["prompts"]).cloned().unwrap_or(json!({})),
+                "prompts": prompts_with_defaults(settings),
             },
             "viewer": viewer.ok(),
             "icarus_version": crate::updates::VERSION,
@@ -730,9 +744,12 @@ impl Server {
             "issue": workspace.issue,
             "git": null,
             "pr": null,
-            "suggested_action": null,
+            "merge_step": null,
             "linked_pr": workspace.pull_request,
             "review_pending": self.unsent_drafts(&workspace.id),
+            "pr_template": crate::next_action::PR_TEMPLATES
+                .iter()
+                .find(|path| workspace.path.join(path).is_file()),
             "agents": agents
                 .iter()
                 .filter(|a| a.workspace.as_deref() == Some(workspace.id.as_str()))
@@ -748,8 +765,8 @@ impl Server {
                 }))
                 .collect::<Vec<_>>(),
         });
-        match self.resolve_next(workspace).await {
-            Ok((action, local, view)) => {
+        match self.local_and_pr(workspace).await {
+            Ok((local, view)) => {
                 value["git"] = json!({
                     "branch": local.branch,
                     "head": local.head_oid,
@@ -770,6 +787,7 @@ impl Server {
                     value["pr"] = pr;
                 }
                 if let Some(pr) = &view.pr {
+                    value["merge_step"] = json!(icarus_rules::next_action::merge_step(pr));
                     value["head_is_local"] =
                         json!(local.head_oid.as_deref() == Some(pr.head_ref_oid.as_str()));
                     value["base_follows_target"] = json!(icarus_rules::facts::base_follows(
@@ -781,7 +799,6 @@ impl Server {
                 if let Some(error) = &view.error {
                     value["pr_error"] = json!(error);
                 }
-                value["suggested_action"] = crate::next_action::action_json(action);
             }
             Err(error) => value["git_error"] = json!(error.message),
         }
@@ -911,10 +928,7 @@ impl Server {
         let acted = outcomes().any(|ok| ok == &Value::Bool(true));
         let failed = output.error.is_some()
             || decision_error.is_some()
-            || results
-                .iter()
-                .chain(&cli_calls)
-                .any(|r| r["ok"] == false);
+            || results.iter().chain(&cli_calls).any(|r| r["ok"] == false);
         let mut memory_after = memory_before.clone();
         let mut memory_error = None;
         if let Some(memory) = &decision.memory {
@@ -1105,9 +1119,9 @@ impl Server {
                 Value::Null => json!({}),
                 other => other,
             };
-            if action.method == "workspace.run_next_action" {
-                params["builtin"] = json!(true);
-            }
+            let vars = params
+                .as_object_mut()
+                .and_then(|params| params.remove("prompt_vars"));
             if let Some(id) = params.get("prompt_id").and_then(Value::as_str)
                 && params.get("prompt").is_none()
             {
@@ -1123,14 +1137,22 @@ impl Server {
                     .and_then(|w| scope_workspace(scope, &w.id))
                     .cloned()
                     .unwrap_or(Value::Null);
-                params["prompt"] =
-                    json!(render_template(template, &prompt_context(scope, &ws_scope)));
+                let mut context = prompt_context(scope, &ws_scope);
+                if let (Some(context), Some(Value::Object(vars))) = (context.as_object_mut(), vars)
+                {
+                    context.extend(vars);
+                }
+                params["prompt"] = json!(render_template(template, &context));
             }
             match self.call_internal(&action.method, params).await {
                 Ok(value) => {
                     self.automations.observe("workspace.changed");
                     if AGENT_METHODS.contains(&action.method.as_str()) {
                         agents_started += 1;
+                        // Its turn may change the PR without a push (marking it ready), so it refreshes the PR.
+                        if let Some(id) = value["id"].as_str() {
+                            self.note_action_agent(id);
+                        }
                     }
                     result["ok"] = json!(true);
                     result["result"] = value;
@@ -1403,17 +1425,11 @@ impl Server {
                     .workspace(&p.id)
                     .map_err(|e| rpc("internal", e))?
                     .ok_or_else(|| rpc("not_found", format!("workspace {}", p.id)))?;
-                let suggested = self
-                    .resolve_next(&workspace)
-                    .await
-                    .map(|(action, _, _)| crate::next_action::action_json(action))
-                    .unwrap_or(Value::Null);
                 let Some(buttons) = self.automations.buttons(&workspace.id) else {
                     return Ok(json!({
                         "workspace": workspace.id,
-                        "decided_by": "built-in",
-                        "buttons": if suggested.is_object() { vec![suggested.clone()] } else { Vec::new() },
-                        "suggested_action": suggested,
+                        "decided_by": null,
+                        "buttons": [],
                     }));
                 };
                 let (run, core) = self.load_run(&buttons.run)?;
@@ -1427,7 +1443,6 @@ impl Server {
                     "run_started_ms": run["started_ms"],
                     "trigger": run["trigger"],
                     "buttons": buttons.list,
-                    "suggested_action": suggested,
                     "scope_then": {
                         "status": ws_scope["status"],
                         "git": ws_scope["git"],
@@ -1443,7 +1458,7 @@ impl Server {
                             "auto_merge": pr.get("auto_merge"),
                             "updated_at": pr.get("updated_at"),
                         })),
-                        "suggested_action": ws_scope["suggested_action"],
+                        "merge_step": ws_scope["merge_step"],
                     },
                 }))
             }
@@ -1650,8 +1665,8 @@ impl Server {
                     statuses.push(id.to_owned());
                 }
             }
-            for id in setting(&s, &["prompts"])
-                .and_then(Value::as_object)
+            for id in prompts_with_defaults(&s)
+                .as_object()
                 .into_iter()
                 .flat_map(|m| m.keys())
             {
@@ -1837,6 +1852,9 @@ fn diff_events(before: &HashMap<String, Value>, after: &HashMap<String, Value>) 
         {
             events.push(event("git.pushed", id, json!({ "head": ng["head"] })));
         }
+        if og != ng && og.is_object() && ng.is_object() {
+            events.push(event("git.changed", id, json!({ "from": og, "to": ng })));
+        }
         let old_agents: HashMap<&str, &Value> = o["agents"]
             .as_array()
             .into_iter()
@@ -1971,6 +1989,7 @@ mod tests {
                 "checks.failed",
                 "review.requested",
                 "git.pushed",
+                "git.changed",
                 "agent.finished",
             ]
         );

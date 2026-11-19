@@ -15,6 +15,11 @@ use crate::server::Server;
 const ENGINE_STATE_KEY: &str = "rules.engine_state";
 const SCRIPT: &str = "automations/orca-flow.ts";
 const BACKUP: &str = "automations/rules-backup.json";
+const RETIRED_KEYS: [&str; 3] = [
+    "automations.hold_status",
+    "sidebar.reviewingStatus",
+    "actions",
+];
 const CONDITIONS: [&str; 10] = [
     "merged",
     "closed",
@@ -91,11 +96,16 @@ impl Server {
     /// rule projects at it and removes `rules`.
     pub(crate) fn migrate_rules(&self) {
         let settings = self.resolved_settings(None);
-        // Hold moved into the script's own options (`holdStatus`); the schema no longer has the key.
-        if let Some(hold) = setting(&settings, &["automations", "hold_status"]) {
-            tracing::info!("automations.hold_status {hold} removed; scripts read their own holdStatus now");
-            if let Err(error) = strip_user_keys(&["automations.hold_status"]) {
-                tracing::warn!("removing automations.hold_status: {error}");
+        // Behaviour moved into the automation script; the schema no longer has these keys.
+        let retired: Vec<&str> = RETIRED_KEYS
+            .iter()
+            .copied()
+            .filter(|key| setting(&settings, &key.split('.').collect::<Vec<_>>()).is_some())
+            .collect();
+        if !retired.is_empty() {
+            tracing::info!("removing settings the automation script now owns: {retired:?}");
+            if let Err(error) = strip_user_keys(&retired) {
+                tracing::warn!("removing {retired:?}: {error}");
             }
         }
         let toggle = setting(&settings, &["notifications", "rules"]).cloned();
@@ -215,11 +225,6 @@ impl Server {
         }
         if let Some(interval) = rules["interval_ms"].as_u64() {
             set("automations.interval_ms", Some(json!(interval)))?;
-        }
-        if let Some(status) = text(&pr["statusByCondition"]["reviewing"])
-            && setting(settings, &["sidebar", "reviewingStatus"]).is_none()
-        {
-            set("sidebar.reviewingStatus", Some(json!(status)))?;
         }
         if let Some(team) = text(&pr["pmApprovalTeam"]) {
             set("automations.teams", Some(json!([team])))?;
