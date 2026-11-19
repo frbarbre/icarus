@@ -4159,7 +4159,8 @@ impl LocalLspStore {
             .entry(language_server_id)
             .or_default();
 
-        if let Some((worktree, literal_prefix, pattern)) =
+        // The prefix isn't scanned: that loads every ignored folder under it, millions of node_modules entries.
+        if let Some((worktree, _literal_prefix, pattern)) =
             Self::worktree_and_path_for_file_watcher(worktrees, watcher, cx)
         {
             if worktree.read(cx).as_local().is_some() {
@@ -4170,20 +4171,6 @@ impl LocalLspStore {
                         .entry(worktree_id)
                         .or_default()
                         .add(registration_id, glob);
-                    // A prefix forces everything under it to load, ignored folders included, so a
-                    // `**/x` watcher would crawl every node_modules; only ignored prefixes need it.
-                    let tracked = literal_prefix.is_empty()
-                        || worktree
-                            .read(cx)
-                            .entry_for_path(&literal_prefix)
-                            .is_some_and(|entry| !entry.is_ignored);
-                    if !tracked {
-                        worktree.update(cx, |worktree, _| {
-                            if let Some(tree) = worktree.as_local_mut() {
-                                tree.add_path_prefix_to_scan(literal_prefix);
-                            }
-                        });
-                    }
                 }
             }
 

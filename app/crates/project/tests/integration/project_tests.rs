@@ -3114,7 +3114,7 @@ async fn test_reporting_fs_changes_to_language_servers(cx: &mut gpui::TestAppCon
 
     cx.executor().run_until_parked();
     assert_eq!(mem::take(&mut *file_changes.lock()), &[]);
-    assert_eq!(fs.read_dir_call_count() - prev_read_dir_count, 4);
+    assert_eq!(fs.read_dir_call_count() - prev_read_dir_count, 0);
 
     let mut new_watched_paths = fs.watched_paths();
     new_watched_paths.retain(|path| {
@@ -3129,8 +3129,7 @@ async fn test_reporting_fs_changes_to_language_servers(cx: &mut gpui::TestAppCon
         ]
     );
 
-    // Now the language server has asked us to watch an ignored directory path,
-    // so we recursively load it.
+    // Watching an ignored directory doesn't load it: in a JS repo that would be every node_modules.
     project.update(cx, |project, cx| {
         let worktree = project.visible_worktrees(cx).next().unwrap();
         assert_eq!(
@@ -3148,11 +3147,6 @@ async fn test_reporting_fs_changes_to_language_servers(cx: &mut gpui::TestAppCon
                 ("src/a.rs", false),
                 ("src/b.rs", false),
                 ("target", true),
-                ("target/x", true),
-                ("target/y", true),
-                ("target/y/out", true),
-                ("target/y/out/y.rs", true),
-                ("target/z", true),
             ]
         );
     });
@@ -3217,10 +3211,6 @@ async fn test_reporting_fs_changes_to_language_servers(cx: &mut gpui::TestAppCon
             },
             lsp::FileEvent {
                 uri: lsp::Uri::from_file_path(path!("/the-root/src/c.rs")).unwrap(),
-                typ: lsp::FileChangeType::CREATED,
-            },
-            lsp::FileEvent {
-                uri: lsp::Uri::from_file_path(path!("/the-root/target/y/out/y2.rs")).unwrap(),
                 typ: lsp::FileChangeType::CREATED,
             },
             lsp::FileEvent {

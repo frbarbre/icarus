@@ -88,13 +88,14 @@ impl AgentServer for CustomAgentServer {
         let agent_id = self.agent_id();
         let config_id = config_id.to_string();
         let value_id = value_id.to_string();
+        let new_entry = new_settings_entry(&agent_id, cx);
 
         update_settings_file(fs, cx, move |settings, _cx| {
             let settings = settings
                 .agent_servers
                 .get_or_insert_default()
                 .entry(agent_id.0.to_string())
-                .or_insert_with(default_settings_for_agent);
+                .or_insert(new_entry);
 
             match settings {
                 settings::CustomAgentServerSettings::Custom {
@@ -131,12 +132,13 @@ impl AgentServer for CustomAgentServer {
         cx: &mut App,
     ) {
         let agent_id = self.agent_id();
+        let new_entry = new_settings_entry(&agent_id, cx);
         update_settings_file(fs, cx, move |settings, _cx| {
             let settings = settings
                 .agent_servers
                 .get_or_insert_default()
                 .entry(agent_id.0.to_string())
-                .or_insert_with(default_settings_for_agent);
+                .or_insert(new_entry);
 
             match settings {
                 settings::CustomAgentServerSettings::Custom { default_mode, .. }
@@ -169,12 +171,13 @@ impl AgentServer for CustomAgentServer {
     ) {
         let agent_id = self.agent_id();
         let config_id = config_id.to_string();
+        let new_entry = new_settings_entry(&agent_id, cx);
         update_settings_file(fs, cx, move |settings, _cx| {
             let settings = settings
                 .agent_servers
                 .get_or_insert_default()
                 .entry(agent_id.0.to_string())
-                .or_insert_with(default_settings_for_agent);
+                .or_insert(new_entry);
 
             match settings {
                 settings::CustomAgentServerSettings::Custom {
@@ -326,6 +329,30 @@ fn is_registry_agent(agent_id: impl Into<AgentId>, cx: &App) -> bool {
     is_in_registry || is_settings_registry
 }
 
+/// The user-settings entry to create for `agent_id`: a copy of how it's defined now, so saving a
+/// default mode for a built-in custom agent (Icarus) doesn't turn it into an unknown registry agent.
+fn new_settings_entry(agent_id: &AgentId, cx: &App) -> settings::CustomAgentServerSettings {
+    let current = cx.read_global(|settings: &SettingsStore, _| {
+        settings
+            .get::<AllAgentServersSettings>(None)
+            .get(agent_id.as_ref())
+            .cloned()
+    });
+    match current {
+        Some(project::agent_server_store::CustomAgentServerSettings::Custom {
+            command, ..
+        }) => settings::CustomAgentServerSettings::Custom {
+            path: command.path,
+            args: command.args,
+            env: command.env.unwrap_or_default(),
+            default_mode: None,
+            default_config_options: Default::default(),
+            favorite_config_option_values: Default::default(),
+        },
+        _ => default_settings_for_agent(),
+    }
+}
+
 fn default_settings_for_agent() -> settings::CustomAgentServerSettings {
     settings::CustomAgentServerSettings::Registry {
         default_mode: None,
@@ -394,6 +421,40 @@ mod tests {
                 ),
                 cx,
             );
+        });
+    }
+
+    #[gpui::test]
+    fn a_new_settings_entry_keeps_a_custom_agent_custom(cx: &mut TestAppContext) {
+        init_test(cx);
+        set_agent_server_settings(
+            cx,
+            vec![(
+                "Icarus",
+                settings::CustomAgentServerSettings::Custom {
+                    path: "icarus".into(),
+                    args: vec!["acp".into()],
+                    env: HashMap::default(),
+                    default_mode: None,
+                    default_config_options: HashMap::default(),
+                    favorite_config_option_values: HashMap::default(),
+                },
+            )],
+        );
+        cx.update(|cx| {
+            let entry = new_settings_entry(&AgentId::new("Icarus"), cx);
+            assert!(
+                matches!(
+                    &entry,
+                    settings::CustomAgentServerSettings::Custom { path, args, .. }
+                        if path.as_path() == std::path::Path::new("icarus") && args == &["acp"]
+                ),
+                "saving a default for Icarus must not make it a registry agent: {entry:?}"
+            );
+            assert!(matches!(
+                new_settings_entry(&AgentId::new("unknown"), cx),
+                settings::CustomAgentServerSettings::Registry { .. }
+            ));
         });
     }
 
