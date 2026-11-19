@@ -266,6 +266,11 @@ async fn a_script_decides_statuses_and_buttons_and_its_runs_replay() {
         .expect("held run");
     let result = &held["runs"][0]["results"][0];
     assert_eq!(result["ok"], false, "{held}");
+    assert_eq!(result["held"], true, "{held}");
+    assert_eq!(
+        held["runs"][0]["failed"], false,
+        "a held action isn't a failure: {held}"
+    );
     assert!(
         result["error"].as_str().is_some_and(|e| e.contains("hold")),
         "{result}"
@@ -284,7 +289,7 @@ async fn a_script_decides_statuses_and_buttons_and_its_runs_replay() {
         )
         .await
         .expect("failed runs");
-    assert_eq!(failed["runs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(failed["runs"].as_array().map(Vec::len), Some(0));
     let shown = client
         .request(
             "automation.show",

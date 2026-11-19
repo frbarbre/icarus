@@ -754,6 +754,105 @@ async fn the_orca_flow_script_moves_a_status_and_creates_a_review_workspace() {
     );
 }
 
+fn write_flow(path: &Path, status_by_condition: Value) {
+    let mut options = icarus_settings::automation_template::orca_flow_defaults();
+    options["statusByCondition"] = status_by_condition;
+    options["newWorkspaceStatus"] = Value::Null;
+    std::fs::write(
+        path,
+        icarus_settings::automation_template::orca_flow(&options),
+    )
+    .expect("script");
+}
+
+fn changes_requested_by(login: &str) -> Value {
+    json!({ "latestReviews": { "nodes": [
+        { "state": "CHANGES_REQUESTED", "author": { "login": login } },
+    ] } })
+}
+
+#[tokio::test]
+async fn remapped_conditions_move_cards_between_columns() {
+    if !bun_installed() {
+        eprintln!("skipped: no bun");
+        return;
+    }
+    let scripts = tempfile::tempdir().expect("scripts");
+    let script = scripts.path().join("orca-flow.ts");
+    write_flow(
+        &script,
+        json!({ "draft": "in-progress", "changes-requested": "in-progress", "review": "in-review", "merged": "done" }),
+    );
+    let world = World::new(flow_settings(&script, true), json!({ "viewer": "me" })).await;
+    let (draft, _, draft_head) = world.workspace("feat-draft").await;
+    let (review, _, review_head) = world.workspace("feat-review").await;
+    let (changes, _, changes_head) = world.workspace("feat-changes").await;
+    let status = async |id: &str| {
+        world.request("workspace.info", json!({ "id": id })).await["status"].clone()
+    };
+    let github_changes = async |draft_extra: Value, review_extra: Value| {
+        world.set_fixtures(json!({ "viewer": "me", "pulls": [
+            pull(1, "feat-draft", &draft_head, draft_extra),
+            pull(2, "feat-review", &review_head, review_extra),
+            pull(3, "feat-changes", &changes_head, changes_requested_by("bob")),
+        ] }));
+        // Stands in for the 60 s poll, which refetches past the PR cache.
+        world
+            .request("pr.status", json!({ "workspace": draft, "refresh": true }))
+            .await;
+    };
+
+    github_changes(json!({ "isDraft": true }), json!({})).await;
+    let out = run(&world).await;
+    assert_eq!(status(&draft).await, "in-progress", "{out}");
+    assert_eq!(status(&review).await, "in-review", "{out}");
+    assert_eq!(status(&changes).await, "in-progress", "{out}");
+
+    write_flow(
+        &script,
+        json!({ "draft": "draft", "changes-requested": "changes-requested", "review": "in-review", "merged": "done" }),
+    );
+    let out = run(&world).await;
+    assert_eq!(status(&draft).await, "draft", "{out}");
+    assert_eq!(status(&review).await, "in-review", "{out}");
+    assert_eq!(status(&changes).await, "changes-requested", "{out}");
+
+    github_changes(json!({}), changes_requested_by("bob")).await;
+    let out = run(&world).await;
+    assert_eq!(status(&draft).await, "in-review", "ready for review: {out}");
+    assert_eq!(status(&review).await, "changes-requested", "{out}");
+    assert_eq!(status(&changes).await, "changes-requested", "{out}");
+
+    write_flow(
+        &script,
+        json!({ "draft": "draft", "changes-requested": "draft", "review": "in-review", "merged": "done" }),
+    );
+    let out = run(&world).await;
+    assert_eq!(status(&draft).await, "in-review", "{out}");
+    assert_eq!(status(&review).await, "draft", "{out}");
+    assert_eq!(status(&changes).await, "draft", "{out}");
+
+    github_changes(json!({ "state": "MERGED" }), json!({ "isDraft": true })).await;
+    let out = run(&world).await;
+    assert_eq!(status(&draft).await, "done", "merged: {out}");
+    assert_eq!(
+        status(&review).await,
+        "draft",
+        "draft wins over changes requested: {out}"
+    );
+
+    write_flow(&script, json!({ "merged": "done" }));
+    world
+        .request("workspace.set", json!({ "id": changes, "status": "todo" }))
+        .await;
+    let out = run(&world).await;
+    assert_eq!(
+        status(&changes).await,
+        "todo",
+        "an unmapped condition leaves the card: {out}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "reads from the real GitHub through the local gh login"]
 async fn live_gh_viewer_login() {

@@ -897,9 +897,13 @@ impl Server {
         };
         let outcomes = || results.iter().chain(&cli_calls).filter_map(|r| r.get("ok"));
         let acted = outcomes().any(|ok| ok == &Value::Bool(true));
+        // The hold column is the user's choice, so a held action doesn't fail the run.
         let failed = output.error.is_some()
             || decision_error.is_some()
-            || outcomes().any(|ok| ok == &Value::Bool(false));
+            || results
+                .iter()
+                .chain(&cli_calls)
+                .any(|r| r["ok"] == false && r["held"] != true);
         let mut memory_after = memory_before.clone();
         let mut memory_error = None;
         if let Some(memory) = &decision.memory {
@@ -1075,6 +1079,7 @@ impl Server {
                 .as_ref()
                 .filter(|w| !action.force && config.hold.is_some() && w.status == config.hold)
             {
+                result["held"] = json!(true);
                 refuse(format!("skipped: {} is in the hold column", w.name))
             } else if AGENT_METHODS.contains(&action.method.as_str())
                 && agents_started >= config.max_agents

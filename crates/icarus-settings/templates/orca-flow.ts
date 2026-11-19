@@ -285,6 +285,31 @@ if (trigger.kind === "event") {
   }
 }
 
+// Linear's "Open in coding tool" hook: `icarus automation emit linear.open_issue --path "$LINEAR_WORK_DIR" --env …`.
+if (scope.trigger?.kind === "event" && scope.trigger.name === "linear.open_issue") {
+  const env = (scope.trigger.payload ?? {}) as Record<string, string | undefined>;
+  const issue = env.LINEAR_ISSUE_IDENTIFIER;
+  // The name doubles as the dev server's <name>.localhost label, so it stays the short issue id.
+  const name = lower(issue ?? env.LINEAR_ISSUE_BRANCH_NAME ?? "linear-task");
+  const existing = scope.workspaces.find((ws) => lower(ws.name) === name);
+  if (issue) actions.push({ method: "issue.assign", params: { id: issue } });
+  if (!existing) {
+    actions.push({
+      method: "workspace.create",
+      params: { project: scope.project.id, name, ...(issue ? { issue } : {}), agent: false },
+    });
+    actions.push({
+      method: "agent.create",
+      params: {
+        workspace: name,
+        provider: config.agent,
+        mode: "plan",
+        prompt: env.LINEAR_PROMPT || `Work on ${issue ?? "this issue"}.`,
+      },
+    });
+  }
+}
+
 // Inbox entries stay while the PR still asks for a review, so a deleted review workspace isn't recreated.
 for (const ledger of [memory.created, memory.attempts]) {
   for (const key of Object.keys(ledger)) if (!inInbox.has(key.split("@")[0]) && now - (memory.created[key] ?? 0) > 14 * DAY) delete ledger[key];

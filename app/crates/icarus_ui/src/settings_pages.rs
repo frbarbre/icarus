@@ -1196,7 +1196,7 @@ impl IcarusSettings {
             .into_iter()
             .map(|(id, text)| {
                 let template = cx.new(|cx| {
-                    let mut editor = Editor::auto_height(1, 8, window, cx);
+                    let mut editor = Editor::auto_height(2, 16, window, cx);
                     editor.set_soft_wrap();
                     let placeholder = if NEXT_ACTION_PROMPTS.contains(&id.as_str()) {
                         "The built-in prompt for the next-action button's step"
@@ -2510,18 +2510,17 @@ impl IcarusSettings {
                     .map(|(_, result)| result.clone());
                 let (id_preview, id_rename, id_remove) = (id.clone(), id.clone(), id.clone());
                 v_flex()
-                    .py_1()
+                    .py_2()
+                    .gap_1()
                     .child(
                         h_flex()
                             .gap_2()
-                            .items_start()
                             .justify_between()
-                            .child(Label::new(id.clone()).size(LabelSize::Small))
+                            .child(Label::new(id.clone()))
                             .child(
                                 h_flex()
                                     .gap_0p5()
                                     .flex_none()
-                                    .child(Self::text_field(&row.template, 420., cx))
                                     .child(
                                         ui::Button::new(element_id("preview"), "Preview")
                                             .label_size(LabelSize::Small)
@@ -2569,6 +2568,16 @@ impl IcarusSettings {
                                             )),
                                     ),
                             ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(row.template.clone()),
                     )
                     .children(preview.map(|preview| {
                         match preview {

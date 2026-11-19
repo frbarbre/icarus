@@ -408,7 +408,7 @@ impl SettingFieldRenderer {
 
 struct NonFocusableHandle {
     handle: FocusHandle,
-    _subscription: Subscription,
+    _subscription: Option<Subscription>,
 }
 
 impl NonFocusableHandle {
@@ -426,8 +426,17 @@ impl NonFocusableHandle {
             });
             Self {
                 handle,
-                _subscription,
+                _subscription: Some(_subscription),
             }
+        })
+    }
+
+    // Embedded views may have no tab stop, so forwarding would wrap focus onto the navbar and switch pages.
+    fn focusable(cx: &mut App) -> Entity<Self> {
+        let handle = cx.focus_handle().tab_index(0).tab_stop(true);
+        cx.new(|_| Self {
+            handle,
+            _subscription: None,
         })
     }
 }
@@ -2619,8 +2628,12 @@ impl SettingsWindow {
             .pages
             .iter()
             .map(|page| {
-                std::iter::repeat_with(|| NonFocusableHandle::new(0, false, window, cx))
-                    .take(page.items.len())
+                page.items
+                    .iter()
+                    .map(|item| match item {
+                        SettingsPageItem::View(_) => NonFocusableHandle::focusable(cx),
+                        _ => NonFocusableHandle::new(0, false, window, cx),
+                    })
                     .collect()
             })
             .collect::<Vec<_>>();
@@ -7739,6 +7752,111 @@ pub mod test {
                 assert_eq!(entry.title, "Second");
             })
             .expect("settings window");
+    }
+
+    #[gpui::test]
+    fn test_extension_page_without_tab_stops_keeps_navigation(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            register_settings(cx);
+            release_channel::init("0.0.0".parse().expect("version"), cx);
+            crate::init(cx);
+            AppState::set_global(AppState::test(cx), cx);
+            register_extension_page(
+                "Extension",
+                |_, _, cx| {
+                    vec![ExtensionSection {
+                        title: "Only",
+                        view: cx.new(|_| gpui::Empty).into(),
+                    }]
+                },
+                cx,
+            );
+        });
+        cx.update(|cx| open_settings_section("General", None, None, cx));
+        cx.run_until_parked();
+        let settings_window = cx
+            .update(|cx| {
+                cx.windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<SettingsWindow>())
+            })
+            .expect("the settings window opens");
+        let cx = &mut gpui::VisualTestContext::from_window(settings_window.into(), cx);
+        cx.update(|window, _| window.activate_window());
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.update_window(settings_window.into(), |_, window, _| window.refresh())
+                .expect("settings window");
+            cx.run_until_parked();
+        };
+        let view_handle = |settings_window: &SettingsWindow, cx: &App| {
+            let view_index = settings_window
+                .current_page()
+                .items
+                .iter()
+                .position(|item| matches!(item, SettingsPageItem::View(_)))?;
+            Some(
+                settings_window.content_handles[settings_window.current_page_index()][view_index]
+                    .focus_handle(cx),
+            )
+        };
+        let assert_on_extension_view = |cx: &mut gpui::VisualTestContext| {
+            settings_window
+                .update(cx, |settings_window, window, cx| {
+                    assert_eq!(settings_window.current_page().title, "Extension");
+                    let handle = view_handle(settings_window, cx).expect("view item");
+                    assert!(handle.is_focused(window));
+                })
+                .expect("settings window");
+        };
+        draw(cx);
+
+        settings_window
+            .update(cx, |settings_window, window, cx| {
+                let extension_entry = settings_window
+                    .navbar_entries
+                    .iter()
+                    .position(|entry| entry.is_root && entry.title == "Extension")
+                    .expect("extension nav entry");
+                settings_window.open_and_scroll_to_navbar_entry(
+                    extension_entry,
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+                // The test platform never delivers the frame that applies this focus.
+                let first_item = settings_window
+                    .visible_page_items()
+                    .next()
+                    .map(|(index, _)| index)
+                    .expect("first item");
+                window.focus(
+                    &settings_window.focus_handle_for_content_element(first_item, cx),
+                    cx,
+                );
+            })
+            .expect("settings window");
+        for _ in 0..3 {
+            draw(cx);
+        }
+        assert_on_extension_view(cx);
+
+        settings_window
+            .update(cx, |settings_window, window, cx| {
+                settings_window.focus_handle.clone().focus(window, cx);
+            })
+            .expect("settings window");
+        draw(cx);
+        settings_window
+            .update(cx, |settings_window, window, cx| {
+                let handle = view_handle(settings_window, cx).expect("view item");
+                window.focus(&handle, cx);
+            })
+            .expect("settings window");
+        for _ in 0..3 {
+            draw(cx);
+        }
+        assert_on_extension_view(cx);
     }
 
     fn settings_window_with_items(
