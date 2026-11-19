@@ -38,4 +38,5 @@ pub mod subagents;
 pub mod terminal;
 pub mod turns;
 pub mod updates;
+pub mod usage;
 pub mod workspaces;

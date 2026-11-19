@@ -438,6 +438,17 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             }
         }
     }
+    println!("\n--- Icarus: icarus_usage ---");
+    for (name, result) in run_icarus_usage_tests(workspace_window, &mut cx, update_baseline) {
+        match result {
+            Ok(TestResult::Passed) => passed += 1,
+            Ok(TestResult::BaselineUpdated(_)) => updated += 1,
+            Err(error) => {
+                eprintln!("✗ {name}: FAILED - {error}");
+                failed += 1;
+            }
+        }
+    }
     println!("\n--- Icarus: icarus_changes_tree ---");
     for (name, result) in run_icarus_changes_tree_tests(workspace_window, &mut cx, update_baseline)
     {
@@ -1870,6 +1881,101 @@ fn run_icarus_dark_and_light(
         result
     });
     vec![(dark_name, dark), (light_name, light)]
+}
+
+fn icarus_usage_fixture() -> (
+    Vec<icarus_ui::accounts::Account>,
+    Vec<icarus_ui::accounts::ProviderUsage>,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    // A few seconds past each mark, so the floored countdowns read the same on every run.
+    let at = |minutes: u64| Some(now + minutes * 60_000 + 30_000);
+    let usage = serde_json::json!([
+        { "provider": "claude", "plan": "Max", "updated_at_ms": now, "windows": [
+            { "key": "session", "used_percent": 2, "window_minutes": 300, "resets_at_ms": at(280) },
+            { "key": "weekly", "used_percent": 11, "window_minutes": 10080, "resets_at_ms": at(6 * 1440 + 480) },
+            { "key": "fable", "used_percent": 0, "window_minutes": 10080, "resets_at_ms": at(6 * 1440 + 480) },
+        ] },
+        { "provider": "codex", "plan": "Plus", "updated_at_ms": now, "windows": [
+            { "key": "session", "used_percent": 64, "window_minutes": 300, "resets_at_ms": at(95) },
+            { "key": "weekly", "used_percent": 87, "window_minutes": 10080, "resets_at_ms": at(2 * 1440 + 180) },
+        ] },
+        { "provider": "cursor", "failure": "expired", "error": "Cursor sign-in expired — run `cursor-agent login` again" },
+    ]);
+    let accounts = serde_json::json!([
+        { "id": "system", "provider": "claude", "label": "System login", "default": false },
+        { "id": "acct-1", "provider": "claude", "label": "Work", "managed": true, "default": true, "email": "work@example.com" },
+        { "id": "system", "provider": "codex", "label": "System login", "default": true },
+    ]);
+    (
+        serde_json::from_value(accounts).unwrap_or_default(),
+        serde_json::from_value(usage).unwrap_or_default(),
+    )
+}
+
+/// The status bar's usage strip, its roster popover and a provider's submenu, from a fixed snapshot.
+fn run_icarus_usage_tests(
+    workspace_window: WindowHandle<Workspace>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Vec<(&'static str, Result<TestResult>)> {
+    use icarus_ui::accounts::AccountsButton;
+
+    let (accounts, usage) = icarus_usage_fixture();
+    let added = workspace_window.update(cx, |workspace, window, cx| {
+        let weak = workspace.weak_handle();
+        let button = cx.new(|cx| AccountsButton::preview(accounts, usage, weak, cx));
+        workspace.status_bar().update(cx, |status_bar, cx| {
+            status_bar.add_right_item(button.clone(), window, cx);
+        });
+        button
+    });
+    let button = match added {
+        Ok(button) => button,
+        Err(error) => return vec![("icarus_usage_strip", Err(error))],
+    };
+    cx.run_until_parked();
+    let mut results = run_icarus_dark_and_light(
+        "icarus_usage_strip",
+        "icarus_usage_strip_light",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+    for (name, light_name, open_provider) in [
+        ("icarus_usage_roster", "icarus_usage_roster_light", false),
+        ("icarus_usage_provider", "icarus_usage_provider_light", true),
+    ] {
+        let shown = cx.update_window(workspace_window.into(), |_, window, cx| {
+            AccountsButton::show_roster(&button, open_provider, window, cx);
+        });
+        cx.run_until_parked();
+        match shown {
+            Ok(()) => results.extend(run_icarus_dark_and_light(
+                name,
+                light_name,
+                workspace_window.into(),
+                cx,
+                update_baseline,
+            )),
+            Err(error) => results.push((name, Err(error))),
+        }
+        cx.update(|cx| AccountsButton::hide_roster(&button, cx));
+        cx.run_until_parked();
+    }
+    workspace_window
+        .update(cx, |workspace, _, cx| {
+            workspace.status_bar().update(cx, |status_bar, cx| {
+                if let Some(position) = status_bar.position_of_item::<AccountsButton>() {
+                    status_bar.remove_item_at(position, cx);
+                }
+            });
+        })
+        .log_err();
+    cx.run_until_parked();
+    results
 }
 
 /// Icarus's Automations settings page, filled from a fixed snapshot.

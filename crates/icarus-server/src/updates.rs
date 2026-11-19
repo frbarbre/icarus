@@ -130,6 +130,11 @@ fn gh_latest(repo: &str) -> Option<Result<Option<Release>, SourceError>> {
 }
 
 fn https_agent() -> Result<ureq::Agent, SourceError> {
+    https_client(CHECK_TIMEOUT).map_err(SourceError::Failed)
+}
+
+/// An HTTPS client that trusts the system's roots and leaves status handling to the caller.
+pub(crate) fn https_client(timeout: Duration) -> Result<ureq::Agent, String> {
     static ROOTS: OnceLock<Result<Vec<ureq::tls::Certificate<'static>>, String>> = OnceLock::new();
     let roots = ROOTS
         .get_or_init(|| {
@@ -144,8 +149,7 @@ fn https_agent() -> Result<ureq::Agent, SourceError> {
                 Ok(certs)
             }
         })
-        .clone()
-        .map_err(SourceError::Failed)?;
+        .clone()?;
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::Rustls)
         .root_certs(ureq::tls::RootCerts::from(roots))
@@ -154,7 +158,7 @@ fn https_agent() -> Result<ureq::Agent, SourceError> {
     Ok(ureq::Agent::config_builder()
         .tls_config(tls)
         .http_status_as_error(false)
-        .timeout_global(Some(CHECK_TIMEOUT))
+        .timeout_global(Some(timeout))
         .user_agent("icarus")
         .build()
         .new_agent())

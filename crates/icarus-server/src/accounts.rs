@@ -296,6 +296,48 @@ impl Server {
                 }
                 Ok(json!(out))
             }
+            "account.usage_summary" => {
+                #[derive(Deserialize)]
+                struct P {
+                    #[serde(default)]
+                    force: bool,
+                }
+                let p: P = params(p)?;
+                let agents = self.agents.list();
+                let mut tasks = Vec::new();
+                for provider in crate::usage::PROVIDERS {
+                    let account = self
+                        .default_account(provider)
+                        .and_then(|id| self.store.account(&id).ok().flatten());
+                    let key = account.as_ref().map_or(SYSTEM.to_owned(), |a| a.id.clone());
+                    let turns = latest_usage(
+                        &agents,
+                        provider,
+                        account.as_ref().map(|a| a.id.as_str()),
+                        now_ms(),
+                    );
+                    let home = account.map(|a| a.home);
+                    tasks.push(tokio::task::spawn_blocking(move || {
+                        let now = now_ms();
+                        let usage =
+                            crate::usage::usage(provider, &key, home.as_deref(), p.force, now);
+                        match turns["at_ms"].as_u64() {
+                            Some(at) => crate::usage::with_turn_windows(
+                                usage,
+                                &turns["rate_limits"],
+                                at,
+                                now,
+                            ),
+                            None => usage,
+                        }
+                    }));
+                }
+                let mut out = Vec::new();
+                for task in tasks {
+                    out.push(task.await.map_err(|e| rpc("internal", e.to_string()))?);
+                }
+                Ok(json!(out))
+            }
             "account.add" => {
                 #[derive(Deserialize)]
                 struct P {
