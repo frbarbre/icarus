@@ -1068,6 +1068,11 @@ impl Server {
         self.store
             .insert_owned_workspace(&workspace)
             .map_err(internal)?;
+        // Workspaces made by the CLI or an automation would otherwise reach the app only on its next poll.
+        self.broadcast(
+            "workspace.changed",
+            json!({ "workspaces": [workspace.id], "source": "create" }),
+        );
         if let Err(error) = self.start_setup(&workspace, &project.root, setup_decision) {
             tracing::warn!("setup for {}: {}", workspace.name, error.message);
             self.record_setup_failure(&workspace.id, error.message);

@@ -173,6 +173,12 @@ fn activate_item_of_same_type(
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Counts the server's `workspace.changed` events, so a background window re-reads on the next tick.
+#[derive(Default)]
+struct WorkspacesChanged(u64);
+
+impl gpui::Global for WorkspacesChanged {}
 /// How often a window that isn't in front re-reads the workspaces; coming forward catches up within one tick.
 const BACKGROUND_INTERVAL: Duration = Duration::from_secs(30);
 /// A server round trip slower than this is logged; a local socket answers in a few milliseconds.
@@ -962,6 +968,9 @@ pub(crate) fn handle_view_event(topic: &str, payload: serde_json::Value, cx: &mu
         "config.changed" => settings_pages::config_changed(cx),
         "account.usage" => accounts::usage_changed(cx),
         "workspace.next_action" | "workspace.changed" => {
+            if topic == "workspace.changed" {
+                cx.default_global::<WorkspacesChanged>().0 += 1;
+            }
             next_action::server_event(topic, &payload, cx)
         }
         "agent.state" => model::agent_state_pushed(payload, cx),
@@ -1663,6 +1672,7 @@ impl WorkspacesPanel {
         }
         panel._poll = cx.spawn(async move |this, cx| {
             let mut last_poll: Option<Instant> = None;
+            let mut seen_changes = 0;
             loop {
                 if this.upgrade().is_none() {
                     return;
@@ -1671,10 +1681,15 @@ impl WorkspacesPanel {
                     cx.update_window(window, |_, window, _| window.is_window_active())
                         .unwrap_or(false)
                 });
-                if !in_front && last_poll.is_some_and(|at| at.elapsed() < BACKGROUND_INTERVAL) {
+                let changes = cx.update(|cx| cx.default_global::<WorkspacesChanged>().0);
+                if !in_front
+                    && changes == seen_changes
+                    && last_poll.is_some_and(|at| at.elapsed() < BACKGROUND_INTERVAL)
+                {
                     cx.background_executor().timer(REFRESH_INTERVAL).await;
                     continue;
                 }
+                seen_changes = changes;
                 last_poll = Some(Instant::now());
                 // The app's own connection: this machine, or the saved server picked in the Servers menu.
                 let Some(client) = cx.update(|cx| app_client(cx)) else {

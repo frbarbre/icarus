@@ -124,7 +124,7 @@ async fn a_workspace_created_with_the_review_layout_puts_its_agent_left_and_the_
             .await
             .expect("event in time")
             .expect("open stream");
-        if event.topic != "agent.state" {
+        if !matches!(event.topic.as_str(), "agent.state" | "workspace.changed") {
             break event;
         }
     };

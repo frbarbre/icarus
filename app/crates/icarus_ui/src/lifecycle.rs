@@ -1857,7 +1857,7 @@ impl CardAction {
             CardAction::Sleep => "Sleep",
             CardAction::Wake => "Wake",
             CardAction::RerunSetup => "Re-run Setup",
-            CardAction::Delete => "Delete…",
+            CardAction::Delete => "Delete",
         }
     }
 }
@@ -2035,7 +2035,7 @@ pub fn bulk_actions(
     if !removable.is_empty() {
         actions.push((
             BulkAction::Delete,
-            format!("{}…", crate::cards::count_label("Delete", removable.len())),
+            crate::cards::count_label("Delete", removable.len()),
             removable,
         ));
     }
@@ -2113,90 +2113,37 @@ pub fn run_bulk_action(
         .detach();
 }
 
-/// Deletes several workspaces after one confirmation (Orca always confirms a bulk delete). Those refused
-/// for local changes, unsent review comments or a failed archive script are offered one Force Delete.
+/// Force-deletes without asking: the user deletes on purpose, so local changes and unsent comments go too.
 fn delete_workspaces(
     targets: Vec<(ServerRef, WorkspaceSummary)>,
     workspace: WeakEntity<Workspace>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let count = targets.len();
-    let answer = window.prompt(
-        PromptLevel::Warning,
-        &format!("Delete {count} workspaces?"),
-        Some(
-            "Each project's archive script runs, then the worktree folders and their branches are removed. Their agents and terminals end.",
-        ),
-        &[&crate::cards::count_label("Delete", count), "Cancel"],
-        cx,
-    );
     window
         .spawn(cx, async move |cx| {
-            if answer.await? != 0 {
-                return anyhow::Ok(());
-            }
-            let mut forceable = Vec::new();
             let mut failures = Vec::new();
             for (server, summary) in targets {
                 let removed = cx
                     .update(|_, cx| {
-                        request(&server, "workspace.remove", json!({ "id": summary.id }), cx)
+                        request(
+                            &server,
+                            "workspace.remove",
+                            json!({ "id": summary.id, "force": true }),
+                            cx,
+                        )
                     })?
                     .await;
                 let Err(error) = removed else {
                     continue;
                 };
-                let line = format!("{}: {}", summary.display_title(), error_text(&error));
-                if error_code(&error)
-                    .as_deref()
-                    .is_some_and(|code| FORCEABLE.contains(&code))
-                {
-                    forceable.push((server, summary, line));
-                } else {
-                    failures.push(line);
-                }
-            }
-            cx.update(|_, cx| refresh_panel(&workspace, cx))?;
-            if !forceable.is_empty() {
-                let detail = forceable
-                    .iter()
-                    .map(|(_, _, line)| line.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let answer = cx.update(|window, cx| {
-                    window.prompt(
-                        PromptLevel::Critical,
-                        &if forceable.len() == 1 {
-                            "1 workspace wasn't deleted".to_owned()
-                        } else {
-                            format!("{} workspaces weren't deleted", forceable.len())
-                        },
-                        Some(&detail),
-                        &["Force Delete", "Cancel"],
-                        cx,
-                    )
-                })?;
-                if answer.await? == 0 {
-                    for (server, summary, _) in forceable {
-                        let forced = cx
-                            .update(|_, cx| {
-                                request(
-                                    &server,
-                                    "workspace.remove",
-                                    json!({ "id": summary.id, "force": true }),
-                                    cx,
-                                )
-                            })?
-                            .await;
-                        if let Err(error) = forced {
-                            failures.push(format!(
-                                "{}: {}",
-                                summary.display_title(),
-                                error_text(&error)
-                            ));
-                        }
-                    }
+                // An earlier delete of the same workspace finished first.
+                if error_code(&error).as_deref() != Some("not_found") {
+                    failures.push(format!(
+                        "{}: {}",
+                        summary.display_title(),
+                        error_text(&error)
+                    ));
                 }
             }
             cx.update(|_, cx| {
@@ -2213,8 +2160,6 @@ fn delete_workspaces(
         .detach_and_log_err(cx);
 }
 
-const FORCEABLE: [&str; 3] = ["dirty", "unsent_review", "archive_failed"];
-
 fn delete_workspace(
     server: ServerRef,
     summary: &WorkspaceSummary,
@@ -2222,83 +2167,7 @@ fn delete_workspace(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let title = summary.display_title();
-    let id = summary.id.clone();
-    let answer = window.prompt(
-        PromptLevel::Warning,
-        &format!("Delete {title}?"),
-        Some(
-            "The project's archive script runs, then the worktree folder and its branch are removed. Its agents and terminals end.",
-        ),
-        &["Delete", "Cancel"],
-        cx,
-    );
-    window
-        .spawn(cx, async move |cx| {
-            if answer.await? != 0 {
-                return anyhow::Ok(());
-            }
-            let removed = cx
-                .update(|_, cx| request(&server, "workspace.remove", json!({ "id": id }), cx))?
-                .await;
-            let error = match removed {
-                Ok(_) => return cx.update(|_, cx| refresh_panel(&workspace, cx)),
-                Err(error) => error,
-            };
-            let code = error_code(&error);
-            // An earlier delete of the same workspace finished first.
-            if code.as_deref() == Some("not_found") {
-                return cx.update(|_, cx| refresh_panel(&workspace, cx));
-            }
-            if !code
-                .as_deref()
-                .is_some_and(|code| FORCEABLE.contains(&code))
-            {
-                return cx.update(|_, cx| {
-                    show_failure(
-                        &workspace,
-                        format!("Couldn't delete {title}: {}", error_text(&error)),
-                        cx,
-                    )
-                });
-            }
-            let detail = if code.as_deref() == Some("dirty") {
-                "It has uncommitted changes. Force Delete throws them away.".to_owned()
-            } else {
-                error_text(&error)
-            };
-            let answer = cx.update(|window, cx| {
-                window.prompt(
-                    PromptLevel::Critical,
-                    &format!("{title} wasn't deleted"),
-                    Some(&detail),
-                    &["Force Delete", "Cancel"],
-                    cx,
-                )
-            })?;
-            if answer.await? != 0 {
-                return Ok(());
-            }
-            let forced = cx
-                .update(|_, cx| {
-                    request(
-                        &server,
-                        "workspace.remove",
-                        json!({ "id": id, "force": true }),
-                        cx,
-                    )
-                })?
-                .await;
-            cx.update(|_, cx| match forced {
-                Ok(_) => refresh_panel(&workspace, cx),
-                Err(error) => show_failure(
-                    &workspace,
-                    format!("Couldn't delete {title}: {}", error_text(&error)),
-                    cx,
-                ),
-            })
-        })
-        .detach_and_log_err(cx);
+    delete_workspaces(vec![(server, summary.clone())], workspace, window, cx);
 }
 
 // Why: only the title changes; the folder and branch names back paths, URLs and git refs.
@@ -3198,7 +3067,7 @@ mod tests {
                 (BulkAction::Pin, "Pin 2 Workspaces".to_owned(), 2),
                 (BulkAction::Sleep, "Sleep 2 Workspaces".to_owned(), 2),
                 (BulkAction::Wake, "Wake 1 Workspace".to_owned(), 1),
-                (BulkAction::Delete, "Delete 3 Workspaces…".to_owned(), 3),
+                (BulkAction::Delete, "Delete 3 Workspaces".to_owned(), 3),
             ]
         );
         assert_eq!(
@@ -3249,19 +3118,14 @@ mod tests {
             )
         });
         cx.run_until_parked();
-        cx.simulate_prompt_answer("Delete 3 Workspaces");
-        cx.run_until_parked();
         assert_eq!(
-            calls_to(&calls, "workspace.remove").len(),
-            3,
-            "one confirmation for all"
-        );
-        assert!(cx.has_pending_prompt(), "the dirty one is offered a force");
-        cx.simulate_prompt_answer("Force Delete");
-        cx.run_until_parked();
-        assert_eq!(
-            calls_to(&calls, "workspace.remove").last(),
-            Some(&json!({ "id": "ws-dirty", "force": true }))
+            calls_to(&calls, "workspace.remove"),
+            [
+                json!({ "id": "ws-pinned", "force": true }),
+                json!({ "id": "ws-asleep", "force": true }),
+                json!({ "id": "ws-dirty", "force": true })
+            ],
+            "every delete is forced, without asking"
         );
         assert!(!cx.has_pending_prompt());
         assert!(!has_failure_toast(&workspace, cx));
@@ -3337,14 +3201,21 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn delete_confirms_and_offers_force_for_a_dirty_checkout(cx: &mut gpui::TestAppContext) {
+    async fn delete_forces_without_asking_and_an_already_deleted_workspace_is_no_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let card = summary("dirty", "/w/dirty", None);
         let (workspace, _, mut cx) = panel_window(vec![card.clone()], cx).await;
         let cx = &mut cx;
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let calls = cx.update(|_, cx| {
-            stub_rpc(cx, |method, params| match method {
+            let gone = gone.clone();
+            stub_rpc(cx, move |method, params| match method {
                 "workspace.remove" if params["force"] != json!(true) => {
                     Err(rpc_error("dirty", "worktree has uncommitted changes"))
+                }
+                "workspace.remove" if gone.load(std::sync::atomic::Ordering::SeqCst) => {
+                    Err(rpc_error("not_found", "workspace ws-dirty"))
                 }
                 _ => Ok(json!({ "removed": true })),
             })
@@ -3365,32 +3236,19 @@ mod tests {
         };
 
         delete(cx);
-        cx.simulate_prompt_answer("Cancel");
-        cx.run_until_parked();
-        assert!(
-            calls_to(&calls, "workspace.remove").is_empty(),
-            "cancel does nothing"
-        );
-
-        delete(cx);
-        cx.simulate_prompt_answer("Delete");
-        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt(), "no confirmation");
         assert_eq!(
             calls_to(&calls, "workspace.remove"),
-            [json!({ "id": "ws-dirty" })]
+            [json!({ "id": "ws-dirty", "force": true })]
         );
-        assert!(cx.has_pending_prompt(), "the dirty refusal asks again");
-        cx.simulate_prompt_answer("Force Delete");
-        cx.run_until_parked();
-        assert_eq!(
-            calls_to(&calls, "workspace.remove"),
-            [
-                json!({ "id": "ws-dirty" }),
-                json!({ "id": "ws-dirty", "force": true })
-            ]
-        );
-        assert!(!cx.has_pending_prompt());
         assert!(!has_failure_toast(&workspace, cx));
+
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        delete(cx);
+        assert!(
+            !has_failure_toast(&workspace, cx),
+            "a second click on a workspace already gone is not an error"
+        );
     }
 
     #[gpui::test]
